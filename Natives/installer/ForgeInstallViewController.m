@@ -21,7 +21,7 @@
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    UISegmentedControl *segment = [[UISegmentedControl alloc] initWithItems:@[@"Forge", @"NeoForge"]];
+    UISegmentedControl *segment = [[UISegmentedControl alloc] initWithItems:@[@"Forge", @"NeoForge", @"OptiFine"]];
     segment.selectedSegmentIndex = 0;
     [segment addTarget:self action:@selector(segmentChanged:) forControlEvents:UIControlEventValueChanged];
     self.navigationItem.titleView = segment;
@@ -41,6 +41,9 @@
         @"NeoForge": @{
             @"installer": @"https://maven.neoforged.net/net/neoforged/forge/%1$@/forge-%1$@-installer.jar",
             @"metadata": @"https://maven.neoforged.net/releases/net/neoforged/forge/maven-metadata.xml"
+        },
+        @"OptiFine": @{
+            @"metadata": @"https://raw.githubusercontent.com/huanghongxun/HMCL/master/hmclweb/optifine/version_manifest.json"
         }
     };
     self.visibilityList = [NSMutableArray new];
@@ -60,14 +63,47 @@
 - (void)loadMetadataFromVendor:(NSString *)vendor {
     [self switchToLoadingState];
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSURL *url = [[NSURL alloc] initWithString:self.endpoints[vendor][@"metadata"]];
-        NSXMLParser *parser = [[NSXMLParser alloc] initWithContentsOfURL:url];
-        parser.delegate = self;
-        if (![parser parse]) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                showDialog(localize(@"Error", nil), parser.parserError.localizedDescription);
-                [self actionClose];
-            });
+        if ([vendor isEqualToString:@"OptiFine"]) {
+            // Handle OptiFine JSON metadata
+            NSURL *url = [[NSURL alloc] initWithString:self.endpoints[vendor][@"metadata"]];
+            NSData *data = [NSData dataWithContentsOfURL:url];
+            if (data) {
+                NSError *error;
+                NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
+                if (!error && json[@"versions"]) {
+                    for (NSDictionary *version in json[@"versions"]) {
+                        NSString *versionStr = version[@"id"];
+                        if (versionStr) {
+                            [self addVersionToList:versionStr];
+                        }
+                    }
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [self switchToReadyState];
+                        [self.tableView reloadData];
+                    });
+                } else {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        showDialog(localize(@"Error", nil), error.localizedDescription ?: @"Failed to parse OptiFine metadata");
+                        [self actionClose];
+                    });
+                }
+            } else {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    showDialog(localize(@"Error", nil), @"Failed to download OptiFine metadata");
+                    [self actionClose];
+                });
+            }
+        } else {
+            // Handle Forge/NeoForge XML metadata
+            NSURL *url = [[NSURL alloc] initWithString:self.endpoints[vendor][@"metadata"]];
+            NSXMLParser *parser = [[NSXMLParser alloc] initWithContentsOfURL:url];
+            parser.delegate = self;
+            if (![parser parse]) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    showDialog(localize(@"Error", nil), parser.parserError.localizedDescription);
+                    [self actionClose];
+                });
+            }
         }
     });
 }
@@ -148,9 +184,24 @@
 
     UISegmentedControl *segment = (id)self.navigationItem.titleView;
     NSString *vendor = [segment titleForSegmentAtIndex:segment.selectedSegmentIndex];
-    NSString *jarURL = [NSString stringWithFormat:self.endpoints[vendor][@"installer"], cell.textLabel.text];
+    
+    NSString *jarURL;
+    if ([vendor isEqualToString:@"OptiFine"]) {
+        // OptiFine download URL format
+        NSString *versionText = cell.textLabel.text;
+        NSArray *components = [versionText componentsSeparatedByString:"_"];
+        if (components.count >= 2) {
+            NSString *mcVersion = components[0];
+            NSString *ofVersion = components[1];
+            jarURL = [NSString stringWithFormat:@"https://optifine.net/download.php?f=OptiFine_%%251$s_%%252$s.jar", mcVersion, ofVersion];
+        }
+    } else {
+        // Forge/NeoForge download URL
+        jarURL = [NSString stringWithFormat:self.endpoints[vendor][@"installer"], cell.textLabel.text];
+    }
+    
     NSString *outPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"tmp.jar"];
-    NSDebugLog(@"[Forge Installer] Downloading %@", jarURL);
+    NSDebugLog(@"[Mod Installer] Downloading %@", jarURL);
 
     self.afManager = [AFURLSessionManager new];
     NSURLRequest *request = [NSURLRequest requestWithURL:[NSURL URLWithString:jarURL]];
