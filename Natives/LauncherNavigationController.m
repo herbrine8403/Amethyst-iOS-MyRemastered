@@ -25,16 +25,16 @@
 
 static void *ProgressObserverContext = &ProgressObserverContext;
 
-@interface LauncherNavigationController () <UIDocumentPickerDelegate, UIPickerViewDataSource, PLPickerViewDelegate, UIPopoverPresentationControllerDelegate> {
-    BOOL _isModpackImportPicker;
-}
-
-@property(nonatomic) MinecraftResourceDownloadTask* task;
-@property(nonatomic) DownloadProgressViewController* progressVC;
-@property(nonatomic) PLPickerView* versionPickerView;
-@property(nonatomic) UITextField* versionTextField;
-@property(nonatomic) int profileSelectedAt;
-
+@interface LauncherNavigationController () <UIDocumentPickerDelegate, UIPickerViewDataSource, PLPickerViewDelegate, UIPopoverPresentationControllerDelegate> {
+    BOOL _isModpackImportPicker;
+}
+
+@property(nonatomic) MinecraftResourceDownloadTask* task;
+@property(nonatomic) DownloadProgressViewController* progressVC;
+@property(nonatomic) PLPickerView* versionPickerView;
+@property(nonatomic) UITextField* versionTextField;
+@property(nonatomic) int profileSelectedAt;
+
 @end
 
 @implementation LauncherNavigationController
@@ -205,15 +205,18 @@ static void *ProgressObserverContext = &ProgressObserverContext;
     [self presentViewController:documentPicker animated:YES completion:nil];
 }
 
-- (void)enterModpackImporter {
-    UIDocumentPickerViewController *documentPicker = [[UIDocumentPickerViewController alloc]
-        initForOpeningContentTypes:@[[UTType typeWithMIMEType:@"application/zip"]]
-        asCopy:YES];
-    documentPicker.delegate = self;
-    documentPicker.modalPresentationStyle = UIModalPresentationFormSheet;
-    // Set a flag to distinguish between modpack import and other document picks
-    _isModpackImportPicker = YES;
-    [self presentViewController:documentPicker animated:YES completion:nil];
+- (void)enterModpackImporter {
+    UIDocumentPickerViewController *documentPicker = [[UIDocumentPickerViewController alloc]
+        initForOpeningContentTypes:@[[UTType typeWithMIMEType:@"application/zip"], [UTType typeWithFilenameExtension:@"mrpack"]]
+        asCopy:YES];
+    UIDocumentPickerViewController *documentPicker = [[UIDocumentPickerViewController alloc]
+        initForOpeningContentTypes:@[[UTType typeWithMIMEType:@"application/zip"]]
+        asCopy:YES];
+    documentPicker.delegate = self;
+    documentPicker.modalPresentationStyle = UIModalPresentationFormSheet;
+    // Set a flag to distinguish between modpack import and other document picks
+    _isModpackImportPicker = YES;
+    [self presentViewController:documentPicker animated:YES completion:nil];
 }
 
 - (void)enterModInstallerWithPath:(NSString *)path hitEnterAfterWindowShown:(BOOL)hitEnter {
@@ -230,15 +233,15 @@ static void *ProgressObserverContext = &ProgressObserverContext;
     }];
 }
 
-- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentAtURL:(NSURL *)url {
-    if (_isModpackImportPicker) {
-        // Handle modpack import
-        [self importModpackFromURL:url];
-        _isModpackImportPicker = NO; // Reset the flag
-    } else {
-        // Handle normal jar file import
-        [self enterModInstallerWithPath:url.path hitEnterAfterWindowShown:NO];
-    }
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentAtURL:(NSURL *)url {
+    if (_isModpackImportPicker) {
+        // Handle modpack import
+        [self importModpackFromURL:url];
+        _isModpackImportPicker = NO; // Reset the flag
+    } else {
+        // Handle normal jar file import
+        [self enterModInstallerWithPath:url.path hitEnterAfterWindowShown:NO];
+    }
 }
 
 - (void)importModpackFromURL:(NSURL *)url {

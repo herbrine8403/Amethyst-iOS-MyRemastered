@@ -20,7 +20,8 @@
     self = [super init];
     // TODO: implement background download
     NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration defaultSessionConfiguration];
-    configuration.timeoutIntervalForRequest = 86400;
+    configuration.timeoutIntervalForRequest = 300; // 5 minutes
+    configuration.timeoutIntervalForResource = 300; // 5 minutes
     //backgroundSessionConfigurationWithIdentifier:@"net.kdt.pojavlauncher.downloadtask"];
     self.manager = [[AFURLSessionManager alloc] initWithSessionConfiguration:configuration];
     self.fileList = [NSMutableArray new];
@@ -319,6 +320,10 @@
                         completedDownloads++;
                         if (completedDownloads >= totalExpectedDownloads) {
                             [self.metadata removeObjectForKey:@"assetIndexObj"];
+                            // Execute modpack download completion if it exists
+                            if (self.modpackDownloadCompletion) {
+                                self.modpackDownloadCompletion();
+                            }
                         }
                     }
                 }];
@@ -329,6 +334,10 @@
                         completedDownloads++;
                         if (completedDownloads >= totalExpectedDownloads) {
                             [self.metadata removeObjectForKey:@"assetIndexObj"];
+                            // Execute modpack download completion if it exists
+                            if (self.modpackDownloadCompletion) {
+                                self.modpackDownloadCompletion();
+                            }
                         }
                     }
                 } else {
@@ -384,17 +393,18 @@
                 }
             }
             
-            // If no downloads were needed, remove the metadata directly
-            if (totalExpectedDownloads == 0) {
-                [self.metadata removeObjectForKey:@"assetIndexObj"];
-            }
-            
-            // If this is part of a modpack installation and we have a completion callback, execute it
-            if (self.modpackDownloadCompletion) {
-                self.modpackDownloadCompletion();
-            }
-        }];
-    }];
+            // If no downloads were needed, remove the metadata directly
+            if (totalExpectedDownloads == 0) {
+                [self.metadata removeObjectForKey:@"assetIndexObj"];
+                // Execute modpack download completion if it exists
+                if (self.modpackDownloadCompletion) {
+                    self.modpackDownloadCompletion();
+                }
+            }
+            
+            
+        }];
+    }];
 }
 
 #pragma mark - Modpack installation
