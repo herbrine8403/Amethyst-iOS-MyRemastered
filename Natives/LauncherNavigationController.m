@@ -209,9 +209,6 @@ static void *ProgressObserverContext = &ProgressObserverContext;
     UIDocumentPickerViewController *documentPicker = [[UIDocumentPickerViewController alloc]
         initForOpeningContentTypes:@[[UTType typeWithMIMEType:@"application/zip"], [UTType typeWithFilenameExtension:@"mrpack"]]
         asCopy:YES];
-    UIDocumentPickerViewController *documentPicker = [[UIDocumentPickerViewController alloc]
-        initForOpeningContentTypes:@[[UTType typeWithMIMEType:@"application/zip"]]
-        asCopy:YES];
     documentPicker.delegate = self;
     documentPicker.modalPresentationStyle = UIModalPresentationFormSheet;
     // Set a flag to distinguish between modpack import and other document picks
