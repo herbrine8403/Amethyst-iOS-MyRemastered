@@ -25,12 +25,17 @@
 #include "utils.h"
 
 #include <dlfcn.h>
+
+// ==========================================
+// [START] TouchController Mod Support
+// ==========================================
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
-#include <arpa/inet.h>
 #include <fcntl.h>
 
-// --- TouchSender Implementation ---
+#define TC_MOD_PORT 12450
+
 @interface TouchSender : NSObject {
     int _sock;
     struct sockaddr_in6 _target;
@@ -45,17 +50,20 @@
     if (self) {
         _sock = socket(AF_INET6, SOCK_DGRAM, 0);
         if (_sock < 0) {
-            NSLog(@"TouchSender: Failed to create socket");
+            NSLog(@"[TouchController] Error: Failed to create socket.");
         } else {
-            // Non-blocking mode
+            // 设置非阻塞模式，防止网络卡顿影响主线程
             int flags = fcntl(_sock, F_GETFL, 0);
             fcntl(_sock, F_SETFL, flags | O_NONBLOCK);
 
+            // 配置 IPv6 本地地址 ::1
             memset(&_target, 0, sizeof(_target));
             _target.sin6_family = AF_INET6;
-            _target.sin6_port = htons(12450);
+            _target.sin6_port = htons(TC_MOD_PORT);
             if (inet_pton(AF_INET6, "::1", &_target.sin6_addr) <= 0) {
-                NSLog(@"TouchSender: Invalid address");
+                 NSLog(@"[TouchController] Error: Invalid IPv6 address.");
+            } else {
+                 NSLog(@"[TouchController] Ready on port %d", TC_MOD_PORT);
             }
         }
     }
@@ -63,14 +71,14 @@
 }
 
 - (void)dealloc {
-    if (_sock >= 0) {
-        close(_sock);
-    }
+    if (_sock >= 0) close(_sock);
 }
 
+// 核心发送方法：严格控制包长度
 - (void)sendType:(int32_t)type id:(int32_t)fingerId x:(float)x y:(float)y {
     if (_sock < 0) return;
 
+    // 定义协议包结构 (对齐模组的 C++ 结构)
     struct {
         int32_t type;
         int32_t id;
@@ -78,22 +86,30 @@
         int32_t y;
     } packet;
 
+    // 1. 写入消息头 (Type 1=Add/Move, 2=Remove)
     packet.type = htonl(type);
+
+    // 2. 写入手指 ID
     packet.id = htonl(fingerId);
 
-    // Raw float bits to int
-    uint32_t rawX, rawY;
-    memcpy(&rawX, &x, sizeof(float));
-    memcpy(&rawY, &y, sizeof(float));
+    // 3. 写入坐标 (使用 union 进行浮点数位转换，保持精度)
+    union { float f; int32_t i; } ux, uy;
+    ux.f = x;
+    uy.f = y;
+    packet.x = htonl(ux.i);
+    packet.y = htonl(uy.i);
 
-    packet.x = htonl(rawX);
-    packet.y = htonl(rawY);
+    // 4. [关键] 根据类型决定发送长度
+    // Type 1 需要坐标数据 (16字节)
+    // Type 2 只需要 Type 和 ID (8字节)，发多了模组会抛出 BadMessageLengthException
+    size_t length = (type == 2) ? 8 : 16;
 
-    sendto(_sock, &packet, sizeof(packet), 0, (struct sockaddr *)&_target, sizeof(_target));
+    sendto(_sock, &packet, length, 0, (struct sockaddr *)&_target, sizeof(_target));
 }
-
 @end
-// ----------------------------------
+// ==========================================
+// [END] TouchController Mod Support
+// ==========================================
 
 int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags, void *buffer, size_t buffersize);
 #define MEMORYSTATUS_CMD_SET_JETSAM_TASK_LIMIT        6
@@ -114,7 +130,7 @@ static GameSurfaceView* pojavWindow;
 @property(nonatomic) UILongPressGestureRecognizer* longPressGesture, *longPressTwoGesture;
 @property(nonatomic) UITapGestureRecognizer *tapGesture, *doubleTapGesture;
 
-@property(nonatomic) TouchSender *touchSender;
+@property(nonatomic, strong) TouchSender *touchSender;
 
 @property(nonatomic) id mouseConnectCallback, mouseDisconnectCallback;
 @property(nonatomic) id controllerConnectCallback, controllerDisconnectCallback;
@@ -143,7 +159,6 @@ static GameSurfaceView* pojavWindow;
 - (void)viewDidLoad
 {
     [super viewDidLoad];
-    self.touchSender = [[TouchSender alloc] init];
     isControlModifiable = NO;
     self.isMacCatalystApp = NSProcessInfo.processInfo.isMacCatalystApp;
     // Load MetalHUD library
@@ -346,6 +361,8 @@ static GameSurfaceView* pojavWindow;
         [self switchToExternalDisplay];
     }
 
+    // 初始化模组通信器
+    self.touchSender = [[TouchSender alloc] init];
     [self launchMinecraft];
 }
 
@@ -1059,23 +1076,27 @@ static GameSurfaceView* pojavWindow;
     [self updateControlHiddenState:self.toggleHidden];
 }
 
-#pragma mark - Input: On-screen touch events
+#pragma mark - Input: On-screen touch events (Modified)
 
-int touchesMovedCount;
-// Equals to Android ACTION_DOWN
-- (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event
-{
+// 生成唯一手指ID
+- (int32_t)getFingerId:(UITouch *)touch {
+    return (int32_t)((long)touch % 100000);
+}
+
+- (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event {
+    // 1. 检查开关：如果开启，走模组逻辑
     if (getPrefBool(@"control.mod_touch_enable")) {
         for (UITouch *touch in touches) {
-            CGPoint loc = [touch locationInView:self.view];
-            float x = loc.x / self.view.bounds.size.width;
-            float y = loc.y / self.view.bounds.size.height;
-            int32_t fid = (int32_t)(uintptr_t)touch;
-            [self.touchSender sendType:1 id:fid x:x y:y]; // 1 = Down/Move
+            CGPoint p = [touch locationInView:self.surfaceView];
+            float x = p.x / self.surfaceView.frame.size.width;
+            float y = p.y / self.surfaceView.frame.size.height;
+            // 发送 Type 1 (按下)
+            [self.touchSender sendType:1 id:[self getFingerId:touch] x:x y:y];
         }
-        return;
+        return; // 2. 直接返回，不执行下面的鼠标模拟
     }
 
+    // 3. 如果没开开关，执行原版逻辑 (保留原有代码)
     [super touchesBegan:touches withEvent:event];
     int i = 0;
     for (UITouch *touch in touches) {
@@ -1097,16 +1118,14 @@ int touchesMovedCount;
     }
 }
 
-// Equals to Android ACTION_MOVE
-- (void)touchesMoved:(NSSet *)touches withEvent:(UIEvent *)event
-{
+- (void)touchesMoved:(NSSet *)touches withEvent:(UIEvent *)event {
     if (getPrefBool(@"control.mod_touch_enable")) {
         for (UITouch *touch in touches) {
-            CGPoint loc = [touch locationInView:self.view];
-            float x = loc.x / self.view.bounds.size.width;
-            float y = loc.y / self.view.bounds.size.height;
-            int32_t fid = (int32_t)(uintptr_t)touch;
-            [self.touchSender sendType:1 id:fid x:x y:y]; // 1 = Down/Move
+            CGPoint p = [touch locationInView:self.surfaceView];
+            float x = p.x / self.surfaceView.frame.size.width;
+            float y = p.y / self.surfaceView.frame.size.height;
+            // 发送 Type 1 (移动)
+            [self.touchSender sendType:1 id:[self getFingerId:touch] x:x y:y];
         }
         return;
     }
@@ -1130,44 +1149,20 @@ int touchesMovedCount;
     }
 }
 
-// For ACTION_UP and ACTION_CANCEL
-- (void)touchesEndedGlobal:(NSSet *)touches withEvent:(UIEvent *)event
-{
+- (void)touchesEnded:(NSSet *)touches withEvent:(UIEvent *)event {
     if (getPrefBool(@"control.mod_touch_enable")) {
         for (UITouch *touch in touches) {
-            CGPoint loc = [touch locationInView:self.view];
-            float x = loc.x / self.view.bounds.size.width;
-            float y = loc.y / self.view.bounds.size.height;
-            int32_t fid = (int32_t)(uintptr_t)touch;
-            [self.touchSender sendType:2 id:fid x:x y:y]; // 2 = Up
+            // 发送 Type 2 (抬起)
+            [self.touchSender sendType:2 id:[self getFingerId:touch] x:0 y:0];
         }
         return;
     }
-
-    for (UITouch *touch in touches) {
-        if (touch.type == UITouchTypeIndirectPointer) {
-            continue; // handle this in a different place
-        }
-        [self sendTouchEvent:touch withUIEvent:event withEvent:ACTION_UP];
-    }
-}
-
-// Equals to Android ACTION_UP
-- (void)touchesEnded:(NSSet *)touches withEvent:(UIEvent *)event
-{
-    if (!getPrefBool(@"control.mod_touch_enable")) {
-        [super touchesEnded:touches withEvent:event];
-    }
+    [super touchesEnded:touches withEvent:event];
     [self touchesEndedGlobal:touches withEvent:event];
 }
 
-// Equals to Android ACTION_CANCEL
-- (void)touchesCancelled:(NSSet *)touches withEvent:(UIEvent *)event
-{
-    if (!getPrefBool(@"control.mod_touch_enable")) {
-        [super touchesCancelled:touches withEvent:event];
-    }
-    [self touchesEndedGlobal:touches withEvent:event];
+- (void)touchesCancelled:(NSSet *)touches withEvent:(UIEvent *)event {
+    [self touchesEnded:touches withEvent:event];
 }
 
 + (BOOL)isRunning {
