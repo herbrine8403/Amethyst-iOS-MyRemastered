@@ -429,6 +429,16 @@
         ], @[
             // Control settings
             @{@"icon": @"gamecontroller"},
+            
+            // --- [新增] TouchController 模组支持开关 ---
+            @{@"key": @"mod_touch_enable",
+              @"icon": @"hand.point.up.left", // SF Symbols 图标
+              @"hasDetail": @YES,
+              @"type": self.typeSwitch,
+              // @"title": @"TouchController 模组支持", // 可选：如果没有翻译文件支持，取消注释这一行
+            },
+            // ------------------------------------------
+
             @{@"key": @"default_gamepad_ctrl",
                 @"icon": @"hammer",
                 @"type": self.typeChildPane,
