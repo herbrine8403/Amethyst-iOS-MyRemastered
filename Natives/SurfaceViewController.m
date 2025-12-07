@@ -25,6 +25,75 @@
 #include "utils.h"
 
 #include <dlfcn.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+
+// --- TouchSender Implementation ---
+@interface TouchSender : NSObject {
+    int _sock;
+    struct sockaddr_in6 _target;
+}
+- (void)sendType:(int32_t)type id:(int32_t)fingerId x:(float)x y:(float)y;
+@end
+
+@implementation TouchSender
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _sock = socket(AF_INET6, SOCK_DGRAM, 0);
+        if (_sock < 0) {
+            NSLog(@"TouchSender: Failed to create socket");
+        } else {
+            // Non-blocking mode
+            int flags = fcntl(_sock, F_GETFL, 0);
+            fcntl(_sock, F_SETFL, flags | O_NONBLOCK);
+
+            memset(&_target, 0, sizeof(_target));
+            _target.sin6_family = AF_INET6;
+            _target.sin6_port = htons(12450);
+            if (inet_pton(AF_INET6, "::1", &_target.sin6_addr) <= 0) {
+                NSLog(@"TouchSender: Invalid address");
+            }
+        }
+    }
+    return self;
+}
+
+- (void)dealloc {
+    if (_sock >= 0) {
+        close(_sock);
+    }
+}
+
+- (void)sendType:(int32_t)type id:(int32_t)fingerId x:(float)x y:(float)y {
+    if (_sock < 0) return;
+
+    struct {
+        int32_t type;
+        int32_t id;
+        int32_t x;
+        int32_t y;
+    } packet;
+
+    packet.type = htonl(type);
+    packet.id = htonl(fingerId);
+
+    // Raw float bits to int
+    uint32_t rawX, rawY;
+    memcpy(&rawX, &x, sizeof(float));
+    memcpy(&rawY, &y, sizeof(float));
+
+    packet.x = htonl(rawX);
+    packet.y = htonl(rawY);
+
+    sendto(_sock, &packet, sizeof(packet), 0, (struct sockaddr *)&_target, sizeof(_target));
+}
+
+@end
+// ----------------------------------
 
 int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags, void *buffer, size_t buffersize);
 #define MEMORYSTATUS_CMD_SET_JETSAM_TASK_LIMIT        6
@@ -44,6 +113,8 @@ static GameSurfaceView* pojavWindow;
 
 @property(nonatomic) UILongPressGestureRecognizer* longPressGesture, *longPressTwoGesture;
 @property(nonatomic) UITapGestureRecognizer *tapGesture, *doubleTapGesture;
+
+@property(nonatomic) TouchSender *touchSender;
 
 @property(nonatomic) id mouseConnectCallback, mouseDisconnectCallback;
 @property(nonatomic) id controllerConnectCallback, controllerDisconnectCallback;
@@ -72,6 +143,7 @@ static GameSurfaceView* pojavWindow;
 - (void)viewDidLoad
 {
     [super viewDidLoad];
+    self.touchSender = [[TouchSender alloc] init];
     isControlModifiable = NO;
     self.isMacCatalystApp = NSProcessInfo.processInfo.isMacCatalystApp;
     // Load MetalHUD library
@@ -114,7 +186,7 @@ static GameSurfaceView* pojavWindow;
     self.ctrlView = [[ControlLayout alloc] initWithFrame:getSafeArea(self.view.frame)];
 
     [self performSelector:@selector(initCategory_Navigation)];
-    
+
     self.surfaceView = [[GameSurfaceView alloc] initWithFrame:self.view.frame];
     self.surfaceView.layer.contentsScale = screenScale * resolutionScale;
     self.surfaceView.layer.magnificationFilter = self.surfaceView.layer.minificationFilter = kCAFilterNearest;
@@ -131,7 +203,7 @@ static GameSurfaceView* pojavWindow;
 
     [self performSelector:@selector(setupCategory_Navigation)];
 
-    
+
     UIHoverGestureRecognizer *hoverGesture = [[NSClassFromString(@"UIHoverGestureRecognizer") alloc] initWithTarget:self action:@selector(surfaceOnHover:)];
     [self.touchView addGestureRecognizer:hoverGesture];
 
@@ -159,7 +231,7 @@ static GameSurfaceView* pojavWindow;
     self.longPressGesture.cancelsTouchesInView = NO;
     self.longPressGesture.delegate = self;
     [self.touchView addGestureRecognizer:self.longPressGesture];
-    
+
     self.longPressTwoGesture = [[UILongPressGestureRecognizer alloc]initWithTarget:self action:@selector(keyboardGesture:)];
     self.longPressTwoGesture.numberOfTouchesRequired = 2;
     self.longPressTwoGesture.allowedTouchTypes = @[@(UITouchTypeDirect)];
@@ -233,7 +305,7 @@ static GameSurfaceView* pojavWindow;
     if (GCMouse.current != nil) {
         [self registerMouseCallbacks:GCMouse.current];
     }
-    
+
 
     // TODO: deal with multiple controllers by letting users decide which one to use?
     self.controllerConnectCallback = [[NSNotificationCenter defaultCenter] addObserverForName:GCControllerDidConnectNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
@@ -441,20 +513,20 @@ static GameSurfaceView* pojavWindow;
     [self updateControlHiddenState:NO];
 }
 
-- (void)launchMinecraft {
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        int minVersion = [self.metadata[@"javaVersion"][@"majorVersion"] intValue];
-        if (minVersion == 0) {
-            minVersion = [self.metadata[@"javaVersion"][@"version"] intValue];
-        }
-        BaseAuthenticator *currentAuth = BaseAuthenticator.current;
-        launchJVM(
-            currentAuth.authData[@"username"],
-            self.metadata,
-            windowWidth, windowHeight,
-            minVersion
-        );
-    });
+- (void)launchMinecraft {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        int minVersion = [self.metadata[@"javaVersion"][@"majorVersion"] intValue];
+        if (minVersion == 0) {
+            minVersion = [self.metadata[@"javaVersion"][@"version"] intValue];
+        }
+        BaseAuthenticator *currentAuth = BaseAuthenticator.current;
+        launchJVM(
+            currentAuth.authData[@"username"],
+            self.metadata,
+            windowWidth, windowHeight,
+            minVersion
+        );
+    });
 }
 
 - (void)loadCustomControls {
@@ -611,7 +683,7 @@ static GameSurfaceView* pojavWindow;
             } /* else if ((event == ACTION_MOVE || event == ACTION_UP) && slot == -1 && currentHotbarSlot != -1) {
                 return;
             } */
-            
+
             if (event == ACTION_DOWN && slot == -1) {
                 currentHotbarSlot = -1;
             }
@@ -644,7 +716,7 @@ static GameSurfaceView* pojavWindow;
             handled = YES;
         }
     }
-    
+
 
     if (!handled) {
         [super pressesBegan:presses withEvent:event];
@@ -659,7 +731,7 @@ static GameSurfaceView* pojavWindow;
             handled = YES;
         }
     }
-    
+
 
     if (!handled) {
         [super pressesEnded:presses withEvent:event];
@@ -711,7 +783,7 @@ static GameSurfaceView* pojavWindow;
             [self.lightHaptic impactOccurred];
         }
     }
-    
+
     if (!self.shouldTriggerClick) return;
 
     if (sender.state == UIGestureRecognizerStateRecognized) {
@@ -736,7 +808,7 @@ static GameSurfaceView* pojavWindow;
             [self.lightHaptic impactOccurred];
         }
     }
-    
+
     if (sender.state == UIGestureRecognizerStateRecognized && isGrabbing) {
         CGFloat screenScale = [[UIScreen mainScreen] scale];
         CGPoint point = [sender locationInView:self.rootView];
@@ -751,7 +823,7 @@ static GameSurfaceView* pojavWindow;
 
 - (void)surfaceOnHover:(UIGestureRecognizer *)sender {
     if (isGrabbing) return;
-    
+
     CGPoint point = [sender locationInView:self.rootView];
     // NSLog(@"Mouse move!!");
     // NSLog(@"Mouse pos = %f, %f", point.x, point.y);
@@ -779,7 +851,7 @@ static GameSurfaceView* pojavWindow;
             [self.mediumHaptic impactOccurred];
         }
     }
-    
+
     if (!self.slideableHotbar) {
         CGPoint location = [sender locationInView:self.rootView];
         CGFloat screenScale = UIScreen.mainScreen.scale;
@@ -816,7 +888,7 @@ static GameSurfaceView* pojavWindow;
             [self.lightHaptic impactOccurred];
         }
     }
-    
+
     if (isGrabbing) return;
     if (sender.state == UIGestureRecognizerStateBegan ||
         sender.state == UIGestureRecognizerStateChanged ||
@@ -919,7 +991,7 @@ static GameSurfaceView* pojavWindow;
     if(self.shouldTriggerHaptic) {
         [self.lightHaptic impactOccurred];
     }
-    
+
     if (sender.savedBackgroundColor == nil) {
         [self executebtn:sender withAction:ACTION_DOWN];
     }
@@ -993,6 +1065,17 @@ int touchesMovedCount;
 // Equals to Android ACTION_DOWN
 - (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event
 {
+    if (getPrefBool(@"control.mod_touch_enable")) {
+        for (UITouch *touch in touches) {
+            CGPoint loc = [touch locationInView:self.view];
+            float x = loc.x / self.view.bounds.size.width;
+            float y = loc.y / self.view.bounds.size.height;
+            int32_t fid = (int32_t)(uintptr_t)touch;
+            [self.touchSender sendType:1 id:fid x:x y:y]; // 1 = Down/Move
+        }
+        return;
+    }
+
     [super touchesBegan:touches withEvent:event];
     int i = 0;
     for (UITouch *touch in touches) {
@@ -1017,6 +1100,17 @@ int touchesMovedCount;
 // Equals to Android ACTION_MOVE
 - (void)touchesMoved:(NSSet *)touches withEvent:(UIEvent *)event
 {
+    if (getPrefBool(@"control.mod_touch_enable")) {
+        for (UITouch *touch in touches) {
+            CGPoint loc = [touch locationInView:self.view];
+            float x = loc.x / self.view.bounds.size.width;
+            float y = loc.y / self.view.bounds.size.height;
+            int32_t fid = (int32_t)(uintptr_t)touch;
+            [self.touchSender sendType:1 id:fid x:x y:y]; // 1 = Down/Move
+        }
+        return;
+    }
+
     [super touchesMoved:touches withEvent:event];
 
     for (UITouch *touch in touches) {
@@ -1039,6 +1133,17 @@ int touchesMovedCount;
 // For ACTION_UP and ACTION_CANCEL
 - (void)touchesEndedGlobal:(NSSet *)touches withEvent:(UIEvent *)event
 {
+    if (getPrefBool(@"control.mod_touch_enable")) {
+        for (UITouch *touch in touches) {
+            CGPoint loc = [touch locationInView:self.view];
+            float x = loc.x / self.view.bounds.size.width;
+            float y = loc.y / self.view.bounds.size.height;
+            int32_t fid = (int32_t)(uintptr_t)touch;
+            [self.touchSender sendType:2 id:fid x:x y:y]; // 2 = Up
+        }
+        return;
+    }
+
     for (UITouch *touch in touches) {
         if (touch.type == UITouchTypeIndirectPointer) {
             continue; // handle this in a different place
@@ -1050,14 +1155,18 @@ int touchesMovedCount;
 // Equals to Android ACTION_UP
 - (void)touchesEnded:(NSSet *)touches withEvent:(UIEvent *)event
 {
-    [super touchesEnded:touches withEvent:event];
+    if (!getPrefBool(@"control.mod_touch_enable")) {
+        [super touchesEnded:touches withEvent:event];
+    }
     [self touchesEndedGlobal:touches withEvent:event];
 }
 
 // Equals to Android ACTION_CANCEL
 - (void)touchesCancelled:(NSSet *)touches withEvent:(UIEvent *)event
 {
-    [super touchesCancelled:touches withEvent:event];
+    if (!getPrefBool(@"control.mod_touch_enable")) {
+        [super touchesCancelled:touches withEvent:event];
+    }
     [self touchesEndedGlobal:touches withEvent:event];
 }
 
