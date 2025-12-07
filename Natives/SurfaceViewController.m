@@ -50,14 +50,12 @@
         if (_sock < 0) {
             NSLog(@"[TouchController] Error: Failed to create socket");
         } else {
-            // Non-blocking mode
             int flags = fcntl(_sock, F_GETFL, 0);
             fcntl(_sock, F_SETFL, flags | O_NONBLOCK);
 
             memset(&_target, 0, sizeof(_target));
             _target.sin6_family = AF_INET6;
             _target.sin6_port = htons(TC_MOD_PORT);
-            // Connect to localhost IPv6 ::1
             if (inet_pton(AF_INET6, "::1", &_target.sin6_addr) <= 0) {
                 NSLog(@"[TouchController] Error: Invalid IPv6 address");
             } else {
@@ -85,14 +83,13 @@
     packet.type = htonl(type);
     packet.id = htonl(fingerId);
 
-    // Float to Int bits (Big Endian)
     union { float f; int32_t i; } ux, uy;
     ux.f = x;
     uy.f = y;
     packet.x = htonl(ux.i);
     packet.y = htonl(uy.i);
 
-    // CRITICAL FIX: Only send 8 bytes for Remove (Type 2), 16 bytes for Add/Move (Type 1)
+    // Type 2 (Remove) MUST be 8 bytes, Type 1 (Add/Move) MUST be 16 bytes
     size_t length = (type == 2) ? 8 : 16;
 
     sendto(_sock, &packet, length, 0, (struct sockaddr *)&_target, sizeof(_target));
@@ -1077,21 +1074,31 @@ static GameSurfaceView* pojavWindow;
 // Equals to Android ACTION_DOWN
 - (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event
 {
-    // Check if mod is enabled via preferences
-    // NOTE: For testing, you can change this to if(YES)
+    // [重要修复] 先让系统处理触摸，确保原生UI能点击
+    [super touchesBegan:touches withEvent:event];
+
     if (getPrefBool(@"control.mod_touch_enable")) {
+        // 只有当触摸点在游戏画面上时才发送给模组
         for (UITouch *touch in touches) {
+            // 如果点的是 UI (按钮等)，不要发给模组
+            if (touch.view != self.surfaceView) continue;
+            
             CGPoint p = [touch locationInView:self.surfaceView];
             float x = p.x / self.surfaceView.frame.size.width;
             float y = p.y / self.surfaceView.frame.size.height;
             // Send Type 1 (Add Pointer)
             [self.touchSender sendType:1 id:[self getFingerId:touch] x:x y:y];
         }
-        return; // Intercept: Do not run standard mouse emulation
+        
+        // [智能拦截]
+        // 只有当游戏正在运行且捕获鼠标（第一人称视角）时，才完全屏蔽原版鼠标模拟。
+        // 如果是在菜单里 (isGrabbing == FALSE)，则允许原版鼠标逻辑继续执行，让你能点菜单！
+        if (isGrabbing == JNI_TRUE) {
+            return;
+        }
     }
 
-    // Standard behavior (Fallback)
-    [super touchesBegan:touches withEvent:event];
+    // 原版逻辑（在菜单界面或没开开关时执行）
     for (UITouch *touch in touches) {
         if (touch.type == UITouchTypeIndirectPointer) {
             continue; 
@@ -1116,13 +1123,15 @@ static GameSurfaceView* pojavWindow;
 {
     if (getPrefBool(@"control.mod_touch_enable")) {
         for (UITouch *touch in touches) {
+            if (touch.view != self.surfaceView) continue;
+
             CGPoint p = [touch locationInView:self.surfaceView];
             float x = p.x / self.surfaceView.frame.size.width;
             float y = p.y / self.surfaceView.frame.size.height;
-            // Send Type 1 (Move Pointer - same as Add in protocol)
             [self.touchSender sendType:1 id:[self getFingerId:touch] x:x y:y];
         }
-        return;
+        // 同理，只在游戏内拦截
+        if (isGrabbing == JNI_TRUE) return;
     }
 
     [super touchesMoved:touches withEvent:event];
@@ -1148,11 +1157,10 @@ static GameSurfaceView* pojavWindow;
 {
     if (getPrefBool(@"control.mod_touch_enable")) {
         for (UITouch *touch in touches) {
-            // Send Type 2 (Remove Pointer)
-            // Note: coordinates 0,0 are ignored for remove events
+            // 这里不判断 view，因为松手时 view 可能变了，只要松手就发 Type 2
             [self.touchSender sendType:2 id:[self getFingerId:touch] x:0 y:0];
         }
-        return;
+        if (isGrabbing == JNI_TRUE) return;
     }
     
     [super touchesEnded:touches withEvent:event];
@@ -1163,8 +1171,11 @@ static GameSurfaceView* pojavWindow;
 - (void)touchesCancelled:(NSSet *)touches withEvent:(UIEvent *)event
 {
     if (getPrefBool(@"control.mod_touch_enable")) {
-        [self touchesEnded:touches withEvent:event];
-        return;
+        // 复用 Ended 的逻辑发送抬起信号
+        for (UITouch *touch in touches) {
+             [self.touchSender sendType:2 id:[self getFingerId:touch] x:0 y:0];
+        }
+        if (isGrabbing == JNI_TRUE) return;
     }
 
     [super touchesCancelled:touches withEvent:event];
