@@ -369,5 +369,6 @@
 "preference.title.appicon-custom" = "自定义";
 "preference.title.custom_appicon" = "自定义应用图标";
 "preference.detail.custom_appicon" = "选择一张自定义图片作为应用图标";
+"preference.title.control.mod_touch_enable" = "TouchController 支持测试";
 "提示" = "提示";
 "spdt" = "我是个飞机!!!!!!";
