@@ -469,6 +469,8 @@
               @"icon": @"antenna.radiowaves.left.and.right", // 信号/天线图标
               @"hasDetail": @YES,
               @"type": self.typeSwitch,
+              @"requestReload": @YES, // [修复] 添加刷新，确保开关状态能被正确保存和显示，修复自动关闭问题
+              @"enableCondition": whenNotInGame, // [新增] 在游戏内禁用此开关，防止误操作
               @"action": showTouchInfoAlert // [修正] 绑定弹窗事件
             },
             // ------------------------------------------
