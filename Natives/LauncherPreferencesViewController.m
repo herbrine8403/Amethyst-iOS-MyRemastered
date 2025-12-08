@@ -460,34 +460,30 @@
               @"icon": @"hand.point.up.left", // SF Symbols 图标
               @"hasDetail": @YES,
               @"type": self.typeSwitch,
-              @"requestReload": @YES, // 添加刷新，以便切换时更新下方slideable_hotbar的状态
-              @"action": showTouchInfoAlert // [修正] 绑定弹窗事件
+              @"requestReload": @YES, // 这个选项保留刷新，因为它控制下方 slideable_hotbar 的状态
+              @"action": showTouchInfoAlert 
             },
             
-            // --- [新增] 启用 TouchController UDP 协议 ---
+            // --- [修复] 启用 TouchController UDP 协议 ---
             @{@"key": @"mod_touch_udp",
               @"icon": @"antenna.radiowaves.left.and.right", // 信号/天线图标
               @"hasDetail": @YES,
               @"type": self.typeSwitch,
+              // [核弹修复 1] 彻底移除 "requestReload": @YES
+              // 原因：刷新UI会导致开关因为还没保存而弹回关闭，移除后开关状态会保持住。
               
-              // [重要修复 1] 删除了 "requestReload": @YES
-              // 原因：这个开关不影响其他菜单项的显示，不需要刷新整个列表。
-              // 之前的刷新会导致配置还没保存就重置UI，导致开关自动关闭。
-              
-              // [重要修复 2] 保持游戏内禁用
+              // [功能保留] 游戏内禁用
               // 这样在游戏运行时，开关会变灰，防止误触。
               @"enableCondition": whenNotInGame,
               
-              // [重要修复 3] 改写 action 逻辑
-              // 我们不直接用 showTouchInfoAlert，而是用一个 Block 先强制保存数据，再弹窗。
+              // [核弹修复 2] 强制写入偏好设置 (C函数直接调用)
               @"action": ^(BOOL enabled) {
-                  // 1. 强制手动保存偏好设置，确保 Environment Variable 能读到 YES
-                  // 使用 weakSelf 防止循环引用
-                  if (weakSelf.setPreference) {
-                      weakSelf.setPreference(@"control", @"mod_touch_udp", @(enabled));
-                  }
+                  // 直接调用 LauncherPreferences.h 中的全局函数，确保数据100%写入
+                  // Key 必须是 "section.key" 的格式
+                  setPrefBool(@"control.mod_touch_udp", enabled);
+                  NSLog(@"[Settings] FORCE SAVED mod_touch_udp to: %d", enabled);
                   
-                  // 2. 调用原来的弹窗提示
+                  // 弹窗提示
                   showTouchInfoAlert(enabled);
               }
             },
