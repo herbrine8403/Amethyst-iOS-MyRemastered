@@ -464,26 +464,59 @@
               @"action": showTouchInfoAlert 
             },
             
-            // --- [修复] 启用 TouchController UDP 协议 ---
+            // --- [方案更新] 启用 TouchController UDP 协议 ---
             @{@"key": @"mod_touch_udp",
               @"icon": @"antenna.radiowaves.left.and.right", // 信号/天线图标
               @"hasDetail": @YES,
               @"type": self.typeSwitch,
-              // [核弹修复 1] 彻底移除 "requestReload": @YES
-              // 原因：刷新UI会导致开关因为还没保存而弹回关闭，移除后开关状态会保持住。
-              
-              // [功能保留] 游戏内禁用
-              // 这样在游戏运行时，开关会变灰，防止误触。
+              // 移除 requestReload 以防状态回弹
               @"enableCondition": whenNotInGame,
               
-              // [核弹修复 2] 强制写入偏好设置 (C函数直接调用)
+              // 使用 Block 直接修改 java.env_variables
               @"action": ^(BOOL enabled) {
-                  // 直接调用 LauncherPreferences.h 中的全局函数，确保数据100%写入
-                  // Key 必须是 "section.key" 的格式
+                  // 1. 手动保存开关状态（为了UI显示正确）
                   setPrefBool(@"control.mod_touch_udp", enabled);
-                  NSLog(@"[Settings] FORCE SAVED mod_touch_udp to: %d", enabled);
                   
-                  // 弹窗提示
+                  // 2. 直接注入/移除环境变量
+                  NSString *envKey = @"java.env_variables";
+                  NSString *targetEnv = @"TOUCH_CONTROLLER_PROXY=12450";
+                  
+                  // 获取当前环境变量字符串
+                  NSString *currentEnv = getPrefObject(envKey);
+                  // 类型安全检查
+                  if (![currentEnv isKindOfClass:[NSString class]]) {
+                      currentEnv = @"";
+                  }
+                  
+                  // 将字符串按空白字符分割成数组
+                  NSMutableArray *parts = [[currentEnv componentsSeparatedByCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] mutableCopy];
+                  if (!parts) parts = [NSMutableArray array];
+                  
+                  // 移除数组中可能存在的空字符串
+                  [parts filterUsingPredicate:[NSPredicate predicateWithFormat:@"length > 0"]];
+                  
+                  // 构建新的数组：先移除已有的 UDP 变量（防止重复），再根据状态决定是否添加
+                  NSMutableArray *newParts = [NSMutableArray array];
+                  for (NSString *part in parts) {
+                      if (![part containsString:@"TOUCH_CONTROLLER_PROXY="]) {
+                          [newParts addObject:part];
+                      }
+                  }
+                  
+                  // 如果是开启状态，则添加环境变量
+                  if (enabled) {
+                      [newParts addObject:targetEnv];
+                  }
+                  
+                  // 组合回字符串
+                  NSString *finalEnv = [newParts componentsJoinedByString:@" "];
+                  
+                  // 保存回偏好设置
+                  setPrefObject(envKey, finalEnv);
+                  
+                  NSLog(@"[Settings] UDP Switch toggled: %d. Env Vars updated to: %@", enabled, finalEnv);
+                  
+                  // 3. 弹窗提示
                   showTouchInfoAlert(enabled);
               }
             },
