@@ -223,6 +223,14 @@ int launchJVM(NSString *username, id launchTarget, int width, int height, int mi
 
     init_loadDefaultEnv();
     init_loadCustomEnv();
+    
+    // --- [新增] TouchController UDP 协议环境变量 ---
+    // 检查是否启用了 UDP 协议开关
+    if (getPrefBool(@"control.mod_touch_udp")) {
+        setenv("TOUCH_CONTROLLER_PROXY", "12450", 1);
+        NSLog(@"[JavaLauncher] Enabled TOUCH_CONTROLLER_PROXY=12450");
+    }
+    // ------------------------------------------
 
     BOOL launchJar = NO;
     NSString *gameDir;

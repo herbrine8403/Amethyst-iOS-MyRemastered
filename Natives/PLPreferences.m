@@ -46,7 +46,14 @@
             @"virtmouse_enable": @NO,
             @"gyroscope_enable": @NO,
             @"gyroscope_invert_x_axis": @NO,
-            @"gyroscope_sensitivity": @(100)
+            @"gyroscope_sensitivity": @(100),
+            
+            // --- [修复] 必须在这里注册新键值，否则无法保存 ---
+            @"mod_touch_enable": @NO,      // TouchController 基础开关
+            @"mod_touch_udp": @NO,         // UDP 协议开关
+            @"two_finger_keyboard": @YES   // 双指键盘开关 (默认开启)
+            // ---------------------------------------------
+            
         }.mutableCopy,
         @"java": @{
             @"java_homes": @{
@@ -236,6 +243,8 @@
         [self saveGlobalPref];
         return YES;
     }
+    // [重要提示] 如果代码执行到这里，说明 key 不在 defaults 里，所以无法保存！
+    // 这就是为什么之前开关自动弹回的原因。
     NSLog(@"[PLPreferences] Setter could not find preference %@", key);
     return NO;
 }

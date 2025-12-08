@@ -206,6 +206,59 @@
     BOOL(^whenNotInGame)() = ^BOOL(){
         return self.navigationController != nil;
     };
+
+    // --- 定义弹窗显示的 Block，防止循环引用使用 weakSelf ---
+    __weak typeof(self) weakSelf = self;
+    void (^showTouchInfoAlert)(BOOL) = ^(BOOL enabled) {
+        // 这个 Block 仅用于显示说明，不再负责逻辑判断
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:localize(@"preference.popup.touch_info.title", nil)
+                                                                           message:localize(@"preference.popup.touch_info.message", nil)
+                                                                    preferredStyle:UIAlertControllerStyleAlert];
+            
+            [alert addAction:[UIAlertAction actionWithTitle:localize(@"OK", nil) style:UIAlertActionStyleDefault handler:nil]];
+            
+            [alert addAction:[UIAlertAction actionWithTitle:@"GitHub" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                [[UIApplication sharedApplication] openURL:[NSURL URLWithString:@"https://github.com/TouchController/TouchController"] options:@{} completionHandler:nil];
+            }]];
+            
+            [weakSelf presentViewController:alert animated:YES completion:nil];
+        });
+    };
+    
+    // --- 定义 helper：修改环境变量的 Block ---
+    void (^toggleTouchEnvVar)(BOOL) = ^(BOOL enable) {
+        NSString *envKey = @"java.env_variables";
+        NSString *targetEnv = @"TOUCH_CONTROLLER_PROXY=12450";
+        NSString *currentEnv = getPrefObject(envKey);
+        if (![currentEnv isKindOfClass:[NSString class]]) currentEnv = @"";
+        
+        NSMutableArray *parts = [[currentEnv componentsSeparatedByCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] mutableCopy];
+        if (!parts) parts = [NSMutableArray array];
+        [parts filterUsingPredicate:[NSPredicate predicateWithFormat:@"length > 0"]];
+        
+        NSMutableArray *newParts = [NSMutableArray array];
+        for (NSString *part in parts) {
+            if (![part containsString:@"TOUCH_CONTROLLER_PROXY="]) {
+                [newParts addObject:part];
+            }
+        }
+        
+        if (enable) {
+            [newParts addObject:targetEnv];
+        }
+        
+        NSString *finalEnv = [newParts componentsJoinedByString:@" "];
+        setPrefObject(envKey, finalEnv);
+        setPrefBool(@"control.mod_touch_udp", enable); // 同步保存偏好布尔值
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+             [weakSelf showSuccessMessage:enable ? @"UDP 协议已开启 (环境变量已添加)" : @"UDP 协议已关闭 (环境变量已移除)"];
+             [weakSelf.tableView reloadData]; // 刷新列表以更新 slideable_hotbar 状态
+        });
+    };
+    // -----------------------------------------------------------
+
     self.prefContents = @[
         @[
             // General settings
@@ -243,7 +296,6 @@
                       iconName = nil;
                       [[CustomIconManager sharedManager] removeCustomIcon];
                   } else if ([iconName isEqualToString:@"CustomIcon"]) {
-                      // 检查自定义图标是否存在
                       if (![[CustomIconManager sharedManager] hasCustomIcon]) {
                           dispatch_async(dispatch_get_main_queue(), ^{
                               UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"提示" message:@"请先设置自定义应用图标：设置 > 自定义应用图标" preferredStyle:UIAlertControllerStyleAlert];
@@ -251,14 +303,11 @@
                               [alert addAction:okAction];
                               [self presentViewController:alert animated:YES completion:nil];
                           });
-                          // 重置选择为默认图标
                           dispatch_async(dispatch_get_main_queue(), ^{
                               [self.tableView reloadData];
                           });
                           return;
                       }
-                      
-                      // 设置自定义图标
                       [[CustomIconManager sharedManager] setCustomIconWithCompletion:^(BOOL success, NSError * _Nullable error) {
                           if (!success) {
                               dispatch_async(dispatch_get_main_queue(), ^{
@@ -292,7 +341,6 @@
                   return NO;
               },
               @"action": ^void(){
-                  // 打开图片选择器
                   [self openImagePicker];
               }
             },
@@ -429,6 +477,60 @@
         ], @[
             // Control settings
             @{@"icon": @"gamecontroller"},
+            
+            // --- [修改] TouchController 模组支持开关 ---
+            @{@"key": @"mod_touch_enable",
+              @"icon": @"hand.point.up.left", // SF Symbols 图标
+              @"hasDetail": @YES,
+              @"type": self.typeSwitch,
+              @"requestReload": @YES,
+              @"action": showTouchInfoAlert 
+            },
+            
+            // --- [重构] TouchController UDP 协议控制 ---
+            // 采用按钮+弹窗模式，彻底解决开关状态不同步问题
+            @{@"key": @"mod_touch_udp",
+              @"icon": @"antenna.radiowaves.left.and.right",
+              @"hasDetail": @YES,
+              @"type": self.typeButton, // 改为按钮类型，点击触发事件
+              @"enableCondition": whenNotInGame,
+              
+              @"action": ^void() {
+                  // 1. 读取当前状态 (通过检查环境变量字符串)
+                  NSString *currentEnv = getPrefObject(@"java.env_variables");
+                  BOOL isOn = [currentEnv isKindOfClass:[NSString class]] && [currentEnv containsString:@"TOUCH_CONTROLLER_PROXY=12450"];
+                  
+                  // 2. 构建弹窗
+                  NSString *title = localize(@"preference.title.mod_touch_udp", nil);
+                  // 构建状态提示信息
+                  NSString *statusMsg = isOn ? @"✅ 当前状态: 已开启 (ON)" : @"❌ 当前状态: 已关闭 (OFF)";
+                  NSString *msg = [NSString stringWithFormat:@"%@\n\n此选项直接修改环境变量。\n开启此功能需要在启动游戏前设置。游戏运行中无法更改。", statusMsg];
+                  
+                  UIAlertController *alert = [UIAlertController alertControllerWithTitle:title message:msg preferredStyle:UIAlertControllerStyleAlert];
+                  
+                  // 3. 根据当前状态添加操作按钮
+                  if (!isOn) {
+                      [alert addAction:[UIAlertAction actionWithTitle:@"开启 UDP 协议 (Enable)" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                          toggleTouchEnvVar(YES); // 开启逻辑
+                      }]];
+                  } else {
+                      [alert addAction:[UIAlertAction actionWithTitle:@"关闭 UDP 协议 (Disable)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+                          toggleTouchEnvVar(NO); // 关闭逻辑
+                      }]];
+                  }
+                  
+                  // 4. 其他按钮
+                  [alert addAction:[UIAlertAction actionWithTitle:@"查看说明" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                       showTouchInfoAlert(YES);
+                  }]];
+                  
+                  [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+                  
+                  [weakSelf presentViewController:alert animated:YES completion:nil];
+              }
+            },
+            // ------------------------------------------
+
             @{@"key": @"default_gamepad_ctrl",
                 @"icon": @"hammer",
                 @"type": self.typeChildPane,
@@ -465,6 +567,56 @@
                 @"hasDetail": @YES,
                 @"type": self.typeSwitch,
             },
+            
+            // --- [重构] 双指呼出键盘控制 ---
+            // 同样改为按钮+弹窗模式，彻底解决开关回弹问题
+            @{@"key": @"two_finger_keyboard", 
+              @"icon": @"keyboard", // 键盘图标
+              @"hasDetail": @YES,
+              @"type": self.typeButton, // 关键：改为 Button 类型
+              
+              @"action": ^void() {
+                  // 1. 获取当前状态
+                  BOOL isOn = getPrefBool(@"control.two_finger_keyboard");
+                  
+                  // 2. 构建弹窗
+                  NSString *title = localize(@"preference.title.two_finger_keyboard", nil);
+                  // 如果没有 localization，设置默认标题
+                  if (!title || [title isEqualToString:@"preference.title.two_finger_keyboard"]) {
+                      title = @"双指呼出键盘";
+                  }
+                  
+                  NSString *statusMsg = isOn ? @"✅ 当前状态: 已开启 (ON)" : @"❌ 当前状态: 已关闭 (OFF)";
+                  NSString *msg = [NSString stringWithFormat:@"%@\n\n开启后，在游戏中双指同时长按屏幕可呼出键盘。", statusMsg];
+                  
+                  UIAlertController *alert = [UIAlertController alertControllerWithTitle:title message:msg preferredStyle:UIAlertControllerStyleAlert];
+                  
+                  // 3. 根据当前状态显示不同的按钮
+                  if (!isOn) {
+                      [alert addAction:[UIAlertAction actionWithTitle:@"开启 (Enable)" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                          // 强制开启
+                          setPrefBool(@"control.two_finger_keyboard", YES);
+                          [weakSelf showSuccessMessage:@"双指呼出键盘已开启"];
+                          // 刷新界面
+                          [weakSelf.tableView reloadData];
+                      }]];
+                  } else {
+                      [alert addAction:[UIAlertAction actionWithTitle:@"关闭 (Disable)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+                          // 强制关闭
+                          setPrefBool(@"control.two_finger_keyboard", NO);
+                          [weakSelf showSuccessMessage:@"双指呼出键盘已关闭"];
+                          // 刷新界面
+                          [weakSelf.tableView reloadData];
+                      }]];
+                  }
+                  
+                  [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+                  
+                  [weakSelf presentViewController:alert animated:YES completion:nil];
+              }
+            },
+            // -----------------------------
+            
             @{@"key": @"gesture_mouse",
                 @"icon": @"cursorarrow.click",
                 @"hasDetail": @YES,
@@ -483,7 +635,12 @@
             @{@"key": @"slideable_hotbar",
                 @"hasDetail": @YES,
                 @"icon": @"slider.horizontal.below.rectangle",
-                @"type": self.typeSwitch
+                @"type": self.typeSwitch,
+                // --- [修改] 添加禁用条件 ---
+                @"enableCondition": ^BOOL(){
+                    // 当 TouchController 启用时，禁用此选项（返回 NO 表示禁用/变灰）
+                    return ![self.getPreference(@"control", @"mod_touch_enable") boolValue];
+                }
             },
             @{@"key": @"press_duration",
                 @"hasDetail": @YES,

@@ -369,5 +369,18 @@
 "preference.title.appicon-custom" = "自定义";
 "preference.title.custom_appicon" = "自定义应用图标";
 "preference.detail.custom_appicon" = "选择一张自定义图片作为应用图标";
+
+"preference.title.mod_touch_enable" = "启用 TouchController 支持";
+"preference.detail.mod_touch_enable" = "启用 TouchController 模组支持。注意：开启此项将禁用“可滑动快捷栏”。";
+
+"preference.title.mod_touch_udp" = "启用 TouchController UDP 协议";
+"preference.detail.mod_touch_udp" = "设置环境变量 TOUCH_CONTROLLER_PROXY=12450 以使用 UDP 协议。";
+
+"preference.popup.touch_info.title" = "TouchController 适配说明";
+"preference.popup.touch_info.message" = "本功能是基于 TouchController 模组的非官方 iOS 移植版本。\n\n原项目信息：https://github.com/TouchController/TouchController \n感谢原作者开源 (GPLv3)。\n\n技术说明：\n由于原模组不支持 iOS，本功能通过本地 UDP 协议 (Localhost) 在启动器与游戏进程间建立通信桥接。此连接仅用于设备内部传输触控数据，绝不会连接互联网，请放心使用。";
+
+"preference.title.two_finger_keyboard" = "双指呼出键盘";
+"preference.detail.two_finger_keyboard" = "在游戏中双指长按屏幕呼出键盘。";
+
 "提示" = "提示";
 "spdt" = "我是个飞机!!!!!!";
