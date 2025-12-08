@@ -206,6 +206,29 @@
     BOOL(^whenNotInGame)() = ^BOOL(){
         return self.navigationController != nil;
     };
+
+    // --- 定义弹窗显示的 Block，防止循环引用使用 weakSelf ---
+    __weak typeof(self) weakSelf = self;
+    void (^showTouchInfoAlert)(BOOL) = ^(BOOL enabled) {
+        if (enabled) {
+            // 只有打开开关时才弹窗
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:localize(@"preference.popup.touch_info.title", nil)
+                                                                           message:localize(@"preference.popup.touch_info.message", nil)
+                                                                    preferredStyle:UIAlertControllerStyleAlert];
+            
+            // "我知道了" 按钮
+            [alert addAction:[UIAlertAction actionWithTitle:localize(@"OK", nil) style:UIAlertActionStyleDefault handler:nil]];
+            
+            // "查看原项目" 按钮 
+            [alert addAction:[UIAlertAction actionWithTitle:@"GitHub" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                [[UIApplication sharedApplication] openURL:[NSURL URLWithString:@"https://github.com/TouchController/TouchController"] options:@{} completionHandler:nil];
+            }]];
+            
+            [weakSelf presentViewController:alert animated:YES completion:nil];
+        }
+    };
+    // -----------------------------------------------------------
+
     self.prefContents = @[
         @[
             // General settings
