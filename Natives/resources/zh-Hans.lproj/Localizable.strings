@@ -369,6 +369,13 @@
 "preference.title.appicon-custom" = "自定义";
 "preference.title.custom_appicon" = "自定义应用图标";
 "preference.detail.custom_appicon" = "选择一张自定义图片作为应用图标";
-"preference.title.control.mod_touch_enable" = "TouchController 支持测试";
+
+// New TouchController and UDP settings
+"preference.title.control.mod_touch_enable" = "启用 TouchController 支持";
+"preference.detail.control.mod_touch_enable" = "启用 TouchController 模组支持。注意：开启此项将禁用“可滑动快捷栏”。";
+
+"preference.title.control.mod_touch_udp" = "启用 TouchController UDP 协议";
+"preference.detail.control.mod_touch_udp" = "设置环境变量 TOUCH_CONTROLLER_PROXY=12450 以使用 UDP 协议。";
+
 "提示" = "提示";
 "spdt" = "我是个飞机!!!!!!";
