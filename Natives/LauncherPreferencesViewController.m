@@ -211,20 +211,22 @@
     __weak typeof(self) weakSelf = self;
     void (^showTouchInfoAlert)(BOOL) = ^(BOOL enabled) {
         if (enabled) {
-            // 只有打开开关时才弹窗
-            UIAlertController *alert = [UIAlertController alertControllerWithTitle:localize(@"preference.popup.touch_info.title", nil)
-                                                                           message:localize(@"preference.popup.touch_info.message", nil)
-                                                                    preferredStyle:UIAlertControllerStyleAlert];
-            
-            // "我知道了" 按钮
-            [alert addAction:[UIAlertAction actionWithTitle:localize(@"OK", nil) style:UIAlertActionStyleDefault handler:nil]];
-            
-            // "查看原项目" 按钮 
-            [alert addAction:[UIAlertAction actionWithTitle:@"GitHub" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
-                [[UIApplication sharedApplication] openURL:[NSURL URLWithString:@"https://github.com/TouchController/TouchController"] options:@{} completionHandler:nil];
-            }]];
-            
-            [weakSelf presentViewController:alert animated:YES completion:nil];
+            // [修正] 增加 dispatch_async 确保在 TableView 刷新后弹出，否则可能因为刷新而无法显示
+            dispatch_async(dispatch_get_main_queue(), ^{
+                UIAlertController *alert = [UIAlertController alertControllerWithTitle:localize(@"preference.popup.touch_info.title", nil)
+                                                                               message:localize(@"preference.popup.touch_info.message", nil)
+                                                                        preferredStyle:UIAlertControllerStyleAlert];
+                
+                // "我知道了" 按钮
+                [alert addAction:[UIAlertAction actionWithTitle:localize(@"OK", nil) style:UIAlertActionStyleDefault handler:nil]];
+                
+                // "查看原项目" 按钮
+                [alert addAction:[UIAlertAction actionWithTitle:@"GitHub" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                    [[UIApplication sharedApplication] openURL:[NSURL URLWithString:@"https://github.com/TouchController/TouchController"] options:@{} completionHandler:nil];
+                }]];
+                
+                [weakSelf presentViewController:alert animated:YES completion:nil];
+            });
         }
     };
     // -----------------------------------------------------------
@@ -458,7 +460,8 @@
               @"icon": @"hand.point.up.left", // SF Symbols 图标
               @"hasDetail": @YES,
               @"type": self.typeSwitch,
-              @"requestReload": @YES // 添加刷新，以便切换时更新下方slideable_hotbar的状态
+              @"requestReload": @YES, // 添加刷新，以便切换时更新下方slideable_hotbar的状态
+              @"action": showTouchInfoAlert // [修正] 绑定弹窗事件
             },
             
             // --- [新增] 启用 TouchController UDP 协议 ---
@@ -466,12 +469,7 @@
               @"icon": @"antenna.radiowaves.left.and.right", // 信号/天线图标
               @"hasDetail": @YES,
               @"type": self.typeSwitch,
-              // 如果需要依赖主开关，可取消注释下方代码：
-              /*
-              @"enableCondition": ^BOOL(){
-                  return [self.getPreference(@"control", @"mod_touch_enable") boolValue];
-              }
-              */
+              @"action": showTouchInfoAlert // [修正] 绑定弹窗事件
             },
             // ------------------------------------------
 
