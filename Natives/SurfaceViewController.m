@@ -1,7 +1,6 @@
 #import <AVFoundation/AVFoundation.h>
 #import <GameController/GameController.h>
 #import <objc/runtime.h>
-
 #import "authenticator/BaseAuthenticator.h"
 #import "customcontrols/ControlButton.h"
 #import "customcontrols/ControlDrawer.h"
@@ -26,9 +25,7 @@
 
 #include <dlfcn.h>
 
-// ==========================================
-// [START] TouchController 模组通信模块 (新思路版)
-// ==========================================
+// --- [START] TouchController Mod Support ---
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -48,20 +45,23 @@
 - (instancetype)init {
     self = [super init];
     if (self) {
-        // 使用 IPv6 socket
         _sock = socket(AF_INET6, SOCK_DGRAM, 0);
         if (_sock < 0) {
-            NSLog(@"[TouchController] Socket error.");
+            NSLog(@"[TouchController] Error: Failed to create socket");
         } else {
-            // 非阻塞模式，防止卡顿 UI
+            // Non-blocking mode
             int flags = fcntl(_sock, F_GETFL, 0);
             fcntl(_sock, F_SETFL, flags | O_NONBLOCK);
 
             memset(&_target, 0, sizeof(_target));
             _target.sin6_family = AF_INET6;
             _target.sin6_port = htons(TC_MOD_PORT);
-            // 绑定到 ::1 (Localhost IPv6)
-            inet_pton(AF_INET6, "::1", &_target.sin6_addr);
+            // Connect to localhost IPv6 ::1
+            if (inet_pton(AF_INET6, "::1", &_target.sin6_addr) <= 0) {
+                NSLog(@"[TouchController] Error: Invalid IPv6 address");
+            } else {
+                NSLog(@"[TouchController] Sender ready on port %d", TC_MOD_PORT);
+            }
         }
     }
     return self;
@@ -74,7 +74,6 @@
 - (void)sendType:(int32_t)type id:(int32_t)fingerId x:(float)x y:(float)y {
     if (_sock < 0) return;
 
-    // 协议包结构 (16 bytes)
     struct {
         int32_t type;
         int32_t id;
@@ -85,24 +84,20 @@
     packet.type = htonl(type);
     packet.id = htonl(fingerId);
 
-    // 浮点数位拷贝转换
+    // Float to Int bits (Big Endian)
     union { float f; int32_t i; } ux, uy;
     ux.f = x;
     uy.f = y;
     packet.x = htonl(ux.i);
     packet.y = htonl(uy.i);
 
-    // [关键修正]
-    // Type 1 (Add/Move) = 16 字节
-    // Type 2 (Remove)   = 8 字节 (严格限制，否则模组拒收导致断触)
+    
     size_t length = (type == 2) ? 8 : 16;
 
     sendto(_sock, &packet, length, 0, (struct sockaddr *)&_target, sizeof(_target));
 }
 @end
-// ==========================================
-// [END] TouchController 模组通信模块
-// ==========================================
+// --- [END] TouchController Mod Support ---
 
 int memorystatus_control(uint32_t command, int32_t pid, uint32_t flags, void *buffer, size_t buffersize);
 #define MEMORYSTATUS_CMD_SET_JETSAM_TASK_LIMIT        6
@@ -136,7 +131,6 @@ static GameSurfaceView* pojavWindow;
 @property(nonatomic) UIImpactFeedbackGenerator *lightHaptic;
 @property(nonatomic) UIImpactFeedbackGenerator *mediumHaptic;
 
-// [新增] 通信器实例
 @property(nonatomic, strong) TouchSender *touchSender;
 
 @end
@@ -144,7 +138,6 @@ static GameSurfaceView* pojavWindow;
 @implementation SurfaceViewController
 
 - (instancetype)initWithMetadata:(NSDictionary *)metadata {
-    self = [super init];
     self.metadata = metadata;
     return self;
 }
@@ -154,11 +147,12 @@ static GameSurfaceView* pojavWindow;
     [super viewDidLoad];
     isControlModifiable = NO;
     self.isMacCatalystApp = NSProcessInfo.processInfo.isMacCatalystApp;
+    // Load MetalHUD library
     dlopen("/usr/lib/libMTLHud.dylib", 0);
 
     self.lightHaptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:(UIImpactFeedbackStyleLight)];
     self.mediumHaptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:(UIImpactFeedbackStyleMedium)];
-
+    
     UIApplication.sharedApplication.idleTimerDisabled = YES;
     BOOL isTVOS = realUIIdiom == UIUserInterfaceIdiomTV;
     if (!isTVOS) {
@@ -208,8 +202,7 @@ static GameSurfaceView* pojavWindow;
     UIHoverGestureRecognizer *hoverGesture = [[NSClassFromString(@"UIHoverGestureRecognizer") alloc] initWithTarget:self action:@selector(surfaceOnHover:)];
     [self.touchView addGestureRecognizer:hoverGesture];
 
-    self.tapGesture = [[UITapGestureRecognizer alloc]
-        initWithTarget:self action:@selector(surfaceOnClick:)];
+    self.tapGesture = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(surfaceOnClick:)];
     self.tapGesture.allowedTouchTypes = @[@(UITouchTypeDirect)];
     self.tapGesture.delegate = self;
     self.tapGesture.numberOfTapsRequired = 1;
@@ -217,8 +210,7 @@ static GameSurfaceView* pojavWindow;
     self.tapGesture.cancelsTouchesInView = NO;
     [self.touchView addGestureRecognizer:self.tapGesture];
 
-    self.doubleTapGesture = [[UITapGestureRecognizer alloc]
-        initWithTarget:self action:@selector(surfaceOnDoubleClick:)];
+    self.doubleTapGesture = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(surfaceOnDoubleClick:)];
     self.doubleTapGesture.allowedTouchTypes = @[@(UITouchTypeDirect)];
     self.doubleTapGesture.delegate = self;
     self.doubleTapGesture.numberOfTapsRequired = 2;
@@ -226,8 +218,7 @@ static GameSurfaceView* pojavWindow;
     self.doubleTapGesture.cancelsTouchesInView = NO;
     [self.touchView addGestureRecognizer:self.doubleTapGesture];
 
-    self.longPressGesture = [[UILongPressGestureRecognizer alloc]
-        initWithTarget:self action:@selector(surfaceOnLongpress:)];
+    self.longPressGesture = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(surfaceOnLongpress:)];
     self.longPressGesture.allowedTouchTypes = @[@(UITouchTypeDirect)];
     self.longPressGesture.cancelsTouchesInView = NO;
     self.longPressGesture.delegate = self;
@@ -240,8 +231,7 @@ static GameSurfaceView* pojavWindow;
     self.longPressTwoGesture.delegate = self;
     [self.touchView addGestureRecognizer:self.longPressTwoGesture];
 
-    self.scrollPanGesture = [[UIPanGestureRecognizer alloc]
-        initWithTarget:self action:@selector(surfaceOnTouchesScroll:)];
+    self.scrollPanGesture = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(surfaceOnTouchesScroll:)];
     self.scrollPanGesture.allowedTouchTypes = @[@(UITouchTypeDirect)];
     self.scrollPanGesture.delegate = self;
     self.scrollPanGesture.minimumNumberOfTouches = 2;
@@ -267,15 +257,9 @@ static GameSurfaceView* pojavWindow;
     self.inputTextField.font = [UIFont fontWithName:@"Menlo-Regular" size:20];
     self.inputTextField.clearsOnBeginEditing = YES;
     self.inputTextField.textAlignment = NSTextAlignmentCenter;
-    self.inputTextField.sendChar = ^(jchar keychar){
-        CallbackBridge_nativeSendChar(keychar);
-    };
-    self.inputTextField.sendCharMods = ^(jchar keychar, int mods){
-        CallbackBridge_nativeSendCharMods(keychar, mods);
-    };
-    self.inputTextField.sendKey = ^(int key, int scancode, int action, int mods) {
-        CallbackBridge_nativeSendKey(key, scancode, action, mods);
-    };
+    self.inputTextField.sendChar = ^(jchar keychar){ CallbackBridge_nativeSendChar(keychar); };
+    self.inputTextField.sendCharMods = ^(jchar keychar, int mods){ CallbackBridge_nativeSendCharMods(keychar, mods); };
+    self.inputTextField.sendKey = ^(int key, int scancode, int action, int mods) { CallbackBridge_nativeSendKey(key, scancode, action, mods); };
 
     self.swipeableButtons = [[NSMutableArray alloc] init];
 
@@ -284,22 +268,16 @@ static GameSurfaceView* pojavWindow;
         GCMouse* mouse = note.object;
         [self registerMouseCallbacks:mouse];
         self.mousePointerView.hidden = isGrabbing || !virtualMouseEnabled;        [self setNeedsUpdateOfPrefersPointerLocked];
-        if (getPrefBool(@"control.hardware_hide")) {
-            self.ctrlView.hidden = YES;
-        }
+        if (getPrefBool(@"control.hardware_hide")) { self.ctrlView.hidden = YES; }
     }];
     self.mouseDisconnectCallback = [[NSNotificationCenter defaultCenter] addObserverForName:GCMouseDidDisconnectNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
         GCMouse* mouse = note.object;
         mouse.mouseInput.mouseMovedHandler = nil;
         [mouse.mouseInput.auxiliaryButtons makeObjectsPerformSelector:@selector(setPressedChangedHandler:) withObject:nil];
         [self setNeedsUpdateOfPrefersPointerLocked];
-        if (getPrefBool(@"controll.hardware_hide")) {
-            self.ctrlView.hidden = NO;
-        }
+        if (getPrefBool(@"controll.hardware_hide")) { self.ctrlView.hidden = NO; }
     }];
-    if (GCMouse.current != nil) {
-        [self registerMouseCallbacks:GCMouse.current];
-    }
+    if (GCMouse.current != nil) { [self registerMouseCallbacks:GCMouse.current]; }
 
     self.controllerConnectCallback = [[NSNotificationCenter defaultCenter] addObserverForName:GCControllerDidConnectNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
         GCController* controller = note.object;
@@ -307,16 +285,12 @@ static GameSurfaceView* pojavWindow;
         [ControllerInput registerControllerCallbacks:controller];
         self.mousePointerView.hidden = isGrabbing;
         virtualMouseEnabled = YES;
-        if (getPrefBool(@"control.hardware_hide")) {
-            self.ctrlView.hidden = YES;
-        }
+        if (getPrefBool(@"control.hardware_hide")) { self.ctrlView.hidden = YES; }
     }];
     self.controllerDisconnectCallback = [[NSNotificationCenter defaultCenter] addObserverForName:GCControllerDidDisconnectNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
         GCController* controller = note.object;
         [ControllerInput unregisterControllerCallbacks:controller];
-        if (getPrefBool(@"control.hardware_hide")) {
-            self.ctrlView.hidden = NO;
-        }
+        if (getPrefBool(@"control.hardware_hide")) { self.ctrlView.hidden = NO; }
     }];
     if (GCController.controllers.count == 1) {
         [ControllerInput initKeycodeTable];
@@ -329,24 +303,14 @@ static GameSurfaceView* pojavWindow;
     [self updatePreferenceChanges];
     [self loadCustomControls];
 
-    if (UIApplication.sharedApplication.connectedScenes.count > 1 &&
-      getPrefBool(@"video.fullscreen_airplay")) {
+    if (UIApplication.sharedApplication.connectedScenes.count > 1 && getPrefBool(@"video.fullscreen_airplay")) {
         [self switchToExternalDisplay];
     }
     
-    // [新增] 初始化发送器
     self.touchSender = [[TouchSender alloc] init];
 
     [self launchMinecraft];
 }
-
-// ... (中间代码省略，为了节省篇幅，请保留原文件中的 reloadMousePointerImage 到 executebtn_special_togglebtn 之间的所有代码，或者告诉我如果需要我完全展开) ...
-// ⚠️ 注意：为了确保你能一次性复制成功，我建议你保留原文件中
-// - reloadMousePointerImage
-// - viewDidAppear
-// - updateAudioSettings
-// ... 等等直到 executebtn_special_togglebtn 结束。
-// 下面我直接给出最关键的触摸部分替换。
 
 - (void)reloadMousePointerImage {
     NSString *path = [NSString stringWithFormat:@"%s/controlmap/mouse_pointer.png", getenv("POJAV_HOME")];
@@ -979,35 +943,27 @@ static GameSurfaceView* pojavWindow;
     return (int32_t)((long)touch % 100000);
 }
 
-// -------------------------------------------------------------
-//  TouchController 核心拦截逻辑
-//  新思路：严格区分 "View Check" 和 "Type Packet Size"
-// -------------------------------------------------------------
-
 - (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event
 {
-    // 1. 先让系统/父类处理 (确保按钮点击有效)
+    
     [super touchesBegan:touches withEvent:event];
 
     if (getPrefBool(@"control.mod_touch_enable")) {
+        
         for (UITouch *touch in touches) {
-            // [误触修复] 只有当手指直接点在游戏画面(surfaceView)上时，才视为游戏操作
-            // 如果点在按钮(CtrlView)上，touch.view 应该是按钮对象，这里会跳过
             if (touch.view != self.surfaceView) continue;
             
             CGPoint p = [touch locationInView:self.surfaceView];
             float x = p.x / self.surfaceView.frame.size.width;
             float y = p.y / self.surfaceView.frame.size.height;
-            
-            // 发送 Type 1 (按下)
+            // Send Type 1 (Add Pointer)
             [self.touchSender sendType:1 id:[self getFingerId:touch] x:x y:y];
         }
         
-        // 如果开启了模组，并且正在游戏中 (isGrabbing)，则不需要再执行下面的鼠标模拟
         if (isGrabbing == JNI_TRUE) return;
     }
 
-    // 原版鼠标模拟逻辑 (菜单界面或未开启模组)
+    
     for (UITouch *touch in touches) {
         if (touch.type == UITouchTypeIndirectPointer) continue; 
         CGPoint locationInView = [touch locationInView:self.rootView];
@@ -1029,13 +985,12 @@ static GameSurfaceView* pojavWindow;
 {
     if (getPrefBool(@"control.mod_touch_enable")) {
         for (UITouch *touch in touches) {
-            // [误触修复] 移动时也要检查View，防止拖动按钮时误触
             if (touch.view != self.surfaceView) continue;
 
             CGPoint p = [touch locationInView:self.surfaceView];
             float x = p.x / self.surfaceView.frame.size.width;
             float y = p.y / self.surfaceView.frame.size.height;
-            // 发送 Type 1 (移动)
+            // Send Type 1 (Move Pointer)
             [self.touchSender sendType:1 id:[self getFingerId:touch] x:x y:y];
         }
         if (isGrabbing == JNI_TRUE) return;
@@ -1063,8 +1018,7 @@ static GameSurfaceView* pojavWindow;
 {
     if (getPrefBool(@"control.mod_touch_enable")) {
         for (UITouch *touch in touches) {
-            // [断触/粘连修复] 必须发送 Type 2 (移除)
-            // 注意：TouchSender 内部已强制 Type 2 只发 8 字节
+            // Send Type 2 (Remove Pointer) for ANY touch ending
             [self.touchSender sendType:2 id:[self getFingerId:touch] x:0 y:0];
         }
         if (isGrabbing == JNI_TRUE) return;
@@ -1076,7 +1030,6 @@ static GameSurfaceView* pojavWindow;
 
 - (void)touchesCancelled:(NSSet *)touches withEvent:(UIEvent *)event
 {
-    // [双击粘连修复] Cancelled 事件也必须发送 Type 2，告诉模组手指没了
     if (getPrefBool(@"control.mod_touch_enable")) {
         for (UITouch *touch in touches) {
              [self.touchSender sendType:2 id:[self getFingerId:touch] x:0 y:0];
