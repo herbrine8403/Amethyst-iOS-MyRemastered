@@ -583,6 +583,11 @@ static GameSurfaceView* pojavWindow;
 }
 
 - (void)keyboardGesture:(UIGestureRecognizer*)gestureRecognizer {
+    // [修正] 添加了对设置项 control.two_finger_keyboard 的检查
+    if (!getPrefBool(@"control.two_finger_keyboard")) {
+        return;
+    }
+
     if (gestureRecognizer.state == UIGestureRecognizerStateBegan) {
         if (self.inputTextField.isFirstResponder) {
             [self.inputTextField resignFirstResponder];
