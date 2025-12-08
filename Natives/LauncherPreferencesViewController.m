@@ -430,12 +430,25 @@
             // Control settings
             @{@"icon": @"gamecontroller"},
             
-            // --- [新增] TouchController 模组支持开关 ---
+            // --- [修改] TouchController 模组支持开关 ---
             @{@"key": @"mod_touch_enable",
               @"icon": @"hand.point.up.left", // SF Symbols 图标
               @"hasDetail": @YES,
               @"type": self.typeSwitch,
-              // @"title": @"TouchController 模组支持", // 可选：如果没有翻译文件支持，取消注释这一行
+              @"requestReload": @YES // 添加刷新，以便切换时更新下方slideable_hotbar的状态
+            },
+            
+            // --- [新增] 启用 TouchController UDP 协议 ---
+            @{@"key": @"mod_touch_udp",
+              @"icon": @"antenna.radiowaves.left.and.right", // 信号/天线图标
+              @"hasDetail": @YES,
+              @"type": self.typeSwitch,
+              // 如果需要依赖主开关，可取消注释下方代码：
+              /*
+              @"enableCondition": ^BOOL(){
+                  return [self.getPreference(@"control", @"mod_touch_enable") boolValue];
+              }
+              */
             },
             // ------------------------------------------
 
@@ -493,7 +506,12 @@
             @{@"key": @"slideable_hotbar",
                 @"hasDetail": @YES,
                 @"icon": @"slider.horizontal.below.rectangle",
-                @"type": self.typeSwitch
+                @"type": self.typeSwitch,
+                // --- [修改] 添加禁用条件 ---
+                @"enableCondition": ^BOOL(){
+                    // 当 TouchController 启用时，禁用此选项（返回 NO 表示禁用/变灰）
+                    return ![self.getPreference(@"control", @"mod_touch_enable") boolValue];
+                }
             },
             @{@"key": @"press_duration",
                 @"hasDetail": @YES,
