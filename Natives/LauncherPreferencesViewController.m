@@ -568,13 +568,52 @@
                 @"type": self.typeSwitch,
             },
             
-            // --- [新增] 双指呼出键盘开关 ---
-            // 你提到的隐藏功能：进入游戏后，双指触摸屏幕 1-2 秒弹出输入法
-            @{@"key": @"two_finger_keyboard", // 对应的 key 为 control.two_finger_keyboard
+            // --- [重构] 双指呼出键盘控制 ---
+            // 同样改为按钮+弹窗模式，彻底解决开关回弹问题
+            @{@"key": @"two_finger_keyboard", 
               @"icon": @"keyboard", // 键盘图标
               @"hasDetail": @YES,
-              @"type": self.typeSwitch,
-              @"default": @YES // 默认设为开启（如果之前是隐藏功能默认有的话）
+              @"type": self.typeButton, // 关键：改为 Button 类型
+              
+              @"action": ^void() {
+                  // 1. 获取当前状态
+                  BOOL isOn = getPrefBool(@"control.two_finger_keyboard");
+                  
+                  // 2. 构建弹窗
+                  NSString *title = localize(@"preference.title.two_finger_keyboard", nil);
+                  // 如果没有 localization，设置默认标题
+                  if (!title || [title isEqualToString:@"preference.title.two_finger_keyboard"]) {
+                      title = @"双指呼出键盘";
+                  }
+                  
+                  NSString *statusMsg = isOn ? @"✅ 当前状态: 已开启 (ON)" : @"❌ 当前状态: 已关闭 (OFF)";
+                  NSString *msg = [NSString stringWithFormat:@"%@\n\n开启后，在游戏中双指同时长按屏幕可呼出键盘。", statusMsg];
+                  
+                  UIAlertController *alert = [UIAlertController alertControllerWithTitle:title message:msg preferredStyle:UIAlertControllerStyleAlert];
+                  
+                  // 3. 根据当前状态显示不同的按钮
+                  if (!isOn) {
+                      [alert addAction:[UIAlertAction actionWithTitle:@"开启 (Enable)" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                          // 强制开启
+                          setPrefBool(@"control.two_finger_keyboard", YES);
+                          [weakSelf showSuccessMessage:@"双指呼出键盘已开启"];
+                          // 刷新界面
+                          [weakSelf.tableView reloadData];
+                      }]];
+                  } else {
+                      [alert addAction:[UIAlertAction actionWithTitle:@"关闭 (Disable)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+                          // 强制关闭
+                          setPrefBool(@"control.two_finger_keyboard", NO);
+                          [weakSelf showSuccessMessage:@"双指呼出键盘已关闭"];
+                          // 刷新界面
+                          [weakSelf.tableView reloadData];
+                      }]];
+                  }
+                  
+                  [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+                  
+                  [weakSelf presentViewController:alert animated:YES completion:nil];
+              }
             },
             // -----------------------------
             
