@@ -469,9 +469,27 @@
               @"icon": @"antenna.radiowaves.left.and.right", // 信号/天线图标
               @"hasDetail": @YES,
               @"type": self.typeSwitch,
-              @"requestReload": @YES, // [修复] 添加刷新，确保开关状态能被正确保存和显示，修复自动关闭问题
-              @"enableCondition": whenNotInGame, // [新增] 在游戏内禁用此开关，防止误操作
-              @"action": showTouchInfoAlert // [修正] 绑定弹窗事件
+              
+              // [重要修复 1] 删除了 "requestReload": @YES
+              // 原因：这个开关不影响其他菜单项的显示，不需要刷新整个列表。
+              // 之前的刷新会导致配置还没保存就重置UI，导致开关自动关闭。
+              
+              // [重要修复 2] 保持游戏内禁用
+              // 这样在游戏运行时，开关会变灰，防止误触。
+              @"enableCondition": whenNotInGame,
+              
+              // [重要修复 3] 改写 action 逻辑
+              // 我们不直接用 showTouchInfoAlert，而是用一个 Block 先强制保存数据，再弹窗。
+              @"action": ^(BOOL enabled) {
+                  // 1. 强制手动保存偏好设置，确保 Environment Variable 能读到 YES
+                  // 使用 weakSelf 防止循环引用
+                  if (weakSelf.setPreference) {
+                      weakSelf.setPreference(@"control", @"mod_touch_udp", @(enabled));
+                  }
+                  
+                  // 2. 调用原来的弹窗提示
+                  showTouchInfoAlert(enabled);
+              }
             },
             // ------------------------------------------
 
