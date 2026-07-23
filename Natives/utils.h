@@ -40,6 +40,12 @@
 #define RENDERER_NAME_MOBILEGLUES "libmobileglues.dylib"
 #define RENDERER_NAME_VK_ZINK "libOSMesa.8.dylib"
 #define RENDERER_NAME_VULKAN "libMoltenVK.dylib"
+// Mithril-Wapper - OpenGL 3.3 Core Profile → Metal 翻译层
+// 由 EternityQwQ / yitenchen123 开发，使用 glslang + SPIRV-Cross 做
+// GLSL → SPIR-V → MSL 即时着色器转译，直接落到原生 Metal 后端。
+// 导出 OpenGL 3.3 Core Profile 符号，定位与 MobileGlues 相同的
+// GL-on-Metal 翻译层生态位，但目标是桌面 Core Profile 而非 GLSL ES。
+#define RENDERER_NAME_MITHRIL "libmithril.dylib"
 // LTW (Large Thin Wrapper) - OpenGL Core 3.3 → OpenGL ES 3 转译层
 // 复刻自官方 MojoLauncher/LTW 仓库，完美支持 Sodium + Iris 光影：
 //   - 伪装成 OpenGL 3.3 Core Profile 让 MC 1.17+ 正常运行

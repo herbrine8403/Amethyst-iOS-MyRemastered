@@ -717,6 +717,7 @@ static NSInteger const kSectionVersions    = 1;
         @"MobileGlues",
         @"Zink",
         @"LTW",
+        @"Mithril",
         @"MoltenVK"
     ];
     self.rendererIcons = @[
@@ -726,6 +727,7 @@ static NSInteger const kSectionVersions    = 1;
         @"bolt.fill",
         @"circle.hexagongrid.fill",
         @"square.stack.3d.up.fill",
+        @"diamond.fill",
         @"flame.fill"
     ];
     self.rendererDescs = @[
@@ -735,6 +737,7 @@ static NSInteger const kSectionVersions    = 1;
         @"Vulkan 转译 OpenGL",
         @"OpenGL 转 Vulkan",
         @"OpenGL Core→ES 转译（Sodium+光影完美兼容）",
+        @"OpenGL 3.3 Core→Metal 原生转译（实验性）",
         @"原生 Vulkan"
     ];
 }

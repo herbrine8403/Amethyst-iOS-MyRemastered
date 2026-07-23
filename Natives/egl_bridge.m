@@ -138,6 +138,16 @@ int pojavInitOpenGL() {
         renderer = @ RENDERER_NAME_MOBILEGLUES;
         setenv("AMETHYST_RENDERER", renderer.UTF8String, 1);
         set_gl_bridge_tbl();
+    } else if ([renderer isEqualToString:@ RENDERER_NAME_MITHRIL]) {
+        // Mithril-Wapper - OpenGL 3.3 Core Profile → Metal 翻译层
+        // 与 MobileGlues 同属纯 GL 翻译层 dylib（导出 EGL/GL 符号，内部走
+        // glslang + SPIRV-Cross 做 GLSL → SPIR-V → MSL 即时转译，落到原生
+        // Metal 后端），因此集成方式与 MobileGlues 完全一致：复用 GL bridge。
+        // 区别：Mithril 目标是桌面 OpenGL 3.3 Core Profile（glGetString 返回
+        // 3.3.0），而 MobileGlues 走 GLSL ES 路线。
+        renderer = @ RENDERER_NAME_MITHRIL;
+        setenv("AMETHYST_RENDERER", renderer.UTF8String, 1);
+        set_gl_bridge_tbl();
     } else if ([renderer isEqualToString:@ RENDERER_NAME_MTL_ANGLE]) {
         set_gl_bridge_tbl();
     } else if ([renderer isEqualToString:@ RENDERER_NAME_LTW]) {

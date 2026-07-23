@@ -231,6 +231,7 @@
 "preference.title.renderer.debug.mg" = "MobileGlues（1.17+）- OpenGL 版本 4.0，实验性";
 "preference.title.renderer.debug.zink" = "Zink（Mesa 25.0.7）- OpenGL 版本 4.1";
 "preference.title.renderer.debug.ltw" = "LTW - OpenGL Core→ES 转译（1.17+）";
+"preference.title.renderer.debug.mithril" = "Mithril-Wapper（1.17+）- OpenGL 3.3 Core，实验性";
 "preference.title.renderer.debug.vulkan" = "MoltenVK（26.2+）- 导出 Vulkan 1.4";
 
 "preference.detail.renderer" = "更改使用的 OpenGL 渲染器";
