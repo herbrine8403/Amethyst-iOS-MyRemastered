@@ -14,6 +14,19 @@
 #import "UIKit+hook.h"
 #import "config.h"
 
+// Build-time injected config macros. CI is supposed to pass these via
+// -DCONFIG_BRANCH=... etc, but provide safe fallbacks so the project compiles
+// when they are not set (e.g. local builds, or CI configs that forgot them).
+#ifndef CONFIG_BRANCH
+#define CONFIG_BRANCH "unknown"
+#endif
+#ifndef CONFIG_COMMIT
+#define CONFIG_COMMIT "unknown"
+#endif
+#ifndef CONFIG_TYPE
+#define CONFIG_TYPE "unknown"
+#endif
+
 #include <libgen.h>
 #include <pthread.h>
 #include <stdio.h>
