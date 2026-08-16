@@ -121,6 +121,12 @@ extern UIWindow *mainWindow;
 #pragma mark - Orientation Support (iOS 16+)
 
 - (UIInterfaceOrientationMask)scene:(UIScene *)scene supportedInterfaceOrientationsForWindowScene:(UIWindowScene *)windowScene API_AVAILABLE(ios(16.0)) {
+    // Stage Manager can only offer its full set of resizable aspect ratios
+    // when the iPad scene accepts both portrait and landscape geometries.
+    // Keep the existing landscape-only behaviour on iPhone.
+    if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad) {
+        return UIInterfaceOrientationMaskAll;
+    }
     return UIInterfaceOrientationMaskLandscape;
 }
 
