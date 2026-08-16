@@ -32,6 +32,9 @@ static const CGFloat kDragThreshold = 10.0;
 @property (nonatomic, assign) BOOL isDragging;
 @property (nonatomic, assign) CGPoint dragStartPoint;
 @property (nonatomic, assign) CGPoint dragStartCenter;
+// Previous overlay size used to preserve relative positions while an iPad
+// Stage Manager window is resized interactively.
+@property (nonatomic, assign) CGSize lastLayoutSize;
 
 @end
 
@@ -335,7 +338,31 @@ static const CGFloat kDragThreshold = 10.0;
 
 - (void)layoutSubviews {
     [super layoutSubviews];
-    // 屏幕旋转后重新约束位置
+
+    CGSize currentSize = self.bounds.size;
+    CGSize previousSize = self.lastLayoutSize;
+    BOOL hasPreviousSize = previousSize.width > 0.0 && previousSize.height > 0.0;
+    BOOL hasCurrentSize = currentSize.width > 0.0 && currentSize.height > 0.0;
+
+    if (hasPreviousSize
+            && hasCurrentSize
+            && !CGSizeEqualToSize(previousSize, currentSize)) {
+        // Keep the user-selected position as a percentage of the window.
+        // This preserves the floating ball and FPS label placement across
+        // continuous Stage Manager resizing instead of pinning them to an
+        // old absolute coordinate.
+        CGFloat scaleX = currentSize.width / previousSize.width;
+        CGFloat scaleY = currentSize.height / previousSize.height;
+        self.menuButton.center = CGPointMake(
+                self.menuButton.center.x * scaleX,
+                self.menuButton.center.y * scaleY);
+        self.statsLabel.center = CGPointMake(
+                self.statsLabel.center.x * scaleX,
+                self.statsLabel.center.y * scaleY);
+    }
+
+    self.lastLayoutSize = currentSize;
+    // Keep both controls visible even in the narrowest supported window.
     [self clampViewsToScreen];
 }
 
