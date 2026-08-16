@@ -1280,7 +1280,55 @@ static GameSurfaceView* pojavWindow;
     [self updateAudioSettings];
     [self updateSavedResolution];
     if (@available(iOS 16, tvOS 16, *)) {
-        CallbackBridge_nativeSendScreenSize(windowWidth, windowHeight);
+        if ([self.surfaceView.layer isKindOfClass:CAMetalLayer.class]) {
+            BOOL perfHUDEnabled = getPrefBool(@"video.performance_hud");
+            ((CAMetalLayer *)self.surfaceView.layer).developerHUDProperties = perfHUDEnabled ? @{@"mode": @"default"} : nil;
+        }
+    }
+    [self setNeedsUpdateOfPrefersPointerLocked];
+}
+
+- (void)updateSavedResolution {
+    if (self.resolutionUpdateScheduled) {
+        return;
+    }
+    self.resolutionUpdateScheduled = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.resolutionUpdateScheduled = NO;
+        [self applySavedResolution];
+    });
+}
+
+- (void)applySavedResolution {
+    if (self.surfaceView == nil) {
+        return;
+    }
+
+    for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes.allObjects) {
+        self.screenScale = scene.screen.scale;
+        if (scene.session.role != UIWindowSceneSessionRoleApplication) {
+            break;
+        }
+    }
+
+    if (self.surfaceView.superview != nil) {
+        self.surfaceView.frame = self.surfaceView.superview.frame;
+    }
+
+    resolutionScale = getPrefFloat(@"video.resolution") / 100.0;
+    self.surfaceView.layer.contentsScale = self.screenScale * resolutionScale;
+
+    physicalWidth = roundf(self.surfaceView.frame.size.width * self.screenScale);
+    physicalHeight = roundf(self.surfaceView.frame.size.height * self.screenScale);
+    windowWidth = roundf(physicalWidth * resolutionScale);
+    windowHeight = roundf(physicalHeight * resolutionScale);
+    if ((windowWidth % 2) != 0) {
+        --windowWidth;
+    }
+    if ((windowHeight % 2) != 0) {
+        --windowHeight;
+    }
+    CallbackBridge_nativeSendScreenSize(windowWidth, windowHeight);
 }
 
 - (void)updateControlHiddenState:(BOOL)hide {
