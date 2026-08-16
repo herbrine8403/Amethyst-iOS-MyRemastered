@@ -258,8 +258,7 @@ static GameSurfaceView* pojavWindow;
 @property(nonatomic) BOOL enableMouseGestures, enableHotbarGestures;
 // Last UIKit layout size propagated to the game surface. Stage Manager can
 // resize a scene without using the traditional rotation transition callback.
-@property(nonatomic) CGSize lastLayoutSize;
-// Coalesces drawable-size updates during Stage Manager interactive resizing.
+// Coalesces preference-triggered drawable updates on the main thread.
 @property(nonatomic, assign) BOOL resolutionUpdateScheduled;
 
 @property(nonatomic) UIImpactFeedbackGenerator *lightHaptic;
@@ -1202,29 +1201,6 @@ static GameSurfaceView* pojavWindow;
     // 自动检测（startDetecting/stopDetecting）已移除，无需在此启动。
 }
 
-- (void)viewDidLayoutSubviews {
-    [super viewDidLayoutSubviews];
-
-    // Stage Manager interactive resizing may reach this layout callback
-    // without a rotation transition. Propagate only real size changes so the
-    // Metal drawable, GLFW framebuffer, touch layer and controls stay aligned
-    // without creating a layout/update loop.
-    CGSize layoutSize = self.view.bounds.size;
-    BOOL validSize = layoutSize.width > 0.0 && layoutSize.height > 0.0;
-    if (validSize
-            && self.surfaceView != nil
-            && !CGSizeEqualToSize(layoutSize, self.lastLayoutSize)) {
-        self.lastLayoutSize = layoutSize;
-        self.rootView.bounds = CGRectMake(0, 0, layoutSize.width + 30.0, layoutSize.height);
-        self.touchView.frame = self.view.bounds;
-        self.inputTextField.frame = CGRectMake(0, -32.0, layoutSize.width, 30.0);
-        self.ctrlView.frame = getSafeArea(self.view.bounds);
-        [self.ctrlView.subviews makeObjectsPerformSelector:@selector(update)];
-        [self viewWillTransitionToSize_LogView:self.view.bounds];
-        [self viewWillTransitionToSize_Navigation:self.view.bounds];
-        [self updateSavedResolution];
-    }
-
     // 更新启动遮罩层渐变背景的 frame（旋转/尺寸变化时）
     if (self.launchGradientLayer && self.launchOverlayView) {
         self.launchGradientLayer.frame = self.launchOverlayView.bounds;
@@ -1310,89 +1286,7 @@ static GameSurfaceView* pojavWindow;
     [self updateAudioSettings];
     [self updateSavedResolution];
     if (@available(iOS 16, tvOS 16, *)) {
-        if ([self.surfaceView.layer isKindOfClass:CAMetalLayer.class]) {
-            BOOL perfHUDEnabled = getPrefBool(@"video.performance_hud");
-            ((CAMetalLayer *)self.surfaceView.layer).developerHUDProperties = perfHUDEnabled ? @{@"mode": @"default"} : nil;
-        }
-    }
-    [self setNeedsUpdateOfPrefersPointerLocked];
-}
-
-- (void)updateSavedResolution {
-    if (self.resolutionUpdateScheduled) {
-        return;
-    }
-    self.resolutionUpdateScheduled = YES;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        self.resolutionUpdateScheduled = NO;
-        [self applySavedResolution];
-    });
-}
-
-- (void)applySavedResolution {
-    if (self.surfaceView == nil) {
-        return;
-    }
-
-    for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes.allObjects) {
-        self.screenScale = scene.screen.scale;
-        if (scene.session.role != UIWindowSceneSessionRoleApplication) {
-            break;
-        }
-    }
-
-    if (self.surfaceView.superview != nil) {
-        // rootView intentionally reserves extra width for the control layout.
-        // The render surface must stay at the actual scene bounds or the game
-        // is rendered with a different aspect ratio than the visible window.
-        CGRect surfaceFrame = self.view.bounds;
-        surfaceFrame.origin = CGPointZero;
-        self.surfaceView.frame = surfaceFrame;
-    }
-
-    resolutionScale = getPrefFloat(@"video.resolution") / 100.0;
-    self.surfaceView.layer.contentsScale = self.screenScale * resolutionScale;
-
-    physicalWidth = roundf(self.surfaceView.frame.size.width * self.screenScale);
-    physicalHeight = roundf(self.surfaceView.frame.size.height * self.screenScale);
-    windowWidth = roundf(physicalWidth * resolutionScale);
-    windowHeight = roundf(physicalHeight * resolutionScale);
-    if ((windowWidth % 2) != 0) { --windowWidth; }
-    if ((windowHeight % 2) != 0) { --windowHeight; }
-    if ([self.surfaceView.layer isKindOfClass:CAMetalLayer.class]) {
-        CAMetalLayer *metalLayer = (CAMetalLayer *)self.surfaceView.layer;
-        metalLayer.drawableSize = CGSizeMake(MAX(windowWidth, 1), MAX(windowHeight, 1));
-        // 解锁帧率（关闭垂直同步）：三缓冲。
-        // 默认 maximumDrawableCount（通常为 2）下，当两个 drawable 都在等待呈现时，
-        // nextDrawable 会阻塞到 vblank 释放一个 drawable，间接把渲染线程锁在刷新率。
-        // 设为 3（三缓冲）后几乎总有空闲 drawable，渲染线程不再因等待 drawable 而 stall，
-        // 配合 VSync 关闭可让帧率超过屏幕刷新率。该值是 Metal 低延迟/高吞吐渲染的标准设置。
-        // 注：此优化对 GL 类渲染器（经 CAMetalLayer 呈现）最有意义；Vulkan/MoltenVK 自管 swapchain。
-        metalLayer.maximumDrawableCount = 3;
-
-        // 显式设置 presentsWithTransaction=NO（默认值）。
-        // presentsWithTransaction=YES 会导致 presentDrawable 同步等待 Core Animation 事务提交，
-        // 增加延迟且不会提高帧率。设为 NO 让 presentDrawable 异步提交到 Core Animation，
-        // 渲染线程可以立即继续下一帧渲染，配合 eglSwapInterval(0) 实现帧率解锁。
-        // 这是 Metal 高吞吐渲染的标准配置。
-        metalLayer.presentsWithTransaction = NO;
-
-        // 确保异步绘制开启（GameSurfaceView.initWithFrame 已设置，此处二次确认）
-        metalLayer.drawsAsynchronously = YES;
-
-        // 记录 Metal 层配置（仅首次），帮助诊断帧率问题
-        static BOOL s_loggedMetalConfig = NO;
-        if (!s_loggedMetalConfig) {
-            s_loggedMetalConfig = YES;
-            NSLog(@"[SurfaceVC] CAMetalLayer configured: drawableSize=%.0fx%.0f, maximumDrawableCount=%ld, presentsWithTransaction=%d, drawsAsynchronously=%d, contentsScale=%.2f",
-                  metalLayer.drawableSize.width, metalLayer.drawableSize.height,
-                  (long)metalLayer.maximumDrawableCount,
-                  metalLayer.presentsWithTransaction,
-                  metalLayer.drawsAsynchronously,
-                  metalLayer.contentsScale);
-        }
-    }
-    CallbackBridge_nativeSendScreenSize(windowWidth, windowHeight);
+        CallbackBridge_nativeSendScreenSize(windowWidth, windowHeight);
 }
 
 - (void)updateControlHiddenState:(BOOL)hide {
@@ -1776,7 +1670,6 @@ static GameSurfaceView* pojavWindow;
 - (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator
 {
     [coordinator animateAlongsideTransition:^(id<UIViewControllerTransitionCoordinatorContext>  _Nonnull context) {
-        self.lastLayoutSize = size;
         self.rootView.bounds = CGRectMake(0, 0, size.width + 30.0, size.height);
 
         CGRect frame = self.view.frame;
