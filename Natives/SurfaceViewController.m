@@ -1201,12 +1201,6 @@ static GameSurfaceView* pojavWindow;
     // 自动检测（startDetecting/stopDetecting）已移除，无需在此启动。
 }
 
-    // 更新启动遮罩层渐变背景的 frame（旋转/尺寸变化时）
-    if (self.launchGradientLayer && self.launchOverlayView) {
-        self.launchGradientLayer.frame = self.launchOverlayView.bounds;
-    }
-}
-
 - (void)updateAudioSettings {
     NSError *sessionError = nil;
     AVAudioSessionCategory category;
