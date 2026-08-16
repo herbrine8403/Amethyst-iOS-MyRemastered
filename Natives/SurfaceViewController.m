@@ -1325,7 +1325,12 @@ static GameSurfaceView* pojavWindow;
     }
 
     if (self.surfaceView.superview != nil) {
-        self.surfaceView.frame = self.surfaceView.superview.frame;
+        // rootView intentionally reserves extra width for the control layout.
+        // The render surface must stay at the actual scene bounds or the game
+        // is rendered with a different aspect ratio than the visible window.
+        CGRect surfaceFrame = self.view.bounds;
+        surfaceFrame.origin = CGPointZero;
+        self.surfaceView.frame = surfaceFrame;
     }
 
     resolutionScale = getPrefFloat(@"video.resolution") / 100.0;
