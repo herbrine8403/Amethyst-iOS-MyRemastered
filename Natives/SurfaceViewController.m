@@ -259,6 +259,8 @@ static GameSurfaceView* pojavWindow;
 // Last UIKit layout size propagated to the game surface. Stage Manager can
 // resize a scene without using the traditional rotation transition callback.
 @property(nonatomic) CGSize lastLayoutSize;
+// Coalesces drawable-size updates during Stage Manager interactive resizing.
+@property(nonatomic, assign) BOOL resolutionUpdateScheduled;
 
 @property(nonatomic) UIImpactFeedbackGenerator *lightHaptic;
 @property(nonatomic) UIImpactFeedbackGenerator *mediumHaptic;
@@ -1317,6 +1319,21 @@ static GameSurfaceView* pojavWindow;
 }
 
 - (void)updateSavedResolution {
+    if (self.resolutionUpdateScheduled) {
+        return;
+    }
+    self.resolutionUpdateScheduled = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.resolutionUpdateScheduled = NO;
+        [self applySavedResolution];
+    });
+}
+
+- (void)applySavedResolution {
+    if (self.surfaceView == nil) {
+        return;
+    }
+
     for (UIWindowScene *scene in UIApplication.sharedApplication.connectedScenes.allObjects) {
         self.screenScale = scene.screen.scale;
         if (scene.session.role != UIWindowSceneSessionRoleApplication) {
