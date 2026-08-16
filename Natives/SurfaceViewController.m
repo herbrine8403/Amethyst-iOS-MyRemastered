@@ -256,6 +256,9 @@ static GameSurfaceView* pojavWindow;
     shouldTriggerClick, shouldTriggerHaptic, slideableHotbar, toggleHidden;
 
 @property(nonatomic) BOOL enableMouseGestures, enableHotbarGestures;
+// Last UIKit layout size propagated to the game surface. Stage Manager can
+// resize a scene without using the traditional rotation transition callback.
+@property(nonatomic) CGSize lastLayoutSize;
 
 @property(nonatomic) UIImpactFeedbackGenerator *lightHaptic;
 @property(nonatomic) UIImpactFeedbackGenerator *mediumHaptic;
@@ -1199,6 +1202,27 @@ static GameSurfaceView* pojavWindow;
 
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
+
+    // Stage Manager interactive resizing may reach this layout callback
+    // without a rotation transition. Propagate only real size changes so the
+    // Metal drawable, GLFW framebuffer, touch layer and controls stay aligned
+    // without creating a layout/update loop.
+    CGSize layoutSize = self.view.bounds.size;
+    BOOL validSize = layoutSize.width > 0.0 && layoutSize.height > 0.0;
+    if (validSize
+            && self.surfaceView != nil
+            && !CGSizeEqualToSize(layoutSize, self.lastLayoutSize)) {
+        self.lastLayoutSize = layoutSize;
+        self.rootView.bounds = CGRectMake(0, 0, layoutSize.width + 30.0, layoutSize.height);
+        self.touchView.frame = self.view.bounds;
+        self.inputTextField.frame = CGRectMake(0, -32.0, layoutSize.width, 30.0);
+        self.ctrlView.frame = getSafeArea(self.view.bounds);
+        [self.ctrlView.subviews makeObjectsPerformSelector:@selector(update)];
+        [self viewWillTransitionToSize_LogView:self.view.bounds];
+        [self viewWillTransitionToSize_Navigation:self.view.bounds];
+        [self updateSavedResolution];
+    }
+
     // 更新启动遮罩层渐变背景的 frame（旋转/尺寸变化时）
     if (self.launchGradientLayer && self.launchOverlayView) {
         self.launchGradientLayer.frame = self.launchOverlayView.bounds;
@@ -1730,6 +1754,7 @@ static GameSurfaceView* pojavWindow;
 - (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator
 {
     [coordinator animateAlongsideTransition:^(id<UIViewControllerTransitionCoordinatorContext>  _Nonnull context) {
+        self.lastLayoutSize = size;
         self.rootView.bounds = CGRectMake(0, 0, size.width + 30.0, size.height);
 
         CGRect frame = self.view.frame;
