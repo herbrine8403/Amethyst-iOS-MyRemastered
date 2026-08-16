@@ -19,14 +19,10 @@ extern UIWindow *mainWindow;
 - (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)connectionOptions {
     UIWindowScene *windowScene = (UIWindowScene *)scene;
     
-    // 强制横屏 (iOS 16+)
-    if (@available(iOS 16.0, *)) {
-        UIWindowSceneGeometryPreferencesIOS *geometryPreferences = [[UIWindowSceneGeometryPreferencesIOS alloc] init];
-        geometryPreferences.interfaceOrientations = UIInterfaceOrientationMaskLandscape;
-        [windowScene requestGeometryUpdateWithPreferences:geometryPreferences errorHandler:^(NSError *error) {
-            NSLog(@"[SceneDelegate] Failed to update geometry: %@", error);
-        }];
-    }
+    // Keep the system-provided scene geometry. Requesting a landscape-only
+    // geometry update here prevents iPadOS Stage Manager from freely resizing
+    // the window. Orientation policy remains handled by the scene delegate
+    // and Info.plist, while the window follows windowScene.coordinateSpace.
     
     self.window = [[UIWindow alloc] initWithWindowScene:windowScene];
     self.window.frame = windowScene.coordinateSpace.bounds;
