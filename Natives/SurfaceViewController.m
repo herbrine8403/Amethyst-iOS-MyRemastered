@@ -258,8 +258,6 @@ static GameSurfaceView* pojavWindow;
 @property(nonatomic) BOOL enableMouseGestures, enableHotbarGestures;
 // Last UIKit layout size propagated to the game surface. Stage Manager can
 // resize a scene without using the traditional rotation transition callback.
-// Coalesces preference-triggered drawable updates on the main thread.
-@property(nonatomic, assign) BOOL resolutionUpdateScheduled;
 
 @property(nonatomic) UIImpactFeedbackGenerator *lightHaptic;
 @property(nonatomic) UIImpactFeedbackGenerator *mediumHaptic;
@@ -1289,17 +1287,6 @@ static GameSurfaceView* pojavWindow;
 }
 
 - (void)updateSavedResolution {
-    if (self.resolutionUpdateScheduled) {
-        return;
-    }
-    self.resolutionUpdateScheduled = YES;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        self.resolutionUpdateScheduled = NO;
-        [self applySavedResolution];
-    });
-}
-
-- (void)applySavedResolution {
     if (self.surfaceView == nil) {
         return;
     }
@@ -1312,10 +1299,23 @@ static GameSurfaceView* pojavWindow;
     }
 
     if (self.surfaceView.superview != nil) {
-        self.surfaceView.frame = self.surfaceView.superview.frame;
+        // Match upstream sizing, but avoid launching with a zero-sized pre-layout view.
+        CGRect surfaceFrame = self.surfaceView.superview.bounds;
+        if (surfaceFrame.size.width <= 0.0 || surfaceFrame.size.height <= 0.0) {
+            surfaceFrame = self.view.bounds;
+        }
+        if (surfaceFrame.size.width <= 0.0 || surfaceFrame.size.height <= 0.0) {
+            surfaceFrame = self.surfaceView.frame;
+        }
+        if (surfaceFrame.size.width > 0.0 && surfaceFrame.size.height > 0.0) {
+            self.surfaceView.frame = surfaceFrame;
+        }
     }
 
     resolutionScale = getPrefFloat(@"video.resolution") / 100.0;
+    if (resolutionScale <= 0.0) {
+        resolutionScale = 1.0;
+    }
     self.surfaceView.layer.contentsScale = self.screenScale * resolutionScale;
 
     physicalWidth = roundf(self.surfaceView.frame.size.width * self.screenScale);
