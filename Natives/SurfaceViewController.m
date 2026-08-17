@@ -1216,6 +1216,7 @@ static GameSurfaceView* pojavWindow;
     }
 
     self.lastSurfaceLayoutSize = size;
+    NSLog(@"[StageManager][M1] UIKit layout %.0fx%.0f pt", size.width, size.height);
 
     // Keep Amethyst's +30pt root container workaround, while the visible
     // touch and game surfaces use the exact Stage Manager window bounds.
@@ -1262,6 +1263,8 @@ static GameSurfaceView* pojavWindow;
         return;
     }
 
+    NSLog(@"[StageManager][M2] Stable window %.0fx%.0f pt; publishing renderer size",
+          currentSize.width, currentSize.height);
     [self updateSavedResolution];
 }
 
@@ -1397,6 +1400,8 @@ static GameSurfaceView* pojavWindow;
     CGSize rendererSize = CGSizeMake(windowWidth, windowHeight);
     if (!CGSizeEqualToSize(rendererSize, self.lastPublishedRendererSize)) {
         self.lastPublishedRendererSize = rendererSize;
+        NSLog(@"[StageManager][M2] Renderer size %dx%d px (scale=%.2f, resolution=%.2f)",
+              windowWidth, windowHeight, self.screenScale, resolutionScale);
         CallbackBridge_nativeSendScreenSize(windowWidth, windowHeight);
     }
 }
