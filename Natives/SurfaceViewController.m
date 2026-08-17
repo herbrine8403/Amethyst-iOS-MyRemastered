@@ -258,6 +258,9 @@ static GameSurfaceView* pojavWindow;
 @property(nonatomic) BOOL enableMouseGestures, enableHotbarGestures;
 // M1: Last UIKit surface size applied during Stage Manager resizing.
 @property(nonatomic, assign) CGSize lastSurfaceLayoutSize;
+// M2: Publish one renderer size after interactive resizing settles.
+@property(nonatomic, assign) CGSize pendingRendererLayoutSize;
+@property(nonatomic, assign) CGSize lastPublishedRendererSize;
 // Last UIKit layout size propagated to the game surface. Stage Manager can
 // resize a scene without using the traditional rotation transition callback.
 
@@ -1220,6 +1223,34 @@ static GameSurfaceView* pojavWindow;
     self.rootView.bounds = CGRectMake(0.0, 0.0, size.width + 30.0, size.height);
     self.touchView.frame = CGRectMake(0.0, 0.0, size.width, size.height);
     self.surfaceView.frame = self.touchView.bounds;
+
+    self.pendingRendererLayoutSize = size;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self
+                                             selector:@selector(commitPendingRendererSize)
+                                               object:nil];
+    [self performSelector:@selector(commitPendingRendererSize)
+               withObject:nil
+               afterDelay:0.20
+                  inModes:@[NSRunLoopCommonModes]];
+}
+
+- (void)commitPendingRendererSize {
+    CGSize currentSize = self.view.bounds.size;
+    if (currentSize.width <= 0.0 || currentSize.height <= 0.0) {
+        return;
+    }
+
+    // If layout changed again after the timer fired, wait for the next stable tick.
+    if (!CGSizeEqualToSize(currentSize, self.pendingRendererLayoutSize)) {
+        self.pendingRendererLayoutSize = currentSize;
+        [self performSelector:@selector(commitPendingRendererSize)
+                   withObject:nil
+                   afterDelay:0.20
+                      inModes:@[NSRunLoopCommonModes]];
+        return;
+    }
+
+    [self updateSavedResolution];
 }
 
 - (void)updateAudioSettings {
@@ -1351,7 +1382,11 @@ static GameSurfaceView* pojavWindow;
     if ((windowHeight % 2) != 0) {
         --windowHeight;
     }
-    CallbackBridge_nativeSendScreenSize(windowWidth, windowHeight);
+    CGSize rendererSize = CGSizeMake(windowWidth, windowHeight);
+    if (!CGSizeEqualToSize(rendererSize, self.lastPublishedRendererSize)) {
+        self.lastPublishedRendererSize = rendererSize;
+        CallbackBridge_nativeSendScreenSize(windowWidth, windowHeight);
+    }
 }
 
 - (void)updateControlHiddenState:(BOOL)hide {
@@ -1744,7 +1779,6 @@ static GameSurfaceView* pojavWindow;
         [self viewWillTransitionToSize_Navigation:frame];
         self.ctrlView.frame = getSafeArea(self.view.frame);
         [self.ctrlView.subviews makeObjectsPerformSelector:@selector(update)];
-        [self updateSavedResolution];
         [GyroInput updateOrientation];
     } completion:^(id<UIViewControllerTransitionCoordinatorContext>  _Nonnull context) {
         virtualMouseFrame = self.mousePointerView.frame;
