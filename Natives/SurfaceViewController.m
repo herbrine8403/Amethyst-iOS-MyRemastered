@@ -1718,7 +1718,6 @@ static GameSurfaceView* pojavWindow;
         frame.size = size;
         self.touchView.frame = frame;
         self.inputTextField.frame = CGRectMake(0, -32.0, size.width, 30.0);
-        [self viewWillTransitionToSize_LogView:frame];
         [self viewWillTransitionToSize_Navigation:frame];
         self.ctrlView.frame = getSafeArea(self.view.frame);
         [self.ctrlView.subviews makeObjectsPerformSelector:@selector(update)];
