@@ -256,6 +256,8 @@ static GameSurfaceView* pojavWindow;
     shouldTriggerClick, shouldTriggerHaptic, slideableHotbar, toggleHidden;
 
 @property(nonatomic) BOOL enableMouseGestures, enableHotbarGestures;
+// M1: Last UIKit surface size applied during Stage Manager resizing.
+@property(nonatomic, assign) CGSize lastSurfaceLayoutSize;
 // Last UIKit layout size propagated to the game surface. Stage Manager can
 // resize a scene without using the traditional rotation transition callback.
 
@@ -1197,6 +1199,27 @@ static GameSurfaceView* pojavWindow;
 
     // LAN 端口检测器已改为手动输入模式（LanPortDetector.h 说明），
     // 自动检测（startDetecting/stopDetecting）已移除，无需在此启动。
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+
+    CGSize size = self.view.bounds.size;
+    if (self.surfaceView == nil
+            || size.width <= 0.0
+            || size.height <= 0.0
+            || CGSizeEqualToSize(size, self.lastSurfaceLayoutSize)) {
+        return;
+    }
+
+    self.lastSurfaceLayoutSize = size;
+
+    // Keep Amethyst's +30pt root container workaround, while the visible
+    // touch and game surfaces use the exact Stage Manager window bounds.
+    self.rootView.frame = CGRectMake(0.0, 0.0, size.width + 30.0, size.height);
+    self.rootView.bounds = CGRectMake(0.0, 0.0, size.width + 30.0, size.height);
+    self.touchView.frame = CGRectMake(0.0, 0.0, size.width, size.height);
+    self.surfaceView.frame = self.touchView.bounds;
 }
 
 - (void)updateAudioSettings {
