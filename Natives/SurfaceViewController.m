@@ -1224,6 +1224,18 @@ static GameSurfaceView* pojavWindow;
     self.touchView.frame = CGRectMake(0.0, 0.0, size.width, size.height);
     self.surfaceView.frame = self.touchView.bounds;
 
+    // Keep input coordinates, safe-area controls, navigation and the floating
+    // menu aligned with the same visible bounds as the game surface.
+    self.inputTextField.frame = CGRectMake(0.0, -32.0, size.width, 30.0);
+    self.ctrlView.frame = getSafeArea(self.view.bounds);
+    [self.ctrlView.subviews makeObjectsPerformSelector:@selector(update)];
+    [self viewWillTransitionToSize_Navigation:self.view.bounds];
+
+    if (self.gameMenuOverlay != nil) {
+        self.gameMenuOverlay.frame = self.view.bounds;
+        [self.gameMenuOverlay setNeedsLayout];
+    }
+
     self.pendingRendererLayoutSize = size;
     [NSObject cancelPreviousPerformRequestsWithTarget:self
                                              selector:@selector(commitPendingRendererSize)
