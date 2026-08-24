@@ -1029,7 +1029,7 @@
 "i18n_str_182" = "No modpacks";
 "i18n_str_183" = "No resource packs";
 "i18n_str_184" = "No data packs";
-"i18n_str_185" = "The world list requires a CurseForge API Key\n\Please configure it in "Settings\"";
+"i18n_str_185" = "The world list requires a CurseForge API Key\n\Please configure it in \"Settings\"";
 "i18n_str_186" = "No worlds";
 "i18n_str_187" = "Options";
 "i18n_str_188" = "Choose Game Version";
