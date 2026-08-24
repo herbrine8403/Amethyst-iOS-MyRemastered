@@ -1029,7 +1029,7 @@
 "i18n_str_182" = "No modpacks";
 "i18n_str_183" = "No resource packs";
 "i18n_str_184" = "No data packs";
-"i18n_str_185" = "The world list requires a CurseForge API Key\nPlease configure it in "Settings"";
+"i18n_str_185" = "The world list requires a CurseForge API Key\n\Please configure it in "Settings\"";
 "i18n_str_186" = "No worlds";
 "i18n_str_187" = "Options";
 "i18n_str_188" = "Choose Game Version";
@@ -1037,7 +1037,7 @@
 "i18n_str_190" = "Set CurseForge API Key";
 "i18n_str_194" = "Unable to install vanilla %@. Please check your network and try again";
 "i18n_str_195" = "Vanilla not installed";
-"i18n_str_196" = "Vanilla %@ must be installed before installing %@.\n\nPlease install that vanilla version in the "Downloads" page first, then install the mod loader.";
+"i18n_str_196" = "Vanilla %@ must be installed before installing %@.\n\nPlease install that vanilla version in the \"Downloads\" page first, then install the mod loader.";
 "i18n_str_197" = "Got It";
 "i18n_str_198" = "%@ installer is not implemented yet";
 "i18n_str_199" = "Network unavailable. Please check your network connection";
@@ -1063,7 +1063,7 @@
 "i18n_str_219" = "No suitable Fabric API version found";
 "i18n_str_220" = "Failed to fetch Fabric API versions";
 "i18n_str_221" = "Unable to parse the installer main class or Java version: %@";
-"i18n_str_222" = "Running the JAR requires Java %d or later, but no matching runtime is configured.\n\nPlease assign a Java %d+ runtime to the "Execute JAR" tag in "Settings → Manage Runtimes".";
+"i18n_str_222" = "Running the JAR requires Java %d or later, but no matching runtime is configured.\n\nPlease assign a Java %d+ runtime to the \"Execute JAR\" tag in \"Settings → Manage Runtimes\".";
 "i18n_str_223" = "%@ installation failed";
 "i18n_str_224" = "%@ installer download result is invalid";
 "i18n_str_225" = "%@ installer downloaded and is launching. Follow the prompts after installation completes.";
@@ -1227,7 +1227,7 @@
 "i18n_str_401" = "Two-finger keyboard disabled";
 "i18n_str_406" = "OK";
 "i18n_str_407" = "New version v%@ found";
-"i18n_str_408" = "Tap "Go to Downloads" to open the GitHub Releases page and download the latest version.";
+"i18n_str_408" = "Tap \"Go to Downloads\" to open the GitHub Releases page and download the latest version.";
 "i18n_str_411" = "No version selected";
 "i18n_str_412" = "Launch Game";
 "i18n_str_413" = "JIT: Detecting...";
@@ -1550,7 +1550,7 @@
 "i18n_str_1007" = "ZeroTier online play";
 "i18n_str_1008" = "Create room";
 "i18n_str_1009" = "Join room";
-"i18n_str_1010" = "First, tap "Open to LAN" in Minecraft, note the displayed port number, enter it below, then tap Create.";
+"i18n_str_1010" = "First, tap \"Open to LAN\" in Minecraft, note the displayed port number, enter it below, then tap Create.";
 "i18n_str_1013" = "Invite code";
 "i18n_str_1014" = "Player list";
 "i18n_str_1015" = "Please enter a valid port";
@@ -1821,7 +1821,7 @@
 "i18n_str_629" = "Timed out waiting for the ZeroTier network to be ready (%.0fs). Please confirm the Network ID is correct and that your node has been authorized on the central.zerotier.com dashboard.";
 "i18n_str_632" = "Failed to start the SOCKS5 proxy";
 "i18n_str_637" = "1. Enter the ZeroTier Network ID above on the launcher's online play page\n";
-"i18n_str_638" = "2. Tap "Join Room"; the launcher will automatically start the online core and connect\n";
+"i18n_str_638" = "2. Tap \"Join Room\"; the launcher will automatically start the online core and connect\n";
 "i18n_str_639" = "3. After connecting, launch the game and add the server in MC: %@";
 "i18n_str_832" = "SHA1 checksum failed: expected %@, got %@ (%@)";
 "i18n_str_883" = "Automatically join this server after launching the game (refer to FCL)\nFormat: host or host:port ([host]:port for IPv6); leave empty to not auto-join";
