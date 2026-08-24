@@ -156,7 +156,7 @@
 
 "preference.title.renderer" = "渲染器";
 
-"preference.title.renderer.debug.auto" = "自動：gl4es或ANGLE";
+"preference.title.renderer.debug.auto" = "自動：ANGLE";
 "preference.title.renderer.debug.gl4es" = "gl4es 1.1.4 － 輸出OpenGL 2.1";
 "preference.title.renderer.debug.angle" = "ANGLE（1.17+）— 輸出OpenGL 3.2（核心，有限）";
 "preference.title.renderer.debug.zink" = "Zink (Mesa 25.0.7) － 輸出OpenGL 4.1";

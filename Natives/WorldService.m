@@ -20,6 +20,8 @@
 #import "PLTaskStages.h"
 #import "LauncherPreferences.h"
 
+static NSString * const PLWorldDownloadGenerationKey = @"worldDownloadGeneration";
+
 @interface WorldService () <NSURLSessionDownloadDelegate>
 @property (nonatomic, strong) NSURLSession *downloadSession;
 // 内部统一存储带 success/error 的 completion handler
@@ -30,6 +32,7 @@
 @property (nonatomic, strong) NSMutableDictionary<NSURLSessionTask *, NSProgress *> *downloadProgresses;
 @property (nonatomic, strong) NSMutableDictionary<NSURLSessionTask *, DownloadTaskItem *> *downloadTaskItems;
 @property (nonatomic, strong) NSMutableDictionary<NSURLSessionTask *, NSMutableDictionary *> *downloadProgressSnapshots;
+@property (nonatomic, strong) NSLock *downloadStateLock;
 // 导入任务专用字典（不通过 NSURLSession 下载，但同样需要进度上报）
 @property (nonatomic, strong) NSMutableDictionary<NSString *, WorldDownloadCompletionHandler> *importCompletionHandlers;
 @end
@@ -61,6 +64,7 @@
         _downloadProgresses = [NSMutableDictionary dictionary];
         _downloadTaskItems = [NSMutableDictionary dictionary];
         _downloadProgressSnapshots = [NSMutableDictionary dictionary];
+        _downloadStateLock = [[NSLock alloc] init];
         _importCompletionHandlers = [NSMutableDictionary dictionary];
     }
     return self;
@@ -70,84 +74,24 @@
 
 // 解析 profile 的 gameDir，返回 gameDir 或 nil
 - (nullable NSString *)gameDirForProfile:(NSString *)profileName {
-    NSString *profile = profileName.length ? profileName : @"default";
-    @try {
-        NSDictionary *profiles = PLProfiles.current.profiles;
-        NSDictionary *prof = profiles[profile];
-        if ([prof isKindOfClass:[NSDictionary class]]) {
-            NSString *gameDir = prof[@"gameDir"];
-            if ([gameDir isKindOfClass:[NSString class]] && gameDir.length > 0) {
-                return gameDir;
-            }
-        }
-    } @catch (NSException *ex) { }
-
-    const char *gameDirC = getenv("POJAV_GAME_DIR");
-    if (gameDirC) {
-        return [NSString stringWithUTF8String:gameDirC];
-    }
-    return nil;
+    return [PLProfiles resolvedGameDirectoryForProfileName:profileName];
 }
 
 #pragma mark - Saves folder detection & scan
 
 // 查找指定 profile 的 saves 目录（已存在时返回路径，否则返回 nil）
 - (nullable NSString *)existingWorldsFolderForProfile:(NSString *)profileName {
-    NSString *profile = profileName.length ? profileName : @"default";
     NSFileManager *fm = [NSFileManager defaultManager];
-
-    @try {
-        NSDictionary *profiles = PLProfiles.current.profiles;
-        NSDictionary *prof = profiles[profile];
-        if ([prof isKindOfClass:[NSDictionary class]]) {
-            NSString *gameDir = prof[@"gameDir"];
-            if ([gameDir isKindOfClass:[NSString class]] && gameDir.length > 0) {
-                NSString *savesPath = [gameDir stringByAppendingPathComponent:@"saves"];
-                BOOL isDir = NO;
-                if ([fm fileExistsAtPath:savesPath isDirectory:&isDir] && isDir) {
-                    return savesPath;
-                }
-            }
-        }
-    } @catch (NSException *ex) { }
-
-    // 回退：读取 POJAV_GAME_DIR 环境变量
-    const char *gameDirC = getenv("POJAV_GAME_DIR");
-    if (gameDirC) {
-        NSString *gameDir = [NSString stringWithUTF8String:gameDirC];
-        NSString *savesPath = [gameDir stringByAppendingPathComponent:@"saves"];
-        BOOL isDir = NO;
-        if ([fm fileExistsAtPath:savesPath isDirectory:&isDir] && isDir) {
-            return savesPath;
-        }
-    }
+    NSString *savesPath = [[self gameDirForProfile:profileName] stringByAppendingPathComponent:@"saves"];
+    BOOL isDir = NO;
+    if ([fm fileExistsAtPath:savesPath isDirectory:&isDir] && isDir) return savesPath;
     return nil;
 }
 
 /// 获取当前 profile 的 saves 目录，不存在时自动创建
 - (nullable NSString *)ensureWorldsFolderForProfile:(NSString *)profileName error:(NSError **)error {
-    NSString *profile = profileName.length ? profileName : @"default";
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *savesPath = nil;
-
-    @try {
-        NSDictionary *profiles = PLProfiles.current.profiles;
-        NSDictionary *prof = profiles[profile];
-        if ([prof isKindOfClass:[NSDictionary class]]) {
-            NSString *gameDir = prof[@"gameDir"];
-            if ([gameDir isKindOfClass:[NSString class]] && gameDir.length > 0) {
-                savesPath = [gameDir stringByAppendingPathComponent:@"saves"];
-            }
-        }
-    } @catch (NSException *ex) { }
-
-    if (!savesPath) {
-        const char *gameDirC = getenv("POJAV_GAME_DIR");
-        if (gameDirC) {
-            NSString *gameDir = [NSString stringWithUTF8String:gameDirC];
-            savesPath = [gameDir stringByAppendingPathComponent:@"saves"];
-        }
-    }
+    NSString *savesPath = [[self gameDirForProfile:profileName] stringByAppendingPathComponent:@"saves"];
 
     if (!savesPath) {
         if (error) {
@@ -268,6 +212,20 @@
 // - 若 zip 内有顶层目录，直接解压到 saves/
 // - 若 zip 内无顶层目录（散装），先用世界名创建子目录，再解压到该子目录
 // - worldName 用于无顶层目录时命名新世界目录
+- (nullable NSString *)worldDirectoryContainingLevelDatUnderPath:(NSString *)rootPath {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *directLevelDat = [rootPath stringByAppendingPathComponent:@"level.dat"];
+    if ([fm fileExistsAtPath:directLevelDat]) return rootPath;
+
+    NSDirectoryEnumerator<NSString *> *enumerator = [fm enumeratorAtPath:rootPath];
+    for (NSString *relativePath in enumerator) {
+        if ([[relativePath lastPathComponent] isEqualToString:@"level.dat"]) {
+            return [[rootPath stringByAppendingPathComponent:relativePath] stringByDeletingLastPathComponent];
+        }
+    }
+    return nil;
+}
+
 - (BOOL)extractWorldZipAt:(NSString *)zipPath
                 toSavesDir:(NSString *)savesDir
                 worldName:(NSString *)worldName
@@ -277,11 +235,13 @@
     NSString *topLevelDir = [self detectTopLevelDirectoryInZip:zipPath];
     NSString *extractTargetDir = nil;
     NSString *finalWorldDir = nil;
+    BOOL finalWorldDirExistedBefore = NO;
 
     if (topLevelDir) {
         // zip 内有顶层目录，直接解压到 saves/
         extractTargetDir = savesDir;
         finalWorldDir = [savesDir stringByAppendingPathComponent:topLevelDir];
+        finalWorldDirExistedBefore = [fm fileExistsAtPath:finalWorldDir];
     } else {
         // zip 内无顶层目录，需要创建子目录后再解压
         NSString *baseName = worldName.length > 0 ? worldName : [zipPath lastPathComponent];
@@ -311,6 +271,7 @@
     NSError *archiveError = nil;
     UZKArchive *archive = [[UZKArchive alloc] initWithPath:zipPath error:&archiveError];
     if (!archive || archiveError) {
+        if (!finalWorldDirExistedBefore) [fm removeItemAtPath:finalWorldDir error:nil];
         if (error) *error = archiveError;
         return NO;
     }
@@ -319,21 +280,39 @@
     BOOL success = [archive extractFilesTo:extractTargetDir overwrite:YES error:&extractError];
     if (!success || extractError) {
         if (error) *error = extractError;
-        // 解压失败时若我们创建了子目录，清理掉空目录
-        if (!topLevelDir && [fm fileExistsAtPath:extractTargetDir]) {
-            NSArray<NSString *> *leftover = [fm contentsOfDirectoryAtPath:extractTargetDir error:nil];
-            if (leftover.count == 0) {
-                [fm removeItemAtPath:extractTargetDir error:nil];
-            }
+        // 仅清理本次新建的世界目录，保留下载前已经存在的用户数据。
+        if (!finalWorldDirExistedBefore) [fm removeItemAtPath:finalWorldDir error:nil];
+        return NO;
+    }
+
+    // Minecraft 只识别 saves/ 的直接子目录。若压缩包多套了一层目录，找到真正
+    // 包含 level.dat 的目录并提升到 saves/，否则管理页和游戏都会把它当作不存在。
+    NSString *actualWorldDir = [self worldDirectoryContainingLevelDatUnderPath:finalWorldDir];
+    if (!actualWorldDir) {
+        if (!finalWorldDirExistedBefore) [fm removeItemAtPath:finalWorldDir error:nil];
+        if (error) {
+            *error = [NSError errorWithDomain:@"WorldServiceError"
+                                         code:7
+                                     userInfo:@{NSLocalizedDescriptionKey: @"The downloaded archive does not contain a valid Minecraft world (level.dat is missing)."}];
         }
         return NO;
     }
 
-    // 校验解压结果：必须存在 level.dat（可能在 finalWorldDir 直接下，也可能在更深一层）
-    NSString *levelDatCheck = [finalWorldDir stringByAppendingPathComponent:@"level.dat"];
-    if (![fm fileExistsAtPath:levelDatCheck]) {
-        // 有些 zip 即使有顶层目录，level.dat 可能还在更深层。这里只做日志，不阻断
-        NSLog(@"[WorldService] warning: level.dat not found at %@ after extraction", finalWorldDir);
+    if (![actualWorldDir isEqualToString:finalWorldDir]) {
+        NSString *baseName = actualWorldDir.lastPathComponent.length > 0 ? actualWorldDir.lastPathComponent : worldName;
+        NSString *promotedWorldDir = [savesDir stringByAppendingPathComponent:baseName];
+        NSInteger suffix = 1;
+        while ([fm fileExistsAtPath:promotedWorldDir]) {
+            promotedWorldDir = [savesDir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@_%ld", baseName, (long)suffix++]];
+        }
+
+        NSError *moveError = nil;
+        if (![fm moveItemAtPath:actualWorldDir toPath:promotedWorldDir error:&moveError]) {
+            if (error) *error = moveError;
+            return NO;
+        }
+        if (!finalWorldDirExistedBefore) [fm removeItemAtPath:finalWorldDir error:nil];
+        finalWorldDir = promotedWorldDir;
     }
 
     NSLog(@"[WorldService] world extracted to: %@", finalWorldDir);
@@ -379,16 +358,13 @@
 
     // 创建下载任务（默认会话配置，无后台限速）
     NSURLSessionDownloadTask *task = [self.downloadSession downloadTaskWithURL:url];
-    self.downloadCompletionHandlers[task] = completion;
-    self.downloadDestinationPaths[task] = destinationPath;
     // 用 taskDescription 暂存世界名和 saves 目录（用于解压阶段）
     // 格式："worldName\nsavesFolder"
     task.taskDescription = [NSString stringWithFormat:@"%@\n%@", worldNameForExtract, savesFolder];
+    NSProgress *progressObj = nil;
     if (progress) {
-        NSProgress *progressObj = [NSProgress progressWithTotalUnitCount:-1];
+        progressObj = [NSProgress progressWithTotalUnitCount:-1];
         progressObj.kind = NSProgressKindFile;
-        self.downloadProgresses[task] = progressObj;
-        self.downloadProgressHandlers[task] = progress;
     }
 
     // 注册到统一下载任务管理器（悬浮球已移除，始终注册以便下载任务列表跟踪）
@@ -404,12 +380,28 @@
                       supportsResume:YES
                              iconURL:item.iconURL];
     taskItem.downloadURL = item.selectedVersionDownloadURL;
+    NSString *taskProfileName = [PLProfiles effectiveProfileNameForPreferredName:profileName];
+    if (taskProfileName.length > 0) taskItem.userInfo[@"profileName"] = taskProfileName;
+    taskItem.userInfo[@"destinationPath"] = destinationPath;
+    taskItem.userInfo[PLWorldDownloadGenerationKey] = @(task.taskIdentifier);
+    // 世界暂停恢复需要用新的 NSURLSessionTask 从头重建，不应消耗网络失败重试预算。
+    taskItem.maxRetryCount = 0;
+    taskItem.autoPresentDetail = YES;
+    [self.downloadStateLock lock];
+    if (completion) self.downloadCompletionHandlers[task] = completion;
+    self.downloadDestinationPaths[task] = destinationPath;
+    if (progressObj) self.downloadProgresses[task] = progressObj;
+    if (progress) self.downloadProgressHandlers[task] = progress;
     self.downloadTaskItems[task] = taskItem;
+    [self.downloadStateLock unlock];
+    [[DownloadTaskManager sharedManager] setTaskWithId:taskItem.taskId stages:PLTaskStagesWorld()];
     [[DownloadTaskManager sharedManager] setTaskWithId:taskItem.taskId state:DownloadTaskStateDownloading];
+    [[DownloadTaskManager sharedManager] updateTaskWithId:taskItem.taskId stageAtIndex:0 status:PLTaskStageStatusRunning];
 
     // 设置 retryHandler：FCL 风格重新下载
     __weak typeof(self) weakSelf = self;
     NSString *capturedDestPath = destinationPath;
+    NSString *capturedTaskDescription = task.taskDescription;
     WorldDownloadCompletionHandler capturedCompletion = completion;
     void (^capturedProgress)(NSProgress *) = progress;
     taskItem.retryHandler = ^id(DownloadTaskItem *taskItemRef) {
@@ -418,13 +410,24 @@
         NSURL *retryURL = [NSURL URLWithString:taskItemRef.downloadURL] ?: url;
         if (!retryURL) return nil;
         NSURLSessionDownloadTask *newTask = [strongSelf.downloadSession downloadTaskWithURL:retryURL];
-        strongSelf.downloadCompletionHandlers[newTask] = capturedCompletion;
+        newTask.taskDescription = capturedTaskDescription;
+        taskItemRef.userInfo[PLWorldDownloadGenerationKey] = @(newTask.taskIdentifier);
+        // manager 随后依据 rawTask 获取并发槽；必须在切换 Downloading 前写入。
+        taskItemRef.rawTask = newTask;
+        [strongSelf.downloadStateLock lock];
+        if (capturedCompletion) strongSelf.downloadCompletionHandlers[newTask] = capturedCompletion;
         strongSelf.downloadDestinationPaths[newTask] = capturedDestPath;
         if (capturedProgress) {
+            NSProgress *progressObj = [NSProgress progressWithTotalUnitCount:-1];
+            progressObj.kind = NSProgressKindFile;
+            strongSelf.downloadProgresses[newTask] = progressObj;
             strongSelf.downloadProgressHandlers[newTask] = capturedProgress;
         }
         strongSelf.downloadTaskItems[newTask] = taskItemRef;
+        [strongSelf.downloadStateLock unlock];
+        [[DownloadTaskManager sharedManager] setTaskWithId:taskItemRef.taskId stages:PLTaskStagesWorld()];
         [[DownloadTaskManager sharedManager] setTaskWithId:taskItemRef.taskId state:DownloadTaskStateDownloading];
+        [[DownloadTaskManager sharedManager] updateTaskWithId:taskItemRef.taskId stageAtIndex:0 status:PLTaskStageStatusRunning];
         [newTask resume];
         return newTask;
     };
@@ -535,6 +538,7 @@
       didWriteData:(int64_t)bytesWritten
  totalBytesWritten:(int64_t)totalBytesWritten
 totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
+    [self.downloadStateLock lock];
     NSProgress *progressObj = self.downloadProgresses[downloadTask];
     WorldDownloadProgressHandler progressHandler = self.downloadProgressHandlers[downloadTask];
     DownloadTaskItem *taskItem = self.downloadTaskItems[downloadTask];
@@ -560,7 +564,7 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
         }
         snapshot[@"lastTime"] = @(now);
         snapshot[@"lastBytes"] = @(totalBytesWritten);
-
+        [self.downloadStateLock unlock];
         [[DownloadTaskManager sharedManager] updateTaskWithId:taskItem.taskId
                                                      progress:fraction
                                                    totalBytes:totalBytesExpectedToWrite
@@ -568,6 +572,12 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
         [[DownloadTaskManager sharedManager] updateTaskWithId:taskItem.taskId
                                                           speed:speed
                                         estimatedTimeRemaining:eta];
+        [[DownloadTaskManager sharedManager] updateTaskWithId:taskItem.taskId
+                                                  stageAtIndex:0
+                                                      progress:fraction
+                                                       message:nil];
+    } else {
+        [self.downloadStateLock unlock];
     }
 
     if (!progressObj || !progressHandler) return;
@@ -585,6 +595,8 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
 }
 
 - (void)URLSession:(NSURLSession *)session downloadTask:(NSURLSessionDownloadTask *)downloadTask didFinishDownloadingToURL:(NSURL *)location {
+    NSNumber *generation = @(downloadTask.taskIdentifier);
+    [self.downloadStateLock lock];
     WorldDownloadCompletionHandler handler = self.downloadCompletionHandlers[downloadTask];
     NSString *destinationPath = self.downloadDestinationPaths[downloadTask];
     NSString *taskDescription = downloadTask.taskDescription;
@@ -596,8 +608,17 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
     [self.downloadProgressHandlers removeObjectForKey:downloadTask];
     [self.downloadTaskItems removeObjectForKey:downloadTask];
     [self.downloadProgressSnapshots removeObjectForKey:downloadTask];
+    [self.downloadStateLock unlock];
 
-    if (!handler || !destinationPath) {
+    if (!destinationPath) {
+        NSError *metadataError = [NSError errorWithDomain:@"WorldServiceError"
+                                                      code:6
+                                                  userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_1098", nil)}];
+        if (taskItem) {
+            [[DownloadTaskManager sharedManager] updateTaskWithId:taskItem.taskId stageAtIndex:0 status:PLTaskStageStatusFailed];
+            [[DownloadTaskManager sharedManager] setTaskWithId:taskItem.taskId completedWithError:metadataError];
+        }
+        if (handler) dispatch_async(dispatch_get_main_queue(), ^{ handler(NO, metadataError); });
         return;
     }
 
@@ -611,16 +632,15 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
         [fm removeItemAtPath:destinationPath error:nil];
     }
     if (![fm moveItemAtURL:location toURL:[NSURL fileURLWithPath:destinationPath] error:&moveError]) {
+        NSError *finalMoveError = moveError ?: [NSError errorWithDomain:@"WorldServiceError"
+                                                                    code:4
+                                                                userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_1096", nil)}];
         if (taskItem) {
-            [[DownloadTaskManager sharedManager] updateTaskWithId:taskItem.taskId error:moveError];
-            [[DownloadTaskManager sharedManager] setTaskWithId:taskItem.taskId state:DownloadTaskStateFailed];
+            [[DownloadTaskManager sharedManager] updateTaskWithId:taskItem.taskId stageAtIndex:0 status:PLTaskStageStatusFailed];
+            [[DownloadTaskManager sharedManager] setTaskWithId:taskItem.taskId completedWithError:finalMoveError];
         }
-        dispatch_async(dispatch_get_main_queue(), ^{ handler(NO, moveError); });
+        if (handler) dispatch_async(dispatch_get_main_queue(), ^{ handler(NO, finalMoveError); });
         return;
-    }
-
-    if (taskItem) {
-        [[DownloadTaskManager sharedManager] setTaskWithId:taskItem.taskId state:DownloadTaskStateCompleted];
     }
 
     // 解析 taskDescription：worldName 与 savesFolder
@@ -634,12 +654,22 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
     if (!savesFolder) {
         // 无 saves 目录信息，回退：删除临时 zip 并报错
         [fm removeItemAtPath:destinationPath error:nil];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            handler(NO, [NSError errorWithDomain:@"WorldServiceError"
-                                            code:6
-                                        userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_1098", nil)}]);
-        });
+        NSError *metadataError = [NSError errorWithDomain:@"WorldServiceError"
+                                                      code:6
+                                                  userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_1098", nil)}];
+        if (taskItem) {
+            [[DownloadTaskManager sharedManager] updateTaskWithId:taskItem.taskId stageAtIndex:0 status:PLTaskStageStatusFailed];
+            [[DownloadTaskManager sharedManager] setTaskWithId:taskItem.taskId completedWithError:metadataError];
+        }
+        if (handler) dispatch_async(dispatch_get_main_queue(), ^{ handler(NO, metadataError); });
         return;
+    }
+
+    if (taskItem) {
+        DownloadTaskManager *manager = [DownloadTaskManager sharedManager];
+        [manager updateTaskWithId:taskItem.taskId stageAtIndex:0 status:PLTaskStageStatusCompleted];
+        [manager updateTaskWithId:taskItem.taskId currentStageIndex:1];
+        [manager updateTaskWithId:taskItem.taskId stageAtIndex:1 status:PLTaskStageStatusRunning];
     }
 
     // 在后台线程做解压
@@ -654,12 +684,30 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
         [fm removeItemAtPath:destinationPath error:nil];
 
         dispatch_async(dispatch_get_main_queue(), ^{
+            DownloadTaskManager *manager = [DownloadTaskManager sharedManager];
+            DownloadTaskItem *latestTask = taskItem ? [manager taskWithId:taskItem.taskId] : nil;
+            // 下载完成后解压仍在后台运行。若用户在此期间暂停或取消，保持用户
+            // 选择，不再把阶段改写为成功/失败，也不弹出相反的结果提示。
+            if (taskItem &&
+                (latestTask.state != DownloadTaskStateDownloading ||
+                 ![latestTask.userInfo[PLWorldDownloadGenerationKey] isEqual:generation])) {
+                return;
+            }
             if (success) {
-                handler(YES, nil);
+                if (taskItem) {
+                    [manager updateTaskWithId:taskItem.taskId stageAtIndex:1 status:PLTaskStageStatusCompleted];
+                    [manager setTaskWithId:taskItem.taskId completedWithError:nil];
+                }
+                if (handler) handler(YES, nil);
             } else {
-                handler(NO, extractError ?: [NSError errorWithDomain:@"WorldServiceError"
-                                                                code:5
-                                                            userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_1097", nil)}]);
+                NSError *finalError = extractError ?: [NSError errorWithDomain:@"WorldServiceError"
+                                                                           code:5
+                                                                       userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_1097", nil)}];
+                if (taskItem) {
+                    [manager updateTaskWithId:taskItem.taskId stageAtIndex:1 status:PLTaskStageStatusFailed];
+                    [manager setTaskWithId:taskItem.taskId completedWithError:finalError];
+                }
+                if (handler) handler(NO, finalError);
             }
         });
     });
@@ -667,21 +715,49 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
 
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
     if (error) {
+        NSNumber *generation = @(task.taskIdentifier);
+        [self.downloadStateLock lock];
         WorldDownloadCompletionHandler handler = self.downloadCompletionHandlers[task];
         DownloadTaskItem *taskItem = self.downloadTaskItems[task];
-        if (taskItem) {
-            [[DownloadTaskManager sharedManager] updateTaskWithId:taskItem.taskId error:error];
-            [[DownloadTaskManager sharedManager] setTaskWithId:taskItem.taskId state:DownloadTaskStateFailed];
-            [self.downloadTaskItems removeObjectForKey:task];
-            [self.downloadProgressSnapshots removeObjectForKey:task];
-        }
-        if (handler) {
-            handler(NO, error);
-            [self.downloadCompletionHandlers removeObjectForKey:task];
-            [self.downloadDestinationPaths removeObjectForKey:task];
-            [self.downloadProgresses removeObjectForKey:task];
-            [self.downloadProgressHandlers removeObjectForKey:task];
-        }
+        [self.downloadTaskItems removeObjectForKey:task];
+        [self.downloadProgressSnapshots removeObjectForKey:task];
+        [self.downloadCompletionHandlers removeObjectForKey:task];
+        [self.downloadDestinationPaths removeObjectForKey:task];
+        [self.downloadProgresses removeObjectForKey:task];
+        [self.downloadProgressHandlers removeObjectForKey:task];
+        [self.downloadStateLock unlock];
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            DownloadTaskManager *manager = [DownloadTaskManager sharedManager];
+            DownloadTaskItem *latestTask = taskItem ? [manager taskWithId:taskItem.taskId] : nil;
+            BOOL isCancellation = [error.domain isEqualToString:NSURLErrorDomain] &&
+                                  error.code == NSURLErrorCancelled;
+            // 该回调若属于已被 retry 替换的旧 NSURLSessionTask，只清理旧映射，
+            // 不得影响新一代任务。
+            if (taskItem &&
+                (!latestTask ||
+                 ![latestTask.userInfo[PLWorldDownloadGenerationKey] isEqual:generation])) {
+                return;
+            }
+            // cancelByProducingResumeData: 也以 NSURLErrorCancelled 收尾。暂停时等待
+            // retryHandler 的最终结果；显式取消由任务列表状态表达，均不误报失败。
+            if (isCancellation) {
+                // 用户在 cancelByProducingResumeData: 尚未收尾时快速点了继续，
+                // manager 会暂时回到 Downloading。旧任务已经无法恢复，转为一次
+                // 原子重试，避免卡在没有活动 rawTask 的“下载中”。
+                if (latestTask.state == DownloadTaskStateDownloading) {
+                    [manager setTaskWithId:taskItem.taskId state:DownloadTaskStatePaused];
+                    [manager retryTaskWithId:taskItem.taskId];
+                }
+                return;
+            }
+            if (taskItem && latestTask.state != DownloadTaskStateDownloading) return;
+            if (taskItem) {
+                [manager updateTaskWithId:taskItem.taskId stageAtIndex:0 status:PLTaskStageStatusFailed];
+                [manager setTaskWithId:taskItem.taskId completedWithError:error];
+            }
+            if (handler) handler(NO, error);
+        });
     }
 }
 

@@ -11,6 +11,12 @@
 + (id)profile:(NSMutableDictionary *)profile resolveKey:(id)key;
 + (NSString *)resolveKeyForCurrentProfile:(id)key;
 
+/// 优先使用 preferredName；无效时依次回退到当前选中档案和首个可用档案。
++ (NSString *)effectiveProfileNameForPreferredName:(NSString *)preferredName;
+
+/// 将档案 gameDir 统一解析为绝对路径（支持 "."、相对隔离目录和绝对目录）。
++ (NSString *)resolvedGameDirectoryForProfileName:(NSString *)profileName;
+
 - (id)initWithCurrentInstance;
 - (NSMutableDictionary<NSString *, NSMutableDictionary<NSString *, NSString *> *> *)profiles;
 

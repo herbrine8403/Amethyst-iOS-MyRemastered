@@ -137,6 +137,14 @@ NS_INLINE NSArray<PLTaskStage *> *PLTaskStagesSingleFile(void) {
     ];
 }
 
+/// 世界下载 2 步：下载压缩包→解压并验证 level.dat
+NS_INLINE NSArray<PLTaskStage *> *PLTaskStagesWorld(void) {
+    return @[
+        [PLTaskStage stageWithTitle:PLTaskStageTitleDownloadFile iconName:@"arrow.down.circle"],
+        [PLTaskStage stageWithTitle:PLTaskStageTitleExtractFiles iconName:@"archivebox"],
+    ];
+}
+
 #pragma mark - 阶段标题渲染（UI 层共用，redesign-download-ui Phase 2）
 
 /// 渲染阶段标题为用户可见文案：PLTaskStage.title 存储本地化 key，

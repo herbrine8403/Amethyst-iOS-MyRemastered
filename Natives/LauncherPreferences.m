@@ -245,3 +245,25 @@ NSArray* getRendererNames(BOOL containsDefault) {
 
     return array;
 }
+
+NSString *PLNormalizeRendererKey(id value) {
+    if (![value isKindOfClass:[NSString class]]) {
+        return @"auto";
+    }
+
+    NSString *key = [(NSString *)value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (key.length == 0 || ![getRendererKeys(NO) containsObject:key]) {
+        if (key.length > 0) {
+            NSLog(@"[Renderer] Unsupported renderer key '%@'; falling back to Auto", key);
+        }
+        return @"auto";
+    }
+    return key;
+}
+
+NSString *PLResolveRendererKey(id value) {
+    NSString *key = PLNormalizeRendererKey(value);
+    // 26.2+ 在 MobileGlues 自动路径上存在上下文初始化崩溃；当前稳定策略与
+    // JavaLauncher 既有行为保持一致，由 Auto 确定地选择 ANGLE。
+    return [key isEqualToString:@"auto"] ? @ RENDERER_NAME_MTL_ANGLE : key;
+}

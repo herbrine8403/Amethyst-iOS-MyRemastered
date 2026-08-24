@@ -485,10 +485,14 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 
 @property (nonatomic, assign) NSInteger currentModOffset;
 @property (nonatomic, assign) NSInteger currentShaderOffset;
-@property (nonatomic, assign) BOOL isLoadingMore;
+@property (nonatomic, assign) BOOL isLoadingMods;
+@property (nonatomic, assign) BOOL isLoadingShaders;
+@property (nonatomic, assign) NSInteger modRequestGeneration;
+@property (nonatomic, assign) NSInteger shaderRequestGeneration;
 @property (nonatomic, assign) BOOL hasMoreMods;
 @property (nonatomic, assign) BOOL hasMoreShaders;
-@property (nonatomic, strong) NSString *currentSearchQuery;
+@property (nonatomic, strong) NSString *modSearchQuery;
+@property (nonatomic, strong) NSString *shaderSearchQuery;
 @property (nonatomic, strong) NSString *currentGameVersion;
 @property (nonatomic, strong) NSString *currentModLoader;
 @property (nonatomic, strong) NSString *currentSortField;
@@ -1891,15 +1895,20 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 #pragma mark - Mod Search & Loading
 
 - (void)refreshModList {
+    self.modRequestGeneration += 1;
+    self.isLoadingMods = NO;
     self.currentModOffset = 0;
     self.hasMoreMods = YES;
     [self.modList removeAllObjects];
+    [self.modTableView reloadData];
     [self loadModList];
 }
 
 - (void)loadModList {
-    if (self.isLoadingMore) return;
-    self.isLoadingMore = YES;
+    if (self.isLoadingMods) return;
+    self.isLoadingMods = YES;
+    NSInteger generation = self.modRequestGeneration;
+    NSInteger requestOffset = self.currentModOffset;
     
     if (self.currentModOffset == 0) {
         [self.loadingIndicator startAnimating];
@@ -1907,10 +1916,10 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
     
     NSMutableDictionary *filters = [NSMutableDictionary dictionary];
     filters[@"limit"] = @30;
-    filters[@"offset"] = @(self.currentModOffset);
+    filters[@"offset"] = @(requestOffset);
     
-    if (self.currentSearchQuery.length > 0) {
-        filters[@"query"] = self.currentSearchQuery;
+    if (self.modSearchQuery.length > 0) {
+        filters[@"query"] = self.modSearchQuery;
     }
     if (self.currentGameVersion.length > 0) {
         filters[@"version"] = self.currentGameVersion;
@@ -1928,23 +1937,28 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) return;
-            [strongSelf.loadingIndicator stopAnimating];
+            if (generation != strongSelf.modRequestGeneration) return;
+            if (strongSelf.tabSegment.selectedSegmentIndex == 1) {
+                [strongSelf.loadingIndicator stopAnimating];
+            }
             [strongSelf.modTableView.refreshControl endRefreshing];
-            strongSelf.isLoadingMore = NO;
+            strongSelf.isLoadingMods = NO;
             
             if (results) {
-                if (strongSelf.currentModOffset == 0) {
+                if (requestOffset == 0) {
                     [strongSelf.modList removeAllObjects];
                 }
                 [strongSelf.modList addObjectsFromArray:results];
                 strongSelf.hasMoreMods = (results.count >= 30);
-                strongSelf.currentModOffset += results.count;
+                strongSelf.currentModOffset = requestOffset + results.count;
                 
                 [strongSelf.modTableView reloadData];
-                strongSelf.emptyLabel.hidden = (strongSelf.modList.count > 0);
-                if (strongSelf.modList.count == 0) {
-                    strongSelf.emptyLabel.text = localize(@"i18n_str_180", nil);
-                    strongSelf.emptyLabel.hidden = NO;
+                if (strongSelf.tabSegment.selectedSegmentIndex == 1) {
+                    strongSelf.emptyLabel.hidden = (strongSelf.modList.count > 0);
+                    if (strongSelf.modList.count == 0) {
+                        strongSelf.emptyLabel.text = localize(@"i18n_str_180", nil);
+                        strongSelf.emptyLabel.hidden = NO;
+                    }
                 }
             } else if (error) {
                 [strongSelf showError:error.localizedDescription];
@@ -1954,26 +1968,27 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 }
 
 - (void)searchMods:(NSString *)query {
-    self.currentSearchQuery = query;
-    self.currentModOffset = 0;
-    self.hasMoreMods = YES;
-    [self.modList removeAllObjects];
-    [self.modTableView reloadData];
-    [self loadModList];
+    self.modSearchQuery = query;
+    [self refreshModList];
 }
 
 #pragma mark - Shader Search & Loading
 
 - (void)refreshShaderList {
+    self.shaderRequestGeneration += 1;
+    self.isLoadingShaders = NO;
     self.currentShaderOffset = 0;
     self.hasMoreShaders = YES;
     [self.shaderList removeAllObjects];
+    [self.shaderTableView reloadData];
     [self loadShaderList];
 }
 
 - (void)loadShaderList {
-    if (self.isLoadingMore) return;
-    self.isLoadingMore = YES;
+    if (self.isLoadingShaders) return;
+    self.isLoadingShaders = YES;
+    NSInteger generation = self.shaderRequestGeneration;
+    NSInteger requestOffset = self.currentShaderOffset;
     
     if (self.currentShaderOffset == 0) {
         [self.loadingIndicator startAnimating];
@@ -1981,11 +1996,11 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
     
     NSMutableDictionary *filters = [NSMutableDictionary dictionary];
     filters[@"limit"] = @30;
-    filters[@"offset"] = @(self.currentShaderOffset);
+    filters[@"offset"] = @(requestOffset);
     filters[@"projectType"] = @"shader";
 
-    if (self.currentSearchQuery.length > 0) {
-        filters[@"query"] = self.currentSearchQuery;
+    if (self.shaderSearchQuery.length > 0) {
+        filters[@"query"] = self.shaderSearchQuery;
     }
     if (self.currentGameVersion.length > 0) {
         filters[@"version"] = self.currentGameVersion;
@@ -1997,23 +2012,28 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) return;
-            [strongSelf.loadingIndicator stopAnimating];
+            if (generation != strongSelf.shaderRequestGeneration) return;
+            if (strongSelf.tabSegment.selectedSegmentIndex == 2) {
+                [strongSelf.loadingIndicator stopAnimating];
+            }
             [strongSelf.shaderTableView.refreshControl endRefreshing];
-            strongSelf.isLoadingMore = NO;
+            strongSelf.isLoadingShaders = NO;
             
             if (results) {
-                if (strongSelf.currentShaderOffset == 0) {
+                if (requestOffset == 0) {
                     [strongSelf.shaderList removeAllObjects];
                 }
                 [strongSelf.shaderList addObjectsFromArray:results];
                 strongSelf.hasMoreShaders = (results.count >= 30);
-                strongSelf.currentShaderOffset += results.count;
+                strongSelf.currentShaderOffset = requestOffset + results.count;
                 
                 [strongSelf.shaderTableView reloadData];
-                strongSelf.emptyLabel.hidden = (strongSelf.shaderList.count > 0);
-                if (strongSelf.shaderList.count == 0) {
-                    strongSelf.emptyLabel.text = localize(@"i18n_str_181", nil);
-                    strongSelf.emptyLabel.hidden = NO;
+                if (strongSelf.tabSegment.selectedSegmentIndex == 2) {
+                    strongSelf.emptyLabel.hidden = (strongSelf.shaderList.count > 0);
+                    if (strongSelf.shaderList.count == 0) {
+                        strongSelf.emptyLabel.text = localize(@"i18n_str_181", nil);
+                        strongSelf.emptyLabel.hidden = NO;
+                    }
                 }
             } else if (error) {
                 [strongSelf showError:error.localizedDescription];
@@ -2023,12 +2043,8 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 }
 
 - (void)searchShaders:(NSString *)query {
-    self.currentSearchQuery = query;
-    self.currentShaderOffset = 0;
-    self.hasMoreShaders = YES;
-    [self.shaderList removeAllObjects];
-    [self.shaderTableView reloadData];
-    [self loadShaderList];
+    self.shaderSearchQuery = query;
+    [self refreshShaderList];
 }
 
 #pragma mark - Modpack Search & Loading
@@ -2477,8 +2493,17 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 
 /// 解析当前 profile 的 Minecraft 版本（用于模组下载版本预选）
 /// 复用 ModpackExportService.parseVersionId: 从 lastVersionId 反解
+- (NSString *)effectiveTargetProfileName {
+    return [PLProfiles effectiveProfileNameForPreferredName:self.targetProfileName];
+}
+
+- (NSDictionary *)effectiveTargetProfile {
+    NSString *profileName = [self effectiveTargetProfileName];
+    return profileName.length > 0 ? PLProfiles.current.profiles[profileName] : nil;
+}
+
 - (NSString *)currentProfileMinecraftVersion {
-    NSDictionary *profile = PLProfiles.current.selectedProfile;
+    NSDictionary *profile = [self effectiveTargetProfile];
     NSString *lastVersionId = profile[@"lastVersionId"];
     if (lastVersionId.length == 0) return nil;
     NSDictionary *parsed = [ModpackExportService parseVersionId:lastVersionId];
@@ -2489,7 +2514,7 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 /// 解析当前 profile 的模组加载器（fabric/forge/neoforge/quilt）
 /// 复用 ModpackExportService.parseVersionId: 从 lastVersionId 反解
 - (NSString *)currentProfileLoader {
-    NSDictionary *profile = PLProfiles.current.selectedProfile;
+    NSDictionary *profile = [self effectiveTargetProfile];
     NSString *lastVersionId = profile[@"lastVersionId"];
     if (lastVersionId.length == 0) return nil;
     NSDictionary *parsed = [ModpackExportService parseVersionId:lastVersionId];
@@ -2600,7 +2625,8 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
     self.currentGameVersion = nil;
     self.currentModLoader = nil;
     self.currentSortField = @"follows";
-    self.currentSearchQuery = nil;
+    self.modSearchQuery = nil;
+    self.shaderSearchQuery = nil;
     self.resourcepackSearchQuery = nil;
     self.datapackSearchQuery = nil;
     self.searchBar.text = nil;
@@ -2614,12 +2640,8 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
     UITableView *targetTable = nil;
     if (tabIndex == 1) {
         targetTable = self.modTableView;
-        self.currentModOffset = 0;
-        [self.modList removeAllObjects];
     } else if (tabIndex == 2) {
         targetTable = self.shaderTableView;
-        self.currentShaderOffset = 0;
-        [self.shaderList removeAllObjects];
     } else if (tabIndex == 3) {
         targetTable = self.resourcepackTableView;
         self.currentResourcepackOffset = 0;
@@ -2642,8 +2664,8 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
         targetTable.alpha = 0;
     } completion:^(BOOL finished) {
         switch (tabIndex) {
-            case 1: [self loadModList]; break;
-            case 2: [self loadShaderList]; break;
+            case 1: [self refreshModList]; break;
+            case 2: [self refreshShaderList]; break;
             case 3: [self loadResourcePackList]; break;
             case 4: [self loadDataPackList]; break;
             case 5: [self loadModpackList]; break;
@@ -2689,7 +2711,8 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 
 - (void)searchBarCancelButtonClicked:(UISearchBar *)searchBar {
     searchBar.text = nil;
-    self.currentSearchQuery = nil;
+    self.modSearchQuery = nil;
+    self.shaderSearchQuery = nil;
     self.modpackSearchQuery = nil;
     self.resourcepackSearchQuery = nil;
     self.datapackSearchQuery = nil;
@@ -4410,6 +4433,7 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 
     ModVersionViewController *versionVC = [[ModVersionViewController alloc] init];
     versionVC.modItem = modItem;
+    versionVC.initialSource = modItem.apiSource;
     versionVC.delegate = self;
     versionVC.title = modItem.displayName;
     // FCL 风格：传入当前 profile 的偏好版本和加载器，自动选中匹配 chip 并置顶
@@ -4827,11 +4851,11 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 }
 
 - (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (tableView == self.modTableView && indexPath.row == self.modList.count - 5 && self.hasMoreMods && !self.isLoadingMore) {
+    if (tableView == self.modTableView && indexPath.row == self.modList.count - 5 && self.hasMoreMods && !self.isLoadingMods) {
         [self loadModList];
     }
 
-    if (tableView == self.shaderTableView && indexPath.row == self.shaderList.count - 5 && self.hasMoreShaders && !self.isLoadingMore) {
+    if (tableView == self.shaderTableView && indexPath.row == self.shaderList.count - 5 && self.hasMoreShaders && !self.isLoadingShaders) {
         [self loadShaderList];
     }
 
@@ -4953,6 +4977,7 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 
     ModVersionViewController *versionVC = [[ModVersionViewController alloc] init];
     versionVC.modItem = modItem;
+    versionVC.initialSource = modItem.apiSource;
     versionVC.delegate = self;
     versionVC.title = modItem.displayName;
     // FCL 风格：传入当前 profile 的偏好版本和加载器，自动选中匹配 chip 并置顶
@@ -4976,6 +5001,7 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 
     ShaderVersionViewController *versionVC = [[ShaderVersionViewController alloc] init];
     versionVC.shaderItem = shaderItem;
+    versionVC.initialSource = shaderItem.apiSource;
     versionVC.delegate = self;
     versionVC.title = shaderItem.displayName;
     // FCL 风格：传入当前 profile 的偏好版本和加载器，自动选中匹配 chip 并置顶匹配版本
@@ -5002,6 +5028,7 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 
     AssetVersionViewController *versionVC = [[AssetVersionViewController alloc] init];
     versionVC.assetType = AssetVersionTypeResourcePack;
+    versionVC.apiSource = item.apiSource;
     versionVC.projectID = item.onlineID;
     versionVC.projectDisplayName = item.displayName;
     versionVC.delegate = self;
@@ -5036,6 +5063,7 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 
     AssetVersionViewController *versionVC = [[AssetVersionViewController alloc] init];
     versionVC.assetType = AssetVersionTypeDataPack;
+    versionVC.apiSource = item.apiSource;
     versionVC.projectID = item.onlineID;
     versionVC.projectDisplayName = item.displayName;
     versionVC.delegate = self;
@@ -5070,6 +5098,7 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 
     AssetVersionViewController *versionVC = [[AssetVersionViewController alloc] init];
     versionVC.assetType = AssetVersionTypeWorld;
+    versionVC.apiSource = item.apiSource;
     versionVC.projectID = item.onlineID;
     versionVC.projectDisplayName = item.displayName;
     versionVC.delegate = self;
@@ -5177,7 +5206,7 @@ static NSString *PLSha1FromPrimaryFile(NSDictionary *primaryFile) {
 // 下载 Mod（redesign-download-ui Phase 4：进度由 Service 内部注册的下载任务 +
 // PLTaskStagesSingleFile 单阶段上报驱动统一进度页，调用方无需管理进度 UI。）
 - (void)startDownloadForModItem:(ModItem *)item {
-    NSString *profileName = PLProfiles.current.selectedProfileName ?: @"default";
+    NSString *profileName = [self effectiveTargetProfileName];
     __weak typeof(self) weakSelf = self;
     [[ModService sharedService] downloadMod:item
                                   toProfile:profileName
@@ -5200,7 +5229,7 @@ static NSString *PLSha1FromPrimaryFile(NSDictionary *primaryFile) {
 // redesign-download-ui Phase 3：进度由 Service 内部注册的下载任务 +
 // PLTaskStagesSingleFile 单阶段上报驱动统一进度页，调用方无需管理进度 UI。
 - (void)startDownloadForResourcePackItem:(ResourcePackItem *)item {
-    NSString *profileName = PLProfiles.current.selectedProfileName ?: @"default";
+    NSString *profileName = [self effectiveTargetProfileName];
     __weak typeof(self) weakSelf = self;
     [[ResourcePackService sharedService] downloadResourcePack:item
                                                     toProfile:profileName
@@ -5223,7 +5252,7 @@ static NSString *PLSha1FromPrimaryFile(NSDictionary *primaryFile) {
 // redesign-download-ui Phase 3：进度由 Service 内部注册的下载任务 +
 // PLTaskStagesSingleFile 单阶段上报驱动统一进度页，调用方无需管理进度 UI。
 - (void)startDownloadForDataPackItem:(DataPackItem *)item {
-    NSString *profileName = PLProfiles.current.selectedProfileName ?: @"default";
+    NSString *profileName = [self effectiveTargetProfileName];
     __weak typeof(self) weakSelf = self;
     [[DataPackService sharedService] downloadDataPack:item
                                             toProfile:profileName
@@ -5247,7 +5276,7 @@ static NSString *PLSha1FromPrimaryFile(NSDictionary *primaryFile) {
 // redesign-download-ui Phase 3：进度由 Service 内部注册的下载任务 +
 // PLTaskStagesSingleFile 单阶段上报驱动统一进度页，调用方无需管理进度 UI。
 - (void)startDownloadForWorldItem:(WorldItem *)item {
-    NSString *profileName = PLProfiles.current.selectedProfileName ?: @"default";
+    NSString *profileName = [self effectiveTargetProfileName];
     __weak typeof(self) weakSelf = self;
     [[WorldService sharedService] downloadWorld:item
                                         toProfile:profileName
@@ -5289,7 +5318,7 @@ static NSString *PLSha1FromPrimaryFile(NSDictionary *primaryFile) {
 // 下载光影包（redesign-download-ui Phase 4：进度由 Service 内部注册的下载任务 +
 // PLTaskStagesSingleFile 单阶段上报驱动统一进度页，调用方无需管理进度 UI。）
 - (void)startDownloadForShaderItem:(ShaderItem *)item {
-    NSString *profileName = PLProfiles.current.selectedProfileName ?: @"default";
+    NSString *profileName = [self effectiveTargetProfileName];
     __weak typeof(self) weakSelf = self;
     [[ShaderService sharedService] downloadShader:item
                                          toProfile:profileName
@@ -5479,8 +5508,7 @@ static NSString *PLSha1FromPrimaryFile(NSDictionary *primaryFile) {
     // 参考 ModService.m 的 existingModsFolderForProfile: 逻辑：
     // 1. 优先读取 profile 的 gameDir，拼接 /mods
     // 2. 若 profile 无 gameDir 或 gameDir 为 "."，回退到 $POJAV_GAME_DIR/mods
-    NSString *instanceName = PLProfiles.current.selectedProfileName;
-    if (!instanceName) instanceName = @"default";
+    NSString *instanceName = [self effectiveTargetProfileName];
 
     NSString *modsDir = nil;
 

@@ -41,3 +41,10 @@ NSString* getSelectedJavaHome(NSString* defaultJRETag, int minVersion);
 
 NSArray* getRendererKeys(BOOL containsDefault);
 NSArray* getRendererNames(BOOL containsDefault);
+
+/// 将偏好值规范化为受支持的渲染器 key；空值或旧版/损坏值回退为 "auto"。
+NSString *PLNormalizeRendererKey(id value);
+
+/// 将渲染器选择解析为本次启动实际使用的动态库。
+/// Auto 的唯一解析策略集中在这里，避免 JavaLauncher 与 EGL bridge 各自解释。
+NSString *PLResolveRendererKey(id value);

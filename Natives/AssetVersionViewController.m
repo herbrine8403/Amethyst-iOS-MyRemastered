@@ -5,12 +5,12 @@
 //
 // 通用资源版本选择视图控制器实现
 // 阶段3统一：重构为 FCL 风格 chips 筛选条（游戏版本 + 排序方式），与 ModVersionViewController 风格一致
-// 资产类型（资源包/数据包/世界）无加载器概念，故无加载器筛选行，无双源切换（仅 Modrinth）
-// 复用 ModrinthAPI 的 getVersionsForModWithID: 方法（API 端点对所有 project_type 通用）
+// 资产类型（资源包/数据包/世界）无加载器概念，故无加载器筛选行；版本源继承搜索结果。
 //
 
 #import "AssetVersionViewController.h"
 #import "installer/modpack/ModrinthAPI.h"
+#import "installer/modpack/CurseForgeAPI.h"
 #import "ModVersion.h"
 #import "ModVersionTableViewCell.h"
 #import "AssetDetailHeaderView.h"
@@ -509,8 +509,7 @@ static NSArray<NSDictionary *> *SortOptionItems(void) {
     }
 
     [self.activityIndicator startAnimating];
-    // 复用 getVersionsForModWithID:（Modrinth /project/<id>/version 端点对所有 project_type 通用）
-    [[ModrinthAPI sharedInstance] getVersionsForModWithID:self.projectID completion:^(NSArray<ModVersion *> * _Nullable versions, NSError * _Nullable error) {
+    void (^completion)(NSArray<ModVersion *> * _Nullable, NSError * _Nullable) = ^(NSArray<ModVersion *> * _Nullable versions, NSError * _Nullable error) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self.activityIndicator stopAnimating];
             if (error) {
@@ -526,7 +525,13 @@ static NSArray<NSDictionary *> *SortOptionItems(void) {
             [self processFilters];
             [self applyFiltersAndSort];
         });
-    }];
+    };
+
+    if (self.apiSource == 2) {
+        [[CurseForgeAPI sharedInstance] getVersionsForModWithID:self.projectID completion:completion];
+    } else {
+        [[ModrinthAPI sharedInstance] getVersionsForModWithID:self.projectID completion:completion];
+    }
 }
 
 #pragma mark - 筛选 + 排序

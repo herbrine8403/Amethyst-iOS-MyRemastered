@@ -41,6 +41,13 @@ static PLProfiles* current;
 
 + (id)profile:(NSMutableDictionary *)profile resolveKey:(id)key {
     id rawValue = profile[key];
+    // renderer 必须先做白名单规范化。显式 "auto" 是档案自己的选择，只有字段
+    // 缺失/空字符串时才允许继承全局默认，避免不同档案之间相互污染。
+    if ([key isEqual:@"renderer"] &&
+        [rawValue isKindOfClass:[NSString class]] &&
+        [(NSString *)rawValue length] > 0) {
+        return PLNormalizeRendererKey(rawValue);
+    }
     // 兼容 javaVersion 字段：Mojang 规范是 NSDictionary（{component, majorVersion}），
     // 但部分代码（如 ForgeDirectInstaller）也写入 NSDictionary。PLProfiles 期望返回 NSString。
     if ([rawValue isKindOfClass:[NSDictionary class]]) {
@@ -69,11 +76,49 @@ static PLProfiles* current;
         // 该字段仅在 MC 26.2+ 生效，旧版本会被 MC 忽略，无副作用。
         @"graphicsApi": @"video.graphics_api"
     };
-    return getPrefObject(prefDefaults[key]);
+    id prefValue = getPrefObject(prefDefaults[key]);
+    return [key isEqual:@"renderer"] ? PLNormalizeRendererKey(prefValue) : prefValue;
 }
 
 + (id)resolveKeyForCurrentProfile:(id)key {
     return [self profile:self.current.selectedProfile resolveKey:key];
+}
+
++ (NSString *)effectiveProfileNameForPreferredName:(NSString *)preferredName {
+    NSDictionary *profiles = self.current.profiles;
+    if (preferredName.length > 0 && [profiles[preferredName] isKindOfClass:[NSDictionary class]]) {
+        return preferredName;
+    }
+
+    NSString *selectedName = self.current.selectedProfileName;
+    if (selectedName.length > 0 && [profiles[selectedName] isKindOfClass:[NSDictionary class]]) {
+        return selectedName;
+    }
+
+    for (NSString *name in profiles) {
+        if ([name isKindOfClass:[NSString class]] && [profiles[name] isKindOfClass:[NSDictionary class]]) {
+            return name;
+        }
+    }
+    return nil;
+}
+
++ (NSString *)resolvedGameDirectoryForProfileName:(NSString *)profileName {
+    const char *gameDirC = getenv("POJAV_GAME_DIR");
+    NSString *baseDirectory = gameDirC ? [NSString stringWithUTF8String:gameDirC] : NSHomeDirectory();
+    NSString *effectiveName = [self effectiveProfileNameForPreferredName:profileName];
+    NSDictionary *profile = effectiveName.length > 0 ? self.current.profiles[effectiveName] : nil;
+    NSString *gameDir = [profile isKindOfClass:[NSDictionary class]] ? profile[@"gameDir"] : nil;
+
+    if (![gameDir isKindOfClass:[NSString class]] || gameDir.length == 0 || [gameDir isEqualToString:@"."]) {
+        return baseDirectory.stringByStandardizingPath;
+    }
+    if (gameDir.isAbsolutePath) {
+        return gameDir.stringByStandardizingPath;
+    }
+
+    NSString *relativePath = [gameDir hasPrefix:@"./"] ? [gameDir substringFromIndex:2] : gameDir;
+    return [[baseDirectory stringByAppendingPathComponent:relativePath] stringByStandardizingPath];
 }
 
 - (id)initWithCurrentInstance {

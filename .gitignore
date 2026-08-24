@@ -17,3 +17,5 @@ $null
 /docs
 .trae-html-share-packages/
 .trae/specs/
+__pycache__/
+*.pyc

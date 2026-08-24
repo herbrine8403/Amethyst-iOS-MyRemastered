@@ -44,7 +44,7 @@ A premium Minecraft: Java Edition launcher for iOS and iPadOS, rebuilt from the 
 - **Complete Chinese Localization** -- Fully translated interface with native-quality Chinese language support.
 - **Unrestricted Accounts** -- Local accounts, demo mode, and third-party authentication all supported; no Microsoft account required to download and play.
 - **Multi-Account** -- Seamlessly switch between Microsoft, local, and third-party authentication accounts.
-- **Auto Renderer Selection** -- Automatically chooses the optimal rendering backend (including MobileGlues, MoltenVK, and more) when set to Auto.
+- **Safe Auto Renderer** -- Auto currently resolves to ANGLE for consistent Minecraft 26.2+ compatibility. Choose MobileGlues, GL4ES, Zink, or MoltenVK explicitly when needed.
 - **Auto JVM Selection** -- Automatically selects the correct JVM version (Java 8, 17, 21, or 25) based on the game version.
 - **Minecraft 26.X Support** -- Experimental support for Minecraft 26.x.
 - **Custom Mouse Pointer** -- Customize the virtual mouse pointer skin in settings.

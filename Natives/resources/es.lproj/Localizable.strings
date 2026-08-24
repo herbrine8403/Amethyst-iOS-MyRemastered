@@ -129,7 +129,7 @@
 
 "preference.title.renderer" = "Renderizador";
 
-"preference.title.renderer.debug.auto" = "Automático: gl4es o ANGLE";
+"preference.title.renderer.debug.auto" = "Automático: ANGLE";
 "preference.title.renderer.debug.gl4es" = "gl4es 1.1.4 - exporta a OpenGL 2.1";
 "preference.title.renderer.debug.angle" = "ANGLE (1.17+) - exporta OpenGL 3.1 (perfil Core, limitado)";
 "preference.title.renderer.debug.zink" = "Zink (Mesa 25.0.7) - exporta a OpenGL 4.1";
