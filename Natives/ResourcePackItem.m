@@ -31,6 +31,7 @@
     if (self = [super init]) {
         // 来自 Modrinth 搜索结果
         _onlineID = data[@"id"] ? [data[@"id"] description] : nil;
+        _apiSource = [data[@"apiSource"] integerValue] == 2 ? 2 : 1;
         _displayName = data[@"title"] ?: @"";
         _resourcePackDescription = data[@"description"] ?: @"";
         _iconURL = data[@"imageUrl"] ?: @"";

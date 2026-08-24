@@ -34,6 +34,8 @@ typedef NS_ENUM(NSInteger, AssetVersionType) {
 @property (nonatomic, assign) AssetVersionType assetType;
 // 在线项目的 Modrinth/CurseForge ID
 @property (nonatomic, copy, nullable) NSString *projectID;
+// 在线 API 来源：1=Modrinth，2=CurseForge；默认 1
+@property (nonatomic, assign) NSInteger apiSource;
 // 项目显示名（用于导航栏标题）
 @property (nonatomic, copy, nullable) NSString *projectDisplayName;
 // 代理

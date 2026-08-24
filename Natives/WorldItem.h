@@ -27,6 +27,8 @@ NS_ASSUME_NONNULL_BEGIN
 
 // --- 在线世界属性（用于在线下载） ---
 @property (nonatomic, copy, nullable) NSString *onlineID;
+/// 在线 API 来源：1=Modrinth，2=CurseForge。
+@property (nonatomic, assign) NSInteger apiSource;
 @property (nonatomic, copy, nullable) NSString *author;
 @property (nonatomic, strong, nullable) NSNumber *downloads;
 @property (nonatomic, strong, nullable) NSNumber *likes;

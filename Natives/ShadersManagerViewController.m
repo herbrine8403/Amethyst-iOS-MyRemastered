@@ -10,6 +10,8 @@
 #import "ShaderService.h"
 #import "ShaderItem.h"
 #import "DownloadViewController.h"
+#import "DownloadTaskManager.h"
+#import "PLProfiles.h"
 #import "utils.h"
 
 #pragma mark - ShaderCardCell（光影卡片，Air-Design L2 标准卡片）
@@ -88,6 +90,8 @@ static NSString * const kShaderCardCellIdentifier = @"ShaderCardCell";
 - (void)viewDidLoad {
     [super viewDidLoad]; // 基类完成标题/毛玻璃背景/搜索栏/表格/三态视图/批量工具栏构建
 
+    self.profileName = [PLProfiles effectiveProfileNameForPreferredName:self.profileName];
+
     // 始终使用本地模式（在线下载入口已移至下载界面）
     self.localShaders = [NSMutableArray array];
     self.filteredLocalShaders = [NSMutableArray array];
@@ -108,7 +112,14 @@ static NSString * const kShaderCardCellIdentifier = @"ShaderCardCell";
     self.tableView.refreshControl = refreshControl;
 
     [self setupNavigationButtons];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(handleDownloadTaskCompleted:)
+                                                 name:DownloadTaskManagerTaskCompletedNotification
+                                               object:nil];
+}
 
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
     [self refreshLocalShadersList];
 }
 
@@ -405,6 +416,7 @@ static NSString * const kShaderCardCellIdentifier = @"ShaderCardCell";
     // 跳转统一下载界面并定位到光影 tab（在线下载入口已统一收口到下载页）
     DownloadViewController *downloadVC = [[DownloadViewController alloc] init];
     downloadVC.initialTabIndex = 2; // 0版本 1模组 2光影
+    downloadVC.targetProfileName = self.profileName;
     if (self.navigationController) {
         [self.navigationController pushViewController:downloadVC animated:YES];
     } else {
@@ -413,6 +425,14 @@ static NSString * const kShaderCardCellIdentifier = @"ShaderCardCell";
         nav.modalPresentationStyle = UIModalPresentationFullScreen;
         [self presentViewController:nav animated:YES completion:nil];
     }
+}
+
+- (void)handleDownloadTaskCompleted:(NSNotification *)notification {
+    DownloadTaskItem *task = notification.userInfo[DownloadTaskManagerTaskKey];
+    if (task.state != DownloadTaskStateCompleted ||
+        ![task.resourceType isEqualToString:DownloadTaskResourceTypeShader] ||
+        ![task.userInfo[@"profileName"] isEqualToString:self.profileName]) return;
+    [self refreshLocalShadersList];
 }
 
 #pragma mark - 搜索（UISearchBarDelegate）

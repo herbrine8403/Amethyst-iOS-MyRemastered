@@ -137,7 +137,7 @@
 
 "preference.title.renderer" = "レンダラー";
 
-"preference.title.renderer.debug.auto" = "自動: gl4es または angle";
+"preference.title.renderer.debug.auto" = "自動: ANGLE";
 "preference.title.renderer.debug.angle" = "ANGLE (1.17+) - エクスポートOpenGL 3.2 (Core Profile, limited)";
 "preference.title.renderer.debug.zink" = "Zink (Mesa 25.0.7) - exports OpenGL 4.1";
 

@@ -30,7 +30,7 @@ typedef void(^ResourcePackDownloadProgressHandler)(NSProgress * _Nullable downlo
 
 // --- 本地资源包管理 ---
 // 扫描指定 profile 的 resourcepacks 目录，返回 .zip 和 .zip.disabled 文件列表
-- (void)scanResourcePacksForProfile:(NSString *)profileName completion:(ResourcePackListHandler)completion;
+- (void)scanResourcePacksForProfile:(NSString * _Nullable)profileName completion:(ResourcePackListHandler)completion;
 // 获取资源包元数据（解析 zip 内的 pack.mcmeta，获取 pack_format 和 description）
 - (void)fetchMetadataForResourcePack:(ResourcePackItem *)item completion:(ResourcePackMetadataHandler)completion;
 // 启用/禁用资源包（加/去 .disabled 后缀）
@@ -41,7 +41,7 @@ typedef void(^ResourcePackDownloadProgressHandler)(NSProgress * _Nullable downlo
 // --- 在线资源包下载 ---
 // 下载资源包到指定 profile 的 resourcepacks 目录，支持实时进度回调
 - (void)downloadResourcePack:(ResourcePackItem *)item
-                   toProfile:(NSString *)profileName
+                   toProfile:(NSString * _Nullable)profileName
                     progress:(ResourcePackDownloadProgressHandler _Nullable)progress
                   completion:(ResourcePackDownloadCompletionHandler _Nullable)completion;
 
@@ -50,7 +50,7 @@ typedef void(^ResourcePackDownloadProgressHandler)(NSProgress * _Nullable downlo
 /// CurseForge hashes algo=1），传入即启用校验，校验失败由统一下载器按镜像/退避节奏重试；
 /// 为 nil 时不做 SHA1 校验，靠 zip EOCD 兜底校验保证完整性。
 - (void)downloadResourcePack:(ResourcePackItem *)item
-                   toProfile:(NSString *)profileName
+                   toProfile:(NSString * _Nullable)profileName
                 expectedSHA1:(nullable NSString *)expectedSHA1
                     progress:(ResourcePackDownloadProgressHandler _Nullable)progress
                   completion:(ResourcePackDownloadCompletionHandler _Nullable)completion;
@@ -59,7 +59,7 @@ typedef void(^ResourcePackDownloadProgressHandler)(NSProgress * _Nullable downlo
 - (NSString *)iconCachePathForURL:(NSString *)urlString;
 
 /// 获取当前 profile 的 resourcepacks 目录，不存在时自动创建
-- (nullable NSString *)ensureResourcePacksFolderForProfile:(NSString *)profileName error:(NSError **)error;
+- (nullable NSString *)ensureResourcePacksFolderForProfile:(NSString * _Nullable)profileName error:(NSError **)error;
 
 @end
 

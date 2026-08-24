@@ -7,4 +7,7 @@
 /// 供资源管理界面"去下载"引导跳转时定位到对应资源类型
 @property (nonatomic, assign) NSInteger initialTabIndex;
 
+/// 资源下载目标档案。由资源管理页传入；为空时回退到当前或首个有效档案。
+@property (nonatomic, copy, nullable) NSString *targetProfileName;
+
 @end

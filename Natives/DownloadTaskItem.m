@@ -9,6 +9,7 @@ NSString * const DownloadTaskResourceTypeDataPack     = @"datapack";
 NSString * const DownloadTaskResourceTypeModpack      = @"modpack";
 NSString * const DownloadTaskResourceTypeWorld        = @"world";
 NSString * const DownloadTaskResourceTypeJavaRuntime  = @"javaruntime";
+NSString * const DownloadTaskUserInfoTransferCompleteKey = @"transferComplete";
 
 /// 快照取值辅助：仅接受非空 NSString，否则返回兜底值（快照内容不可信，需类型清洗）
 static NSString *PLSnapshotString(id value, NSString *fallback) {

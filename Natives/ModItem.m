@@ -24,6 +24,7 @@
     if (self = [super init]) {
         // Data from Modrinth or CurseForge search results
         _onlineID = data[@"id"] ? [data[@"id"] description] : nil; // Ensure string
+        _apiSource = [data[@"apiSource"] integerValue] == 2 ? 2 : 1;
         _displayName = data[@"title"] ?: @"";
         _modDescription = data[@"description"] ?: @"";
         _iconURL = data[@"imageUrl"] ?: @"";

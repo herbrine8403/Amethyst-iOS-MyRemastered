@@ -44,7 +44,7 @@
 - **完整中文本地化** -- 界面完整汉化，提供原生级中文语言体验。
 - **账户限制解除** -- 支持本地账户、演示模式和第三方认证，无需 Microsoft 账户即可下载和游玩。
 - **多账户支持** -- 在 Microsoft 账户、本地账户和第三方认证账户之间无缝切换。
-- **自动渲染器选择** -- 设为 Auto 时自动选择最优渲染后端（含 MobileGlues、MoltenVK 等渲染器）。
+- **安全的自动渲染器** -- Auto 当前固定解析为 ANGLE，以兼容 Minecraft 26.2+；如需 MobileGlues、GL4ES、Zink 或 MoltenVK，请手动明确选择。
 - **适配 Minecraft 26.X** -- 添加 Minecraft 26.X 支持（实验性）
 - **自定义鼠标指针** -- 在设置中自定义虚拟鼠标指针皮肤。
 - **TouchController 支持** -- 通过 UDP 和 XCFramework 两种通信方式与 TouchController Mod 通信，为 iOS 提供完整的触屏控制。

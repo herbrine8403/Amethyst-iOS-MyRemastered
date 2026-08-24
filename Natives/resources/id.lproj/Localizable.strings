@@ -151,7 +151,7 @@
 
 "preference.title.renderer" = "Renderer";
 
-"preference.title.renderer.debug.auto" = "Otomatis: gl4es atau ANGLE";
+"preference.title.renderer.debug.auto" = "Otomatis: ANGLE";
 "preference.title.renderer.debug.gl4es" = "gl4es 1.1.4 - mengekspor OpenGL 2.1";
 "preference.title.renderer.debug.angle" = "ANGLE (1.17+) - mengekspor OpenGL 3.2 (Profil Core, terbatas)";
 "preference.title.renderer.debug.zink" = "Zink (Mesa 25.0.7) - mengekspor OpenGL 4.1";

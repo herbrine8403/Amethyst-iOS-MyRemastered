@@ -31,6 +31,7 @@
     if (self = [super init]) {
         // Data from Modrinth search results
         _onlineID = data[@"id"] ? [data[@"id"] description] : nil;
+        _apiSource = [data[@"apiSource"] integerValue] == 2 ? 2 : 1;
         _displayName = data[@"title"] ?: @"";
         _shaderDescription = data[@"description"] ?: @"";
         _iconURL = data[@"imageUrl"] ?: @"";

@@ -139,7 +139,7 @@ Bu seçenek varsayılan JitStreamer sunucusunu kullanıyorsanız olduğu gibi b�
 
 "preference.title.renderer" = "İşleyici";
 
-"preference.title.renderer.debug.auto" = "Oto: gl4es ya da ANGLE";
+"preference.title.renderer.debug.auto" = "Oto: ANGLE";
 "preference.title.renderer.debug.gl4es" = "gl4es 1.1.4 - OpenGL 2.1 çıkarır";
 "preference.title.renderer.debug.angle" = "ANGLE (1.17+) - OpenGL 3.2 dışa aktarır (Çekirdek profili, kısıtlı)";
 "preference.title.renderer.debug.zink" = "Zonk (Mesa 25.0.7) - OpenGL 4.1 çıkarır";

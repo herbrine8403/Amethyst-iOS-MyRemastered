@@ -1,4 +1,5 @@
 #import "SurfaceViewController.h"
+#import "LauncherPreferences.h"
 
 #include "jni.h"
 #include <assert.h>
@@ -107,12 +108,10 @@ int pojavInit(BOOL useStackQueue) {
 }
 
 int pojavInitOpenGL() {
-    NSString *renderer = NSProcessInfo.processInfo.environment[@"AMETHYST_RENDERER"];
-    BOOL isAuto = [renderer isEqualToString:@"auto"];
-    if (isAuto || [renderer isEqualToString:@ RENDERER_NAME_GL4ES]) {
-        // At this point, if renderer is still auto (unspecified major version), pick gl4es
-        renderer = @ RENDERER_NAME_GL4ES;
-        setenv("AMETHYST_RENDERER", renderer.UTF8String, 1);
+    // 复用唯一 resolver；即使旁路调用没有经过 JavaLauncher，也与正常启动保持同一语义。
+    NSString *renderer = PLResolveRendererKey(NSProcessInfo.processInfo.environment[@"AMETHYST_RENDERER"]);
+    setenv("AMETHYST_RENDERER", renderer.UTF8String, 1);
+    if ([renderer isEqualToString:@ RENDERER_NAME_GL4ES]) {
         set_gl_bridge_tbl();
     } else if ([renderer isEqualToString:@ RENDERER_NAME_MOBILEGLUES]) {
         renderer = @ RENDERER_NAME_MOBILEGLUES;
@@ -187,19 +186,6 @@ int pojavInitOpenGL() {
 void pojavSetWindowHint(int hint, int value) {
     if (hint == GLFW_CLIENT_API) {
         clientAPI = value;
-    } else if (strcmp(getenv("AMETHYST_RENDERER"), "auto")==0 && hint == GLFW_CONTEXT_VERSION_MAJOR) {
-        switch (value) {
-            case 1:
-            case 2:
-                setenv("AMETHYST_RENDERER", RENDERER_NAME_GL4ES, 1);
-                JNI_LWJGL_changeRenderer(RENDERER_NAME_GL4ES);
-                break;
-            // case 4: use Zink?
-            default:
-                setenv("AMETHYST_RENDERER", RENDERER_NAME_MOBILEGLUES, 1);
-                JNI_LWJGL_changeRenderer(RENDERER_NAME_MOBILEGLUES);
-                break;
-        }
     }
 }
 
@@ -313,4 +299,3 @@ void pojavSwapInterval(int interval) {
 
     br_swap_interval(interval);
 }
-

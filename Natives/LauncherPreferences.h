@@ -41,3 +41,24 @@ NSString* getSelectedJavaHome(NSString* defaultJRETag, int minVersion);
 
 NSArray* getRendererKeys(BOOL containsDefault);
 NSArray* getRendererNames(BOOL containsDefault);
+
+/// Profile 选择器内部使用的“继承全局设置”稳定值。
+/// 显示时必须使用 PLProfileInheritedDisplayName()，不要直接展示或比较本地化文本。
+FOUNDATION_EXPORT NSString * const PLProfileInheritedValue;
+NSString *PLProfileInheritedDisplayName(void);
+
+/// 将偏好值规范化为受支持的渲染器 key；空值或旧版/损坏值回退为 "auto"。
+NSString *PLNormalizeRendererKey(id value);
+
+/// 将渲染器选择解析为本次启动实际使用的动态库。
+/// Auto 的唯一解析策略集中在这里，避免 JavaLauncher 与 EGL bridge 各自解释。
+NSString *PLResolveRendererKey(id value);
+
+/// MC 26.2+ Graphics API 的合法 key/本地化显示名。
+/// containsDefault=YES 时首项是“继承全局设置”，与显式 "default" 不同。
+NSArray* getGraphicsApiKeys(BOOL containsDefault);
+NSArray* getGraphicsApiNames(BOOL containsDefault);
+
+/// 将 Graphics API 偏好规范化到 default/prefer_vulkan/prefer_opengl 白名单；
+/// 空值或旧版/损坏值回退为 "default"。
+NSString *PLNormalizeGraphicsApiKey(id value);

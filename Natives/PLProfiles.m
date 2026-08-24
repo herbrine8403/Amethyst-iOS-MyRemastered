@@ -41,6 +41,20 @@ static PLProfiles* current;
 
 + (id)profile:(NSMutableDictionary *)profile resolveKey:(id)key {
     id rawValue = profile[key];
+    // renderer 必须先做白名单规范化。显式 "auto" 是档案自己的选择，只有字段
+    // 缺失/空字符串时才允许继承全局默认，避免不同档案之间相互污染。
+    if ([key isEqual:@"renderer"] &&
+        [rawValue isKindOfClass:[NSString class]] &&
+        [(NSString *)rawValue length] > 0) {
+        return PLNormalizeRendererKey(rawValue);
+    }
+    // graphicsApi 与 renderer 使用相同的边界策略：档案显式值先做白名单
+    // 规范化；只有字段缺失/空字符串时才继承全局设置。
+    if ([key isEqual:@"graphicsApi"] &&
+        [rawValue isKindOfClass:[NSString class]] &&
+        [(NSString *)rawValue length] > 0) {
+        return PLNormalizeGraphicsApiKey(rawValue);
+    }
     // 兼容 javaVersion 字段：Mojang 规范是 NSDictionary（{component, majorVersion}），
     // 但部分代码（如 ForgeDirectInstaller）也写入 NSDictionary。PLProfiles 期望返回 NSString。
     if ([rawValue isKindOfClass:[NSDictionary class]]) {
@@ -69,11 +83,63 @@ static PLProfiles* current;
         // 该字段仅在 MC 26.2+ 生效，旧版本会被 MC 忽略，无副作用。
         @"graphicsApi": @"video.graphics_api"
     };
-    return getPrefObject(prefDefaults[key]);
+    id prefValue = getPrefObject(prefDefaults[key]);
+    if ([key isEqual:@"renderer"]) {
+        return PLNormalizeRendererKey(prefValue);
+    }
+    if ([key isEqual:@"graphicsApi"]) {
+        return PLNormalizeGraphicsApiKey(prefValue);
+    }
+    return prefValue;
 }
 
 + (id)resolveKeyForCurrentProfile:(id)key {
     return [self profile:self.current.selectedProfile resolveKey:key];
+}
+
++ (nullable NSString *)effectiveProfileNameForPreferredName:(nullable NSString *)preferredName {
+    NSDictionary *profiles = self.current.profiles;
+    if (preferredName.length > 0) {
+        // 显式指定的目标不能静默落到当前或任意首个档案，否则下载可能写错实例。
+        return [profiles[preferredName] isKindOfClass:[NSDictionary class]] ? preferredName : nil;
+    }
+
+    NSString *selectedName = self.current.selectedProfileName;
+    if (selectedName.length > 0 && [profiles[selectedName] isKindOfClass:[NSDictionary class]]) {
+        return selectedName;
+    }
+
+    for (NSString *name in profiles) {
+        if ([name isKindOfClass:[NSString class]] && [profiles[name] isKindOfClass:[NSDictionary class]]) {
+            return name;
+        }
+    }
+    return nil;
+}
+
++ (nullable NSString *)resolvedGameDirectoryForProfileName:(nullable NSString *)profileName {
+    const char *gameDirC = getenv("POJAV_GAME_DIR");
+    NSString *baseDirectory = (gameDirC ? [NSString stringWithUTF8String:gameDirC] : NSHomeDirectory()).stringByStandardizingPath;
+    if (!baseDirectory.isAbsolutePath) return nil;
+    NSString *effectiveName = [self effectiveProfileNameForPreferredName:profileName];
+    if (effectiveName.length == 0) return nil;
+    NSDictionary *profile = self.current.profiles[effectiveName];
+    NSString *gameDir = profile[@"gameDir"];
+
+    if (![gameDir isKindOfClass:[NSString class]] || gameDir.length == 0 || [gameDir isEqualToString:@"."]) {
+        return baseDirectory;
+    }
+    if (gameDir.isAbsolutePath) {
+        return gameDir.stringByStandardizingPath;
+    }
+
+    NSString *relativePath = [gameDir hasPrefix:@"./"] ? [gameDir substringFromIndex:2] : gameDir;
+    NSString *resolvedPath = [[baseDirectory stringByAppendingPathComponent:relativePath] stringByStandardizingPath];
+    NSString *basePrefix = [baseDirectory stringByAppendingString:@"/"];
+    if (![resolvedPath isEqualToString:baseDirectory] && ![resolvedPath hasPrefix:basePrefix]) {
+        return nil;
+    }
+    return resolvedPath;
 }
 
 - (id)initWithCurrentInstance {

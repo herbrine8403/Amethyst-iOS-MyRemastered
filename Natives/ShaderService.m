@@ -110,75 +110,30 @@
 /// 用户点击下载光影按钮后没反应（实际是 ensureShadersFolderForProfile 创建目录到错误位置，
 /// 下载完成后 moveItem 失败但 handler 已切主线程报错，用户感知"无反应"）。
 - (nullable NSString *)resolveAbsoluteGameDirForProfile:(NSString *)profileName {
-    NSString *profile = profileName.length ? profileName : @"default";
-    @try {
-        NSDictionary *profiles = PLProfiles.current.profiles;
-        NSDictionary *prof = profiles[profile];
-        if (![prof isKindOfClass:[NSDictionary class]]) return nil;
-        NSString *gameDir = prof[@"gameDir"];
-        if (![gameDir isKindOfClass:[NSString class]] || gameDir.length == 0) return nil;
-        if ([gameDir isEqualToString:@"."]) {
-            const char *env = getenv("POJAV_GAME_DIR");
-            return env ? [NSString stringWithUTF8String:env] : NSHomeDirectory();
-        }
-        if ([gameDir isAbsolutePath]) {
-            return gameDir;
-        }
-        const char *env = getenv("POJAV_GAME_DIR");
-        NSString *baseDir = env ? [NSString stringWithUTF8String:env] : NSHomeDirectory();
-        NSString *cleanGameDir = [gameDir hasPrefix:@"./"] ? [gameDir substringFromIndex:2] : gameDir;
-        return [baseDir stringByAppendingPathComponent:cleanGameDir];
-    } @catch (NSException *ex) {
-        return nil;
-    }
+    return [PLProfiles resolvedGameDirectoryForProfileName:profileName];
 }
 
 - (nullable NSString *)existingShadersFolderForProfile:(NSString *)profileName {
-    NSString *profile = profileName.length ? profileName : @"default";
     NSFileManager *fm = [NSFileManager defaultManager];
 
-    // 优先用 profile gameDir（已解析为绝对路径）
-    NSString *resolvedGameDir = [self resolveAbsoluteGameDirForProfile:profile];
-    if (resolvedGameDir.length > 0) {
-        NSString *shadersPath = [resolvedGameDir stringByAppendingPathComponent:@"shaderpacks"];
-        BOOL isDir = NO;
-        if ([fm fileExistsAtPath:shadersPath isDirectory:&isDir] && isDir) {
-            return shadersPath;
-        }
-    }
+    NSString *resolvedGameDir = [self resolveAbsoluteGameDirForProfile:profileName];
+    if (resolvedGameDir.length == 0) return nil;
 
-    // 回退到 POJAV_GAME_DIR/shaderpacks
-    const char *gameDirC = getenv("POJAV_GAME_DIR");
-    if (gameDirC) {
-        NSString *gameDir = [NSString stringWithUTF8String:gameDirC];
-        NSString *shadersPath = [gameDir stringByAppendingPathComponent:@"shaderpacks"];
-        BOOL isDir = NO;
-        if ([fm fileExistsAtPath:shadersPath isDirectory:&isDir] && isDir) {
-            return shadersPath;
-        }
+    NSString *shadersPath = [resolvedGameDir stringByAppendingPathComponent:@"shaderpacks"];
+    BOOL isDir = NO;
+    if ([fm fileExistsAtPath:shadersPath isDirectory:&isDir] && isDir) {
+        return shadersPath;
     }
     return nil;
 }
 
 /// 获取当前 profile 的 shaderpacks 目录，不存在时自动创建
 - (nullable NSString *)ensureShadersFolderForProfile:(NSString *)profileName error:(NSError **)error {
-    NSString *profile = profileName.length ? profileName : @"default";
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *shadersPath = nil;
-
-    // 优先用 profile gameDir（已解析为绝对路径）
-    NSString *resolvedGameDir = [self resolveAbsoluteGameDirForProfile:profile];
-    if (resolvedGameDir.length > 0) {
-        shadersPath = [resolvedGameDir stringByAppendingPathComponent:@"shaderpacks"];
-    }
-
-    if (!shadersPath) {
-        const char *gameDirC = getenv("POJAV_GAME_DIR");
-        if (gameDirC) {
-            NSString *gameDir = [NSString stringWithUTF8String:gameDirC];
-            shadersPath = [gameDir stringByAppendingPathComponent:@"shaderpacks"];
-        }
-    }
+    NSString *resolvedGameDir = [self resolveAbsoluteGameDirForProfile:profileName];
+    NSString *shadersPath = resolvedGameDir.length > 0
+        ? [resolvedGameDir stringByAppendingPathComponent:@"shaderpacks"]
+        : nil;
 
     if (!shadersPath) {
         if (error) {
@@ -316,9 +271,8 @@
     if (!shadersFolder) {
         // 回退到 ensureShadersFolderForProfile:error:，复用绝对路径解析逻辑
         // （之前直接读 prof[@"gameDir"] 不做相对路径解析，会导致目录创建到错误位置）
-        NSString *profile = profileName.length ? profileName : @"default";
         NSError *dirError = nil;
-        NSString *created = [self ensureShadersFolderForProfile:profile error:&dirError];
+        NSString *created = [self ensureShadersFolderForProfile:profileName error:&dirError];
         if (!created) {
             if (completion) {
                 NSError *error = [NSError errorWithDomain:@"ShaderServiceError"
@@ -370,6 +324,9 @@
                       supportsResume:YES
                              iconURL:shader.iconURL];
     taskItem.downloadURL = shader.selectedVersionDownloadURL;
+    NSString *taskProfileName = [PLProfiles effectiveProfileNameForPreferredName:profileName];
+    if (taskProfileName.length > 0) taskItem.userInfo[@"profileName"] = taskProfileName;
+    taskItem.userInfo[@"destinationPath"] = destinationPath;
     // redesign-download-ui Phase 4：单文件下载接入统一进度页——
     // PLTaskStagesSingleFile 单阶段 + autoPresentDetail 自动弹出 PLTaskProgressViewController
     [[DownloadTaskManager sharedManager] setTaskWithId:taskItem.taskId stages:PLTaskStagesSingleFile()];
@@ -377,10 +334,11 @@
 
     // retryHandler：FCL 风格重新下载，复用同一 taskItem，重新发起 PLDownloadClient 请求
     __weak typeof(self) weakSelf = self;
+    __block PLDownloadRequest *retryRequest = nil;
     taskItem.retryHandler = ^id(DownloadTaskItem *taskItemRef) {
         __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (!strongSelf) return nil;
-        return [strongSelf restartPLDownloadForTaskId:taskItemRef.taskId];
+        if (!strongSelf || !retryRequest) return nil;
+        return [strongSelf startPLDownloadWithRequest:retryRequest taskItem:taskItemRef progress:progress completion:completion];
     };
 
     PLDownloadRequest *request = [[PLDownloadRequest alloc] init];
@@ -397,6 +355,7 @@
     request.taskIdentifier = taskItem.taskId;
     // 无 SHA1 时对 .zip 做 EOCD 兜底完整性校验
     request.allowZipFallbackCheck = YES;
+    retryRequest = request;
 
     [self startPLDownloadWithRequest:request taskItem:taskItem progress:progress completion:completion];
 
@@ -425,7 +384,6 @@
     self.downloadAccumulatedBytes[taskId] = @(0);
     self.downloadTotalBytes[taskId] = @(-1);
     self.downloadLastSpeeds[taskId] = @(0.0);
-    [self.downloadStateLock unlock];
 
     PLDownloadOperation *operation = [[PLDownloadClient sharedClient] startRequest:request
                                                                           progress:^(int64_t deltaBytes, int64_t totalExpectedBytes) {
@@ -445,12 +403,11 @@
     }];
     if (!operation) {
         // 参数错误：PLDownloadClient 会异步回调 completion（error），由统一失败路径收尾
+        [self.downloadStateLock unlock];
         return nil;
     }
 
-    [self.downloadStateLock lock];
     self.downloadOperations[taskId] = operation;
-    [self.downloadStateLock unlock];
 
     // rawTask 为 weak 引用：operation 由 PLDownloadClient 与本 Service 共同持有，
     // DownloadTaskManager 据此对 PLDownloadOperation 做 pause/resume/cancel
@@ -461,6 +418,7 @@
     [[DownloadTaskManager sharedManager] updateTaskWithId:taskId
                                               stageAtIndex:0
                                                   status:PLTaskStageStatusRunning];
+    [self.downloadStateLock unlock];
     return operation;
 }
 
@@ -552,20 +510,20 @@
     [self.downloadStateLock unlock];
 
     DownloadTaskManager *manager = [DownloadTaskManager sharedManager];
+    NSError *completionError = success ? nil : (error ?: [NSError errorWithDomain:@"ShaderServiceError" code:3 userInfo:@{NSLocalizedDescriptionKey: @"Shader download failed."}]);
     if (success) {
         [manager updateTaskWithId:taskId stageAtIndex:0 status:PLTaskStageStatusCompleted];
-        [manager setTaskWithId:taskId state:DownloadTaskStateCompleted];
+        [manager setTaskWithId:taskId completedWithError:nil];
     } else if ([error.domain isEqualToString:NSURLErrorDomain] && error.code == NSURLErrorCancelled) {
         // 用户取消（DownloadTaskManager 已置 Cancelled，这里幂等对齐）
         [manager setTaskWithId:taskId state:DownloadTaskStateCancelled];
     } else {
         [manager updateTaskWithId:taskId stageAtIndex:0 status:PLTaskStageStatusFailed];
-        [manager updateTaskWithId:taskId error:error];
-        [manager setTaskWithId:taskId state:DownloadTaskStateFailed];
+        [manager setTaskWithId:taskId completedWithError:completionError];
     }
 
     if (completion) {
-        NSError *capturedError = success ? nil : error;
+        NSError *capturedError = completionError;
         dispatch_async(dispatch_get_main_queue(), ^{
             completion(capturedError);
         });
