@@ -1,0 +1,640 @@
+/*
+  Localizable.strings
+  StringLocalization
+  Khmer (km) - Partial translation: Settings/Preferences section
+  Translated by Claude for the Amethyst iOS launcher community.
+  Untranslated keys automatically fall back to English (or base.lproj).
+*/
+
+"preference.title.news_url" = "URL ព័ត៌មាន";
+"preference.detail.news_url" = "កំណត់ URL សម្រាប់ទំព័រព័ត៌មាន";
+"preference.title.reset_news_url" = "កំណត់ URL ព័ត៌មានទៅលំនាំដើមវិញ";
+"preference.detail.reset_news_url" = "កំណត់ URL ព័ត៌មានទៅតម្លៃលំនាំដើមវិញ";
+
+"preference.section.general" = "ការកំណត់ទូទៅ";
+"preference.section.video" = "ការកំណត់វីដេអូ និងសំឡេង";
+"preference.section.footer.video" = "Renderer ស្វ័យប្រវត្តិអនុញ្ញាតឱ្យ Amethyst ជ្រើសរើសជម្រើសល្អបំផុតដោយផ្អែកលើកំណែ Minecraft។ ការបន្ថយភាពច្បាស់ (resolution) កាត់បន្ថយបន្ទុក GPU សម្រាប់ដំណើរការល្អប្រសើរជាង។";
+"preference.section.mobileglues" = "MobileGlues Renderer";
+"preference.section.footer.mobileglues" = "ការកំណត់ទាំងនេះមានប្រសិទ្ធភាពនៅពេល renderer ត្រូវបានកំណត់ជា MobileGlues ឬ Vulkan។ Vulkan renderer's OpenGL fallback ប្រើ MobileGlues (ស្របតាម Ynnyny repo) ដូច្នេះ config.json ត្រូវបានអាន។ Auto renderer ដោះស្រាយទៅ ANGLE ហើយមិនផ្ទុក MobileGlues ទេ ដូច្នេះការកំណត់មិនអនុវត្តទេ។ Config ត្រូវបានសរសេរទៅ <POJAV_HOME>/MG/config.json នៅពេលចាប់ផ្តើមហ្គេម។";
+"preference.section.control" = "ការប្តូរតាមបំណងគ្រប់គ្រង";
+"preference.section.debug" = "ការកំណត់ Debug UI";
+"preference.section.footer.debug" = "អ្នកប្រហែលជាត្រូវការចាប់ផ្តើម launcher ឡើងវិញ ដើម្បីឱ្យការផ្លាស់ប្តូរមានប្រសិទ្ធភាព។";
+
+"preference.section.java" = "ការកែសម្រួល Java";
+
+"preference.title.confirm" = "តើអ្នកប្រាកដទេ?";
+
+"preference.title.game_directory" = "ថតឯកសារហ្គេម";
+"preference.title.confirm.delete_game_directory" = "Instance %@ នឹងត្រូវបានលុបជាអចិន្ត្រៃយ៍ ហើយមិនអាចស្តារឡើងវិញបានទេ។";
+"preference.multidir.add_directory" = "បន្ថែមថតឯកសារហ្គេម";
+
+"preference.title.check_sha" = "ពិនិត្យឯកសារបន្ទាប់ពីទាញយក";
+"preference.detail.check_sha" = "ជម្រើសនេះបង្ខំឱ្យ launcher ពិនិត្យ hash ឯកសារ ប្រសិនបើមាន។ ការពារការទាញយកខូច។";
+"preference.title.cosmetica" = "អាវ Cosmetica (Cosmetica Capes)";
+"preference.detail.cosmetica" = "បើកអាវពី Cosmetica (មុនហៅ Arc)។ សម្រាប់ព័ត៌មានបន្ថែម សូមចូលទៅ https://cosmetica.cc។ តម្រូវការ OptiFine";
+"preference.title.download_source" = "ប្រភពទាញយក";
+"preference.detail.download_source" = "ជ្រើសរើសប្រភពទាញយកសម្រាប់ធនធានហ្គេម។ BMCLAPI mirror ផ្តល់ល្បឿនទាញយកលឿនជាងនៅប្រទេសចិន។";
+"preference.title.download_source-official" = "ប្រភពផ្លូវការ";
+"preference.title.download_source-bmclapi" = "BMCLAPI Mirror";
+"preference.section.download" = "គោលការណ៍ Mirror ទាញយក";
+"preference.title.fileSource" = "ប្រភពឯកសារហ្គេម";
+"preference.detail.fileSource" = "គោលការណ៍ប្រភពសម្រាប់ឯកសារហ្គេម libraries និង assets (ការចែកចាយ Mojang)។ Mirror ប្រើ BMCLAPI mirror ជាមុនសិន។";
+"preference.title.assetSearchSource" = "ប្រភពស្វែងរកធនធាន";
+"preference.detail.assetSearchSource" = "គោលការណ៍ប្រភពសម្រាប់សំណួរ Modrinth / CurseForge API។ Mirror ប្រើ MCIM mirror ជាមុនសិន។";
+"preference.title.assetDownloadSource" = "ប្រភពទាញយកធនធាន";
+"preference.detail.assetDownloadSource" = "គោលការណ៍ប្រភពសម្រាប់ការទាញយក mod / shader / resource pack តាម CDN។ Mirror ប្រើ MCIM mirror ជាមុនសិន។";
+"preference.title.modLoaderSource" = "ប្រភព Mod Loader";
+"preference.detail.modLoaderSource" = "គោលការណ៍ប្រភពសម្រាប់ meta, maven និង installer របស់ Fabric / Forge / NeoForge។ Mirror ប្រើ BMCLAPI mirror ជាមុនសិន។";
+"preference.title.mirror_policy-official_first" = "ផ្លូវការជាមុន";
+"preference.title.mirror_policy-mirror_first" = "Mirror ជាមុន";
+"preference.title.mod_mirror" = "ប្រភព Mod Mirror";
+"preference.detail.mod_mirror" = "ជ្រើសរើសប្រភព mirror សម្រាប់ mod/shader/resourcepack/datapack/modpack/world API និងការទាញយកឯកសារ។ MCIM mirror (mod.mcimirror.top) ផ្តល់ការបង្កើនល្បឿននៅប្រទេសចិន ត្រូវគ្នាទាំង Modrinth និង CurseForge API។";
+"preference.title.mod_mirror-official" = "ប្រភពផ្លូវការ";
+"preference.title.mod_mirror-mcim" = "MCIM Mirror";
+"preference.title.debug_logging" = "កំណត់ត្រា Debug";
+"preference.detail.debug_logging" = "កត់ត្រាការកំណត់ និងសកម្មភាពខាងក្នុងទៅ latestlog.txt។ ជួយអ្នកអភិវឌ្ឍន៍រកបញ្ហាបានងាយជាង ប៉ុន្តែ Minecraft អាចដំណើរការយឺតជាង ព្រោះកំណត់ត្រាត្រូវបានសរសេរញឹកញាប់ជាង។";
+"preference.title.appicon" = "កំណត់រូបតំណាង App";
+"preference.detail.appicon" = "អនុញ្ញាតឱ្យអ្នកជ្រើសរើសរូបតំណាងផ្ទាំងដើមផ្សេងៗសម្រាប់ Amethyst។";
+"preference.title.appicon-default" = "Amethyst ស្គាល់ (ស)";
+"preference.title.appicon-dark" = "Amethyst ស្គាល់ (ងងឹត)";
+"preference.title.appicon-development" = "ការអភិវឌ្ឍន៍ (គូរដោយដៃ)";
+"preference.title.hidden_sidebar" = "លាក់របារចំហៀងម៉ឺនុយចម្បងតាមលំនាំដើម";
+"preference.detail.hidden_sidebar" = "អនុញ្ញាតឱ្យអ្នកលាក់របារចំហៀងនៅម៉ឺនុយចម្បងតាមលំនាំដើម និងនៅពេលបង្វិលអេក្រង់។";
+
+"preference.title.reset_warnings" = "កំណត់ការព្រមានទាំងអស់ឡើងវិញ";
+"preference.title.done.reset_warnings" = "ការព្រមានទាំងអស់ត្រូវបានកំណត់ឡើងវិញ។";
+
+"preference.title.reset_settings" = "កំណត់ការកំណត់ទាំងអស់ឡើងវិញ";
+"preference.title.confirm.reset_settings" = "នេះនឹងលុបចោលការកំណត់ផ្ទាល់ខ្លួនរបស់អ្នកទាំងអស់ រួមទាំង resolution, ទំហំប៊ូតុង និង Java arguments។";
+"preference.title.done.reset_settings" = "ការកំណត់លំនាំដើមទាំងអស់ត្រូវបានស្តារឡើងវិញ។";
+
+"preference.title.erase_demo_data" = "លុបទិន្នន័យហ្គេម Demo";
+"preference.title.confirm.erase_demo_data" = "នេះនឹងលុបកំណែហ្គេម និងទិន្នន័យ Demo ទាំងអស់ដែលប្រើសម្រាប់គណនី Demo។";
+"preference.title.done.erase_demo_data" = "ទិន្នន័យហ្គេម Demo ទាំងអស់ត្រូវបានលុប។";
+
+"preference.title.renderer" = "Renderer";
+
+"preference.title.renderer.release.auto" = "ស្វ័យប្រវត្តិ";
+"preference.title.renderer.release.gl4es" = "holy gl4es";
+"preference.title.renderer.release.angle" = "ANGLE";
+"preference.title.renderer.release.mg" = "MobileGlues";
+"preference.title.renderer.release.zink" = "Zink";
+
+"preference.title.renderer.debug.auto" = "ស្វ័យប្រវត្តិ៖ gl4es ឬ ANGLE";
+"preference.title.renderer.debug.gl4es" = "holy gl4es - នាំចេញ OpenGL 2.1";
+"preference.title.renderer.debug.angle" = "ANGLE (1.17+) - នាំចេញ OpenGL 3.2 (Core Profile, កំណត់)";
+"preference.title.renderer.debug.mg" = "MobileGlues (1.17+) - នាំចេញ OpenGL 4.0, EXPERIMENTAL";
+"preference.title.renderer.debug.zink" = "Zink (Mesa 25.0.7) - នាំចេញ OpenGL 4.1";
+"preference.title.renderer.debug.ltw" = "LTW - OpenGL Core→ES wrapper (1.17+)";
+"preference.title.renderer.debug.vulkan" = "MoltenVK (26.2+) - នាំចេញ vulkan 1.4";
+
+"preference.detail.renderer" = "ប្តូរ OpenGL render engine ដែលត្រូវប្រើ។ Zink ត្រូវបានបិទបណ្តោះអាសន្ននៅ iOS 16 ឡើងទៅ ដើម្បីធ្វើរោគវិនិច្ឆ័យបញ្ហា។";
+
+"preference.title.resolution" = "គុណភាពបង្ហាញ (%)";
+"preference.detail.resolution" = "អនុញ្ញាតឱ្យអ្នកបន្ថយគុណភាពបង្ហាញហ្គេម។";
+
+"preference.title.disable_game_vsync" = "ដោះសោអត្រា Frame (បិទ VSync)";
+"preference.detail.disable_game_vsync" = "Minecraft បើក VSync តាមលំនាំដើម ដែលកំណត់ FPS ត្រឹមអត្រា refresh អេក្រង់ (60 ឬ 120)។ នៅពេលបើក launcher នឹងបង្ខំបិទ VSync ដើម្បីឱ្យហ្គេមអាចលើសពីអត្រា refresh។ បិទប្រសិនបើអ្នកចង់ VSync ឬកាត់បន្ថយកម្ដៅ/ការប្រើថ្ម។";
+
+"preference.title.performance_hud" = "បង្ហាញ Performance HUD";
+"preference.detail.performance_hud" = "នៅពេលអាចប្រើបាន បង្ហាញ overlay តាមដានដំណើរការ។";
+
+"preference.title.fullscreen_airplay" = "AirPlay ពេញអេក្រង់";
+"preference.detail.fullscreen_airplay" = "អនុញ្ញាតឱ្យបង្ហាញផ្ទាំងហ្គេមពេញអេក្រង់នៅលើអេក្រង់ខាងក្រៅ ជំនួសឱ្យការឆ្លុះអ្វីៗគ្រប់យ៉ាងលើអេក្រង់។";
+"preference.title.silence_other_audio" = "ផ្អាកសំឡេងនៅពេលបើកហ្គេម";
+"preference.detail.silence_other_audio" = "បើកដើម្បីអនុញ្ញាតឱ្យ Amethyst ផ្អាកសំឡេងពី app ផ្សេងទៀត ដូចជា Music នៅពេលចាប់ផ្តើមហ្គេម។";
+"preference.title.silence_with_switch" = "បិទសំឡេងជាមួយកុងតាក់ស្ងាត់";
+"preference.detail.silence_with_switch" = "បើកដើម្បីបិទសំឡេងនៅពេលបើក Silent Mode។ ត្រចៀកស្តាប់ និងសំឡេងខាងក្រៅមិនរងផលប៉ះពាល់ទេ។";
+"preference.title.allow_microphone" = "អនុញ្ញាតការបញ្ចូលមីក្រូហ្វូន";
+"preference.detail.allow_microphone" = "បើកជម្រើសនេះតែក្នុងករណីអ្នកប្រើ mod voice chat ប៉ុណ្ណោះ។ ជម្រើសកុងតាក់ស្ងាត់នឹងមិនអើពើ ហើយគុណភាពសំឡេងពី app ផ្សេងនឹងរងផលប៉ះពាល់។";
+
+"preference.title.enable_angle" = "ANGLE ES Driver";
+"preference.detail.enable_angle" = "ប្រើ ANGLE ជា OpenGL ES driver ជំនួសឱ្យ driver ប្រព័ន្ធ។ អាចធ្វើឱ្យប្រសើរឡើងភាពត្រូវគ្នាលើឧបករណ៍ខ្លះ។";
+"preference.title.enable_no_error" = "GL No Error";
+"preference.detail.enable_no_error" = "គ្រប់គ្រងឥរិយាបថ GL_NO_ERROR។ 0=លំនាំដើម, 1=គ្មានកំហុសជានិច្ច, 2=មិនដែល។";
+"preference.title.mg_enable_no_error-0" = "លំនាំដើម";
+"preference.title.mg_enable_no_error-1" = "គ្មានកំហុសជានិច្ច";
+"preference.title.mg_enable_no_error-2" = "មិនដែល";
+"preference.title.enable_ext_timer_query" = "EXT Timer Query";
+"preference.detail.enable_ext_timer_query" = "បើកផ្នែកបន្ថែម GL_EXT_disjoint_timer_query សម្រាប់សំណួរកម្រិត GPU timer។";
+"preference.title.enable_ext_compute_shader" = "EXT Compute Shader";
+"preference.detail.enable_ext_compute_shader" = "បើកផ្នែកបន្ថែម compute shader។ អាចធ្វើឱ្យ shader ខ្លះខូច។";
+"preference.title.enable_ext_direct_state_access" = "EXT Direct State Access";
+"preference.detail.enable_ext_direct_state_access" = "បើកផ្នែកបន្ថែម direct state access សម្រាប់ការគ្រប់គ្រង object ដោយសុវត្ថិភាពជាង។";
+"preference.title.max_glsl_cache_size" = "ទំហំ Cache របស់ GLSL";
+"preference.detail.max_glsl_cache_size" = "ចំនួនអតិបរមារបស់ shader GLSL ដែលបានចងក្រង ដើម្បីរក្សាទុកជា cache។ 0 បិទ caching។";
+"preference.title.multidraw_mode" = "របៀប Multidraw";
+"preference.detail.multidraw_mode" = "របៀប multi-draw indirect rendering សម្រាប់ដំណើរការ draw call ប្រសើរឡើង។";
+"preference.title.mg_multidraw_mode-0" = "ស្វ័យប្រវត្តិ";
+"preference.title.mg_multidraw_mode-1" = "Indirect";
+"preference.title.mg_multidraw_mode-2" = "Emulated";
+"preference.title.angle_depth_clear_fix_mode" = "ANGLE Depth Clear Fix";
+"preference.detail.angle_depth_clear_fix_mode" = "ដំណោះស្រាយបញ្ហាការសម្អាត depth buffer នៅពេលប្រើ ANGLE ES driver។";
+"preference.title.custom_gl_version" = "កំណែ OpenGL ផ្ទាល់ខ្លួន";
+"preference.detail.custom_gl_version" = "បដិសេធកំណែ OpenGL ដែលបានរាយការណ៍។ មានប្រយោជន៍សម្រាប់ភាពត្រូវគ្នាជាមួយ mod ដែលត្រូវការកំណែ GL ជាក់លាក់។";
+"preference.title.mg_custom_gl_version-0" = "លំនាំដើម";
+"preference.title.mg_custom_gl_version-4.0" = "OpenGL 4.0";
+"preference.title.mg_custom_gl_version-4.1" = "OpenGL 4.1";
+"preference.title.mg_custom_gl_version-4.2" = "OpenGL 4.2";
+"preference.title.mg_custom_gl_version-4.3" = "OpenGL 4.3";
+"preference.title.mg_custom_gl_version-4.4" = "OpenGL 4.4";
+"preference.title.mg_custom_gl_version-4.5" = "OpenGL 4.5";
+"preference.title.mg_custom_gl_version-4.6" = "OpenGL 4.6";
+"preference.title.fsr1_setting" = "ការពង្រីកគុណភាព FSR 1.0";
+"preference.detail.fsr1_setting" = "គុណភាព AMD FidelityFX Super Resolution 1.0 upscaling។ ធ្វើឱ្យដំណើរការប្រសើរឡើងនៅ resolution ទាប។";
+"preference.title.mg_fsr1_setting-0" = "បិទ";
+"preference.title.mg_fsr1_setting-1" = "គុណភាពខ្ពស់បំផុត";
+"preference.title.mg_fsr1_setting-2" = "គុណភាព";
+"preference.title.mg_fsr1_setting-3" = "ដំណើរការ";
+
+"preference.title.default_gamepad_ctrl" = "ការកំណត់ Controller";
+"preference.title.hardware_hide" = "លាក់ការគ្រប់គ្រងនៅពេលភ្ជាប់ hardware";
+"preference.detail.hardware_hide" = "បើកឥរិយាបថបិទ overlay ការគ្រប់គ្រងលើអេក្រង់ដោយស្វ័យប្រវត្តិ នៅពេលមានកណ្តុរ ឬ game controller ភ្ជាប់។";
+"preference.title.recording_hide" = "លាក់ការគ្រប់គ្រងពីការថតអេក្រង់";
+"preference.detail.recording_hide" = "លាក់ការគ្រប់គ្រងពីរូបថតអេក្រង់ និងការថតវីដេអូអេក្រង់ ខណៈពេលដែលនៅតែមើលឃើញនៅលើអេក្រង់។";
+"preference.title.gesture_mouse" = "កាយវិការកណ្តុរ";
+"preference.detail.gesture_mouse" = "បើកកាយវិការ ដូចជា ចុចដើម្បីដាក់ប្លុក ចុចសង្កត់ដើម្បីបំបែកប្លុក រំកិលដោយម្រាមដៃពីរ";
+"preference.title.gesture_hotbar" = "កាយវិការ Hotbar";
+"preference.detail.gesture_hotbar" = "បើកកាយវិការ ដូចជា ប៉ះកន្លែង hotbar ប្តូរវត្ថុរវាងដៃ ចោលវត្ថុ";
+"preference.title.disable_haptics" = "បិទ Haptics លើអេក្រង់";
+"preference.detail.disable_haptics" = "បិទបែបផែនការឆ្លើយតប haptic (រំញ័រ) ក្នុងហ្គេម ដើម្បីសន្សំថ្ម។";
+"preference.title.press_duration" = "រយៈពេលចុចសង្កត់ (ms)";
+"preference.detail.press_duration" = "រយៈពេលចុចសម្រាប់បំផ្លាញប្លុក និងទម្លាក់វត្ថុ។";
+"preference.title.button_scale" = "ទំហំប៊ូតុងលើអេក្រង់ (%)";
+"preference.detail.button_scale" = "ពង្រីកប៊ូតុងប្រសិនបើវាតូចពេក ជាធម្មតាត្រូវការសម្រាប់អ្នកប្រើ iPad។";
+"preference.title.custom_mouse_pointer" = "ព្រួញកណ្តុរផ្ទាល់ខ្លួន";
+"preference.detail.custom_mouse_pointer" = "ជ្រើសរើសរូបភាពផ្ទាល់ខ្លួនសម្រាប់រូបរាងព្រួញកណ្តុរក្នុងហ្គេម។";
+"preference.title.reset_mouse_pointer" = "កំណត់ព្រួញកណ្តុរឡើងវិញ";
+"preference.detail.reset_mouse_pointer" = "កំណត់ព្រួញកណ្តុរទៅរូបរាងលំនាំដើមវិញ។";
+"preference.title.mouse_scale" = "ទំហំកណ្តុរ (%)";
+"preference.detail.mouse_scale" = "ប្តូរទំហំកណ្តុរនិម្មិត";
+"preference.title.mouse_speed" = "ល្បឿនកណ្តុរ (%)";
+"preference.detail.mouse_speed" = "ប្តូរល្បឿនកណ្តុរនិម្មិត";
+"preference.title.virtmouse_enable" = "កណ្តុរនិម្មិត";
+"preference.detail.virtmouse_enable" = "បើកជម្រើសនេះដើម្បីចាប់ផ្តើមជាមួយកណ្តុរនិម្មិតបើក";
+"preference.title.slideable_hotbar" = "Hotbar អាចអូស";
+"preference.detail.slideable_hotbar" = "ធ្វើឱ្យ hotbar អាចអូសបានដូចកង់កណ្តុរ";
+
+"preference.title.gyroscope_enable" = "បើកការគ្រប់គ្រង Gyroscope";
+"preference.detail.gyroscope_enable" = "ការបើកនេះនឹងអនុញ្ញាតឱ្យអ្នកបត់ក្នុងហ្គេមដោយបត់ឧបករណ៍របស់អ្នក";
+"preference.title.gyroscope_invert_x_axis" = "បញ្ច្រាស gyroscope ឆ្វេង-ស្តាំ";
+"preference.detail.gyroscope_invert_x_axis" = "បញ្ច្រាសអ័ក្ស X របស់ gyroscope";
+"preference.title.gyroscope_sensitivity" = "ភាពប្រែប្រួលនៃការគ្រប់គ្រង Gyroscope";
+"preference.detail.gyroscope_sensitivity" = "លៃតម្រូវភាពប្រែប្រួលនៃការគ្រប់គ្រង gyroscope";
+
+"preference.title.manage_runtime" = "គ្រប់គ្រង Runtimes";
+"preference.title.confirm.delete_runtime" = "%@ នឹងត្រូវបានលុប";
+"preference.manage_runtime.header.default" = "កំណែ Java ដែលចង់បាន";
+"preference.manage_runtime.default.1165" = "1.16.5 និងចាស់ជាងនេះ";
+"preference.manage_runtime.default.117" = "1.17 និងថ្មីជាងនេះ";
+"preference.manage_runtime.footer.default" = "Minecraft 1.16.5 និងចាស់ជាងអាចដំណើរការជាមួយកំណែ Java ថ្មីជាង ប៉ុន្តែភាពត្រូវគ្នាជាមួយ mod មិនត្រូវបានធានាទេ។ Runtimes ខាងក្រៅអាចដាក់ក្នុងថត "java_runtimes"។ ការប្តូរកំណែ Java សម្រាប់ "Execute .jar" មានប្រសិទ្ធភាពតែនៅពេល installer មិនរំពឹងកំណែ Java ថ្មីជាងប៉ុណ្ណោះ។";
+"preference.manage_runtime.footer.java8" = "នេះជាកំណែលំនាំដើមសម្រាប់ Minecraft 1.16.5 និងចាស់ជាងនេះ។";
+"preference.manage_runtime.footer.java17" = "នេះជាកំណែលំនាំដើមសម្រាប់ Minecraft 1.17 និងថ្មីជាងនេះ។";
+"preference.manage_runtime.header.invalid" = "Runtimes មិនត្រឹមត្រូវ";
+
+"preference.title.java_args" = "JVM Launch arguments";
+"preference.detail.java_args" = "ផ្ញើ arguments ទៅ Java នៅពេលចាប់ផ្តើម Minecraft។ ប្រយ័ត្ន វាអាចធ្វើឱ្យហ្គេម crash ប្រសិនបើកែសម្រួលមិនត្រឹមត្រូវ។";
+"preference.placeholder.java_args" = "បញ្ជាក់ arguments...";
+"preference.title.env_variables" = "អថេរបរិស្ថាន";
+"preference.detail.env_variables" = "កំណត់អថេរបរិស្ថានផ្ទាល់ខ្លួននៅពេលចាប់ផ្តើម Minecraft។ ប្រយ័ត្ន វាអាចធ្វើឱ្យហ្គេម crash ប្រសិនបើកែសម្រួលមិនត្រឹមត្រូវ។";
+"preference.placeholder.env_variables" = "បញ្ជាក់អថេរ...";
+"preference.title.auto_ram" = "RAM ស្វ័យប្រវត្តិ";
+"preference.detail.auto_ram" = "បើកកម្មវិធីលៃតម្រូវ RAM ស្វ័យប្រវត្តិ";
+"preference.warn.auto_ram" = "ការបិទជម្រើសនេះលើឧបករណ៍ដែលមិនបាន jailbreak អាចបង្កភាពមិនស្ថិតស្ថេរប្រសិនបើផ្លាស់ប្តូរ។ សូមធ្វើដោយប្រុងប្រយ័ត្ន។";
+"preference.title.allocated_memory" = "ការបែងចែកសតិ (MB)";
+"preference.detail.allocated_memory" = "គ្រប់គ្រងចំនួនសតិដែលបានប្រគល់ឱ្យ Minecraft";
+"preference.warn.allocated_memory" = "ដោយសារកម្រិតកំណត់ក្នុងប្រព័ន្ធប្រតិបត្តិការខ្លួនឯង ជម្រើសនេះអាចបង្កភាពមិនស្ថិតស្ថេរនៅតម្លៃនេះ ឬខ្ពស់ជាងនេះ។ សូមធ្វើដោយប្រុងប្រយ័ត្ន។";
+"preference.title.custom_env" = "អថេរបរិស្ថាន";
+"preference.detail.custom_env" = "ជម្រើសនេះកំពុងស្ថាបនា។ ចន្លោះនេះ សូមបង្កើត និងកែសម្រួល custom_env.txt។";
+
+"preference.title.debug_universal_script_jit" = "ប្រើ Universal StikDebug Script";
+"preference.title.debug_always_attached_jit" = "រក្សានៅជាប់ជាមួយ StikDebug";
+"preference.detail.debug_always_attached_jit" = "បើកជម្រើសនេះប្រសិនបើ mod របស់អ្នកត្រូវការផ្ទុក .dylib នៅពេលដំណើរការ។ នៅពេលបើក PiP របស់ StikDebug មិនគួរបិទក្នុងពេលលេងហ្គេមទេ។ ត្រូវការបើក Universal Script";
+"preference.title.debug_skip_wait_jit" = "រំលង Dialog \"កំពុងរង់ចាំ JIT\"";
+"preference.detail.debug_skip_wait_jit" = "នេះមិនអនុញ្ញាតឱ្យអ្នកចាប់ផ្តើមដោយគ្មាន JIT ទេ ផ្ទុយទៅវិញនេះនឹងរំលងការពិនិត្យ debugger ព្រោះការពិនិត្យបរាជ័យលើ jailbreak មួយចំនួន។";
+"preference.title.debug_ipad_ui" = "ដោះសោ UI iPadOS";
+"preference.detail.debug_ipad_ui" = "ដោះសោ UI ផ្តាច់មុខ iPad (alert, keyboard ។ល។) ប្រសិនបើបើក ឬ UI iPhone ប្រសិនបើបិទ។";
+"preference.title.debug_auto_correction" = "ការកែតម្រូវស្វ័យប្រវត្តិ";
+"preference.detail.debug_auto_correction" = "បើកការកែតម្រូវស្វ័យប្រវត្តិនៅពេលវាយអក្សរក្នុងហ្គេម។";
+"preference.title.debug_hide_home_indicator" = "លាក់ Home Indicator";
+"preference.detail.debug_hide_home_indicator" = "នេះនឹងបិទការចាក់សោ home indicator។ អ្នកនឹងត្រូវការប្រើ Guided Access ដើម្បីលាក់ និងចាក់សោ home indicator ក្នុងពេលតែមួយ។";
+
+"preference.profile.title.name" = "ឈ្មោះ";
+"preference.profile.title.loader_type" = "ប្រភេទ Loader";
+"preference.profile.title.loader_vendor" = "អ្នកផ្គត់ផ្គង់ Loader";
+"preference.profile.title.loader_version" = "កំណែ Loader";
+"preference.profile.title.version" = "កំណែ";
+"preference.profile.title.version_type" = "ប្រភេទកំណែ";
+"preference.profile.title.default_touch_control" = "ការគ្រប់គ្រងប៉ះ";
+"preference.profile.title.default_gamepad_control" = "ការគ្រប់គ្រង Gamepad";
+
+"preference.title.appicon-custom" = "ផ្ទាល់ខ្លួន";
+"preference.title.custom_appicon" = "រូបតំណាង App ផ្ទាល់ខ្លួន";
+"preference.detail.custom_appicon" = "ជ្រើសរើសរូបភាពផ្ទាល់ខ្លួនសម្រាប់ប្រើជារូបតំណាង app";
+
+"preference.touchcontroller.title" = "TouchController";
+"preference.touchcontroller.section.mode" = "របៀបទំនាក់ទំនង";
+"preference.touchcontroller.section.info" = "ព័ត៌មាន";
+"preference.touchcontroller.mode.title" = "របៀបទំនាក់ទំនង";
+"preference.touchcontroller.select_mode.title" = "ជ្រើសរើសរបៀបទំនាក់ទំនង";
+"preference.touchcontroller.mode.disabled" = "បិទ";
+"preference.touchcontroller.mode.udp" = "ពិធីការ UDP";
+"preference.touchcontroller.mode.staticlib" = "Static Library";
+"preference.touchcontroller.udp.title" = "របៀបពិធីការ UDP";
+"preference.touchcontroller.udp.message" = "TouchController នឹងទាក់ទងតាមរយៈច្រក UDP 12450។ របៀបនេះត្រូវគ្នាជាមួយ server ភាគច្រើន និងផ្តល់ការទំនាក់ទំនងបណ្តាញដ៏មានស្ថេរភាព។";
+"preference.touchcontroller.staticlib.title" = "របៀប Static Library";
+"preference.touchcontroller.staticlib.message" = "TouchController នឹងប្រើ static library ដើម្បីទំនាក់ទំនងក្នុងតំបន់ដែលមានប្រសិទ្ធភាពខ្ពស់ តាមរយៈ Unix Domain Socket។ របៀបនេះផ្តល់ដំណើរការល្អជាង ប៉ុន្តែត្រូវការ static library ត្រូវបានភ្ជាប់។";
+"preference.touchcontroller.about" = "អំពី TouchController";
+"preference.touchcontroller.about.title" = "អំពី TouchController";
+"preference.touchcontroller.about.message" = "TouchController ជា mod Minecraft ដែលបន្ថែមការគ្រប់គ្រងប៉ះទៅ Java Edition។ Launcher នេះគាំទ្ររបៀបទំនាក់ទំនងពីរ៖\n\n• ពិធីការ UDP៖ ការទំនាក់ទំនងផ្អែកលើបណ្តាញ\n• Static Library៖ ការទំនាក់ទំនងក្នុងតំបន់ដែលមានប្រសិទ្ធភាពខ្ពស់\n\nចូលទៅ GitHub សម្រាប់ព័ត៌មានបន្ថែម។";
+"preference.touchcontroller.ok" = "យល់ព្រម";
+"preference.touchcontroller.cancel" = "បោះបង់";
+"preference.touchcontroller.vibrate.enable" = "បើកការញ័រ";
+"preference.touchcontroller.vibrate.intensity" = "កម្រិតការញ័រ";
+"preference.touchcontroller.vibrate.intensity.light" = "ស្រាល";
+"preference.touchcontroller.vibrate.intensity.medium" = "មធ្យម";
+"preference.touchcontroller.vibrate.intensity.heavy" = "ខ្លាំង";
+"preference.touchcontroller.moveview.enable" = "បើកការផ្លាស់ទីទស្សនៈ";
+
+"preference.title.ai_crash_fix" = "ការជួសជុល Crash ដោយ AI";
+"preference.detail.ai_crash_fix" = "កំណត់រចនាសម្ព័ន្ធ និងប្រើជំនួយការ AI ដើម្បីធ្វើរោគវិនិច្ឆ័យ និងជួសជុលបញ្ហាហ្គេម crash ដោយស្វ័យប្រវត្តិ";
+"preference.title.memory_limit_help" = "ព័ត៌មានកម្រិតសតិ";
+"preference.detail.memory_limit_help" = "ស្វែងយល់ពីមូលហេតុដែលកម្រិតសតិ iOS បណ្តាលឱ្យ modpack crash និងរបៀបជួសជុលវា (GetMoreRam)";
+"preference.title.check_update" = "ពិនិត្យរកកំណែថ្មី";
+"preference.detail.check_update" = "ពិនិត្យ GitHub Releases សម្រាប់កំណែស្ថិតស្ថេរចុងក្រោយបំផុតរបស់ Amethyst iOS";
+
+"preference.auto" = "ស្វ័យប្រវត្តិ";
+"preference.auto_select" = "ស្វ័យប្រវត្តិ";
+
+"game.menu.force_close" = "បង្ខំបិទ";
+"game.menu.confirm.force_close" = "តើអ្នកប្រាកដជាចង់បង្ខំបិទឬ?";
+"game.menu.log_output" = "លទ្ធផលកំណត់ត្រា";
+"game.menu.custom_controls" = "ការគ្រប់គ្រងផ្ទាល់ខ្លួន";
+"game.menu.multiplayer" = "អ្នកលេងច្រើននាក់";
+"game.menu.toggle_stats" = "បិទ/បើក FPS/សតិ";
+"game.menu.toggle_controls" = "បិទ/បើក ការគ្រប់គ្រង";
+"game.menu.toggle_virtual_mouse" = "បិទ/បើក កណ្តុរនិម្មិត";
+"game.menu.toggle_keyboard" = "បិទ/បើក ក្តារចុច";
+"game.menu.resolution" = "គុណភាពបង្ហាញ";
+"game.menu.resolution.message" = "ជ្រើសរើសមាត្រដ្ឋានគុណភាពបង្ហាញហ្គេម";
+
+"game.note.airplay" = "Minecraft កំពុងបង្ហាញនៅលើអេក្រង់ AirPlay ដែលឆ្លុះបញ្ចាំង";
+
+"game.title.exit_code" = "ហ្គេមបានចេញដោយកូដ %d";
+
+"Play" = "លេង";
+"Details" = "លម្អិត";
+
+"Installed" = "បានដំឡើង";
+"Snapshot" = "Snapshot";
+"Releases" = "កំណែផ្លូវការ";
+"Unstable" = "មិនស្ថិតស្ថេរ";
+"Old-beta" = "Beta ចាស់";
+"Old-alpha" = "Alpha ចាស់";
+
+"Copy" = "ចម្លង";
+"Edit" = "កែសម្រួល";
+"Move" = "ផ្លាស់ទី";
+"Remove" = "លុប";
+"Resize" = "ប្តូរទំហំ";
+"Always" = "ជានិច្ច";
+"In game" = "ក្នុងហ្គេម";
+"In menu" = "ក្នុងម៉ឺនុយ";
+
+"custom_controls.button_edit.forward_lock" = "ចាក់សោបញ្ជូនបន្ត";
+"custom_controls.button_edit.name" = "ឈ្មោះ";
+"custom_controls.button_edit.size" = "ទំហំ";
+"custom_controls.button_edit.mapping" = "ការគូសផែនទី";
+"custom_controls.button_edit.orientation" = "ទិសដៅ";
+"custom_controls.button_edit.toggleable" = "អាចបិទ/បើកបាន";
+"custom_controls.button_edit.mouse_pass" = "អនុញ្ញាតកណ្តុរឆ្លងកាត់";
+"custom_controls.button_edit.swipeable" = "អាចអូសបាន";
+"custom_controls.button_edit.bg_color" = "ពណ៌ផ្ទៃខាងក្រោយ";
+"custom_controls.button_edit.stroke_width" = "ទទឹងបន្ទាត់គែម (dp)";
+"custom_controls.button_edit.stroke_color" = "ពណ៌បន្ទាត់គែម";
+"custom_controls.button_edit.corner_radius" = "កម្រិតកោងជ្រុង (%)";
+"custom_controls.button_edit.opacity" = "ភាពស្រអាប់ (%)";
+"custom_controls.button_edit.visibility" = "ភាពមើលឃើញ";
+"custom_controls.button_edit.section.basic" = "មូលដ្ឋាន";
+"custom_controls.button_edit.section.input" = "ការបញ្ចូល";
+"custom_controls.button_edit.section.behavior" = "ឥរិយាបថ";
+"custom_controls.button_edit.section.appearance" = "រូបរាង";
+
+"custom_controls.button_menu.add_subbutton" = "បន្ថែមប៊ូតុងរង";
+"custom_controls.control_menu.discard_changes" = "បោះបង់ការផ្លាស់ប្តូរ";
+"custom_controls.control_menu.exit" = "ចាកចេញ";
+"custom_controls.control_menu.exit.warn" = "អ្នកកំពុងនឹងចាកចេញដោយមិនរក្សាទុកការផ្លាស់ប្តូរ។";
+"custom_controls.control_menu.save" = "រក្សាទុក";
+"custom_controls.control_menu.save.error.json" = "កំហុស JSON";
+"custom_controls.control_menu.save.error.write" = "កំហុសក្នុងការរក្សាទុកឯកសារ";
+"custom_controls.control_menu.load" = "ផ្ទុក";
+"custom_controls.control_menu.make_default" = "កំណត់ជាលំនាំដើម";
+"custom_controls.control_menu.safe_area" = "តំបន់សុវត្ថិភាព";
+"custom_controls.control_menu.add_button" = "បន្ថែមប៊ូតុង";
+"custom_controls.control_menu.add_drawer" = "បន្ថែម Drawer";
+"custom_controls.control_menu.add_joystick" = "បន្ថែម Joystick";
+"custom_controls.error.incompatible" = "កំណែការគ្រប់គ្រងនេះ (កូដ %d) មិនត្រូវបានអនុវត្តក្នុងកំណែ launcher នេះទេ។";
+"custom_controls.hint" = "ចុចសង្កត់ទីណាមួយលើអេក្រង់សម្រាប់ជម្រើសបន្ថែម";
+
+"init.migrateDir" = "ថតទិន្នន័យ Amethyst ឥឡូវនេះគឺ %@។ ទិន្នន័យទាំងអស់របស់អ្នកត្រូវបានផ្លាស់ទីទៅទីតាំងថ្មី។";
+
+"java.error.missing_main_class" = "%@ បាត់លក្ខណៈសម្បត្តិ main class។ ប្រសិនបើនេះជា mod សូមដាក់វាទៅក្នុងថត "mods" របស់ instance ដែលអ្នកបានជ្រើសរើស។";
+"java.error.missing_runtime" = "%@ ត្រូវការ Java %d ឬថ្មីជាងដើម្បីដំណើរការ។ សូមដំឡើងវាជាមុនសិន ហើយបញ្ជាក់ក្នុង គ្រប់គ្រង Runtimes។";
+
+"launcher.mcl.downloading_file" = "កំពុងទាញយក %@";
+"launcher.mcl.error_download" = "បរាជ័យក្នុងការទាញយក %@៖ %@";
+
+"launcher.menu.custom_controls" = "ការគ្រប់គ្រងផ្ទាល់ខ្លួន";
+"launcher.menu.execute_jar" = "ដំណើរការ .jar";
+"launcher.menu.import_modpack" = "នាំចូល Modpack";
+
+"launcher.wait_jit.title" = "កំពុងរង់ចាំ JIT";
+"launcher.wait_jit.message" = "Amethyst ពឹងផ្អែកលើ Just-in-time compilation ដើម្បីឱ្យ Java ដំណើរការបានល្អបំផុត។";
+"launcher.wait_jit_trollstore.message" = "ប្រសិនបើអ្នកនៅតែឃើញសារនេះ សូមបើក URL Scheme ក្នុង TrollStore។";
+
+"login.error.username.outOfRange" = "ឈ្មោះអ្នកប្រើត្រូវមានយ៉ាងតិច 3 តួអក្សរ និងច្រើនបំផុត 16 តួអក្សរ";
+"login.error.fields.empty" = "សូមបំពេញគ្រប់ចន្លោះទាំងអស់";
+"login.error.invalid_credentials" = "ឈ្មោះអ្នកប្រើ ឬពាក្យសម្ងាត់មិនត្រឹមត្រូវ";
+"login.error.token_missing" = "បាត់ Access token ឬ client token";
+"login.error.token_expired" = "Token ផ្ទៀងផ្ទាត់អស់សុពលភាព សូមចូលគណនីម្តងទៀត";
+"login.error.invalid_response" = "ការឆ្លើយតបពី server មិនត្រឹមត្រូវ";
+
+"login.alert.field.username" = "ឈ្មោះអ្នកប្រើ";
+"login.alert.field.password" = "ពាក្យសម្ងាត់";
+"login.alert.field.server" = "អាសយដ្ឋាន Server";
+"login.error.invalid_server" = "អាសយដ្ឋាន server មិនត្រឹមត្រូវ";
+
+"login.jit.checking" = "កំពុងពិនិត្យរក JIT";
+"login.jit.enabled" = "JIT ត្រូវបានបើក";
+"login.jit.fail" = "មិនអាចបើក JIT បានទេ។";
+"login.jit.fail.title" = "មិនអាចបើក JIT បានលើឧបករណ៍របស់អ្នកទេ។";
+"login.jit.fail.description" = "គ្មានការតភ្ជាប់ណាមួយអាចប្រើដើម្បីបើក JIT ដោយស្វ័យប្រវត្តិលើឧបករណ៍របស់អ្នកបានទេ ហើយឥឡូវនេះត្រូវបើកដោយដៃ។ កំហុសត្រូវបានកត់ត្រាទៅ latestlog.txt។";
+"login.jit.fail.description_unsupported" = "រកឃើញវិធីដំឡើងដែលមិនគាំទ្រ។ សូមដំឡើងឡើងវិញដោយប្រើវិធីមួយក្នុងចំណោមវិធីដែលគាំទ្រ។";
+
+"login.menu.sendlogs" = "ផ្ញើកំណត់ត្រារបស់អ្នក";
+"login.option.add" = "បន្ថែមគណនី";
+"login.option.select" = "ជ្រើសរើសគណនី";
+"login.option.demo" = "គណនី Demo";
+"login.option.microsoft" = "គណនី Microsoft";
+"login.option.local" = "គណនីមូលដ្ឋាន";
+"login.option.3rdparty" = "គណនីភាគីទីបី";
+
+"login.warn.title.legacy_device" = "កំណែថ្មីបន្ទាប់របស់ Amethyst នឹងមិនត្រូវគ្នាជាមួយឧបករណ៍នេះទេ។";
+"login.warn.message.legacy_device" = "ដើម្បីដំណើរការកំណែធំបន្ទាប់ ត្រូវការឧបករណ៍ដែលអាចដំណើរការ iOS 14។";
+"login.warn.title.legacy_ios" = "កំណែថ្មីបន្ទាប់របស់ Amethyst នឹងត្រូវការការធ្វើបច្ចុប្បន្នភាពប្រព័ន្ធ។";
+"login.warn.message.legacy_ios" = "ដើម្បីដំណើរការកំណែធំបន្ទាប់ ឧបករណ៍នេះត្រូវការដំណើរការ iOS 14 ឬថ្មីជាង។";
+"login.warn.title.limited_ram" = "ឧបករណ៍នេះមានសតិកំណត់។";
+"login.warn.message.limited_ram" = "យើងណែនាំឱ្យទុក Auto RAM ជានិច្ចដើម្បីការពារភាពមិនស្ថិតស្ថេរ និងបញ្ហាដំណើរការ។";
+"login.warn.title.ios19_jitdead" = "Amethyst មិនគាំទ្រនៅលើ iOS 26 ឬថ្មីជាងទេ។";
+"login.warn.message.ios19_jitdead" = "ដោយសារការផ្លាស់ប្តូរនៅក្នុង iOS ដែលរារាំងសមត្ថភាពបើក JIT Amethyst មិនអាចដំណើរការក្នុងស្ថានភាពបច្ចុប្បន្នបានទេ ហើយត្រូវការការស្រាវជ្រាវយ៉ាងច្រើនដើម្បីរកផ្លូវថ្មី។\n\nការចុច OK នឹងបិទ app។";
+
+"login.warn.title.demomode" = "គណនីរបស់អ្នកជា Demo";
+"login.warn.message.demomode" = "ជាការជំនួស offline និង local mode demo mode នឹងអនុញ្ញាតឱ្យអ្នកចូលគណនី Microsoft ដែលមិនមានកម្មសិទ្ធិលើហ្គេម និងលេង Java Edition trial ដែលបានណែនាំក្នុងកំណែ 1.3.1 និងក្រោយមកទៀត។ កំណែចាស់ជាងមានហ្គេមពេញលេញ ដោយសារ launcher ផ្លូវការមិនដាក់កំហិតទាំងនេះទេ។ សូមមើលគេហទំព័ររបស់យើងសម្រាប់ព័ត៌មានបន្ថែមអំពីការផ្លាស់ប្តូរនេះពី offline mode។";
+
+"login.warn.title.localmode" = "Offline mode ឥឡូវនេះក្លាយជា Local mode។";
+"login.warn.message.localmode" = "អ្នកអាចបន្តលេងកំណែដែលបានដំឡើងហើយ ប៉ុន្តែអ្នកលែងអាចទាញយក Minecraft បានទៀតទេដោយគ្មានគណនីបង់ប្រាក់។ គ្មានការគាំទ្រនឹងផ្តល់ជូនសម្រាប់បញ្ហាជាមួយគណនីមូលដ្ឋាន ឬវិធីផ្សេងទៀតក្នុងការទទួលបាន Minecraft ទេ។";
+
+"login.msa.error.xsts.noxboxacc" = "គណនី Microsoft នេះមិនមានទម្រង់ Xbox ចុះឈ្មោះទេ។ សូមប្រាកដថាអ្នកបានបង្កើតទម្រង់ Xbox។\nលេខកូដកំហុស៖ 2148916233";
+"login.msa.error.xsts.noxbox" = "Xbox Live បច្ចុប្បន្នមិនអាចប្រើបានក្នុងប្រទេសរបស់អ្នកទេ។\nលេខកូដកំហុស៖ 2148916235";
+"login.msa.error.xsts.krverify" = "គណនីរបស់អ្នកត្រូវការការផ្ទៀងផ្ទាត់ដោយឪពុកម្តាយមុននឹងអ្នកអាចបន្តបាន។\nលេខកូដកំហុស៖ 2148916236 ឬ 2148916237។";
+"login.msa.error.xsts.underage" = "គណនីរបស់អ្នកត្រូវការភ្ជាប់ជាមួយគណនីឪពុកម្តាយមុននឹងអ្នកអាចបន្តបាន។\nលេខកូដកំហុស៖ 2148916238";
+
+"login.msa.progress.acquireAccessToken" = "(1/5) កំពុងទទួល Access token";
+"login.msa.progress.acquireXBLToken" = "(2/5) កំពុងទទួល Xbox Live token";
+"login.msa.progress.acquireXSTS" = "កំពុងទទួល XSTS";
+"login.msa.progress.acquireXboxProfile" = "(3/5) កំពុងទទួលទម្រង់ Xbox";
+"login.msa.progress.acquireMCToken" = "(4/5) កំពុងទទួល Minecraft token";
+"login.msa.progress.checkMCProfile" = "(5/5) កំពុងពិនិត្យទម្រង់ Minecraft";
+
+"login.3rdparty.progress.auth" = "កំពុងផ្ទៀងផ្ទាត់ជាមួយ server ភាគីទីបី";
+"login.3rdparty.progress.refresh" = "កំពុងធ្វើឱ្យស្រស់នូវការផ្ទៀងផ្ទាត់ភាគីទីបី";
+"login.3rdparty.2fa.title" = "ការផ្ទៀងផ្ទាត់ពីរជាន់";
+"login.3rdparty.2fa.message" = "សូមបញ្ចូលកូដផ្ទៀងផ្ទាត់ពីរជាន់របស់អ្នក";
+"login.3rdparty.2fa.code" = "កូដផ្ទៀងផ្ទាត់";
+"login.3rdparty.2fa.empty" = "កូដផ្ទៀងផ្ទាត់មិនអាចទទេបានទេ";
+
+"News" = "ព័ត៌មាន";
+"Profiles" = "ទម្រង់";
+"Settings" = "ការកំណត់";
+
+"ai.fix.dash_title" = "ផ្ទាំងគ្រប់គ្រងជួសជុលដោយ AI";
+"ai.fix.dash_subtitle" = "វិភាគជាមុន បន្ទាប់មកជួសជុល។ សកម្មភាពហានិភ័យខ្ពស់ទាំងអស់រង់ចាំការបញ្ជាក់។";
+"ai.fix.tile.analyze" = "វិភាគ";
+"ai.fix.tile.analyze_value" = "កំណត់ត្រា និង Config";
+"ai.fix.tile.analyze_sub" = "អានកំណត់ត្រា Crash";
+"ai.fix.tile.plan" = "គម្រោង";
+"ai.fix.tile.plan_value" = "ជាជំហានៗ";
+"ai.fix.tile.plan_sub" = "បង្កើតគម្រោងជួសជុលហានិភ័យទាប";
+"ai.fix.tile.safe" = "សុវត្ថិភាព";
+"ai.fix.tile.safe_value" = "បញ្ជាក់ដោយដៃ";
+"ai.fix.tile.safe_sub" = "សកម្មភាពគ្រោះថ្នាក់ត្រូវការការអនុម័ត";
+"ai.fix.history.title" = "ប្រវត្តិការជួសជុល";
+"ai.fix.history.sessions" = "សម័យប្រជុំ";
+"ai.fix.history.sessions_value" = "កត់ត្រាដោយស្វ័យប្រវត្តិ";
+"ai.fix.history.sessions_sub" = "ពិនិត្យការជួសជុលនីមួយៗ";
+"ai.fix.history.rollback" = "ត្រឡប់ក្រោយ";
+"ai.fix.history.rollback_value" = "ដកម្តងទៀត";
+"ai.fix.history.rollback_sub" = "រក្សាដានការកែប្រែ";
+"ai.fix.risk.title" = "កំណត់ចំណាំហានិភ័យ";
+"ai.fix.risk.backup" = "បានបម្រុងទុកមុនផ្លាស់ប្តូរ";
+"ai.fix.risk.backup_sub" = "ឯកសារសំខាន់ៗរក្សាទុកទិន្នន័យសង្គ្រោះនៅពេលអាចធ្វើទៅបាន";
+"ai.fix.risk.confirm" = "សកម្មភាពហានិភ័យខ្ពស់ត្រូវការការអនុម័ត";
+"ai.fix.risk.confirm_sub" = "ការលុប ប្តូរឈ្មោះ និងសកម្មភាព Mod នឹងមិនដំណើរការស្ងាត់ៗទេ";
+"ai.fix.risk.verify" = "ត្រូវការផ្ទៀងផ្ទាត់ដោយដៃ";
+"ai.fix.risk.verify_sub" = "សូមចាប់ផ្តើមហ្គេមឡើងវិញដើម្បីបញ្ជាក់លទ្ធផល";
+"ai.fix.input_title" = "សេចក្តីណែនាំ និងកំណត់ចំណាំ";
+"ai.fix.input_placeholder" = "ពិពណ៌នាបញ្ហា បន្ថែមកំណត់ចំណាំ ឬចាប់ផ្តើមការសន្ទនា...";
+"ai.fix.stop" = "ឈប់";
+"ai.fix.send" = "ផ្ញើ";
+"ai.fix.exit" = "ចាកចេញពី Launcher";
+"ai.fix.model_config" = "ការកំណត់រចនាសម្ព័ន្ធម៉ូដែល";
+"ai.fix.config_subtitle" = "ភ្ជាប់ទៅសេវាកម្ម API ដែលត្រូវគ្នា OpenAI ណាមួយ";
+"ai.fix.start_fix" = "ចាប់ផ្តើមជួសជុល";
+"ai.fix.model_name" = "ឈ្មោះម៉ូដែល";
+"ai.fix.save" = "រក្សាទុក";
+"ai.fix.tool_requests" = "សំណើឧបករណ៍";
+"ai.fix.tool_subtitle" = "សកម្មភាពហានិភ័យខ្ពស់រង់ចាំការបញ្ជាក់របស់អ្នកនៅទីនេះ";
+"ai.fix.ready" = "រួចរាល់";
+"ai.fix.ready_subtitle" = "កំពុងរង់ចាំការបញ្ចូល ឬការវិភាគស្វ័យប្រវត្តិ";
+"ai.fix.config_saved" = "ការកំណត់រចនាសម្ព័ន្ធត្រូវបានរក្សាទុក";
+"ai.fix.configured" = "បានកំណត់រចនាសម្ព័ន្ធ";
+"ai.fix.not_configured" = "មិនទាន់កំណត់រចនាសម្ព័ន្ធ";
+"ai.fix.running" = "កំពុងដំណើរការ";
+"ai.fix.experimental_title" = "លក្ខណៈពិសេសសាកល្បង";
+"ai.fix.experimental_message" = "ការជួសជុល Crash ដោយ AI គឺជាការសាកល្បង ហើយអាចមិនស្ថិតស្ថេរ។ សូមប្រាកដថាអ្នកមានការបម្រុងទុកមុននឹងបន្ត។ បន្តទេ?";
+"ai.fix.continue" = "បន្ត";
+"ai.fix.cancel" = "បោះបង់";
+"ai.fix.please_configure" = "សូមបំពេញការកំណត់រចនាសម្ព័ន្ធ API ហើយចុច \"រក្សាទុក\" ជាមុនសិន។";
+"ai.fix.settings_mode" = "អ្នកកំពុងនៅអេក្រង់ការកំណត់ជួសជុលដោយ AI។ ចុច \"ចាប់ផ្តើមជួសជុល\" ដើម្បីចាប់ផ្តើមរោគវិនិច្ឆ័យ ឬផ្ញើកំណត់ចំណាំបន្ថែមដោយផ្ទាល់។";
+"ai.fix.starting" = "កំពុងចាប់ផ្តើមដំណើរការជួសជុលដោយ AI...";
+"ai.fix.start_failed" = "បរាជ័យក្នុងការចាប់ផ្តើម";
+"ai.fix.tool_success" = "%@ បានប្រតិបត្តិដោយជោគជ័យ";
+"ai.fix.tool_failed" = "ការប្រតិបត្តិបរាជ័យ";
+"ai.fix.error" = "កំហុស";
+"ai.fix.completed" = "ការជួសជុលបានបញ្ចប់!";
+"ai.fix.modifications" = "%lu ឯកសារត្រូវបានកែប្រែ";
+"ai.fix.restart_hint" = "ការជួសជុលបានចប់។ សូមចាប់ផ្តើមហ្គេមឡើងវិញដោយដៃដើម្បីផ្ទៀងផ្ទាត់៖ ១) បិទ instance ហ្គេមបច្ចុប្បន្ន; ២) ត្រឡប់ទៅ launcher ហើយបើកទម្រង់ឡើងវិញ; ៣) ចាប់ផ្តើមហ្គេមធម្មតា ហើយធ្វើឡើងវិញនូវសេណារីយ៉ូដើម; ៤) ប្រសិនបើបញ្ហានៅតែមាន សូមផ្ញើមតិកែលម្អ ឬប្រើការត្រឡប់ក្រោយ។";
+"ai.fix.waiting_confirm" = "កំពុងរង់ចាំការបញ្ជាក់";
+"ai.fix.waiting_subtitle" = "សកម្មភាពនេះត្រូវការការអនុម័តរបស់អ្នកមុននឹងប្រតិបត្តិ";
+"ai.fix.executing" = "កំពុងប្រតិបត្តិឧបករណ៍...";
+"ai.fix.executing_subtitle" = "កំពុងអនុវត្តជំហានជួសជុលដែលបានគ្រប់គ្រង";
+"ai.fix.completed_subtitle" = "សូមចាប់ផ្តើមហ្គេមឡើងវិញដើម្បីផ្ទៀងផ្ទាត់លទ្ធផល";
+"ai.fix.error_subtitle" = "អ្នកអាចនាំចេញរបាយការណ៍ ឬត្រឡប់ការផ្លាស់ប្តូរក្រោយ";
+"ai.fix.stopped" = "បានឈប់";
+"ai.fix.stopped_subtitle" = "សម័យប្រជុំបានបញ្ចប់ អ្នកអាចចាប់ផ្តើមម្តងទៀត";
+"ai.fix.stopped_by_user" = "ការជួសជុលបានឈប់";
+"ai.fix.approve" = "អនុម័ត";
+"ai.fix.reject" = "បដិសេធ";
+
+"profile.error.name_exists" = "ទម្រង់ដែលមានឈ្មោះនេះមានរួចហើយ។ សូមប្រើឈ្មោះផ្សេង។";
+"profile.section.instance" = "ការកំណត់ Game Instance";
+"profile.section.profiles" = "ទម្រង់ក្នុង Instance នេះ";
+"profile.title.create" = "បង្កើតទម្រង់ថ្មី";
+"profile.title.separate_preference" = "កំណត់ការកំណត់ដាច់ដោយឡែក";
+"profile.detail.separate_preference" = "បើកជម្រើសនេះដើម្បីញែកការផ្លាស់ប្តូរណាមួយដែលធ្វើនៅក្នុងការកំណត់។ ការធ្វើ Reset នឹងស្តារទៅការកំណត់សកលជំនួសឱ្យការកំណត់លំនាំដើម។";
+"profile.title.install_fabric_quilt" = "ដំឡើង Fabric/Quilt";
+
+"controller_configurator.title.current" = "ឯកសារកំណត់រចនាសម្ព័ន្ធ Gamepad";
+"controller_configurator.title.type.xbox" = "Xbox";
+"controller_configurator.title.type.playstation" = "PlayStation";
+
+"controller_configurator.xbox.title.bumper_left" = "Bumper ឆ្វេង";
+"controller_configurator.xbox.title.bumper_right" = "Bumper ស្តាំ";
+"controller_configurator.xbox.title.trigger_left" = "Trigger ឆ្វេង";
+"controller_configurator.xbox.title.trigger_right" = "Trigger ស្តាំ";
+"controller_configurator.xbox.title.named_back" = "Guide";
+"controller_configurator.xbox.title.named_start" = "Menu";
+"controller_configurator.xbox.title.named_a" = "A";
+"controller_configurator.xbox.title.named_b" = "B";
+"controller_configurator.xbox.title.named_x" = "X";
+"controller_configurator.xbox.title.named_y" = "Y";
+"controller_configurator.xbox.title.dpad_up" = "ឡើងលើ";
+"controller_configurator.xbox.title.dpad_down" = "ចុះក្រោម";
+"controller_configurator.xbox.title.dpad_left" = "ឆ្វេង";
+"controller_configurator.xbox.title.dpad_right" = "ស្តាំ";
+"controller_configurator.xbox.title.thumb_left" = "ចុច Thumbstick ឆ្វេង";
+"controller_configurator.xbox.title.thumb_right" = "ចុច Thumbstick ស្តាំ";
+
+"controller_configurator.playstation.title.bumper_left" = "L1";
+"controller_configurator.playstation.title.bumper_right" = "R1";
+"controller_configurator.playstation.title.trigger_left" = "L2";
+"controller_configurator.playstation.title.trigger_right" = "R2";
+"controller_configurator.playstation.title.named_back" = "Select";
+"controller_configurator.playstation.title.named_start" = "Start";
+"controller_configurator.playstation.title.named_a" = "Cross";
+"controller_configurator.playstation.title.named_b" = "Circle";
+"controller_configurator.playstation.title.named_x" = "Square";
+"controller_configurator.playstation.title.named_y" = "Triangle";
+"controller_configurator.playstation.title.dpad_up" = "ឡើងលើ";
+"controller_configurator.playstation.title.dpad_down" = "ចុះក្រោម";
+"controller_configurator.playstation.title.dpad_left" = "ឆ្វេង";
+"controller_configurator.playstation.title.dpad_right" = "ស្តាំ";
+"controller_configurator.playstation.title.thumb_left" = "L3";
+"controller_configurator.playstation.title.thumb_right" = "R3";
+
+"controller_configurator.section.config_files" = "ឯកសារកំណត់រចនាសម្ព័ន្ធបច្ចុប្បន្ន";
+"controller_configurator.section.game_mappings" = "ការគូសផែនទីហ្គេម";
+"controller_configurator.section.footer.game_mappings" = "ការចង នៅពេលកណ្តុរចាក់សោក្នុងហ្គេម។";
+"controller_configurator.section.menu_mappings" = "ការគូសផែនទីម៉ឺនុយ";
+"controller_configurator.section.footer.menu_mappings" = "ការចង នៅពេលកណ្តុរមិនចាក់សោ ដូចជានៅអេក្រង់ចំណងជើង ឬក្នុងម៉ឺនុយផ្អាក។";
+"controller_configurator.section.controller_style" = "ប្រភេទ Controller";
+"controller_configurator.section.footer.controller_style" = "បង្ហាញឈ្មោះប៊ូតុង controller ខុសគ្នាក្នុងកម្មវិធីកំណត់រចនាសម្ព័ន្ធនេះ។";
+
+"提示" = "ជូនដំណឹង";
+
+"announcement.preview_version" = "សូមស្វាគមន៍មកកាន់ Amethyst iOS Remastered កំណែសាកល្បង!";
+"announcement.latest_version" = "សូមស្វាគមន៍មកកាន់ Amethyst iOS Remastered! នេះជាកំណែស្ថិតស្ថេរចុងក្រោយបំផុត។";
+"announcement.new_version_available" = "មានកំណែថ្មី៖ %@";
+"announcement.download_button" = "ទាញយកឥឡូវ";
+
+"crash.title" = "ហ្គេមបានចេញដោយមិនរំពឹងទុក";
+"crash.subtitle" = "កំហុសមួយត្រូវបានរកឃើញ ហើយដំណើរការហ្គេមបានបញ្ចប់";
+
+"crash.exit_code" = "កូដចេញ";
+"crash.reason" = "មូលហេតុដែលអាចមាន";
+"crash.reason.normal" = "ហ្គេមបានចេញធម្មតា";
+"crash.reason.java_exception" = "Java VM ជួប Exception ដែលមិនបានចាប់";
+"crash.reason.memory" = "អស់សតិ ដំណើរការត្រូវបានបញ្ចប់ដោយប្រព័ន្ធ (OOM)";
+"crash.reason.segmentation" = "Segmentation fault អាចជាបញ្ហា JNI ឬ native library";
+"crash.reason.abort" = "កម្មវិធីបានបញ្ឈប់ (abort)";
+"crash.reason.terminated" = "ដំណើរការត្រូវបានបញ្ចប់ដោយសញ្ញាខាងក្រៅ";
+"crash.reason.unknown" = "កំហុសមិនស្គាល់ (កូដ៖ %d)";
+"crash.suggestion" = "សកម្មភាពដែលណែនាំ";
+"crash.suggestion.oom" = "Crash បណ្តាលមកពីកម្រិតសតិ iOS។ ប្រើ GetMoreRam (LiveContainer) ដើម្បីលើកកម្រិតសតិ ហើយសាកល្បងម្តងទៀត";
+"crash.view_log" = "មើលលម្អិតកំណត់ត្រា";
+"crash.share_log" = "ចែករំលែកកំណត់ត្រា";
+"crash.full_log" = "មើលកំណត់ត្រាពេញលេញ";
+"crash.return_launcher" = "ចាកចេញពី Launcher";
+"crash.restart_launcher" = "ចាប់ផ្តើម Launcher ឡើងវិញ";
+"crash.log_unavailable" = "មិនអាចអានឯកសារកំណត់ត្រាបានទេ";
+"crash.interface_title" = "ចំណុចប្រទាក់ Crash";
+"crash.log_info" = "ព័ត៌មានកំណត់ត្រា";
+"crash.error_title" = "ហ្គេម crash ដោយសារកំហុសធ្ងន់ធ្ងរ";
+"crash.error_code" = "កូដកំហុស៖ ";
+"crash.possible_reason" = "មូលហេតុដែលអាចមាន៖ ";
+"crash.debug_reference" = "សូមមើលឯកសារ Debug";
+"crash.github_issue" = "ចូលទៅ GitHub Issues";
+"crash.ai_solve" = "ប្រើ AI ដើម្បីដោះស្រាយ";
+"crash.ai_solve_experimental" = "ប្រើ AI ដើម្បីដោះស្រាយ";
+"crash.experimental" = "សាកល្បង";
+"crash.quick_fix" = "ការណែនាំជួសជុលរហ័ស";
+"crash.reason.mod_conflict" = "Mod ប៉ះទង្គិចគ្នា (NoSuchMethodError/ClassCastException)";
+"crash.reason.missing_library" = "បាត់ Library (UnsatisfiedLinkError/NoClassDefFoundError)";
+"crash.reason.java_version" = "កំណែ Java មិនត្រូវគ្នា (UnsupportedClassVersionError)";
+"crash.reason.renderer" = "កំហុស Renderer (ចាប់ផ្តើម OpenGL/Metal/EGL បរាជ័យ)";
+"crash.reason.mod_loading" = "បរាជ័យផ្ទុក Mod (Forge/Fabric/OptiFine)";
+
+"crash.suggestion.oom_ram" = "កាត់បន្ថយការបែងចែកសតិ (ណែនាំ 1024-2048MB)";
+"crash.suggestion.oom_getmoream" = "ប្រើ GetMoreRam (LiveContainer) ដើម្បីរំលងកម្រិតសតិ iOS";
+"crash.suggestion.oom_mods" = "លុប mod ធ្ងន់ៗ (shader, texture គុណភាពខ្ពស់)";
+"crash.suggestion.oom_restart" = "ចាប់ផ្តើម launcher ឡើងវិញ ហើយសាកល្បងម្តងទៀត (ដោះលែងបំណែកសតិ)";
+"crash.suggestion.segfault_renderer" = "សាកល្បងប្តូរ renderer (gl4es / MetalGlues / virgil)";
+"crash.suggestion.segfault_jit" = "ត្រូវប្រាកដថា JIT ត្រូវបានបើក (TrollStore/SideStore + JIT)";
+"crash.suggestion.segfault_restart" = "ចាប់ផ្តើម launcher ឡើងវិញ ហើយសាកល្បងម្តងទៀត";
+"crash.suggestion.abort_mods" = "ពិនិត្យភាពត្រូវគ្នារបស់ mod (លុប mod ដែលបានបន្ថែមថ្មីៗ)";
+"crash.suggestion.abort_renderer" = "សាកល្បងប្តូរ renderer";
+"crash.suggestion.abort_restart" = "ចាប់ផ្តើម launcher ឡើងវិញ ហើយសាកល្បងម្តងទៀត";
+"crash.suggestion.modconflict_remove" = "លុប mod ដែលបានបន្ថែមថ្មីៗ";
+"crash.suggestion.modconflict_check" = "ពិនិត្យភាពត្រូវគ្នារបស់កំណែ mod (Forge/Fabric/API)";
+"crash.suggestion.modconflict_log" = "មើលកំណត់ត្រាពេញលេញដើម្បីរកមើល mod ដែលប៉ះទង្គិច";
+"crash.suggestion.missinglib_reinstall" = "ដំឡើងកំណែហ្គេមបច្ចុប្បន្នឡើងវិញ";
+"crash.suggestion.missinglib_check" = "ពិនិត្យថតឯកសារ libraries ថាពេញលេញឬអត់";
+"crash.suggestion.missinglib_network" = "ពិនិត្យការតភ្ជាប់បណ្តាញ និងប្រភពទាញយក";
+"crash.suggestion.javaver_change" = "ប្តូរកំណែ Java ក្នុងការកំណត់ (8/17/21)";
+"crash.suggestion.javaver_check" = "ពិនិត្យកំណែ Java ដែលត្រូវការសម្រាប់កំណែហ្គេម";
+"crash.suggestion.renderer_switch" = "សាកល្បងប្តូរ renderer៖ gl4es / MetalGlues / virgil";
+"crash.suggestion.renderer_shader" = "បិទ shader ហើយសាកល្បងម្តងទៀត";
+"crash.suggestion.renderer_resolution" = "បន្ថយមាត្រដ្ឋានគុណភាពបង្ហាញហ្គេម";
+"crash.suggestion.modload_remove" = "លុប mod ដែលមានបញ្ហា (ពិនិត្យកំណត់ត្រាសម្រាប់កំហុស)";
+"crash.suggestion.modload_update" = "ធ្វើបច្ចុប្បន្នភាព mod loader (Forge/Fabric/OptiFine)";
+"crash.suggestion.modload_version" = "ពិនិត្យថា mod គាំទ្រកំណែ MC បច្ចុប្បន្នឬអត់";
+"crash.suggestion.java_log" = "មើលកំណត់ត្រាពេញលេញសម្រាប់ stack trace";
+"crash.suggestion.java_mods" = "ពិនិត្យភាពត្រូវគ្នារបស់ mod (លុប mod ដែលបានបន្ថែមថ្មីៗ)";
+"crash.suggestion.java_restart" = "ចាប់ផ្តើម launcher ឡើងវិញ ហើយសាកល្បងម្តងទៀត";
+
+"launch.title" = "កំពុងចាប់ផ្តើម Minecraft";
+"launch.stage.init_env" = "កំពុងចាប់ផ្តើមបរិស្ថាន...";
+"launch.stage.verify_files" = "កំពុងផ្ទៀងផ្ទាត់ឯកសារហ្គេម...";
+"launch.stage.load_jre" = "កំពុងផ្ទុក Java runtime...";
+"launch.stage.config_jvm" = "កំពុងកំណត់រចនាសម្ព័ន្ធប៉ារ៉ាម៉ែត្រ JVM...";
+"launch.stage.start_jvm" = "កំពុងចាប់ផ្តើម Java virtual machine...";
+"launch.stage.load_libs" = "កំពុងផ្ទុក libraries ហ្គេម...";
+"launch.stage.init_mc" = "កំពុងចាប់ផ្តើម Minecraft...";
+"launch.stage.load_assets" = "កំពុងផ្ទុក assets...";
+"launch.stage.entering" = "កំពុងចូលហ្គេម...";
+"launch.stage.preparing" = "កំពុងរៀបចំ...";
+"launch.elapsed" = "ចំណាយពេល 0s";
+"launch.elapsed_seconds" = "ចំណាយពេល %.0fវិ";
+"launch.elapsed_minutes" = "ចំណាយពេល %.0fនាទី %.0fវិ";
+"launch.complete" = "ការចាប់ផ្តើមបានចប់!";
+"launch.total_seconds" = "សរុប %.1fវិ";
+"launch.total_minutes" = "សរុប %.0fនាទី %.0fវិ";
+"launch.cancel" = "បោះបង់";
+"launch.cancel_confirm_title" = "បោះបង់ការចាប់ផ្តើម?";
+"launch.cancel_confirm_message" = "ការបោះបង់នឹងបញ្ចប់ដំណើរការផ្ទុកហ្គេមបច្ចុប្បន្ន ហើយត្រឡប់ទៅ launcher វិញ។";
+"launch.cancel_confirm_yes" = "បោះបង់";
+"launch.cancel_confirm_no" = "បន្តរង់ចាំ";
+
+"ai.fix.conversation" = "ការសន្ទនា";
+"ai.fix.restart" = "ចាប់ផ្តើម Launcher ឡើងវិញ";
+"ai.fix.thinking" = "AI កំពុងគិត...";
