@@ -21,17 +21,17 @@ typedef void(^ModDownloadHandler)(NSError * _Nullable error); // Added for downl
 + (instancetype)sharedService;
 
 // --- Local Mod Management ---
-- (void)scanModsForProfile:(NSString *)profileName completion:(ModListHandler)completion;
+- (void)scanModsForProfile:(NSString * _Nullable)profileName completion:(ModListHandler)completion;
 - (void)fetchMetadataForMod:(ModItem *)mod completion:(ModMetadataHandler)completion;
 - (BOOL)toggleEnableForMod:(ModItem *)mod error:(NSError **)error;
 - (BOOL)deleteMod:(ModItem *)mod error:(NSError **)error;
 
 // --- Online Mod Downloading ---
-- (void)downloadMod:(ModItem *)mod toProfile:(NSString *)profileName completion:(ModDownloadHandler)completion;
+- (void)downloadMod:(ModItem *)mod toProfile:(NSString * _Nullable)profileName completion:(ModDownloadHandler)completion;
 
 /// 下载 Mod 并上报进度
 - (void)downloadMod:(ModItem *)mod
-          toProfile:(NSString *)profileName
+          toProfile:(NSString * _Nullable)profileName
             progress:(void (^)(NSProgress *downloadProgress))progress
           completion:(ModDownloadHandler)completion;
 
@@ -40,7 +40,7 @@ typedef void(^ModDownloadHandler)(NSError * _Nullable error); // Added for downl
 /// CurseForge hashes algo=1），传入即启用校验，校验失败由统一下载器按镜像/退避节奏重试；
 /// 为 nil 时不做 SHA1 校验，靠 zip EOCD 兜底校验保证完整性。
 - (void)downloadMod:(ModItem *)mod
-          toProfile:(NSString *)profileName
+          toProfile:(NSString * _Nullable)profileName
        expectedSHA1:(nullable NSString *)expectedSHA1
            progress:(nullable void (^)(NSProgress *downloadProgress))progress
          completion:(ModDownloadHandler)completion;
@@ -49,7 +49,7 @@ typedef void(^ModDownloadHandler)(NSError * _Nullable error); // Added for downl
 - (NSString *)iconCachePathForURL:(NSString *)urlString;
 
 /// 获取当前 profile 的 mods 目录，不存在时自动创建
-- (nullable NSString *)ensureModsFolderForProfile:(NSString *)profileName error:(NSError **)error;
+- (nullable NSString *)ensureModsFolderForProfile:(NSString * _Nullable)profileName error:(NSError **)error;
 
 @end
 

@@ -31,7 +31,7 @@ typedef void(^DataPackDownloadProgressHandler)(NSProgress * _Nullable downloadPr
 
 // --- 本地数据包管理 ---
 // 扫描指定 profile 的 datapacks 目录，返回 .zip 和 .zip.disabled 文件列表
-- (void)scanDataPacksForProfile:(NSString *)profileName completion:(DataPackListHandler)completion;
+- (void)scanDataPacksForProfile:(NSString * _Nullable)profileName completion:(DataPackListHandler)completion;
 // 获取数据包元数据（解析 zip 内的 pack.mcmeta，获取 pack_format 和 description）
 - (void)fetchMetadataForDataPack:(DataPackItem *)item completion:(DataPackMetadataHandler)completion;
 // 启用/禁用数据包（加/去 .disabled 后缀）
@@ -44,14 +44,14 @@ typedef void(^DataPackDownloadProgressHandler)(NSProgress * _Nullable downloadPr
 // 注意：Minecraft 要求数据包放在 <gameDir>/saves/<世界名>/datapacks/，但 iOS 上无法选择世界，
 // 因此默认下载到 <gameDir>/datapacks/，需用户手动移动到对应世界目录。
 - (void)downloadDataPack:(DataPackItem *)item
-               toProfile:(NSString *)profileName
+               toProfile:(NSString * _Nullable)profileName
                 progress:(DataPackDownloadProgressHandler _Nullable)progress
               completion:(DataPackDownloadCompletionHandler _Nullable)completion;
 
 // 下载数据包到指定世界的 datapacks 目录（<gameDir>/saves/<worldName>/datapacks/）
 // worldName 为 nil 时回退到 <gameDir>/datapacks/
 - (void)downloadDataPack:(DataPackItem *)item
-               toProfile:(NSString *)profileName
+               toProfile:(NSString * _Nullable)profileName
                worldName:(nullable NSString *)worldName
                 progress:(DataPackDownloadProgressHandler _Nullable)progress
               completion:(DataPackDownloadCompletionHandler _Nullable)completion;
@@ -61,7 +61,7 @@ typedef void(^DataPackDownloadProgressHandler)(NSProgress * _Nullable downloadPr
 /// CurseForge hashes algo=1），传入即启用校验，校验失败由统一下载器按镜像/退避节奏重试；
 /// 为 nil 时不做 SHA1 校验，靠 zip EOCD 兜底校验保证完整性。
 - (void)downloadDataPack:(DataPackItem *)item
-               toProfile:(NSString *)profileName
+               toProfile:(NSString * _Nullable)profileName
                worldName:(nullable NSString *)worldName
             expectedSHA1:(nullable NSString *)expectedSHA1
                 progress:(DataPackDownloadProgressHandler _Nullable)progress
@@ -71,7 +71,7 @@ typedef void(^DataPackDownloadProgressHandler)(NSProgress * _Nullable downloadPr
 - (NSString *)iconCachePathForURL:(NSString *)urlString;
 
 /// 获取当前 profile 的 datapacks 目录，不存在时自动创建
-- (nullable NSString *)ensureDataPacksFolderForProfile:(NSString *)profileName error:(NSError **)error;
+- (nullable NSString *)ensureDataPacksFolderForProfile:(NSString * _Nullable)profileName error:(NSError **)error;
 
 @end
 

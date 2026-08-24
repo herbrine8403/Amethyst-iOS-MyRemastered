@@ -208,51 +208,26 @@
 }
 
 - (nullable NSString *)existingModsFolderForProfile:(NSString *)profileName {
-    NSString *profile = profileName.length ? profileName : @"default";
     NSFileManager *fm = [NSFileManager defaultManager];
 
-    // 优先用 profile gameDir（已解析为绝对路径）
-    NSString *resolvedGameDir = [self resolveAbsoluteGameDirForProfile:profile];
-    if (resolvedGameDir.length > 0) {
-        NSString *modsPath = [resolvedGameDir stringByAppendingPathComponent:@"mods"];
-        BOOL isDir = NO;
-        if ([fm fileExistsAtPath:modsPath isDirectory:&isDir] && isDir) {
-            return modsPath;
-        }
-    }
+    NSString *resolvedGameDir = [self resolveAbsoluteGameDirForProfile:profileName];
+    if (resolvedGameDir.length == 0) return nil;
 
-    // 回退到 POJAV_GAME_DIR/mods
-    const char *gameDirC = getenv("POJAV_GAME_DIR");
-    if (gameDirC) {
-        NSString *gameDir = [NSString stringWithUTF8String:gameDirC];
-        NSString *modsPath = [gameDir stringByAppendingPathComponent:@"mods"];
-        BOOL isDir = NO;
-        if ([fm fileExistsAtPath:modsPath isDirectory:&isDir] && isDir) {
-            return modsPath;
-        }
+    NSString *modsPath = [resolvedGameDir stringByAppendingPathComponent:@"mods"];
+    BOOL isDir = NO;
+    if ([fm fileExistsAtPath:modsPath isDirectory:&isDir] && isDir) {
+        return modsPath;
     }
     return nil;
 }
 
 /// 获取当前 profile 的 mods 目录，不存在时自动创建
 - (nullable NSString *)ensureModsFolderForProfile:(NSString *)profileName error:(NSError **)error {
-    NSString *profile = profileName.length ? profileName : @"default";
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *modsPath = nil;
-
-    // 优先用 profile gameDir（已解析为绝对路径）
-    NSString *resolvedGameDir = [self resolveAbsoluteGameDirForProfile:profile];
-    if (resolvedGameDir.length > 0) {
-        modsPath = [resolvedGameDir stringByAppendingPathComponent:@"mods"];
-    }
-
-    if (!modsPath) {
-        const char *gameDirC = getenv("POJAV_GAME_DIR");
-        if (gameDirC) {
-            NSString *gameDir = [NSString stringWithUTF8String:gameDirC];
-            modsPath = [gameDir stringByAppendingPathComponent:@"mods"];
-        }
-    }
+    NSString *resolvedGameDir = [self resolveAbsoluteGameDirForProfile:profileName];
+    NSString *modsPath = resolvedGameDir.length > 0
+        ? [resolvedGameDir stringByAppendingPathComponent:@"mods"]
+        : nil;
 
     if (!modsPath) {
         if (error) {

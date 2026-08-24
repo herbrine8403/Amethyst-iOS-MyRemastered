@@ -114,51 +114,26 @@
 }
 
 - (nullable NSString *)existingShadersFolderForProfile:(NSString *)profileName {
-    NSString *profile = profileName.length ? profileName : @"default";
     NSFileManager *fm = [NSFileManager defaultManager];
 
-    // 优先用 profile gameDir（已解析为绝对路径）
-    NSString *resolvedGameDir = [self resolveAbsoluteGameDirForProfile:profile];
-    if (resolvedGameDir.length > 0) {
-        NSString *shadersPath = [resolvedGameDir stringByAppendingPathComponent:@"shaderpacks"];
-        BOOL isDir = NO;
-        if ([fm fileExistsAtPath:shadersPath isDirectory:&isDir] && isDir) {
-            return shadersPath;
-        }
-    }
+    NSString *resolvedGameDir = [self resolveAbsoluteGameDirForProfile:profileName];
+    if (resolvedGameDir.length == 0) return nil;
 
-    // 回退到 POJAV_GAME_DIR/shaderpacks
-    const char *gameDirC = getenv("POJAV_GAME_DIR");
-    if (gameDirC) {
-        NSString *gameDir = [NSString stringWithUTF8String:gameDirC];
-        NSString *shadersPath = [gameDir stringByAppendingPathComponent:@"shaderpacks"];
-        BOOL isDir = NO;
-        if ([fm fileExistsAtPath:shadersPath isDirectory:&isDir] && isDir) {
-            return shadersPath;
-        }
+    NSString *shadersPath = [resolvedGameDir stringByAppendingPathComponent:@"shaderpacks"];
+    BOOL isDir = NO;
+    if ([fm fileExistsAtPath:shadersPath isDirectory:&isDir] && isDir) {
+        return shadersPath;
     }
     return nil;
 }
 
 /// 获取当前 profile 的 shaderpacks 目录，不存在时自动创建
 - (nullable NSString *)ensureShadersFolderForProfile:(NSString *)profileName error:(NSError **)error {
-    NSString *profile = profileName.length ? profileName : @"default";
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *shadersPath = nil;
-
-    // 优先用 profile gameDir（已解析为绝对路径）
-    NSString *resolvedGameDir = [self resolveAbsoluteGameDirForProfile:profile];
-    if (resolvedGameDir.length > 0) {
-        shadersPath = [resolvedGameDir stringByAppendingPathComponent:@"shaderpacks"];
-    }
-
-    if (!shadersPath) {
-        const char *gameDirC = getenv("POJAV_GAME_DIR");
-        if (gameDirC) {
-            NSString *gameDir = [NSString stringWithUTF8String:gameDirC];
-            shadersPath = [gameDir stringByAppendingPathComponent:@"shaderpacks"];
-        }
-    }
+    NSString *resolvedGameDir = [self resolveAbsoluteGameDirForProfile:profileName];
+    NSString *shadersPath = resolvedGameDir.length > 0
+        ? [resolvedGameDir stringByAppendingPathComponent:@"shaderpacks"]
+        : nil;
 
     if (!shadersPath) {
         if (error) {
@@ -296,9 +271,8 @@
     if (!shadersFolder) {
         // 回退到 ensureShadersFolderForProfile:error:，复用绝对路径解析逻辑
         // （之前直接读 prof[@"gameDir"] 不做相对路径解析，会导致目录创建到错误位置）
-        NSString *profile = profileName.length ? profileName : @"default";
         NSError *dirError = nil;
-        NSString *created = [self ensureShadersFolderForProfile:profile error:&dirError];
+        NSString *created = [self ensureShadersFolderForProfile:profileName error:&dirError];
         if (!created) {
             if (completion) {
                 NSError *error = [NSError errorWithDomain:@"ShaderServiceError"

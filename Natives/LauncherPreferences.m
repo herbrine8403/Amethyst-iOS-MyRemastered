@@ -208,6 +208,12 @@ NSString* getSelectedJavaHome(NSString* defaultJRETag, int minVersion) {
 }
 
 #pragma mark Renderer
+NSString * const PLProfileInheritedValue = @"(default)";
+
+NSString *PLProfileInheritedDisplayName(void) {
+    return [NSString stringWithFormat:@"(%@)", localize(@"i18n_str_943", nil)];
+}
+
 NSArray* getRendererKeys(BOOL containsDefault) {
     NSMutableArray *array = @[
         @"auto",
@@ -220,7 +226,7 @@ NSArray* getRendererKeys(BOOL containsDefault) {
     ].mutableCopy;
 
     if (containsDefault) {
-        [array insertObject:@"(default)" atIndex:0];
+        [array insertObject:PLProfileInheritedValue atIndex:0];
     }
     
     return array;
@@ -240,7 +246,7 @@ NSArray* getRendererNames(BOOL containsDefault) {
     ].mutableCopy;
 
     if (containsDefault) {
-        [array insertObject:@"(default)" atIndex:0];
+        [array insertObject:PLProfileInheritedDisplayName() atIndex:0];
     }
 
     return array;
@@ -266,4 +272,46 @@ NSString *PLResolveRendererKey(id value) {
     // 26.2+ 在 MobileGlues 自动路径上存在上下文初始化崩溃；当前稳定策略与
     // JavaLauncher 既有行为保持一致，由 Auto 确定地选择 ANGLE。
     return [key isEqualToString:@"auto"] ? @ RENDERER_NAME_MTL_ANGLE : key;
+}
+
+#pragma mark Graphics API
+NSArray* getGraphicsApiKeys(BOOL containsDefault) {
+    NSMutableArray *array = @[
+        @"default",
+        @"prefer_vulkan",
+        @"prefer_opengl"
+    ].mutableCopy;
+
+    if (containsDefault) {
+        [array insertObject:PLProfileInheritedValue atIndex:0];
+    }
+    return array;
+}
+
+NSArray* getGraphicsApiNames(BOOL containsDefault) {
+    NSMutableArray *array = @[
+        localize(@"i18n_str_943", nil),
+        localize(@"i18n_str_941", nil),
+        localize(@"i18n_str_942", nil)
+    ].mutableCopy;
+
+    if (containsDefault) {
+        [array insertObject:PLProfileInheritedDisplayName() atIndex:0];
+    }
+    return array;
+}
+
+NSString *PLNormalizeGraphicsApiKey(id value) {
+    if (![value isKindOfClass:[NSString class]]) {
+        return @"default";
+    }
+
+    NSString *key = [(NSString *)value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (key.length == 0 || ![getGraphicsApiKeys(NO) containsObject:key]) {
+        if (key.length > 0) {
+            NSLog(@"[GraphicsAPI] Unsupported key '%@'; falling back to Default", key);
+        }
+        return @"default";
+    }
+    return key;
 }

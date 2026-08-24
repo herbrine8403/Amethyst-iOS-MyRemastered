@@ -21,12 +21,26 @@
 #import "LauncherPreferences.h"
 
 static NSString * const PLWorldDownloadGenerationKey = @"worldDownloadGeneration";
+static NSString * const PLWorldStagingRootName = @".amethyst-world-staging";
+static NSString * const PLWorldArchiveFileName = @"world.zip";
+
+@interface PLStagedWorld : NSObject
+@property (nonatomic, copy) NSString *stagingDirectory;
+@property (nonatomic, copy) NSString *worldDirectory;
+@property (nonatomic, copy) NSString *suggestedName;
+@end
+
+@implementation PLStagedWorld
+@end
 
 @interface WorldService () <NSURLSessionDownloadDelegate>
 @property (nonatomic, strong) NSURLSession *downloadSession;
 // 内部统一存储带 success/error 的 completion handler
 @property (nonatomic, strong) NSMutableDictionary<NSURLSessionTask *, WorldDownloadCompletionHandler> *downloadCompletionHandlers;
 @property (nonatomic, strong) NSMutableDictionary<NSURLSessionTask *, NSString *> *downloadDestinationPaths;
+@property (nonatomic, strong) NSMutableDictionary<NSURLSessionTask *, NSString *> *downloadStagingDirectories;
+@property (nonatomic, strong) NSMutableDictionary<NSURLSessionTask *, NSString *> *downloadWorldNames;
+@property (nonatomic, strong) NSMutableDictionary<NSURLSessionTask *, NSString *> *downloadSavesFolders;
 // 进度回调相关：分别保存进度 handler 和 NSProgress 对象
 @property (nonatomic, strong) NSMutableDictionary<NSURLSessionTask *, WorldDownloadProgressHandler> *downloadProgressHandlers;
 @property (nonatomic, strong) NSMutableDictionary<NSURLSessionTask *, NSProgress *> *downloadProgresses;
@@ -60,6 +74,9 @@ static NSString * const PLWorldDownloadGenerationKey = @"worldDownloadGeneration
         _downloadSession = [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:nil];
         _downloadCompletionHandlers = [NSMutableDictionary dictionary];
         _downloadDestinationPaths = [NSMutableDictionary dictionary];
+        _downloadStagingDirectories = [NSMutableDictionary dictionary];
+        _downloadWorldNames = [NSMutableDictionary dictionary];
+        _downloadSavesFolders = [NSMutableDictionary dictionary];
         _downloadProgressHandlers = [NSMutableDictionary dictionary];
         _downloadProgresses = [NSMutableDictionary dictionary];
         _downloadTaskItems = [NSMutableDictionary dictionary];
@@ -82,7 +99,9 @@ static NSString * const PLWorldDownloadGenerationKey = @"worldDownloadGeneration
 // 查找指定 profile 的 saves 目录（已存在时返回路径，否则返回 nil）
 - (nullable NSString *)existingWorldsFolderForProfile:(NSString *)profileName {
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *savesPath = [[self gameDirForProfile:profileName] stringByAppendingPathComponent:@"saves"];
+    NSString *gameDir = [self gameDirForProfile:profileName];
+    if (gameDir.length == 0) return nil;
+    NSString *savesPath = [gameDir stringByAppendingPathComponent:@"saves"];
     BOOL isDir = NO;
     if ([fm fileExistsAtPath:savesPath isDirectory:&isDir] && isDir) return savesPath;
     return nil;
@@ -180,143 +199,294 @@ static NSString * const PLWorldDownloadGenerationKey = @"worldDownloadGeneration
 
 #pragma mark - 健壮解压逻辑
 
-// 检测 zip 内是否存在顶层目录（即所有条目都以同一个目录名开头）
-// 若存在，返回该顶层目录名；否则返回 nil（说明 zip 直接散装了 level.dat 等文件）
-- (nullable NSString *)detectTopLevelDirectoryInZip:(NSString *)zipPath {
-    NSError *err = nil;
-    UZKArchive *archive = [[UZKArchive alloc] initWithPath:zipPath error:&err];
-    if (!archive || err) return nil;
-
-    NSArray<NSString *> *fileNames = [archive listFilenames:&err];
-    if (!fileNames || fileNames.count == 0) return nil;
-
-    NSMutableSet<NSString *> *topLevels = [NSMutableSet set];
-    for (NSString *name in fileNames) {
-        if (name.length == 0) continue;
-        // 跳过 macOS 元数据文件（如 __MACOSX/...）
-        if ([name hasPrefix:@"__MACOSX/"]) continue;
-        // 取第一段作为顶层目录候选
-        NSString *firstComponent = [name componentsSeparatedByString:@"/"].firstObject;
-        if (firstComponent.length == 0) continue;
-        [topLevels addObject:firstComponent];
+// 每次下载/导入使用 saves 同级的唯一 staging。它与 saves 位于同一卷，最终
+// moveItemAtPath: 可安全 rename，同时任何解压失败都不会触碰已有世界。
+- (nullable NSString *)createWorldStagingDirectoryForSavesDir:(NSString *)savesDir
+                                                         error:(NSError **)error {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *gameDirectory = savesDir.stringByDeletingLastPathComponent;
+    NSString *stagingRoot = [gameDirectory stringByAppendingPathComponent:PLWorldStagingRootName];
+    BOOL isDirectory = NO;
+    if ([fm fileExistsAtPath:stagingRoot isDirectory:&isDirectory]) {
+        if (!isDirectory) {
+            if (error) {
+                *error = [NSError errorWithDomain:@"WorldServiceError"
+                                             code:8
+                                         userInfo:@{NSLocalizedDescriptionKey: @"The world staging path is not a directory."}];
+            }
+            return nil;
+        }
+    } else if (![fm createDirectoryAtPath:stagingRoot
+              withIntermediateDirectories:YES
+                               attributes:nil
+                                    error:error]) {
+        return nil;
     }
 
-    // 仅当所有条目共享同一个顶层目录时，才认为 zip 内有顶层目录
-    if (topLevels.count == 1) {
-        return [topLevels anyObject];
+    NSString *stagingDirectory = [stagingRoot stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
+    if (![fm createDirectoryAtPath:stagingDirectory
+       withIntermediateDirectories:NO
+                        attributes:nil
+                             error:error]) {
+        return nil;
     }
-    return nil;
+    return stagingDirectory.stringByStandardizingPath;
 }
 
-// 健壮解压：
-// - 若 zip 内有顶层目录，直接解压到 saves/
-// - 若 zip 内无顶层目录（散装），先用世界名创建子目录，再解压到该子目录
-// - worldName 用于无顶层目录时命名新世界目录
-- (nullable NSString *)worldDirectoryContainingLevelDatUnderPath:(NSString *)rootPath {
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *directLevelDat = [rootPath stringByAppendingPathComponent:@"level.dat"];
-    if ([fm fileExistsAtPath:directLevelDat]) return rootPath;
-
-    NSDirectoryEnumerator<NSString *> *enumerator = [fm enumeratorAtPath:rootPath];
-    for (NSString *relativePath in enumerator) {
-        if ([[relativePath lastPathComponent] isEqualToString:@"level.dat"]) {
-            return [[rootPath stringByAppendingPathComponent:relativePath] stringByDeletingLastPathComponent];
-        }
+- (void)cleanupWorldStagingDirectory:(nullable NSString *)stagingDirectory {
+    if (stagingDirectory.length == 0) return;
+    NSString *standardPath = stagingDirectory.stringByStandardizingPath;
+    NSString *parentName = standardPath.stringByDeletingLastPathComponent.lastPathComponent;
+    if (![parentName isEqualToString:PLWorldStagingRootName] || standardPath.lastPathComponent.length == 0) {
+        NSLog(@"[WorldService] refusing to remove unexpected staging path: %@", stagingDirectory);
+        return;
     }
-    return nil;
+    [[NSFileManager defaultManager] removeItemAtPath:standardPath error:nil];
 }
 
-- (BOOL)extractWorldZipAt:(NSString *)zipPath
-                toSavesDir:(NSString *)savesDir
-                worldName:(NSString *)worldName
-                    error:(NSError **)error {
-    NSFileManager *fm = [NSFileManager defaultManager];
-
-    NSString *topLevelDir = [self detectTopLevelDirectoryInZip:zipPath];
-    NSString *extractTargetDir = nil;
-    NSString *finalWorldDir = nil;
-    BOOL finalWorldDirExistedBefore = NO;
-
-    if (topLevelDir) {
-        // zip 内有顶层目录，直接解压到 saves/
-        extractTargetDir = savesDir;
-        finalWorldDir = [savesDir stringByAppendingPathComponent:topLevelDir];
-        finalWorldDirExistedBefore = [fm fileExistsAtPath:finalWorldDir];
-    } else {
-        // zip 内无顶层目录，需要创建子目录后再解压
-        NSString *baseName = worldName.length > 0 ? worldName : [zipPath lastPathComponent];
-        // 去除可能的 .zip 后缀
-        if ([baseName.lowercaseString hasSuffix:@".zip"]) {
-            baseName = [baseName substringToIndex:baseName.length - @".zip".length];
+- (BOOL)archiveEntries:(NSArray<NSString *> *)entries
+  areSafeUnderDirectory:(NSString *)directory
+                  error:(NSError **)error {
+    NSString *root = directory.stringByStandardizingPath;
+    NSString *rootPrefix = [root stringByAppendingString:@"/"];
+    for (id rawEntry in entries) {
+        if (![rawEntry isKindOfClass:[NSString class]]) continue;
+        NSString *entry = [(NSString *)rawEntry stringByReplacingOccurrencesOfString:@"\\" withString:@"/"];
+        if (entry.length == 0) continue;
+        NSArray<NSString *> *components = [entry componentsSeparatedByString:@"/"];
+        if ([entry hasPrefix:@"/"] || [components containsObject:@".."]) {
+            if (error) {
+                *error = [NSError errorWithDomain:@"WorldServiceError"
+                                             code:9
+                                         userInfo:@{NSLocalizedDescriptionKey: @"The world archive contains an unsafe path."}];
+            }
+            return NO;
         }
-        // 若 saves/<baseName> 已存在，则追加数字后缀避免覆盖
-        NSString *candidate = [savesDir stringByAppendingPathComponent:baseName];
-        NSInteger suffix = 1;
-        while ([fm fileExistsAtPath:candidate]) {
-            candidate = [savesDir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@_%ld", baseName, (long)suffix]];
-            suffix++;
-        }
-        extractTargetDir = candidate;
-        finalWorldDir = candidate;
-
-        // 创建目标子目录
-        NSError *createError = nil;
-        if (![fm createDirectoryAtPath:extractTargetDir withIntermediateDirectories:YES attributes:nil error:&createError]) {
-            if (error) *error = createError;
+        NSString *candidate = [[root stringByAppendingPathComponent:entry] stringByStandardizingPath];
+        if (![candidate isEqualToString:root] && ![candidate hasPrefix:rootPrefix]) {
+            if (error) {
+                *error = [NSError errorWithDomain:@"WorldServiceError"
+                                             code:9
+                                         userInfo:@{NSLocalizedDescriptionKey: @"The world archive contains an unsafe path."}];
+            }
             return NO;
         }
     }
+    return YES;
+}
 
-    // 使用 UnzipKit 解压到目标目录
-    NSError *archiveError = nil;
-    UZKArchive *archive = [[UZKArchive alloc] initWithPath:zipPath error:&archiveError];
-    if (!archive || archiveError) {
-        if (!finalWorldDirExistedBefore) [fm removeItemAtPath:finalWorldDir error:nil];
-        if (error) *error = archiveError;
-        return NO;
+// 找到唯一的最浅层世界根目录。压缩包可有任意层 wrapper，但多个同层世界
+// 属于歧义输入，不能依赖目录枚举顺序任意安装其中一个。
+- (nullable NSString *)worldDirectoryContainingLevelDatUnderPath:(NSString *)rootPath
+                                                             error:(NSError **)error {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *root = rootPath.stringByStandardizingPath;
+    NSString *rootPrefix = [root stringByAppendingString:@"/"];
+    NSMutableDictionary<NSString *, NSNumber *> *candidates = [NSMutableDictionary dictionary];
+    NSDirectoryEnumerator<NSString *> *enumerator = [fm enumeratorAtPath:root];
+
+    for (NSString *relativePath in enumerator) {
+        NSString *fullPath = [[root stringByAppendingPathComponent:relativePath] stringByStandardizingPath];
+        if (![fullPath hasPrefix:rootPrefix]) {
+            if (error) {
+                *error = [NSError errorWithDomain:@"WorldServiceError"
+                                             code:9
+                                         userInfo:@{NSLocalizedDescriptionKey: @"The extracted world escaped its staging directory."}];
+            }
+            return nil;
+        }
+
+        NSError *attributeError = nil;
+        NSDictionary *attributes = [fm attributesOfItemAtPath:fullPath error:&attributeError];
+        if (attributeError) {
+            if (error) *error = attributeError;
+            return nil;
+        }
+        if ([attributes[NSFileType] isEqualToString:NSFileTypeSymbolicLink]) {
+            if (error) {
+                *error = [NSError errorWithDomain:@"WorldServiceError"
+                                             code:9
+                                         userInfo:@{NSLocalizedDescriptionKey: @"The world archive contains a symbolic link."}];
+            }
+            return nil;
+        }
+        if (![relativePath.lastPathComponent isEqualToString:@"level.dat"] ||
+            [[relativePath pathComponents] containsObject:@"__MACOSX"]) {
+            continue;
+        }
+        if (![attributes[NSFileType] isEqualToString:NSFileTypeRegular]) continue;
+
+        NSString *worldDirectory = fullPath.stringByDeletingLastPathComponent;
+        NSString *relativeWorld = [worldDirectory isEqualToString:root]
+            ? @""
+            : [worldDirectory substringFromIndex:rootPrefix.length];
+        NSUInteger depth = relativeWorld.length == 0 ? 0 : relativeWorld.pathComponents.count;
+        candidates[worldDirectory] = @(depth);
     }
 
-    NSError *extractError = nil;
-    BOOL success = [archive extractFilesTo:extractTargetDir overwrite:YES error:&extractError];
-    if (!success || extractError) {
-        if (error) *error = extractError;
-        // 仅清理本次新建的世界目录，保留下载前已经存在的用户数据。
-        if (!finalWorldDirExistedBefore) [fm removeItemAtPath:finalWorldDir error:nil];
-        return NO;
-    }
-
-    // Minecraft 只识别 saves/ 的直接子目录。若压缩包多套了一层目录，找到真正
-    // 包含 level.dat 的目录并提升到 saves/，否则管理页和游戏都会把它当作不存在。
-    NSString *actualWorldDir = [self worldDirectoryContainingLevelDatUnderPath:finalWorldDir];
-    if (!actualWorldDir) {
-        if (!finalWorldDirExistedBefore) [fm removeItemAtPath:finalWorldDir error:nil];
+    if (candidates.count == 0) {
         if (error) {
             *error = [NSError errorWithDomain:@"WorldServiceError"
                                          code:7
                                      userInfo:@{NSLocalizedDescriptionKey: @"The downloaded archive does not contain a valid Minecraft world (level.dat is missing)."}];
         }
-        return NO;
+        return nil;
     }
 
-    if (![actualWorldDir isEqualToString:finalWorldDir]) {
-        NSString *baseName = actualWorldDir.lastPathComponent.length > 0 ? actualWorldDir.lastPathComponent : worldName;
-        NSString *promotedWorldDir = [savesDir stringByAppendingPathComponent:baseName];
-        NSInteger suffix = 1;
-        while ([fm fileExistsAtPath:promotedWorldDir]) {
-            promotedWorldDir = [savesDir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@_%ld", baseName, (long)suffix++]];
+    NSUInteger minimumDepth = NSUIntegerMax;
+    for (NSNumber *depth in candidates.allValues) minimumDepth = MIN(minimumDepth, depth.unsignedIntegerValue);
+    NSArray<NSString *> *shallowest = [candidates keysOfEntriesPassingTest:^BOOL(NSString *key, NSNumber *depth, BOOL *stop) {
+        return depth.unsignedIntegerValue == minimumDepth;
+    }].allObjects;
+    if (shallowest.count != 1) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"WorldServiceError"
+                                         code:10
+                                     userInfo:@{NSLocalizedDescriptionKey: @"The world archive contains multiple ambiguous worlds."}];
         }
+        return nil;
+    }
+    return shallowest.firstObject;
+}
+
+- (NSString *)sanitizedWorldDirectoryName:(nullable NSString *)preferredName {
+    NSString *normalized = [(preferredName ?: @"") stringByReplacingOccurrencesOfString:@"\\" withString:@"/"];
+    NSString *name = [normalized.lastPathComponent stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if ([name.lowercaseString hasSuffix:@".zip"]) {
+        name = [name substringToIndex:name.length - @".zip".length];
+    }
+    name = [[name componentsSeparatedByCharactersInSet:NSCharacterSet.controlCharacterSet] componentsJoinedByString:@"_"];
+    if (name.length == 0 || [name isEqualToString:@"."] || [name isEqualToString:@".."]) {
+        return @"imported_world";
+    }
+    return name;
+}
+
+- (nullable PLStagedWorld *)stageWorldZipAt:(NSString *)zipPath
+                           stagingDirectory:(NSString *)stagingDirectory
+                                  worldName:(NSString *)worldName
+                                      error:(NSError **)error {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *staging = stagingDirectory.stringByStandardizingPath;
+    NSString *stagingPrefix = [staging stringByAppendingString:@"/"];
+    NSString *archivePath = zipPath.stringByStandardizingPath;
+    if (![archivePath hasPrefix:stagingPrefix]) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"WorldServiceError"
+                                         code:9
+                                     userInfo:@{NSLocalizedDescriptionKey: @"The world archive is outside its staging directory."}];
+        }
+        return nil;
+    }
+
+    NSError *archiveError = nil;
+    UZKArchive *archive = [[UZKArchive alloc] initWithPath:archivePath error:&archiveError];
+    NSArray<NSString *> *entries = archive ? [archive listFilenames:&archiveError] : nil;
+    if (!archive || archiveError || entries.count == 0) {
+        if (error) *error = archiveError ?: [NSError errorWithDomain:@"WorldServiceError"
+                                                                code:5
+                                                            userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_1097", nil)}];
+        return nil;
+    }
+
+    NSString *extractDirectory = [staging stringByAppendingPathComponent:@"extracted"];
+    if (![self archiveEntries:entries areSafeUnderDirectory:extractDirectory error:error]) return nil;
+    if (![fm createDirectoryAtPath:extractDirectory
+       withIntermediateDirectories:NO
+                        attributes:nil
+                             error:error]) {
+        return nil;
+    }
+
+    NSError *extractError = nil;
+    if (![archive extractFilesTo:extractDirectory overwrite:NO error:&extractError] || extractError) {
+        if (error) *error = extractError;
+        return nil;
+    }
+
+    NSString *worldDirectory = [self worldDirectoryContainingLevelDatUnderPath:extractDirectory error:error];
+    if (!worldDirectory) return nil;
+
+    PLStagedWorld *stagedWorld = [[PLStagedWorld alloc] init];
+    stagedWorld.stagingDirectory = staging;
+    stagedWorld.worldDirectory = worldDirectory;
+    stagedWorld.suggestedName = [self sanitizedWorldDirectoryName:
+        [worldDirectory isEqualToString:extractDirectory] ? worldName : worldDirectory.lastPathComponent];
+    return stagedWorld;
+}
+
+- (nullable NSString *)commitStagedWorld:(PLStagedWorld *)stagedWorld
+                              toSavesDir:(NSString *)savesDir
+                                   error:(NSError **)error {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *staging = stagedWorld.stagingDirectory.stringByStandardizingPath;
+    NSString *source = stagedWorld.worldDirectory.stringByStandardizingPath;
+    NSString *stagingPrefix = [staging stringByAppendingString:@"/"];
+    if (![source hasPrefix:stagingPrefix]) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"WorldServiceError"
+                                         code:9
+                                     userInfo:@{NSLocalizedDescriptionKey: @"The staged world is outside its staging directory."}];
+        }
+        return nil;
+    }
+
+    NSString *levelDat = [source stringByAppendingPathComponent:@"level.dat"];
+    NSDictionary *attributes = [fm attributesOfItemAtPath:levelDat error:error];
+    if (![attributes[NSFileType] isEqualToString:NSFileTypeRegular]) {
+        if (error && !*error) {
+            *error = [NSError errorWithDomain:@"WorldServiceError"
+                                         code:7
+                                     userInfo:@{NSLocalizedDescriptionKey: @"The staged world does not contain a regular level.dat file."}];
+        }
+        return nil;
+    }
+
+    NSString *baseName = [self sanitizedWorldDirectoryName:stagedWorld.suggestedName];
+    for (NSInteger suffix = 0; suffix < 10000; suffix++) {
+        NSString *candidateName = suffix == 0
+            ? baseName
+            : [NSString stringWithFormat:@"%@_%ld", baseName, (long)suffix];
+        NSString *destination = [savesDir stringByAppendingPathComponent:candidateName];
+        if ([fm fileExistsAtPath:destination]) continue;
 
         NSError *moveError = nil;
-        if (![fm moveItemAtPath:actualWorldDir toPath:promotedWorldDir error:&moveError]) {
-            if (error) *error = moveError;
-            return NO;
+        if ([fm moveItemAtPath:source toPath:destination error:&moveError]) {
+            NSString *installedLevelDat = [destination stringByAppendingPathComponent:@"level.dat"];
+            NSDictionary *installedAttributes = [fm attributesOfItemAtPath:installedLevelDat error:&moveError];
+            if ([installedAttributes[NSFileType] isEqualToString:NSFileTypeRegular]) {
+                NSLog(@"[WorldService] staged world committed to: %@", destination);
+                return destination;
+            }
+            [fm removeItemAtPath:destination error:nil];
+            if (error) *error = moveError ?: [NSError errorWithDomain:@"WorldServiceError"
+                                                                  code:7
+                                                              userInfo:@{NSLocalizedDescriptionKey: @"The installed world failed level.dat validation."}];
+            return nil;
         }
-        if (!finalWorldDirExistedBefore) [fm removeItemAtPath:finalWorldDir error:nil];
-        finalWorldDir = promotedWorldDir;
+
+        // 两个并发导入可能同时选择同一名字。目标刚被占用时换下一个后缀；
+        // 其他移动错误直接返回，绝不删除或覆盖目标目录。
+        if ([fm fileExistsAtPath:destination]) continue;
+        if (error) *error = moveError;
+        return nil;
     }
 
-    NSLog(@"[WorldService] world extracted to: %@", finalWorldDir);
-    return YES;
+    if (error) {
+        *error = [NSError errorWithDomain:@"WorldServiceError"
+                                     code:11
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Unable to allocate a unique world directory name."}];
+    }
+    return nil;
+}
+
+- (BOOL)isWorldTaskItemCurrent:(nullable DownloadTaskItem *)taskItem
+                     generation:(NSNumber *)generation {
+    if (!taskItem || !generation) return NO;
+    DownloadTaskItem *latestTask = [[DownloadTaskManager sharedManager] taskWithId:taskItem.taskId];
+    return latestTask != nil &&
+           latestTask.state == DownloadTaskStateDownloading &&
+           [latestTask.userInfo[PLWorldDownloadGenerationKey] isEqual:generation];
 }
 
 #pragma mark - 在线世界下载（含健壮解压）
@@ -350,17 +520,25 @@ static NSString * const PLWorldDownloadGenerationKey = @"worldDownloadGeneration
         return;
     }
 
-    // 下载到临时 zip 路径，解压后再删除
-    NSString *tempZipName = [NSString stringWithFormat:@"world_%@.zip", [[NSUUID UUID] UUIDString]];
-    NSString *destinationPath = [NSTemporaryDirectory() stringByAppendingPathComponent:tempZipName];
+    // 下载到 saves 同卷的唯一 staging。任何下载、解压或验证失败都只清理该目录，
+    // 不会把压缩包内容直接写入已有世界。
+    NSError *stagingError = nil;
+    NSString *stagingDirectory = [self createWorldStagingDirectoryForSavesDir:savesFolder error:&stagingError];
+    if (!stagingDirectory) {
+        if (completion) {
+            NSError *error = stagingError ?: [NSError errorWithDomain:@"WorldServiceError"
+                                                                  code:8
+                                                              userInfo:@{NSLocalizedDescriptionKey: @"Unable to create world staging directory."}];
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(NO, error); });
+        }
+        return;
+    }
+    NSString *destinationPath = [stagingDirectory stringByAppendingPathComponent:PLWorldArchiveFileName];
     // 同时记录预期世界名（用于无顶层目录时的子目录命名）
     NSString *worldNameForExtract = item.displayName ?: item.worldName ?: [url lastPathComponent];
 
     // 创建下载任务（默认会话配置，无后台限速）
     NSURLSessionDownloadTask *task = [self.downloadSession downloadTaskWithURL:url];
-    // 用 taskDescription 暂存世界名和 saves 目录（用于解压阶段）
-    // 格式："worldName\nsavesFolder"
-    task.taskDescription = [NSString stringWithFormat:@"%@\n%@", worldNameForExtract, savesFolder];
     NSProgress *progressObj = nil;
     if (progress) {
         progressObj = [NSProgress progressWithTotalUnitCount:-1];
@@ -383,6 +561,7 @@ static NSString * const PLWorldDownloadGenerationKey = @"worldDownloadGeneration
     NSString *taskProfileName = [PLProfiles effectiveProfileNameForPreferredName:profileName];
     if (taskProfileName.length > 0) taskItem.userInfo[@"profileName"] = taskProfileName;
     taskItem.userInfo[@"destinationPath"] = destinationPath;
+    taskItem.userInfo[@"stagingDirectory"] = stagingDirectory;
     taskItem.userInfo[PLWorldDownloadGenerationKey] = @(task.taskIdentifier);
     // 世界暂停恢复需要用新的 NSURLSessionTask 从头重建，不应消耗网络失败重试预算。
     taskItem.maxRetryCount = 0;
@@ -390,6 +569,9 @@ static NSString * const PLWorldDownloadGenerationKey = @"worldDownloadGeneration
     [self.downloadStateLock lock];
     if (completion) self.downloadCompletionHandlers[task] = completion;
     self.downloadDestinationPaths[task] = destinationPath;
+    self.downloadStagingDirectories[task] = stagingDirectory;
+    self.downloadWorldNames[task] = worldNameForExtract;
+    self.downloadSavesFolders[task] = savesFolder;
     if (progressObj) self.downloadProgresses[task] = progressObj;
     if (progress) self.downloadProgressHandlers[task] = progress;
     self.downloadTaskItems[task] = taskItem;
@@ -400,8 +582,8 @@ static NSString * const PLWorldDownloadGenerationKey = @"worldDownloadGeneration
 
     // 设置 retryHandler：FCL 风格重新下载
     __weak typeof(self) weakSelf = self;
-    NSString *capturedDestPath = destinationPath;
-    NSString *capturedTaskDescription = task.taskDescription;
+    NSString *capturedWorldName = worldNameForExtract;
+    NSString *capturedSavesFolder = savesFolder;
     WorldDownloadCompletionHandler capturedCompletion = completion;
     void (^capturedProgress)(NSProgress *) = progress;
     taskItem.retryHandler = ^id(DownloadTaskItem *taskItemRef) {
@@ -409,14 +591,30 @@ static NSString * const PLWorldDownloadGenerationKey = @"worldDownloadGeneration
         if (!strongSelf) return nil;
         NSURL *retryURL = [NSURL URLWithString:taskItemRef.downloadURL] ?: url;
         if (!retryURL) return nil;
+        NSError *retryStagingError = nil;
+        NSString *retryStagingDirectory = [strongSelf createWorldStagingDirectoryForSavesDir:capturedSavesFolder
+                                                                                        error:&retryStagingError];
+        if (!retryStagingDirectory) {
+            NSError *finalError = retryStagingError ?: [NSError errorWithDomain:@"WorldServiceError"
+                                                                            code:8
+                                                                        userInfo:@{NSLocalizedDescriptionKey: @"Unable to create world staging directory."}];
+            [[DownloadTaskManager sharedManager] setTaskWithId:taskItemRef.taskId completedWithError:finalError];
+            return nil;
+        }
+        NSString *retryDestinationPath = [retryStagingDirectory stringByAppendingPathComponent:PLWorldArchiveFileName];
         NSURLSessionDownloadTask *newTask = [strongSelf.downloadSession downloadTaskWithURL:retryURL];
-        newTask.taskDescription = capturedTaskDescription;
         taskItemRef.userInfo[PLWorldDownloadGenerationKey] = @(newTask.taskIdentifier);
+        taskItemRef.userInfo[@"destinationPath"] = retryDestinationPath;
+        taskItemRef.userInfo[@"stagingDirectory"] = retryStagingDirectory;
+        taskItemRef.supportsResume = YES;
         // manager 随后依据 rawTask 获取并发槽；必须在切换 Downloading 前写入。
         taskItemRef.rawTask = newTask;
         [strongSelf.downloadStateLock lock];
         if (capturedCompletion) strongSelf.downloadCompletionHandlers[newTask] = capturedCompletion;
-        strongSelf.downloadDestinationPaths[newTask] = capturedDestPath;
+        strongSelf.downloadDestinationPaths[newTask] = retryDestinationPath;
+        strongSelf.downloadStagingDirectories[newTask] = retryStagingDirectory;
+        strongSelf.downloadWorldNames[newTask] = capturedWorldName;
+        strongSelf.downloadSavesFolders[newTask] = capturedSavesFolder;
         if (capturedProgress) {
             NSProgress *progressObj = [NSProgress progressWithTotalUnitCount:-1];
             progressObj.kind = NSProgressKindFile;
@@ -463,6 +661,7 @@ static NSString * const PLWorldDownloadGenerationKey = @"worldDownloadGeneration
             needsStopAccessing = [sourceURL startAccessingSecurityScopedResource];
         }
 
+        __block NSString *stagingDirectory = nil;
         @try {
             NSString *sourcePath = sourceURL.path;
             if (!sourcePath || ![[NSFileManager defaultManager] fileExistsAtPath:sourcePath]) {
@@ -475,11 +674,23 @@ static NSString * const PLWorldDownloadGenerationKey = @"worldDownloadGeneration
                 return;
             }
 
-            // 复制到临时文件以便 UnzipKit 安全读取（避免安全作用域限制）
-            NSString *tempZipPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
-                                     [NSString stringWithFormat:@"world_import_%@.zip", [[NSUUID UUID] UUIDString]]];
+            NSError *stagingError = nil;
+            stagingDirectory = [self createWorldStagingDirectoryForSavesDir:savesFolder error:&stagingError];
+            if (!stagingDirectory) {
+                if (completion) {
+                    NSError *error = stagingError ?: [NSError errorWithDomain:@"WorldServiceError"
+                                                                          code:8
+                                                                      userInfo:@{NSLocalizedDescriptionKey: @"Unable to create world staging directory."}];
+                    dispatch_async(dispatch_get_main_queue(), ^{ completion(NO, error); });
+                }
+                return;
+            }
+
+            // 复制进唯一 staging 后再读取，既保持 security-scoped URL 生命周期安全，
+            // 也确保后续解压和最终 rename 都不接触现有世界。
+            NSString *stagedZipPath = [stagingDirectory stringByAppendingPathComponent:PLWorldArchiveFileName];
             NSError *copyError = nil;
-            if (![[NSFileManager defaultManager] copyItemAtPath:sourcePath toPath:tempZipPath error:&copyError]) {
+            if (![[NSFileManager defaultManager] copyItemAtPath:sourcePath toPath:stagedZipPath error:&copyError]) {
                 if (completion) {
                     NSError *error = copyError ?: [NSError errorWithDomain:@"WorldServiceError"
                                                                        code:4
@@ -489,41 +700,40 @@ static NSString * const PLWorldDownloadGenerationKey = @"worldDownloadGeneration
                 return;
             }
 
-            // 本地导入可直接上报 100% 进度（无网络下载阶段）
-            if (progress) {
-                NSProgress *prog = [NSProgress progressWithTotalUnitCount:1];
-                prog.completedUnitCount = 1;
-                dispatch_async(dispatch_get_main_queue(), ^{ progress(prog); });
-            }
-
             // 推导世界名（去除 .zip 后缀）
             NSString *worldName = [sourceURL lastPathComponent];
             if ([worldName.lowercaseString hasSuffix:@".zip"]) {
                 worldName = [worldName substringToIndex:worldName.length - @".zip".length];
             }
 
-            // 解压
-            NSError *extractError = nil;
-            BOOL success = [self extractWorldZipAt:tempZipPath
-                                        toSavesDir:savesFolder
-                                        worldName:worldName
-                                            error:&extractError];
+            NSError *installError = nil;
+            PLStagedWorld *stagedWorld = [self stageWorldZipAt:stagedZipPath
+                                             stagingDirectory:stagingDirectory
+                                                    worldName:worldName
+                                                        error:&installError];
+            NSString *installedWorldPath = stagedWorld
+                ? [self commitStagedWorld:stagedWorld toSavesDir:savesFolder error:&installError]
+                : nil;
+            BOOL success = installedWorldPath.length > 0;
 
-            // 删除临时文件
-            [[NSFileManager defaultManager] removeItemAtPath:tempZipPath error:nil];
-
-            if (completion) {
+            if (completion || (success && progress)) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     if (success) {
-                        completion(YES, nil);
-                    } else {
-                        completion(NO, extractError ?: [NSError errorWithDomain:@"WorldServiceError"
+                        if (progress) {
+                            NSProgress *prog = [NSProgress progressWithTotalUnitCount:1];
+                            prog.completedUnitCount = 1;
+                            progress(prog);
+                        }
+                        if (completion) completion(YES, nil);
+                    } else if (completion) {
+                        completion(NO, installError ?: [NSError errorWithDomain:@"WorldServiceError"
                                                                             code:5
                                                                         userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_1097", nil)}]);
                     }
                 });
             }
         } @finally {
+            [self cleanupWorldStagingDirectory:stagingDirectory];
             if (needsStopAccessing) {
                 [sourceURL stopAccessingSecurityScopedResource];
             }
@@ -599,116 +809,124 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
     [self.downloadStateLock lock];
     WorldDownloadCompletionHandler handler = self.downloadCompletionHandlers[downloadTask];
     NSString *destinationPath = self.downloadDestinationPaths[downloadTask];
-    NSString *taskDescription = downloadTask.taskDescription;
+    NSString *stagingDirectory = self.downloadStagingDirectories[downloadTask];
+    NSString *worldName = self.downloadWorldNames[downloadTask];
+    NSString *savesFolder = self.downloadSavesFolders[downloadTask];
     DownloadTaskItem *taskItem = self.downloadTaskItems[downloadTask];
 
     [self.downloadCompletionHandlers removeObjectForKey:downloadTask];
     [self.downloadDestinationPaths removeObjectForKey:downloadTask];
+    [self.downloadStagingDirectories removeObjectForKey:downloadTask];
+    [self.downloadWorldNames removeObjectForKey:downloadTask];
+    [self.downloadSavesFolders removeObjectForKey:downloadTask];
     [self.downloadProgresses removeObjectForKey:downloadTask];
     [self.downloadProgressHandlers removeObjectForKey:downloadTask];
     [self.downloadTaskItems removeObjectForKey:downloadTask];
     [self.downloadProgressSnapshots removeObjectForKey:downloadTask];
     [self.downloadStateLock unlock];
 
-    if (!destinationPath) {
+    if (!destinationPath || !stagingDirectory || !savesFolder) {
         NSError *metadataError = [NSError errorWithDomain:@"WorldServiceError"
                                                       code:6
                                                   userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_1098", nil)}];
-        if (taskItem) {
-            [[DownloadTaskManager sharedManager] updateTaskWithId:taskItem.taskId stageAtIndex:0 status:PLTaskStageStatusFailed];
-            [[DownloadTaskManager sharedManager] setTaskWithId:taskItem.taskId completedWithError:metadataError];
-        }
-        if (handler) dispatch_async(dispatch_get_main_queue(), ^{ handler(NO, metadataError); });
+        [self cleanupWorldStagingDirectory:stagingDirectory];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (![self isWorldTaskItemCurrent:taskItem generation:generation]) return;
+            DownloadTaskManager *manager = [DownloadTaskManager sharedManager];
+            [manager updateTaskWithId:taskItem.taskId stageAtIndex:0 status:PLTaskStageStatusFailed];
+            [manager setTaskWithId:taskItem.taskId completedWithError:metadataError];
+            if (handler) handler(NO, metadataError);
+        });
         return;
     }
 
     NSFileManager *fm = [NSFileManager defaultManager];
     NSError *moveError = nil;
-    NSString *dir = [destinationPath stringByDeletingLastPathComponent];
-    if (![fm fileExistsAtPath:dir]) {
-        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-    }
-    if ([fm fileExistsAtPath:destinationPath]) {
-        [fm removeItemAtPath:destinationPath error:nil];
-    }
     if (![fm moveItemAtURL:location toURL:[NSURL fileURLWithPath:destinationPath] error:&moveError]) {
         NSError *finalMoveError = moveError ?: [NSError errorWithDomain:@"WorldServiceError"
                                                                     code:4
                                                                 userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_1096", nil)}];
-        if (taskItem) {
-            [[DownloadTaskManager sharedManager] updateTaskWithId:taskItem.taskId stageAtIndex:0 status:PLTaskStageStatusFailed];
-            [[DownloadTaskManager sharedManager] setTaskWithId:taskItem.taskId completedWithError:finalMoveError];
-        }
-        if (handler) dispatch_async(dispatch_get_main_queue(), ^{ handler(NO, finalMoveError); });
+        [self cleanupWorldStagingDirectory:stagingDirectory];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (![self isWorldTaskItemCurrent:taskItem generation:generation]) return;
+            DownloadTaskManager *manager = [DownloadTaskManager sharedManager];
+            [manager updateTaskWithId:taskItem.taskId stageAtIndex:0 status:PLTaskStageStatusFailed];
+            [manager setTaskWithId:taskItem.taskId completedWithError:finalMoveError];
+            if (handler) handler(NO, finalMoveError);
+        });
         return;
     }
 
-    // 解析 taskDescription：worldName 与 savesFolder
-    NSString *worldName = nil;
-    NSString *savesFolder = nil;
-    if (taskDescription.length > 0) {
-        NSArray<NSString *> *parts = [taskDescription componentsSeparatedByString:@"\n"];
-        if (parts.count >= 1) worldName = parts[0];
-        if (parts.count >= 2) savesFolder = parts[1];
-    }
-    if (!savesFolder) {
-        // 无 saves 目录信息，回退：删除临时 zip 并报错
-        [fm removeItemAtPath:destinationPath error:nil];
-        NSError *metadataError = [NSError errorWithDomain:@"WorldServiceError"
-                                                      code:6
-                                                  userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_1098", nil)}];
-        if (taskItem) {
-            [[DownloadTaskManager sharedManager] updateTaskWithId:taskItem.taskId stageAtIndex:0 status:PLTaskStageStatusFailed];
-            [[DownloadTaskManager sharedManager] setTaskWithId:taskItem.taskId completedWithError:metadataError];
-        }
-        if (handler) dispatch_async(dispatch_get_main_queue(), ^{ handler(NO, metadataError); });
+    // 下载完成后只允许在 staging 中继续解压。暂停、取消或旧 generation 即使
+    // 解压仍在运行，也只能清理 staging，不能把任何目录提交到 saves。
+    if (![self isWorldTaskItemCurrent:taskItem generation:generation]) {
+        [self cleanupWorldStagingDirectory:stagingDirectory];
         return;
     }
+    taskItem.supportsResume = NO;
+    DownloadTaskManager *manager = [DownloadTaskManager sharedManager];
+    [manager updateTaskWithId:taskItem.taskId stageAtIndex:0 status:PLTaskStageStatusCompleted];
+    [manager updateTaskWithId:taskItem.taskId currentStageIndex:1];
+    [manager updateTaskWithId:taskItem.taskId stageAtIndex:1 status:PLTaskStageStatusRunning];
 
-    if (taskItem) {
-        DownloadTaskManager *manager = [DownloadTaskManager sharedManager];
-        [manager updateTaskWithId:taskItem.taskId stageAtIndex:0 status:PLTaskStageStatusCompleted];
-        [manager updateTaskWithId:taskItem.taskId currentStageIndex:1];
-        [manager updateTaskWithId:taskItem.taskId stageAtIndex:1 status:PLTaskStageStatusRunning];
-    }
-
-    // 在后台线程做解压
+    // 后台阶段只写唯一 staging；最终进入 saves 的 rename 在主线程 gate 内完成，
+    // 与 UI 的暂停/取消操作形成确定顺序。
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSError *extractError = nil;
-        BOOL success = [self extractWorldZipAt:destinationPath
-                                    toSavesDir:savesFolder
-                                    worldName:worldName ?: @"imported_world"
-                                        error:&extractError];
-
-        // 解压完成后删除临时 zip
-        [fm removeItemAtPath:destinationPath error:nil];
+        NSError *stageError = nil;
+        PLStagedWorld *stagedWorld = [self stageWorldZipAt:destinationPath
+                                          stagingDirectory:stagingDirectory
+                                                 worldName:worldName ?: @"imported_world"
+                                                     error:&stageError];
 
         dispatch_async(dispatch_get_main_queue(), ^{
-            DownloadTaskManager *manager = [DownloadTaskManager sharedManager];
-            DownloadTaskItem *latestTask = taskItem ? [manager taskWithId:taskItem.taskId] : nil;
-            // 下载完成后解压仍在后台运行。若用户在此期间暂停或取消，保持用户
-            // 选择，不再把阶段改写为成功/失败，也不弹出相反的结果提示。
-            if (taskItem &&
-                (latestTask.state != DownloadTaskStateDownloading ||
-                 ![latestTask.userInfo[PLWorldDownloadGenerationKey] isEqual:generation])) {
+            if (![self isWorldTaskItemCurrent:taskItem generation:generation]) {
+                [self cleanupWorldStagingDirectory:stagingDirectory];
                 return;
             }
-            if (success) {
-                if (taskItem) {
-                    [manager updateTaskWithId:taskItem.taskId stageAtIndex:1 status:PLTaskStageStatusCompleted];
-                    [manager setTaskWithId:taskItem.taskId completedWithError:nil];
-                }
-                if (handler) handler(YES, nil);
-            } else {
-                NSError *finalError = extractError ?: [NSError errorWithDomain:@"WorldServiceError"
-                                                                           code:5
-                                                                       userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_1097", nil)}];
-                if (taskItem) {
-                    [manager updateTaskWithId:taskItem.taskId stageAtIndex:1 status:PLTaskStageStatusFailed];
-                    [manager setTaskWithId:taskItem.taskId completedWithError:finalError];
-                }
+
+            DownloadTaskManager *currentManager = [DownloadTaskManager sharedManager];
+            if (!stagedWorld) {
+                NSError *finalError = stageError ?: [NSError errorWithDomain:@"WorldServiceError"
+                                                                         code:5
+                                                                     userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_1097", nil)}];
+                [self cleanupWorldStagingDirectory:stagingDirectory];
+                [currentManager updateTaskWithId:taskItem.taskId stageAtIndex:1 status:PLTaskStageStatusFailed];
+                [currentManager setTaskWithId:taskItem.taskId completedWithError:finalError];
                 if (handler) handler(NO, finalError);
+                return;
             }
+
+            NSError *commitError = nil;
+            NSString *installedWorldPath = [self commitStagedWorld:stagedWorld
+                                                        toSavesDir:savesFolder
+                                                             error:&commitError];
+            [self cleanupWorldStagingDirectory:stagingDirectory];
+            if (!installedWorldPath) {
+                NSError *finalError = commitError ?: [NSError errorWithDomain:@"WorldServiceError"
+                                                                          code:5
+                                                                      userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_1097", nil)}];
+                if (![self isWorldTaskItemCurrent:taskItem generation:generation]) return;
+                [currentManager updateTaskWithId:taskItem.taskId stageAtIndex:1 status:PLTaskStageStatusFailed];
+                [currentManager setTaskWithId:taskItem.taskId completedWithError:finalError];
+                if (handler) handler(NO, finalError);
+                return;
+            }
+
+            // 防御后台状态变更：若 commit 后任务已不再属于本 generation，回滚
+            // 本次唯一目标。它从未覆盖旧世界，因此可安全删除。
+            if (![self isWorldTaskItemCurrent:taskItem generation:generation]) {
+                [fm removeItemAtPath:installedWorldPath error:nil];
+                return;
+            }
+            [currentManager updateTaskWithId:taskItem.taskId stageAtIndex:1 status:PLTaskStageStatusCompleted];
+            [currentManager setTaskWithId:taskItem.taskId completedWithError:nil];
+            DownloadTaskItem *completedTask = [currentManager taskWithId:taskItem.taskId];
+            if (completedTask.state != DownloadTaskStateCompleted ||
+                ![completedTask.userInfo[PLWorldDownloadGenerationKey] isEqual:generation]) {
+                [fm removeItemAtPath:installedWorldPath error:nil];
+                return;
+            }
+            if (handler) handler(YES, nil);
         });
     });
 }
@@ -719,13 +937,18 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
         [self.downloadStateLock lock];
         WorldDownloadCompletionHandler handler = self.downloadCompletionHandlers[task];
         DownloadTaskItem *taskItem = self.downloadTaskItems[task];
+        NSString *stagingDirectory = self.downloadStagingDirectories[task];
         [self.downloadTaskItems removeObjectForKey:task];
         [self.downloadProgressSnapshots removeObjectForKey:task];
         [self.downloadCompletionHandlers removeObjectForKey:task];
         [self.downloadDestinationPaths removeObjectForKey:task];
+        [self.downloadStagingDirectories removeObjectForKey:task];
+        [self.downloadWorldNames removeObjectForKey:task];
+        [self.downloadSavesFolders removeObjectForKey:task];
         [self.downloadProgresses removeObjectForKey:task];
         [self.downloadProgressHandlers removeObjectForKey:task];
         [self.downloadStateLock unlock];
+        [self cleanupWorldStagingDirectory:stagingDirectory];
 
         dispatch_async(dispatch_get_main_queue(), ^{
             DownloadTaskManager *manager = [DownloadTaskManager sharedManager];

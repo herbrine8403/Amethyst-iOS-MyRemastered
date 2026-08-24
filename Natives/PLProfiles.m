@@ -48,6 +48,13 @@ static PLProfiles* current;
         [(NSString *)rawValue length] > 0) {
         return PLNormalizeRendererKey(rawValue);
     }
+    // graphicsApi 与 renderer 使用相同的边界策略：档案显式值先做白名单
+    // 规范化；只有字段缺失/空字符串时才继承全局设置。
+    if ([key isEqual:@"graphicsApi"] &&
+        [rawValue isKindOfClass:[NSString class]] &&
+        [(NSString *)rawValue length] > 0) {
+        return PLNormalizeGraphicsApiKey(rawValue);
+    }
     // 兼容 javaVersion 字段：Mojang 规范是 NSDictionary（{component, majorVersion}），
     // 但部分代码（如 ForgeDirectInstaller）也写入 NSDictionary。PLProfiles 期望返回 NSString。
     if ([rawValue isKindOfClass:[NSDictionary class]]) {
@@ -77,17 +84,24 @@ static PLProfiles* current;
         @"graphicsApi": @"video.graphics_api"
     };
     id prefValue = getPrefObject(prefDefaults[key]);
-    return [key isEqual:@"renderer"] ? PLNormalizeRendererKey(prefValue) : prefValue;
+    if ([key isEqual:@"renderer"]) {
+        return PLNormalizeRendererKey(prefValue);
+    }
+    if ([key isEqual:@"graphicsApi"]) {
+        return PLNormalizeGraphicsApiKey(prefValue);
+    }
+    return prefValue;
 }
 
 + (id)resolveKeyForCurrentProfile:(id)key {
     return [self profile:self.current.selectedProfile resolveKey:key];
 }
 
-+ (NSString *)effectiveProfileNameForPreferredName:(NSString *)preferredName {
++ (nullable NSString *)effectiveProfileNameForPreferredName:(nullable NSString *)preferredName {
     NSDictionary *profiles = self.current.profiles;
-    if (preferredName.length > 0 && [profiles[preferredName] isKindOfClass:[NSDictionary class]]) {
-        return preferredName;
+    if (preferredName.length > 0) {
+        // 显式指定的目标不能静默落到当前或任意首个档案，否则下载可能写错实例。
+        return [profiles[preferredName] isKindOfClass:[NSDictionary class]] ? preferredName : nil;
     }
 
     NSString *selectedName = self.current.selectedProfileName;
@@ -103,22 +117,29 @@ static PLProfiles* current;
     return nil;
 }
 
-+ (NSString *)resolvedGameDirectoryForProfileName:(NSString *)profileName {
++ (nullable NSString *)resolvedGameDirectoryForProfileName:(nullable NSString *)profileName {
     const char *gameDirC = getenv("POJAV_GAME_DIR");
-    NSString *baseDirectory = gameDirC ? [NSString stringWithUTF8String:gameDirC] : NSHomeDirectory();
+    NSString *baseDirectory = (gameDirC ? [NSString stringWithUTF8String:gameDirC] : NSHomeDirectory()).stringByStandardizingPath;
+    if (!baseDirectory.isAbsolutePath) return nil;
     NSString *effectiveName = [self effectiveProfileNameForPreferredName:profileName];
-    NSDictionary *profile = effectiveName.length > 0 ? self.current.profiles[effectiveName] : nil;
-    NSString *gameDir = [profile isKindOfClass:[NSDictionary class]] ? profile[@"gameDir"] : nil;
+    if (effectiveName.length == 0) return nil;
+    NSDictionary *profile = self.current.profiles[effectiveName];
+    NSString *gameDir = profile[@"gameDir"];
 
     if (![gameDir isKindOfClass:[NSString class]] || gameDir.length == 0 || [gameDir isEqualToString:@"."]) {
-        return baseDirectory.stringByStandardizingPath;
+        return baseDirectory;
     }
     if (gameDir.isAbsolutePath) {
         return gameDir.stringByStandardizingPath;
     }
 
     NSString *relativePath = [gameDir hasPrefix:@"./"] ? [gameDir substringFromIndex:2] : gameDir;
-    return [[baseDirectory stringByAppendingPathComponent:relativePath] stringByStandardizingPath];
+    NSString *resolvedPath = [[baseDirectory stringByAppendingPathComponent:relativePath] stringByStandardizingPath];
+    NSString *basePrefix = [baseDirectory stringByAppendingString:@"/"];
+    if (![resolvedPath isEqualToString:baseDirectory] && ![resolvedPath hasPrefix:basePrefix]) {
+        return nil;
+    }
+    return resolvedPath;
 }
 
 - (id)initWithCurrentInstance {

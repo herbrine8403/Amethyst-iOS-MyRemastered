@@ -134,6 +134,7 @@
 - (nullable NSString *)existingResourcePacksFolderForProfile:(NSString *)profileName {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *gameDir = [PLProfiles resolvedGameDirectoryForProfileName:profileName];
+    if (gameDir.length == 0) return nil;
     NSString *resourcePacksPath = [gameDir stringByAppendingPathComponent:@"resourcepacks"];
     BOOL isDir = NO;
     if ([fm fileExistsAtPath:resourcePacksPath isDirectory:&isDir] && isDir) return resourcePacksPath;
@@ -278,54 +279,16 @@
                     progress:(ResourcePackDownloadProgressHandler _Nullable)progress
                   completion:(ResourcePackDownloadCompletionHandler _Nullable)completion {
     // 确保 resourcepacks 目录存在
-    NSString *resourcePacksFolder = [self existingResourcePacksFolderForProfile:profileName];
-    NSFileManager *fm = [NSFileManager defaultManager];
-
+    NSError *folderError = nil;
+    NSString *resourcePacksFolder = [self ensureResourcePacksFolderForProfile:profileName error:&folderError];
     if (!resourcePacksFolder) {
-        // 目录不存在时尝试创建
-        NSString *profile = profileName.length ? profileName : @"default";
-        NSString *gameDir = nil;
-
-        @try {
-            NSDictionary *profiles = PLProfiles.current.profiles;
-            NSDictionary *prof = profiles[profile];
-            if ([prof isKindOfClass:[NSDictionary class]]) {
-                gameDir = prof[@"gameDir"];
-            }
-        } @catch (NSException *ex) { }
-
-        if (!gameDir) {
-            const char *gameDirC = getenv("POJAV_GAME_DIR");
-            if (gameDirC) {
-                gameDir = [NSString stringWithUTF8String:gameDirC];
-            }
+        if (completion) {
+            NSError *error = folderError ?: [NSError errorWithDomain:@"ResourcePackServiceError"
+                                                              code:1
+                                                          userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_106", nil)}];
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(NO, error); });
         }
-
-        if (gameDir) {
-            resourcePacksFolder = [gameDir stringByAppendingPathComponent:@"resourcepacks"];
-            NSError *dirError = nil;
-            BOOL created = [fm createDirectoryAtPath:resourcePacksFolder
-                         withIntermediateDirectories:YES
-                                          attributes:nil
-                                               error:&dirError];
-            if (!created || dirError) {
-                if (completion) {
-                    NSError *error = [NSError errorWithDomain:@"ResourcePackServiceError"
-                                                         code:1
-                                                     userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_951", nil)}];
-                    dispatch_async(dispatch_get_main_queue(), ^{ completion(NO, error); });
-                }
-                return;
-            }
-        } else {
-            if (completion) {
-                NSError *error = [NSError errorWithDomain:@"ResourcePackServiceError"
-                                                     code:1
-                                                 userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_106", nil)}];
-                dispatch_async(dispatch_get_main_queue(), ^{ completion(NO, error); });
-            }
-            return;
-        }
+        return;
     }
 
     // 校验下载链接

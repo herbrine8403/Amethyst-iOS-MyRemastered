@@ -21,17 +21,17 @@ typedef void(^ShaderDownloadHandler)(NSError * _Nullable error);
 + (instancetype)sharedService;
 
 // --- Local Shader Management ---
-- (void)scanShadersForProfile:(NSString *)profileName completion:(ShaderListHandler)completion;
+- (void)scanShadersForProfile:(NSString * _Nullable)profileName completion:(ShaderListHandler)completion;
 - (void)fetchMetadataForShader:(ShaderItem *)shader completion:(ShaderMetadataHandler)completion;
 - (BOOL)toggleEnableForShader:(ShaderItem *)shader error:(NSError **)error;
 - (BOOL)deleteShader:(ShaderItem *)shader error:(NSError **)error;
 
 // --- Online Shader Downloading ---
-- (void)downloadShader:(ShaderItem *)shader toProfile:(NSString *)profileName completion:(ShaderDownloadHandler)completion;
+- (void)downloadShader:(ShaderItem *)shader toProfile:(NSString * _Nullable)profileName completion:(ShaderDownloadHandler)completion;
 
 /// 下载光影包并上报进度
 - (void)downloadShader:(ShaderItem *)shader
-             toProfile:(NSString *)profileName
+             toProfile:(NSString * _Nullable)profileName
               progress:(void (^)(NSProgress *downloadProgress))progress
             completion:(ShaderDownloadHandler)completion;
 
@@ -40,7 +40,7 @@ typedef void(^ShaderDownloadHandler)(NSError * _Nullable error);
 /// 传入即启用校验，校验失败由统一下载器按镜像/退避节奏重试；
 /// 为 nil 时不做 SHA1 校验，靠 zip EOCD 兜底校验保证完整性。
 - (void)downloadShader:(ShaderItem *)shader
-             toProfile:(NSString *)profileName
+             toProfile:(NSString * _Nullable)profileName
           expectedSHA1:(nullable NSString *)expectedSHA1
               progress:(nullable void (^)(NSProgress *downloadProgress))progress
             completion:(ShaderDownloadHandler)completion;
@@ -49,7 +49,7 @@ typedef void(^ShaderDownloadHandler)(NSError * _Nullable error);
 - (NSString *)iconCachePathForURL:(NSString *)urlString;
 
 /// 获取当前 profile 的 shaderpacks 目录，不存在时自动创建
-- (nullable NSString *)ensureShadersFolderForProfile:(NSString *)profileName error:(NSError **)error;
+- (nullable NSString *)ensureShadersFolderForProfile:(NSString * _Nullable)profileName error:(NSError **)error;
 
 @end
 
