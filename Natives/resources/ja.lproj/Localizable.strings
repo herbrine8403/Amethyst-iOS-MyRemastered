@@ -3,40 +3,40 @@
   StringLocalization
 */
 
-"game.menu.force_close" = "Force close";
-"game.menu.confirm.force_close" = "Are you sure you want to force close?";
+"game.menu.force_close" = "強制停止";
+"game.menu.confirm.force_close" = "強制的にゲームを停止しますか？";
 "game.menu.log_output" = "Log output";
-"game.menu.custom_controls" = "Custom controls";
-"game.menu.multiplayer" = "Multiplayer";
+"game.menu.custom_controls" = "カスタムコントロール";
+"game.menu.multiplayer" = "マルチプレイヤー";
 "game.menu.toggle_stats" = "Toggle FPS/Memory";
 "game.menu.toggle_controls" = "Toggle Controls";
 "game.menu.toggle_virtual_mouse" = "Toggle Virtual Mouse";
 "game.menu.toggle_keyboard" = "Toggle Keyboard";
-"game.menu.resolution" = "Resolution";
-"game.menu.resolution.message" = "Select game resolution scale";
+"game.menu.resolution" = "解像度";
+"game.menu.resolution.message" = "ゲームの解像度を選択";
 
-"game.note.airplay" = "Minecraft is being displayed in AirPlay mirrored display";
+"game.note.airplay" = "マインクラフトはAirPlayのミラーリング画面で表示されています";
 
-"game.title.exit_code" = "Game exited with code %d";
+"game.title.exit_code" = "ゲームはコード%dで終了しました";
 
 // The play button
-"Play" = "Play";
-"Details" = "Details";
+"Play" = "プレイ";
+"Details" = "詳細";
 
 // Version categories
-"Installed" = "Installed";
-"Snapshot" = "Snapshot";
-"Releases" = "Releases";
+"Installed" = "インストール済み";
+"Snapshot" = "スナップショット";
+"Releases" = "リリース";
 "Unstable" = "Unstable";
-"Old-beta" = "Old-beta";
-"Old-alpha" = "Old-alpha";
+"Old-beta" = "ベータ版";
+"Old-alpha" = "アルファ版";
 
 // Custom controls
-"Copy" = "Copy";
-"Edit" = "Edit";
-"Move" = "Move";
-"Remove" = "Remove";
-"Resize" = "Resize";
+"Copy" = "コピー";
+"Edit" = "編集";
+"Move" = "移動";
+"Remove" = "削除";
+"Resize" = "サイズ変更";
 // Visibility
 "Always" = "Always";
 "In game" = "In game";
@@ -61,9 +61,9 @@
 "custom_controls.button_edit.section.behavior" = "Behavior";
 "custom_controls.button_edit.section.appearance" = "Appearance";
 
-"custom_controls.button_menu.add_subbutton" = "Add sub-button";
-"custom_controls.control_menu.discard_changes" = "Discard changes";
-"custom_controls.control_menu.exit" = "Exit";
+"custom_controls.button_menu.add_subbutton" = "サブボタンを追加";
+"custom_controls.control_menu.discard_changes" = "変更を破棄";
+"custom_controls.control_menu.exit" = "退出";
 "custom_controls.control_menu.exit.warn" = "You are about to exit without saving changes.";
 "custom_controls.control_menu.save" = "Save";
 "custom_controls.control_menu.save.error.json" = "JSON error";
