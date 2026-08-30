@@ -15,7 +15,7 @@
 "game.menu.resolution" = "解像度";
 "game.menu.resolution.message" = "ゲームの解像度を選択";
 
-"game.note.airplay" = "マインクラフトはAirPlayのミラーリング画面で表示されています";
+"game.note.airplay" = "MinecraftはAirPlayのミラーリング画面で表示されています";
 
 "game.title.exit_code" = "ゲームはコード%dで終了しました";
 
@@ -87,41 +87,41 @@
 
 "launcher.menu.custom_controls" = "Custom controls";
 "launcher.menu.execute_jar" = "Execute .jar";
-"launcher.menu.import_modpack" = "Import modpack";
+"launcher.menu.import_modpack" = "Modをインポート";
 
-"launcher.wait_jit.title" = "Waiting for JIT";
+"launcher.wait_jit.title" = "JITを待っています";
 "launcher.wait_jit.message" = "Amethyst relies on Just-in-time compilation for Java to work at maximum performance.";
 "launcher.wait_jit_trollstore.message" = "If you still see this message, please enable URL Scheme in TrollStore.";
 
 "login.error.username.outOfRange" = "Username must be at least 3 characters and a maximum of 16 characters";
 "login.error.fields.empty" = "Please fill in all fields";
-"login.error.invalid_credentials" = "Invalid username or password";
-"login.error.token_missing" = "Access token or client token is missing";
-"login.error.token_expired" = "Authentication token has expired, please log in again";
-"login.error.invalid_response" = "Invalid server response";
+"login.error.invalid_credentials" = "ユーザーネームまたはパスワードが無効です";
+"login.error.token_missing" = "アクセストークンまたはクライアントトークンが見つかりません";
+"login.error.token_expired" = "認証トークン";
+"login.error.invalid_response" = "無効なサーバーの応答";
 
-"login.alert.field.username" = "Username";
-"login.alert.field.password" = "Password";
-"login.alert.field.server" = "Server Address";
-"login.error.invalid_server" = "Invalid server address";
+"login.alert.field.username" = "ユーザーネーム";
+"login.alert.field.password" = "パスワード";
+"login.alert.field.server" = "サーバーアドレス";
+"login.error.invalid_server" = "無効なサーバーアドレス";
 
-"login.jit.checking" = "Checking for JIT";
-"login.jit.enabled" = "JIT has been enabled";
-"login.jit.fail" = "JIT could not be enabled.";
-"login.jit.fail.title" = "JIT could not be enabled on your device.";
+"login.jit.checking" = "JITを確認中";
+"login.jit.enabled" = "JITは有効化されました";
+"login.jit.fail" = "JiTを有効化できませんでした。";
+"login.jit.fail.title" = "ご使用の端末ではJITを有効化できません。";
 "login.jit.fail.description" = "No integrations could be used to automatically enable JIT on your device, and it must now be enabled manually. Errors have been logged to latestlog.txt.";
-"login.jit.fail.description_unsupported" = "An unsupported installation method has been detected. Please reinstall using one of supported methods.";
+"login.jit.fail.description_unsupported" = "サポート外のインストール方法を検知しました。サポートされているインストール方法で再インストールしてください。";
 
 // Login buttons
-"login.menu.sendlogs" = "Send your logs";
-"login.option.add" = "Add account";
-"login.option.select" = "Select account";
-"login.option.demo" = "Demo account";
-"login.option.microsoft" = "Microsoft account";
-"login.option.local" = "Local account";
-"login.option.3rdparty" = "Third-party account";
+"login.menu.sendlogs" = "ログを送信";
+"login.option.add" = "アカウントを追加";
+"login.option.select" = "アカウントを選択";
+"login.option.demo" = "デモアカウント";
+"login.option.microsoft" = "Microsoftアカウント";
+"login.option.local" = "ローカルアカウント";
+"login.option.3rdparty" = "サードパーティアカウント";
 
-"login.warn.title.legacy_device" = "The next release of Amethyst will not be compatible with this device.";
+"login.warn.title.legacy_device" = "次のAmethystのバージョンではこのデバイスはサポート外になります。";
 "login.warn.message.legacy_device" = "To run the next major release, a device capable of running iOS 14 is required.";
 "login.warn.title.legacy_ios" = "The next release of Amethyst will require a system update.";
 "login.warn.message.legacy_ios" = "To run the next major release, this device needs to be running iOS 14 or later.";
@@ -136,26 +136,26 @@
 "login.warn.title.localmode" = "Offline mode is now Local mode.";
 "login.warn.message.localmode" = "You can continue to play installed versions, but you can no longer download Minecraft without a paid account. No support will be provided for issues with local accounts, or other means of acquiring Minecraft.";
 
-"login.msa.error.xsts.noxboxacc" = "An Xbox profile is not registered for this Microsoft account. Please make sure that you have made an Xbox profile.\nError code: 2148916233";
-"login.msa.error.xsts.noxbox" = "Xbox Live is currently unavailable in your country.\nError code: 2148916235";
-"login.msa.error.xsts.krverify" = "Your account needs to be verified by your parents before you can continue.\nError code: 2148916236 or 2148916237.";
-"login.msa.error.xsts.underage" = "Your account needs to be linked to a parent account before you can continue.\nError code: 2148916238";
+"login.msa.error.xsts.noxboxacc" = "このMicrosoftアカウントではXboxプロフィールが登録されていません。Xboxプロフィールが作成済みであることを確かめてください。\nエラーコード:2148916233";
+"login.msa.error.xsts.noxbox" = "Xbox Liveは現在あなたの国では利用できません。\nエラーコード:2148916235";
+"login.msa.error.xsts.krverify" = "続ける前に保護者の認証が必要です。\nエラーコード:2148916236 または 2148916237";
+"login.msa.error.xsts.underage" = "続ける前にアカウントを保護者のアカウントと紐づける必要があります。\nエラーコード:2148916238";
 
-"login.msa.progress.acquireAccessToken" = "(1/5) Acquiring the Access token";
-"login.msa.progress.acquireXBLToken" = "(2/5) Acquiring the Xbox Live token";
-"login.msa.progress.acquireXSTS" = "Acquiring XSTS";
-"login.msa.progress.acquireXboxProfile" = "(3/5) Acquiring the Xbox profile";
-"login.msa.progress.acquireMCToken" = "(4/5) Acquiring the Minecraft token";
-"login.msa.progress.checkMCProfile" = "(5/5) Checking the Minecraft profile";
+"login.msa.progress.acquireAccessToken" = "(1/5)アクセストークンを取得中";
+"login.msa.progress.acquireXBLToken" = "(2/5)Xbox Liveトークンを取得中";
+"login.msa.progress.acquireXSTS" = "XSTSを取得中";
+"login.msa.progress.acquireXboxProfile" = "(3/5)Xboxのプロファイルを取得中";
+"login.msa.progress.acquireMCToken" = "(4/5)Minecraftのトークンを取得中";
+"login.msa.progress.checkMCProfile" = "(5/5)Minecraftのプロファイルをチェック中";
 
-"login.3rdparty.progress.auth" = "Authenticating with third-party server";
+"login.3rdparty.progress.auth" = "サードパーティサーバーを使って認証中";
 "login.3rdparty.progress.refresh" = "Refreshing third-party authentication";
-"login.3rdparty.2fa.title" = "Two-Factor Authentication";
-"login.3rdparty.2fa.message" = "Please enter your two-factor authentication code";
-"login.3rdparty.2fa.code" = "Authentication code";
+"login.3rdparty.2fa.title" = "2FA認証";
+"login.3rdparty.2fa.message" = "2FA認証コードを入力してください";
+"login.3rdparty.2fa.code" = "認証コード";
 "login.3rdparty.2fa.empty" = "Authentication code cannot be empty";
 
-"News" = "News";
+"News" = "ニュース";
 "preference.title.news_url" = "News URL";
 "preference.detail.news_url" = "Set the URL for the news page";
 "preference.title.reset_news_url" = "Reset news URL to default";
@@ -207,7 +207,7 @@
 "preference.title.mod_mirror-mcim" = "MCIM Mirror";
 "preference.title.debug_logging" = "Debug logging";
 "preference.detail.debug_logging" = "Logs internal settings and actions to latestlog.txt. This helps the developers find issues easier, but Minecraft may run slower as the logs will be written to more often.";
-"preference.title.appicon" = "Set app icon";
+"preference.title.appicon" = "アプリアイコンを設定";
 "preference.detail.appicon" = "Allows you to choose between different Home Screen icons for Amethyst.";
 "preference.title.appicon-default" = "Familiar Amethyst light";
 "preference.title.appicon-dark" = "Familiar Amethyst dark";
@@ -218,7 +218,7 @@
 "preference.title.reset_warnings" = "Reset all warnings";
 "preference.title.done.reset_warnings" = "All warnings have been reset.";
 
-"preference.title.reset_settings" = "Reset all settings";
+"preference.title.reset_settings" = "全ての設定をリセット";
 "preference.title.confirm.reset_settings" = "This will remove all of your custom preferences, including resolution, button size, and Java arguments.";
 "preference.title.done.reset_settings" = "All of the default settings have been restored.";
 
@@ -1768,12 +1768,12 @@
 "i18n_str_1266" = "Start Installation";
 "i18n_str_1267" = "Reading install_profile.json";
 "i18n_str_1268" = "Preparing version directory";
-"i18n_str_1269" = "Registering version";
-"i18n_str_1270" = "Installation complete";
+"i18n_str_1269" = "バージョンを登録中";
+"i18n_str_1270" = "インストール完了";
 "i18n_str_1271" = "Downloading installer toolchain dependencies";
 "i18n_str_1272" = "Running installer processor";
-"i18n_str_1274" = "Start exporting modpack";
-"i18n_str_1275" = "Scanning Mod files";
+"i18n_str_1274" = "Modパックのエクスポートを開始";
+"i18n_str_1275" = "Modファイルをスキャン";
 "i18n_str_1276" = "Generating modrinth.index.json";
 "i18n_str_1277" = "Writing modrinth.index.json";
 "i18n_str_1278" = "Generating manifest.json";
@@ -1781,26 +1781,26 @@
 "i18n_str_1280" = "Generating mmc-pack.json";
 "i18n_str_1281" = "Writing mmc-pack.json";
 "i18n_str_1282" = "Writing instance.cfg";
-"i18n_str_1283" = "Mods";
-"i18n_str_1284" = "Shader Packs";
-"i18n_str_1285" = "Resource Packs";
-"i18n_str_1286" = "Data Packs";
-"i18n_str_1287" = "Modpacks";
-"i18n_str_1288" = "Snapshot";
-"i18n_str_1289" = "A version profile with this name already exists. Please use a different name.";
+"i18n_str_1283" = "Mod";
+"i18n_str_1284" = "シェダー";
+"i18n_str_1285" = "リソースパック";
+"i18n_str_1286" = "データパック";
+"i18n_str_1287" = "Modパック";
+"i18n_str_1288" = "スナップショット";
+"i18n_str_1289" = "この名前を使用したバージョンが既に存在します。別の名前を使用してください。";
 "i18n_str_1290" = "Preparing modpack directory";
 "i18n_str_1291" = "Extracting overrides";
-"i18n_str_1292" = "Installing mod loader";
+"i18n_str_1292" = "Modローダーをインストール中";
 "i18n_str_1293" = "Downloading game files (libraries + assets)";
 "i18n_str_1294" = "Writing configuration file";
 "i18n_str_1295" = "Import complete";
 "i18n_str_1296" = "Opacity";
 "i18n_str_1297" = "Blur Level";
 "i18n_str_1298" = "Export";
-"i18n_str_1299" = "%ld sec";
-"i18n_str_1301" = "%ld min";
-"i18n_str_1303" = "%ld h";
-"i18n_str_1307" = "Error Details";
+"i18n_str_1299" = "%ld 秒";
+"i18n_str_1301" = "%ld 分";
+"i18n_str_1303" = "%ld 時間";
+"i18n_str_1307" = "エラーの詳細";
 "i18n_str_1308" = "Total Progress";
 "i18n_str_1309" = "Minimize";
 "i18n_str_1314" = "Collapse Details";
