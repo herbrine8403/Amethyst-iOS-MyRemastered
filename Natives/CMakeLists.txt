@@ -356,6 +356,7 @@ add_executable(AngelAuraAmethyst
   ProfileSettingsViewController.m
   DownloadViewController.m
   LauncherPreferences.m
+  PLThemeManager.m
   LauncherPreferencesViewController.m
   LauncherPrefContCfgViewController.m
   LauncherPrefGameDirViewController.m

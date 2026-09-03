@@ -1,0 +1,35 @@
+{
+  "accent": "#7797CF",
+  "background": {
+    "light": "#F3F5F8",
+    "dark": "#15181D"
+  },
+  "sidebar": {
+    "light": "#E9EDF3",
+    "dark": "#1C2027"
+  },
+  "surface": {
+    "light": "#FFFFFFE8",
+    "dark": "#252A32E8"
+  },
+  "surfaceElevated": {
+    "light": "#FFFFFF",
+    "dark": "#2D333D"
+  },
+  "textPrimary": {
+    "light": "#1F2329",
+    "dark": "#F4F6F8"
+  },
+  "textSecondary": {
+    "light": "#68707C",
+    "dark": "#AAB2BE"
+  },
+  "border": {
+    "light": "#D9DEE7",
+    "dark": "#3A424E"
+  },
+  "selection": "#7797CF24",
+  "success": "#57A773",
+  "warning": "#D99B45",
+  "danger": "#D65B65"
+}

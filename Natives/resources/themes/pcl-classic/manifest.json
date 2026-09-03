@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "id": "pcl-classic",
+  "name": "PCL Classic",
+  "author": "Pear",
+  "colors": "colors.json",
+  "images": {}
+}

@@ -1,6 +1,7 @@
 #import "config.h"
 #import "utils.h"
 #import "LauncherPreferences.h"
+#import "PLThemeManager.h"
 #import "PLPreferences.h"
 #import "UIKit+hook.h"
 #import <CoreFoundation/CoreFoundation.h>
@@ -123,8 +124,9 @@ UIColor *accentColor(void) {
     NSString *hex = getPrefObject(@"general.accent_color");
     UIColor *custom = colorFromHex(hex);
     if (custom) return custom;
-    // 默认蓝 RGB(0.26, 0.63, 0.96) = #429CF5
-    return [UIColor colorWithRed:0.26 green:0.63 blue:0.96 alpha:1.0];
+    // 未手动覆盖时由主题包提供强调色，缺失再回退到旧默认蓝。
+    UIColor *legacyDefault = [UIColor colorWithRed:0.26 green:0.63 blue:0.96 alpha:1.0];
+    return [PLThemeManager.sharedManager colorForToken:@"accent" fallback:legacyDefault];
 }
 
 #pragma mark Safe area

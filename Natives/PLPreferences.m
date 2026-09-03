@@ -173,7 +173,9 @@ NSString *const PREF_MOD_MIRROR = @"general.mod_mirror";
             @"card_color": @"",
             // 主题强调色（hex 字符串，空串=回退到默认蓝 #429CF5，见 LauncherPreferences.m accentColor()）
             // 提供默认值避免每次访问触发 "Getter could not find preference general.accent_color" 日志
-            @"accent_color": @""
+            @"accent_color": @"",
+            // 可换肤主题包；主题资源位于 Bundle/themes 或 $POJAV_HOME/themes。
+            @"theme_pack": @"pcl-classic"
         };
         [defaults[@"general"] addEntriesFromDictionary:general];
 
