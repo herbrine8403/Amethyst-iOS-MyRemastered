@@ -152,5 +152,5 @@
 3.  此项目使用 Xcode 15.4/16，iPhoneOS 17.5 SDK 构建，且最低系统支持为 iOS 14.0。
 4.  Git 提交时请使用 `herbrine8403` 用户名和 `weishixvn@outlook.com` 邮箱。
 5.  项目支持多平台构建，包括 iOS、tvOS、iOS 模拟器和 visionOS，通过 `PLATFORM` 参数指定。
-6.  渲染器设置为 Auto 时将自动选择合适的渲染器，包括 MobileGlues。
+6.  渲染器设置为 Auto 时固定解析为 ANGLE；其他渲染后端需手动明确选择。
 7.  JVM 版本将根据游戏版本自动选择 (Java 8/17/21)。

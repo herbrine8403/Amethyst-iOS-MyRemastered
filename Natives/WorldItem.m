@@ -42,6 +42,7 @@
     if (self = [super init]) {
         // 来自 Modrinth/CurseForge 搜索结果
         _onlineID = data[@"id"] ? [data[@"id"] description] : nil;
+        _apiSource = [data[@"apiSource"] integerValue] == 2 ? 2 : 1;
         _displayName = data[@"title"] ?: @"";
         _worldDescription = data[@"description"] ?: @"";
         _iconURL = data[@"imageUrl"] ?: @"";

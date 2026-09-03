@@ -7,6 +7,7 @@
 #import "BackgroundManager.h"
 #import "ModLoaderIconHelper.h"
 #import "IconLoader.h"
+#include <math.h>
 
 #pragma mark - 常量与辅助
 
@@ -350,7 +351,10 @@ static NSString *PLFormatDuration(NSTimeInterval seconds) {
         self.flowView.hidden = YES;
         [self.flowView stopFlowing];
         [self.progressView setProgress:(float)clamped animated:NO];
-        NSString *percent = [NSString stringWithFormat:@"%.0f%%", clamped * 100.0];
+        NSInteger displayPercent = (stage.status == PLTaskStageStatusCompleted)
+            ? 100
+            : MIN(99, (NSInteger)floor(clamped * 100.0));
+        NSString *percent = [NSString stringWithFormat:@"%ld%%", (long)displayPercent];
         self.percentRateLabel.text = rateText ? [NSString stringWithFormat:@"%@ · %@", percent, rateText] : percent;
     } else {
         self.progressView.hidden = YES;
@@ -969,7 +973,9 @@ static __weak PLTaskProgressViewController *PLTaskProgressActiveInstance = nil;
         case DownloadTaskStatePending:
             return PLTaskProgressText(@"taskProgress.state.pending", localize(@"i18n_str_124", nil));
         case DownloadTaskStateDownloading:
-            return PLTaskProgressText(@"taskProgress.state.downloading", localize(@"i18n_str_138", nil));
+            return [task.userInfo[DownloadTaskUserInfoTransferCompleteKey] boolValue]
+                ? localize(@"i18n_str_78", nil)
+                : PLTaskProgressText(@"taskProgress.state.downloading", localize(@"i18n_str_138", nil));
         case DownloadTaskStatePaused:
             return PLTaskProgressText(@"taskProgress.state.paused", localize(@"i18n_str_125", nil));
         case DownloadTaskStateCompleted:
@@ -1123,7 +1129,11 @@ static __weak PLTaskProgressViewController *PLTaskProgressActiveInstance = nil;
         self.totalFlowView.hidden = YES;
         [self.totalFlowView stopFlowing];
         [self.totalProgressView setProgress:(float)MIN(1.0, MAX(0.0, overall)) animated:NO];
-        NSString *percent = [NSString stringWithFormat:@"%.0f%%", overall * 100.0];
+        double clampedOverall = MIN(1.0, MAX(0.0, overall));
+        NSInteger displayPercent = (task.state == DownloadTaskStateCompleted)
+            ? 100
+            : MIN(99, (NSInteger)floor(clampedOverall * 100.0));
+        NSString *percent = [NSString stringWithFormat:@"%ld%%", (long)displayPercent];
         self.totalValueLabel.text = rateText ? [NSString stringWithFormat:@"%@ · %@", percent, rateText] : percent;
     } else {
         // 不确定进度：流动动画，不显示百分比

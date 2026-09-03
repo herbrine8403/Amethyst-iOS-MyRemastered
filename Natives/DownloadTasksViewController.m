@@ -9,6 +9,7 @@
 #import "DownloadHistoryViewController.h"
 #import "PLTaskStages.h"
 #import "PLTaskProgressViewController.h"
+#include <math.h>
 
 static NSString * const kTaskCellReuseIdentifier = @"DownloadTaskCell";
 static NSString * const kEmptyStateReuseIdentifier = @"DownloadTaskEmptyCell";
@@ -310,8 +311,11 @@ static const CGFloat kSectionInset = 16.0;
             self.progressView.hidden = NO;
             break;
         case DownloadTaskStateDownloading:
+            if ([task.userInfo[DownloadTaskUserInfoTransferCompleteKey] boolValue]) {
+                self.speedLabel.text = localize(@"i18n_str_78", nil);
+            }
             // Phase 6 Task 6.1：多文件任务显示 "42/100 · 2.1MB/s"（文件计数 + 速率）
-            if (task.totalFileCount > 0) {
+            else if (task.totalFileCount > 0) {
                 NSString *speedText = [self compactSpeedText:task.speed];
                 if (speedText.length > 0) {
                     self.speedLabel.text = [NSString
@@ -556,7 +560,10 @@ static const CGFloat kSectionInset = 16.0;
 
 - (NSString *)formattedProgress:(double)progress {
     if (progress < 0.0) return @"--";
-    return [NSString stringWithFormat:@"%.1f%%", progress * 100.0];
+    // 非终态卡片不会走本方法显示 100%；向下截断可避免 99.95% 四舍五入为 100.0%。
+    double clamped = MIN(0.999, MAX(0.0, progress));
+    double truncated = floor(clamped * 1000.0) / 10.0;
+    return [NSString stringWithFormat:@"%.1f%%", truncated];
 }
 
 - (void)configureSourceTagWithSource:(NSString *)source {

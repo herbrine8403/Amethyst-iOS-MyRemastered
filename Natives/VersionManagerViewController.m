@@ -1136,12 +1136,7 @@ static NSInteger const kSectionVersions    = 1;
 /// 获取当前选中 profile 的渲染器（如未设置则回退到全局偏好）
 - (NSString *)currentRendererForSelectedProfile {
     if (!self.selectedProfile) return @"auto";
-    NSDictionary *profile = PLProfiles.current.profiles[self.selectedProfile];
-    NSString *r = profile[@"renderer"];
-    if (r.length == 0) {
-        r = getPrefObject(@"video.renderer");
-    }
-    return r.length > 0 ? r : @"auto";
+    return [PLProfiles profile:PLProfiles.current.profiles[self.selectedProfile] resolveKey:@"renderer"] ?: @"auto";
 }
 
 /// 获取当前选中 profile 的图形 API（MC 26.2+，如未设置则回退到全局偏好，再回退到 default）
@@ -1592,9 +1587,6 @@ static NSInteger const kSectionVersions    = 1;
     profiles[self.selectedProfile] = profile;
     [PLProfiles.current save];
 
-    // 同步到全局偏好（保证启动游戏时 LauncherRightPanelViewController 能读到）
-    setPrefString(@"video.renderer", key);
-
     [self.collectionView reloadData];
 
     NSLog(@"[VersionMgr] Renderer for profile '%@' set to '%@' (%@)", self.selectedProfile, key, displayName);
@@ -1627,9 +1619,6 @@ static NSInteger const kSectionVersions    = 1;
     profile[@"graphicsApi"] = key;
     profiles[self.selectedProfile] = profile;
     [PLProfiles.current save];
-
-    // 同步到全局偏好
-    setPrefString(@"video.graphics_api", key);
 
     [self.collectionView reloadData];
 

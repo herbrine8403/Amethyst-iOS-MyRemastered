@@ -167,7 +167,7 @@
 "preference.title.renderer.release.angle" = "ANGLE";
 "preference.title.renderer.release.zink" = "Zink";
 
-"preference.title.renderer.debug.auto" = "Automaticky: gl4es či ANGLE";
+"preference.title.renderer.debug.auto" = "Automaticky: ANGLE";
 "preference.title.renderer.debug.gl4es" = "gl4es 1.1.4 - exportuje OpenGL 2.1";
 "preference.title.renderer.debug.angle" = "ANGLE (1.17+) - exportuje OpenGL 3.2 (Jádrový Profil, omezen)";
 "preference.title.renderer.debug.zink" = "Zink (Mesa 25.0.7) - exportuje OpenGL 4.1";

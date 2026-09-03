@@ -1149,19 +1149,8 @@ static void *ProgressObserverContext = &ProgressObserverContext;
             NSDictionary *profile = PLProfiles.current.profiles[profileName];
             
             if (profile) {
-                // 应用渲染器设置
-                NSString *renderer = profile[@"renderer"] ?: @"auto";
-                if (![renderer isEqualToString:@"auto"]) {
-                    setPrefString(@"video.renderer", renderer);
-                }
-
-                // 应用图形 API 设置（MC 26.2+ 游戏内 OpenGL/Vulkan 切换）
-                // 由 JavaLauncher.m 读取并设置 AMETHYST_GRAPHICS_API 环境变量，
-                // PojavLauncher.java 写入 options.txt 的 graphicsApi 字段
-                NSString *graphicsApi = profile[@"graphicsApi"];
-                if (graphicsApi.length > 0) {
-                    setPrefString(@"video.graphics_api", graphicsApi);
-                }
+                // renderer / graphicsApi 由 JavaLauncher 直接从当前 profile 解析。
+                // 不再写回全局偏好，避免启动一个档案后污染其他继承全局设置的档案。
 
                 // 应用Java版本设置（兼容旧版直装器写入的 NSDictionary 格式）
                 id javaVerRaw = profile[@"javaVersion"];

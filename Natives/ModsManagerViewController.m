@@ -18,6 +18,7 @@
 #import "PLProfiles.h"
 #import "LauncherPreferences.h"
 #import "DownloadViewController.h"
+#import "DownloadTaskManager.h"
 #import "utils.h"
 #import <CommonCrypto/CommonDigest.h>
 
@@ -146,6 +147,8 @@ static NSString *ModsManagerSHA1ForFile(NSString *path) {
 - (void)viewDidLoad {
     [super viewDidLoad]; // 基类构建背景/搜索栏/表格/空态/加载态/批量工具栏
 
+    self.profileName = [PLProfiles effectiveProfileNameForPreferredName:self.profileName];
+
     self.localMods = [NSMutableArray array];
     self.filteredLocalMods = [NSMutableArray array];
     self.modDates = [NSMutableDictionary dictionary];
@@ -158,7 +161,14 @@ static NSString *ModsManagerSHA1ForFile(NSString *path) {
     [self setupNavigationButtons];
     [self setupChipsRow];
     [self setupTableViewExtras];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(handleDownloadTaskCompleted:)
+                                                 name:DownloadTaskManagerTaskCompletedNotification
+                                               object:nil];
+}
 
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
     [self loadMods];
 }
 
@@ -495,6 +505,7 @@ static NSString *ModsManagerSHA1ForFile(NSString *path) {
 /// 空状态"去下载"：跳转统一下载页（无参数化资源类型入口，进入默认页）
 - (void)openDownloadPage {
     DownloadViewController *vc = [[DownloadViewController alloc] init];
+    vc.initialTabIndex = 1;
     // 关键修复（目标实例不一致）：传入本管理页绑定的 profileName，
     // 保证下载写入的实例与当前打开的实例一致
     vc.targetProfileName = self.profileName;
@@ -505,6 +516,14 @@ static NSString *ModsManagerSHA1ForFile(NSString *path) {
         nav.modalPresentationStyle = UIModalPresentationFullScreen;
         [self presentViewController:nav animated:YES completion:nil];
     }
+}
+
+- (void)handleDownloadTaskCompleted:(NSNotification *)notification {
+    DownloadTaskItem *task = notification.userInfo[DownloadTaskManagerTaskKey];
+    if (task.state != DownloadTaskStateCompleted ||
+        ![task.resourceType isEqualToString:DownloadTaskResourceTypeMod] ||
+        ![task.userInfo[@"profileName"] isEqualToString:self.profileName]) return;
+    [self loadMods];
 }
 
 #pragma mark - UISearchBarDelegate

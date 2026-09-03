@@ -470,10 +470,18 @@ static NSString * localizeProfileTitle(NSString *title) {
 
 - (void)loadSettings {
     // 渲染器
-    self.selectedRenderer = self.profile[@"renderer"] ?: @"auto";
+    id profileRenderer = self.profile[@"renderer"];
+    self.selectedRenderer = ([profileRenderer isKindOfClass:[NSString class]] &&
+                             [(NSString *)profileRenderer length] > 0)
+        ? PLNormalizeRendererKey(profileRenderer)
+        : PLProfileInheritedValue;
 
     // 图形 API（MC 26.2+ 游戏内 OpenGL/Vulkan 切换）
-    self.selectedGraphicsApi = self.profile[@"graphicsApi"] ?: @"default";
+    id profileGraphicsApi = self.profile[@"graphicsApi"];
+    self.selectedGraphicsApi = ([profileGraphicsApi isKindOfClass:[NSString class]] &&
+                                [(NSString *)profileGraphicsApi length] > 0)
+        ? PLNormalizeGraphicsApiKey(profileGraphicsApi)
+        : PLProfileInheritedValue;
 
     // Java版本（兼容旧版直装器写入的 NSDictionary 格式）
     id javaVerRaw = self.profile[@"javaVersion"];
@@ -616,8 +624,16 @@ static NSString * localizeProfileTitle(NSString *title) {
     if (!existing) {
         existing = [NSMutableDictionary dictionary];
     }
-    existing[@"renderer"] = self.selectedRenderer;
-    existing[@"graphicsApi"] = self.selectedGraphicsApi;
+    if ([self.selectedRenderer isEqualToString:PLProfileInheritedValue]) {
+        [existing removeObjectForKey:@"renderer"];
+    } else {
+        existing[@"renderer"] = PLNormalizeRendererKey(self.selectedRenderer);
+    }
+    if ([self.selectedGraphicsApi isEqualToString:PLProfileInheritedValue]) {
+        [existing removeObjectForKey:@"graphicsApi"];
+    } else {
+        existing[@"graphicsApi"] = PLNormalizeGraphicsApiKey(self.selectedGraphicsApi);
+    }
     existing[@"javaVersion"] = self.selectedJavaVersion;
     existing[@"allocatedMemory"] = @(self.allocatedMemory);
     existing[@"serverIp"] = self.serverIp ?: @"";
@@ -1096,8 +1112,8 @@ static NSString * localizeProfileTitle(NSString *title) {
 #pragma mark - Helpers
 
 - (NSString *)rendererDisplayName:(NSString *)renderer {
-    NSArray *keys = getRendererKeys(NO);
-    NSArray *names = getRendererNames(NO);
+    NSArray *keys = getRendererKeys(YES);
+    NSArray *names = getRendererNames(YES);
     NSUInteger idx = [keys indexOfObject:renderer];
     if (idx != NSNotFound && idx < names.count) {
         return names[idx];
@@ -1988,8 +2004,8 @@ static NSString * localizeProfileTitle(NSString *title) {
                                                                    message:nil
                                                             preferredStyle:UIAlertControllerStyleActionSheet];
 
-    NSArray *renderers = getRendererKeys(NO);
-    NSArray *displayNames = getRendererNames(NO);
+    NSArray *renderers = getRendererKeys(YES);
+    NSArray *displayNames = getRendererNames(YES);
 
     for (NSInteger i = 0; i < renderers.count; i++) {
         NSString *renderer = renderers[i];
@@ -2039,8 +2055,12 @@ static NSString * localizeProfileTitle(NSString *title) {
 
 /// 图形 API 显示名
 - (NSString *)graphicsApiDisplayName:(NSString *)api {
-    if ([api isEqualToString:@"prefer_vulkan"]) return localize(@"i18n_str_941", nil);
-    if ([api isEqualToString:@"prefer_opengl"]) return localize(@"i18n_str_942", nil);
+    NSArray *keys = getGraphicsApiKeys(YES);
+    NSArray *names = getGraphicsApiNames(YES);
+    NSUInteger idx = [keys indexOfObject:api];
+    if (idx != NSNotFound && idx < names.count) {
+        return names[idx];
+    }
     return localize(@"i18n_str_943", nil);
 }
 
@@ -2050,8 +2070,8 @@ static NSString * localizeProfileTitle(NSString *title) {
                                                                    message:localize(@"i18n_str_945", nil)
                                                             preferredStyle:UIAlertControllerStyleActionSheet];
 
-    NSArray *keys = @[@"default", @"prefer_vulkan", @"prefer_opengl"];
-    NSArray *names = @[localize(@"i18n_str_943", nil), localize(@"i18n_str_941", nil), localize(@"i18n_str_942", nil)];
+    NSArray *keys = getGraphicsApiKeys(YES);
+    NSArray *names = getGraphicsApiNames(YES);
 
     for (NSInteger i = 0; i < keys.count; i++) {
         NSString *key = keys[i];

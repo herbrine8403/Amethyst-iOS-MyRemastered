@@ -137,7 +137,7 @@
 
 "preference.title.renderer" = "رندر کننده";
 
-"preference.title.renderer.debug.auto" = "خودکار: gl4es یا ANGLE";
+"preference.title.renderer.debug.auto" = "خودکار: ANGLE";
 "preference.title.renderer.debug.angle" = "ANGLE (1.17+) - OpenGL 3.2 را صادر می کند (نمایه هسته، محدود)";
 "preference.title.renderer.debug.zink" = "Zink (Mesa 25.0.7) - OpenGL 4.1 را صادر می کند";
 

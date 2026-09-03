@@ -19,6 +19,8 @@ NS_ASSUME_NONNULL_BEGIN
 
 // --- Properties for Online Shaders ---
 @property (nonatomic, copy, nullable) NSString *onlineID;
+/// 在线 API 来源：1=Modrinth，2=CurseForge。
+@property (nonatomic, assign) NSInteger apiSource;
 @property (nonatomic, copy, nullable) NSString *author;
 @property (nonatomic, strong, nullable) NSNumber *downloads;
 @property (nonatomic, strong, nullable) NSNumber *likes;

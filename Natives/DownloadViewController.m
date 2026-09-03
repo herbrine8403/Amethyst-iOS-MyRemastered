@@ -486,11 +486,11 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 
 @property (nonatomic, assign) NSInteger currentModOffset;
 @property (nonatomic, assign) NSInteger currentShaderOffset;
-// 关键修复（Mod 与 Shader 共用 loading/query 状态）：此前 Mod 与 Shader 分页共用一个
-// isLoadingMore、搜索共用一个 currentSearchQuery。Mod 分页未完成时切到 Shader 分页会被
-// return 拦截，或一个分类的旧响应把另一个分类的查询状态覆盖。参照 ZL2 按分类隔离状态。
-@property (nonatomic, assign) BOOL isLoadingMoreMods;
-@property (nonatomic, assign) BOOL isLoadingMoreShaders;
+// Mod 与 Shader 的分页、搜索和请求代次完全隔离，旧响应不会污染另一分类。
+@property (nonatomic, assign) BOOL isLoadingMods;
+@property (nonatomic, assign) BOOL isLoadingShaders;
+@property (nonatomic, assign) NSInteger modRequestGeneration;
+@property (nonatomic, assign) NSInteger shaderRequestGeneration;
 @property (nonatomic, assign) BOOL hasMoreMods;
 @property (nonatomic, assign) BOOL hasMoreShaders;
 @property (nonatomic, strong) NSString *modSearchQuery;
@@ -1911,6 +1911,8 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 #pragma mark - Mod Search & Loading
 
 - (void)refreshModList {
+    self.modRequestGeneration += 1;
+    self.isLoadingMods = NO;
     self.currentModOffset = 0;
     self.hasMoreMods = YES;
     [self.modList removeAllObjects];
@@ -1919,12 +1921,10 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 }
 
 - (void)loadModList {
-    if (self.isLoadingMoreMods) return;
-    self.isLoadingMoreMods = YES;
-
-    // 快照发起时的搜索词：响应返回后若搜索词已变化（用户又搜了新词或切走），
-    // 丢弃该旧响应，避免"旧响应覆盖新结果"（问题4 反馈点之一）
-    NSString *requestedQuery = self.modSearchQuery ?: @"";
+    if (self.isLoadingMods) return;
+    self.isLoadingMods = YES;
+    NSInteger generation = self.modRequestGeneration;
+    NSInteger requestOffset = self.currentModOffset;
     
     if (self.currentModOffset == 0) {
         [self.loadingIndicator startAnimating];
@@ -1932,7 +1932,7 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
     
     NSMutableDictionary *filters = [NSMutableDictionary dictionary];
     filters[@"limit"] = @30;
-    filters[@"offset"] = @(self.currentModOffset);
+    filters[@"offset"] = @(requestOffset);
     
     if (self.modSearchQuery.length > 0) {
         filters[@"query"] = self.modSearchQuery;
@@ -1954,29 +1954,28 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) return;
 
-            // 旧响应防护：发起后搜索词已变更的过期响应直接丢弃，不写列表/状态
-            if (![(strongSelf.modSearchQuery ?: @"") isEqualToString:requestedQuery]) {
-                strongSelf.isLoadingMoreMods = NO;
-                return;
+            if (generation != strongSelf.modRequestGeneration) return;
+            if (strongSelf.tabSegment.selectedSegmentIndex == 1) {
+                [strongSelf.loadingIndicator stopAnimating];
             }
-
-            [strongSelf.loadingIndicator stopAnimating];
             [strongSelf.modTableView.refreshControl endRefreshing];
-            strongSelf.isLoadingMoreMods = NO;
+            strongSelf.isLoadingMods = NO;
             
             if (results) {
-                if (strongSelf.currentModOffset == 0) {
+                if (requestOffset == 0) {
                     [strongSelf.modList removeAllObjects];
                 }
                 [strongSelf.modList addObjectsFromArray:results];
                 strongSelf.hasMoreMods = (results.count >= 30);
-                strongSelf.currentModOffset += results.count;
+                strongSelf.currentModOffset = requestOffset + results.count;
                 
                 [strongSelf.modTableView reloadData];
-                strongSelf.emptyLabel.hidden = (strongSelf.modList.count > 0);
-                if (strongSelf.modList.count == 0) {
-                    strongSelf.emptyLabel.text = localize(@"i18n_str_180", nil);
-                    strongSelf.emptyLabel.hidden = NO;
+                if (strongSelf.tabSegment.selectedSegmentIndex == 1) {
+                    strongSelf.emptyLabel.hidden = (strongSelf.modList.count > 0);
+                    if (strongSelf.modList.count == 0) {
+                        strongSelf.emptyLabel.text = localize(@"i18n_str_180", nil);
+                        strongSelf.emptyLabel.hidden = NO;
+                    }
                 }
             } else if (error) {
                 [strongSelf showError:error.localizedDescription];
@@ -1987,16 +1986,14 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 
 - (void)searchMods:(NSString *)query {
     self.modSearchQuery = query;
-    self.currentModOffset = 0;
-    self.hasMoreMods = YES;
-    [self.modList removeAllObjects];
-    [self.modTableView reloadData];
-    [self loadModList];
+    [self refreshModList];
 }
 
 #pragma mark - Shader Search & Loading
 
 - (void)refreshShaderList {
+    self.shaderRequestGeneration += 1;
+    self.isLoadingShaders = NO;
     self.currentShaderOffset = 0;
     self.hasMoreShaders = YES;
     [self.shaderList removeAllObjects];
@@ -2005,11 +2002,10 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 }
 
 - (void)loadShaderList {
-    if (self.isLoadingMoreShaders) return;
-    self.isLoadingMoreShaders = YES;
-
-    // 快照发起时的搜索词：响应返回后若搜索词已变化，丢弃该旧响应（问题4 修复，同 loadModList）
-    NSString *requestedQuery = self.shaderSearchQuery ?: @"";
+    if (self.isLoadingShaders) return;
+    self.isLoadingShaders = YES;
+    NSInteger generation = self.shaderRequestGeneration;
+    NSInteger requestOffset = self.currentShaderOffset;
     
     if (self.currentShaderOffset == 0) {
         [self.loadingIndicator startAnimating];
@@ -2017,7 +2013,7 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
     
     NSMutableDictionary *filters = [NSMutableDictionary dictionary];
     filters[@"limit"] = @30;
-    filters[@"offset"] = @(self.currentShaderOffset);
+    filters[@"offset"] = @(requestOffset);
     filters[@"projectType"] = @"shader";
 
     if (self.shaderSearchQuery.length > 0) {
@@ -2034,29 +2030,28 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) return;
 
-            // 旧响应防护：发起后搜索词已变更的过期响应直接丢弃，不写列表/状态
-            if (![(strongSelf.shaderSearchQuery ?: @"") isEqualToString:requestedQuery]) {
-                strongSelf.isLoadingMoreShaders = NO;
-                return;
+            if (generation != strongSelf.shaderRequestGeneration) return;
+            if (strongSelf.tabSegment.selectedSegmentIndex == 2) {
+                [strongSelf.loadingIndicator stopAnimating];
             }
-
-            [strongSelf.loadingIndicator stopAnimating];
             [strongSelf.shaderTableView.refreshControl endRefreshing];
-            strongSelf.isLoadingMoreShaders = NO;
+            strongSelf.isLoadingShaders = NO;
             
             if (results) {
-                if (strongSelf.currentShaderOffset == 0) {
+                if (requestOffset == 0) {
                     [strongSelf.shaderList removeAllObjects];
                 }
                 [strongSelf.shaderList addObjectsFromArray:results];
                 strongSelf.hasMoreShaders = (results.count >= 30);
-                strongSelf.currentShaderOffset += results.count;
+                strongSelf.currentShaderOffset = requestOffset + results.count;
                 
                 [strongSelf.shaderTableView reloadData];
-                strongSelf.emptyLabel.hidden = (strongSelf.shaderList.count > 0);
-                if (strongSelf.shaderList.count == 0) {
-                    strongSelf.emptyLabel.text = localize(@"i18n_str_181", nil);
-                    strongSelf.emptyLabel.hidden = NO;
+                if (strongSelf.tabSegment.selectedSegmentIndex == 2) {
+                    strongSelf.emptyLabel.hidden = (strongSelf.shaderList.count > 0);
+                    if (strongSelf.shaderList.count == 0) {
+                        strongSelf.emptyLabel.text = localize(@"i18n_str_181", nil);
+                        strongSelf.emptyLabel.hidden = NO;
+                    }
                 }
             } else if (error) {
                 [strongSelf showError:error.localizedDescription];
@@ -2067,11 +2062,7 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 
 - (void)searchShaders:(NSString *)query {
     self.shaderSearchQuery = query;
-    self.currentShaderOffset = 0;
-    self.hasMoreShaders = YES;
-    [self.shaderList removeAllObjects];
-    [self.shaderTableView reloadData];
-    [self loadShaderList];
+    [self refreshShaderList];
 }
 
 #pragma mark - Modpack Search & Loading
@@ -2524,8 +2515,17 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 
 /// 解析当前 profile 的 Minecraft 版本（用于模组下载版本预选）
 /// 复用 ModpackExportService.parseVersionId: 从 lastVersionId 反解
+- (NSString *)effectiveTargetProfileName {
+    return [PLProfiles effectiveProfileNameForPreferredName:self.targetProfileName];
+}
+
+- (NSDictionary *)effectiveTargetProfile {
+    NSString *profileName = [self effectiveTargetProfileName];
+    return profileName.length > 0 ? PLProfiles.current.profiles[profileName] : nil;
+}
+
 - (NSString *)currentProfileMinecraftVersion {
-    NSDictionary *profile = PLProfiles.current.selectedProfile;
+    NSDictionary *profile = [self effectiveTargetProfile];
     NSString *lastVersionId = profile[@"lastVersionId"];
     if (lastVersionId.length == 0) return nil;
     NSDictionary *parsed = [ModpackExportService parseVersionId:lastVersionId];
@@ -2536,7 +2536,7 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 /// 解析当前 profile 的模组加载器（fabric/forge/neoforge/quilt）
 /// 复用 ModpackExportService.parseVersionId: 从 lastVersionId 反解
 - (NSString *)currentProfileLoader {
-    NSDictionary *profile = PLProfiles.current.selectedProfile;
+    NSDictionary *profile = [self effectiveTargetProfile];
     NSString *lastVersionId = profile[@"lastVersionId"];
     if (lastVersionId.length == 0) return nil;
     NSDictionary *parsed = [ModpackExportService parseVersionId:lastVersionId];
@@ -2662,12 +2662,8 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
     UITableView *targetTable = nil;
     if (tabIndex == 1) {
         targetTable = self.modTableView;
-        self.currentModOffset = 0;
-        [self.modList removeAllObjects];
     } else if (tabIndex == 2) {
         targetTable = self.shaderTableView;
-        self.currentShaderOffset = 0;
-        [self.shaderList removeAllObjects];
     } else if (tabIndex == 3) {
         targetTable = self.resourcepackTableView;
         self.currentResourcepackOffset = 0;
@@ -2691,8 +2687,8 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
         targetTable.alpha = 0;
     } completion:^(BOOL finished) {
         switch (tabIndex) {
-            case 1: [self loadModList]; break;
-            case 2: [self loadShaderList]; break;
+            case 1: [self refreshModList]; break;
+            case 2: [self refreshShaderList]; break;
             case 3: [self loadResourcePackList]; break;
             case 4: [self loadDataPackList]; break;
             case 5: [self loadModpackList]; break;
@@ -4496,6 +4492,7 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 
     ModVersionViewController *versionVC = [[ModVersionViewController alloc] init];
     versionVC.modItem = modItem;
+    versionVC.initialSource = modItem.apiSource;
     versionVC.delegate = self;
     versionVC.title = modItem.displayName;
     // 修复（来源丢失）：沿用 modpack 搜索时的 API 来源，避免拿 CurseForge 数字 ID 请求 Modrinth
@@ -4915,11 +4912,11 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 }
 
 - (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
-    if (tableView == self.modTableView && indexPath.row == self.modList.count - 5 && self.hasMoreMods && !self.isLoadingMoreMods) {
+    if (tableView == self.modTableView && indexPath.row == self.modList.count - 5 && self.hasMoreMods && !self.isLoadingMods) {
         [self loadModList];
     }
 
-    if (tableView == self.shaderTableView && indexPath.row == self.shaderList.count - 5 && self.hasMoreShaders && !self.isLoadingMoreShaders) {
+    if (tableView == self.shaderTableView && indexPath.row == self.shaderList.count - 5 && self.hasMoreShaders && !self.isLoadingShaders) {
         [self loadShaderList];
     }
 
@@ -5041,6 +5038,7 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 
     ModVersionViewController *versionVC = [[ModVersionViewController alloc] init];
     versionVC.modItem = modItem;
+    versionVC.initialSource = modItem.apiSource;
     versionVC.delegate = self;
     versionVC.title = modItem.displayName;
     // 修复（来源丢失）：沿用 mod 搜索时的 API 来源，避免拿 CurseForge 数字 ID 请求 Modrinth
@@ -5066,6 +5064,7 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 
     ShaderVersionViewController *versionVC = [[ShaderVersionViewController alloc] init];
     versionVC.shaderItem = shaderItem;
+    versionVC.initialSource = shaderItem.apiSource;
     versionVC.delegate = self;
     versionVC.title = shaderItem.displayName;
     // 修复（来源丢失）：沿用 shader 搜索时的 API 来源，避免拿 CurseForge 数字 ID 请求 Modrinth
@@ -5094,6 +5093,7 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 
     AssetVersionViewController *versionVC = [[AssetVersionViewController alloc] init];
     versionVC.assetType = AssetVersionTypeResourcePack;
+    versionVC.apiSource = item.apiSource;
     versionVC.projectID = item.onlineID;
     // 修复（来源丢失）：沿用 resourcepack 搜索时的 API 来源，避免拿 CurseForge 数字 ID 请求 Modrinth
     versionVC.apiSource = [self apiSourceForType:@"resourcepack"];
@@ -5130,6 +5130,7 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 
     AssetVersionViewController *versionVC = [[AssetVersionViewController alloc] init];
     versionVC.assetType = AssetVersionTypeDataPack;
+    versionVC.apiSource = item.apiSource;
     versionVC.projectID = item.onlineID;
     // 修复（来源丢失）：沿用 datapack 搜索时的 API 来源，避免拿 CurseForge 数字 ID 请求 Modrinth
     versionVC.apiSource = [self apiSourceForType:@"datapack"];
@@ -5166,6 +5167,7 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 
     AssetVersionViewController *versionVC = [[AssetVersionViewController alloc] init];
     versionVC.assetType = AssetVersionTypeWorld;
+    versionVC.apiSource = item.apiSource;
     versionVC.projectID = item.onlineID;
     // 世界强制 CurseForge（currentAPIForTabType 也是强制 CurseForge），此处显式传入来源
     versionVC.apiSource = 2;
@@ -5277,7 +5279,7 @@ static NSString *PLSha1FromPrimaryFile(NSDictionary *primaryFile) {
 - (void)startDownloadForModItem:(ModItem *)item {
     // 关键修复（目标实例不一致）：统一使用打开下载页时锁定的 targetProfileName，
     // 而非实时读取 selectedProfileName，避免与资源管理页绑定的实例不一致导致写入另一游戏目录
-    NSString *profileName = self.targetProfileName ?: @"default";
+    NSString *profileName = [self effectiveTargetProfileName];
     __weak typeof(self) weakSelf = self;
     [[ModService sharedService] downloadMod:item
                                   toProfile:profileName
@@ -5302,7 +5304,7 @@ static NSString *PLSha1FromPrimaryFile(NSDictionary *primaryFile) {
 - (void)startDownloadForResourcePackItem:(ResourcePackItem *)item {
     // 关键修复（目标实例不一致）：统一使用打开下载页时锁定的 targetProfileName，
     // 而非实时读取 selectedProfileName，避免与资源管理页绑定的实例不一致导致写入另一游戏目录
-    NSString *profileName = self.targetProfileName ?: @"default";
+    NSString *profileName = [self effectiveTargetProfileName];
     __weak typeof(self) weakSelf = self;
     [[ResourcePackService sharedService] downloadResourcePack:item
                                                     toProfile:profileName
@@ -5327,7 +5329,7 @@ static NSString *PLSha1FromPrimaryFile(NSDictionary *primaryFile) {
 - (void)startDownloadForDataPackItem:(DataPackItem *)item {
     // 关键修复（目标实例不一致）：统一使用打开下载页时锁定的 targetProfileName，
     // 而非实时读取 selectedProfileName，避免与资源管理页绑定的实例不一致导致写入另一游戏目录
-    NSString *profileName = self.targetProfileName ?: @"default";
+    NSString *profileName = [self effectiveTargetProfileName];
     __weak typeof(self) weakSelf = self;
     [[DataPackService sharedService] downloadDataPack:item
                                             toProfile:profileName
@@ -5353,7 +5355,7 @@ static NSString *PLSha1FromPrimaryFile(NSDictionary *primaryFile) {
 - (void)startDownloadForWorldItem:(WorldItem *)item {
     // 关键修复（目标实例不一致）：统一使用打开下载页时锁定的 targetProfileName，
     // 而非实时读取 selectedProfileName，避免与资源管理页绑定的实例不一致导致写入另一游戏目录
-    NSString *profileName = self.targetProfileName ?: @"default";
+    NSString *profileName = [self effectiveTargetProfileName];
     __weak typeof(self) weakSelf = self;
     [[WorldService sharedService] downloadWorld:item
                                         toProfile:profileName
@@ -5397,7 +5399,7 @@ static NSString *PLSha1FromPrimaryFile(NSDictionary *primaryFile) {
 - (void)startDownloadForShaderItem:(ShaderItem *)item {
     // 关键修复（目标实例不一致）：统一使用打开下载页时锁定的 targetProfileName，
     // 而非实时读取 selectedProfileName，避免与资源管理页绑定的实例不一致导致写入另一游戏目录
-    NSString *profileName = self.targetProfileName ?: @"default";
+    NSString *profileName = [self effectiveTargetProfileName];
     __weak typeof(self) weakSelf = self;
     [[ShaderService sharedService] downloadShader:item
                                          toProfile:profileName
@@ -5587,8 +5589,7 @@ static NSString *PLSha1FromPrimaryFile(NSDictionary *primaryFile) {
     // 参考 ModService.m 的 existingModsFolderForProfile: 逻辑：
     // 1. 优先读取 profile 的 gameDir，拼接 /mods
     // 2. 若 profile 无 gameDir 或 gameDir 为 "."，回退到 $POJAV_GAME_DIR/mods
-    NSString *instanceName = PLProfiles.current.selectedProfileName;
-    if (!instanceName) instanceName = @"default";
+    NSString *instanceName = [self effectiveTargetProfileName];
 
     NSString *modsDir = nil;
 

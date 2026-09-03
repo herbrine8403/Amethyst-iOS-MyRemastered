@@ -34,6 +34,10 @@ extern NSString * const DownloadTaskResourceTypeModpack;
 extern NSString * const DownloadTaskResourceTypeWorld;
 extern NSString * const DownloadTaskResourceTypeJavaRuntime;
 
+/// 传输字节已完成，但任务仍在校验、落盘、解压或安装。
+/// 此阶段不应在 UI 中显示为“下载中 100%”。
+extern NSString * const DownloadTaskUserInfoTransferCompleteKey;
+
 @class DownloadTaskItem;
 
 /// 重试回调类型：业务方注册任务时设置，DownloadTaskManager.retryTaskWithId: 会调用它重建底层 rawTask。

@@ -12,6 +12,12 @@ NSString * const DownloadTaskManagerTaskKey                             = @"Down
 /// 全局并发下载上限（同时 Downloading 的任务数）
 NSInteger const PLDownloadMaxConcurrentTasks = 3;
 
+static BOOL PLDownloadTaskStateIsTerminal(DownloadTaskState state) {
+    return state == DownloadTaskStateCompleted ||
+           state == DownloadTaskStateCancelled ||
+           state == DownloadTaskStateFailed;
+}
+
 /// NSURLSession 断点续传失效错误码（即文档中的 NSURLErrorCannotResume，
 /// iOS SDK 头文件未导出该符号，此处按系统取值本地定义）
 static NSInteger const PLNSURLErrorCannotResume = -3004;
@@ -326,11 +332,12 @@ static const NSTimeInterval kUIProgressNotifyThrottleInterval = 0.2;
     if (!rawTask) return; // rawTask 为 nil 时仅做状态层排队
 
     if ([rawTask isKindOfClass:[PLDownloadOperation class]]) {
-        if (((PLDownloadOperation *)rawTask).state == PLDownloadOperationStateRunning) {
-            [[PLDownloadClient sharedClient] pauseOperation:rawTask];
-            NSNumber *held = self.holdCounts[item.taskId];
-            self.holdCounts[item.taskId] = @((held ? held.integerValue : 0) + 1);
-        }
+        // 不在此处预读 operation.state：pauseOperation 自身会在 PLDownloadClient
+        // 的串行 stateQueue 上做幂等检查。无条件入队可保证快速出队时形成
+        // begin -> pause -> resume 的确定顺序，避免 TOCTOU 后永久停在 Paused。
+        [[PLDownloadClient sharedClient] pauseOperation:rawTask];
+        NSNumber *held = self.holdCounts[item.taskId];
+        self.holdCounts[item.taskId] = @((held ? held.integerValue : 0) + 1);
         return;
     }
 
@@ -355,10 +362,8 @@ static const NSTimeInterval kUIProgressNotifyThrottleInterval = 0.2;
     if (!rawTask) return;
 
     if ([rawTask isKindOfClass:[PLDownloadOperation class]]) {
-        PLDownloadOperation *operation = (PLDownloadOperation *)rawTask;
-        if (operation.state == PLDownloadOperationStatePaused) {
-            [[PLDownloadClient sharedClient] resumeOperation:operation];
-        }
+        // 与 pause 同一串行队列排队；不要用异步更新前的 state 做判断。
+        [[PLDownloadClient sharedClient] resumeOperation:rawTask];
         return;
     }
 
@@ -431,6 +436,10 @@ static const NSTimeInterval kUIProgressNotifyThrottleInterval = 0.2;
     if (!item) return;
 
     [self.lock lock];
+    if (PLDownloadTaskStateIsTerminal(item.state)) {
+        [self.lock unlock];
+        return;
+    }
     if (item.state == DownloadTaskStateDownloading) {
         [self.lock unlock];
         return; // 已占用槽位，幂等返回
@@ -559,6 +568,17 @@ static const NSTimeInterval kUIProgressNotifyThrottleInterval = 0.2;
 
     id rawTask = item.rawTask;
 
+    // NSURLSessionTask 在取消式暂停的 delegate 收尾后可能已释放；rawTask 是 weak，
+    // 此时会变成 nil。业务方提供了 retryHandler 时直接重建，避免“继续”把状态
+    // 改回 Downloading 却没有任何底层任务在运行。
+    if (!rawTask && state == DownloadTaskStatePaused && item.retryHandler) {
+        [self removeFromWaitQueueLocked:taskId];
+        [self.lock unlock];
+        [self deleteResumeDataForItem:item];
+        [self retryTaskWithId:taskId];
+        return;
+    }
+
     // 底层任务已终止（此前 pause 经 cancelByProducingResumeData: 结束）：
     // resumeData 无业务方 session 归属无法直接复用 → 清除断点，回退 retryHandler 从头下载
     if ([rawTask isKindOfClass:[NSURLSessionTask class]] &&
@@ -657,6 +677,16 @@ static const NSTimeInterval kUIProgressNotifyThrottleInterval = 0.2;
     DownloadTaskItem *item = self.tasks[taskId];
     if (!item) { [self.lock unlock]; return; }
 
+    // 重试只允许从可恢复的静止状态进入。否则快速双击“重试”或自动重试与
+    // 人工重试重叠时，会同时重建多个 rawTask，较晚返回的旧任务还可能覆盖
+    // 新任务，导致后续暂停/取消控制错对象。
+    if (item.state != DownloadTaskStateFailed &&
+        item.state != DownloadTaskStateCancelled &&
+        item.state != DownloadTaskStatePaused) {
+        [self.lock unlock];
+        return;
+    }
+
     // 无 retryHandler 无法重建
     if (!item.retryHandler) {
         [self.lock unlock];
@@ -687,6 +717,7 @@ static const NSTimeInterval kUIProgressNotifyThrottleInterval = 0.2;
     item.speed = 0.0;
     item.estimatedTimeRemaining = 0.0;
     item.errorInfo = nil;
+    [item.userInfo removeObjectForKey:DownloadTaskUserInfoTransferCompleteKey];
     item.retryCount += 1;
     item.needsRecreate = NO;
 
@@ -782,9 +813,7 @@ static const NSTimeInterval kUIProgressNotifyThrottleInterval = 0.2;
     if (item) {
         // 关键修复（下载中 100%）：终态任务不再接受进度写入（防旧启动/旧任务的
         // 滞后进度回调污染已完成状态）。
-        if (item.state == DownloadTaskStateCompleted ||
-            item.state == DownloadTaskStateFailed ||
-            item.state == DownloadTaskStateCancelled) {
+        if (PLDownloadTaskStateIsTerminal(item.state)) {
             [self.lock unlock];
             return;
         }
@@ -792,8 +821,16 @@ static const NSTimeInterval kUIProgressNotifyThrottleInterval = 0.2;
         // SHA1 校验、原子落盘或解压阶段，此时任务仍处于 Downloading，UI 不应显示
         // 100%（下载中心以 %.0f/%.1f 四舍五入，0.999 会被显示成 100%）。
         // 网络进度封顶 0.99，仅真正进入 Completed 终态时 progress 才置 1.0。
-        if (progress >= 1.0) progress = 0.99;
-        item.progress = progress;
+        BOOL transferComplete = (progress >= 1.0 &&
+                                 item.state != DownloadTaskStateCompleted &&
+                                 item.state != DownloadTaskStateCancelled &&
+                                 item.state != DownloadTaskStateFailed);
+        item.progress = transferComplete ? 0.99 : progress;
+        if (transferComplete) {
+            item.userInfo[DownloadTaskUserInfoTransferCompleteKey] = @YES;
+        } else {
+            [item.userInfo removeObjectForKey:DownloadTaskUserInfoTransferCompleteKey];
+        }
         if (totalBytes >= 0) item.totalSize = totalBytes;
         item.downloadedSize = downloadedBytes;
         if (item.state == DownloadTaskStatePending && ![self isQueuedLocked:taskId]) {
@@ -823,6 +860,10 @@ static const NSTimeInterval kUIProgressNotifyThrottleInterval = 0.2;
     [self.lock lock];
     DownloadTaskItem *item = self.tasks[taskId];
     if (item) {
+        if (PLDownloadTaskStateIsTerminal(item.state)) {
+            [self.lock unlock];
+            return;
+        }
         item.speed = speed;
         item.estimatedTimeRemaining = estimatedTimeRemaining;
     }
@@ -862,10 +903,7 @@ static const NSTimeInterval kUIProgressNotifyThrottleInterval = 0.2;
     // 不再接受任何状态覆盖。此前各资源 Service 的完成回调可能先于"写回 Downloading"执行，
     // 终态随后被旧的启动状态（setTaskWithId:Downloading）覆盖回 Downloading，造成永久卡住。
     // 重试不受影响：retryTaskWithId: 内部直接重置状态，不走本方法。
-    if ((oldState == DownloadTaskStateCompleted ||
-         oldState == DownloadTaskStateFailed ||
-         oldState == DownloadTaskStateCancelled) &&
-        state != oldState) {
+    if (PLDownloadTaskStateIsTerminal(oldState) && state != oldState) {
         [self.lock unlock];
         return;
     }
@@ -888,6 +926,9 @@ static const NSTimeInterval kUIProgressNotifyThrottleInterval = 0.2;
     }
 
     item.state = state;
+    if (state != DownloadTaskStateDownloading) {
+        [item.userInfo removeObjectForKey:DownloadTaskUserInfoTransferCompleteKey];
+    }
     [self removeFromWaitQueueLocked:taskId];
     self.holdCounts[taskId] = nil;
 
@@ -926,6 +967,10 @@ static const NSTimeInterval kUIProgressNotifyThrottleInterval = 0.2;
     [self.lock lock];
     DownloadTaskItem *item = self.tasks[taskId];
     if (!item) { [self.lock unlock]; return; }
+    if (PLDownloadTaskStateIsTerminal(item.state)) {
+        [self.lock unlock];
+        return;
+    }
 
     // 关键修复（永久卡住/状态回跳）：已在终态的任务不再被后续完成/失败回调覆盖。
     // 例：WorldService 解压期间旧任务回调到达，或完成回调先于写回 Downloading 的
@@ -962,6 +1007,7 @@ static const NSTimeInterval kUIProgressNotifyThrottleInterval = 0.2;
         item.speed = 0.0;
         item.estimatedTimeRemaining = 0.0;
     }
+    [item.userInfo removeObjectForKey:DownloadTaskUserInfoTransferCompleteKey];
 
     BOOL didReleaseSlot = NO;
     if (wasDownloading) {
@@ -1048,13 +1094,16 @@ static const NSTimeInterval kUIProgressNotifyThrottleInterval = 0.2;
     [self.lock lock];
     DownloadTaskItem *item = self.tasks[taskId];
     PLTaskStage *stage = [self stageForItem:item atIndex:index];
-    if (stage) stage.status = status;
+    BOOL ignoredTerminal = (stage && PLDownloadTaskStateIsTerminal(item.state) && status == PLTaskStageStatusRunning);
+    if (stage && !ignoredTerminal) {
+        stage.status = status;
+    }
     [self.lock unlock];
 
-    if (stage) {
+    if (stage && !ignoredTerminal) {
         [self postUpdateForTask:item];
         [self schedulePersistSnapshot];
-    } else if (item) {
+    } else if (item && !ignoredTerminal) {
         NSLog(@"[DownloadTaskManager] updateTaskWithId:stageAtIndex:status: invalid stage index %lu for task %@", (unsigned long)index, taskId);
     }
 }
@@ -1068,16 +1117,22 @@ static const NSTimeInterval kUIProgressNotifyThrottleInterval = 0.2;
     [self.lock lock];
     DownloadTaskItem *item = self.tasks[taskId];
     PLTaskStage *stage = [self stageForItem:item atIndex:index];
-    if (stage) {
-        stage.progress = progress;
+    BOOL ignoredTerminal = (stage && PLDownloadTaskStateIsTerminal(item.state));
+    if (stage && !ignoredTerminal) {
+        BOOL transferComplete = (progress >= 1.0 &&
+                                 stage.status == PLTaskStageStatusRunning &&
+                                 item.state != DownloadTaskStateCompleted &&
+                                 item.state != DownloadTaskStateCancelled &&
+                                 item.state != DownloadTaskStateFailed);
+        stage.progress = transferComplete ? 0.99 : progress;
         if (message) stage.message = [message copy]; // nil 表示保留原文案
     }
     [self.lock unlock];
 
-    if (stage) {
+    if (stage && !ignoredTerminal) {
         [self postProgressUpdateForTask:item];
         [self schedulePersistSnapshotForProgress];
-    } else if (item) {
+    } else if (item && !ignoredTerminal) {
         NSLog(@"[DownloadTaskManager] updateTaskWithId:stageAtIndex:progress:message: invalid stage index %lu for task %@", (unsigned long)index, taskId);
     }
 }

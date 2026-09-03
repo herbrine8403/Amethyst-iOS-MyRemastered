@@ -52,7 +52,7 @@
 
 "preference.title.renderer" = "Renderdaja";
 
-"preference.title.renderer.debug.auto" = "Autom.: gl4es või ANGLE";
+"preference.title.renderer.debug.auto" = "Autom.: ANGLE";
 "preference.title.renderer.debug.gl4es" = "gl4es 1.1.4 - väljastab OpenGL 2.1";
 "preference.title.renderer.debug.angle" = "ANGLE (1.17+) - väljastab OpenGL 3.2 (Core Profile, piiratud)";
 "preference.title.renderer.debug.zink" = "Zink (Mesa 25.0.7) - väljastab OpenGL 4.1";

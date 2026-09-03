@@ -13,6 +13,8 @@
 #import "DataPackItem.h"
 #import "ResourceCardTableViewCell.h"
 #import "DownloadViewController.h"
+#import "DownloadTaskManager.h"
+#import "PLProfiles.h"
 #import "utils.h"
 
 #pragma mark - 数据包卡片 Cell（继承 Air-Design 卡片基类，本文件内轻量子类）
@@ -91,6 +93,7 @@
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    self.profileName = [PLProfiles effectiveProfileNameForPreferredName:self.profileName];
     // 在线下载入口已移至下载界面：固定本地模式（currentMode 等属性保留仅为兼容 .h 既有声明）
     self.currentMode = DataPacksManagerModeLocal;
     self.localItems = [NSMutableArray array];
@@ -123,6 +126,14 @@
     // 顶部提示横幅（保留既有提示文案）
     [self setupTipHeaderView];
 
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(handleDownloadTaskCompleted:)
+                                                 name:DownloadTaskManagerTaskCompletedNotification
+                                               object:nil];
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
     [self refreshLocalList];
 }
 
@@ -346,6 +357,7 @@
 - (void)openDownloadPage {
     // 在线下载入口已收敛到统一下载界面（未区分资源类型 Tab，进入默认页）
     DownloadViewController *downloadVC = [[DownloadViewController alloc] init];
+    downloadVC.initialTabIndex = 4;
     // 关键修复（目标实例不一致）：传入本管理页绑定的 profileName
     downloadVC.targetProfileName = self.profileName;
     if (self.navigationController) {
@@ -356,6 +368,14 @@
         nav.modalPresentationStyle = UIModalPresentationFullScreen;
         [self presentViewController:nav animated:YES completion:nil];
     }
+}
+
+- (void)handleDownloadTaskCompleted:(NSNotification *)notification {
+    DownloadTaskItem *task = notification.userInfo[DownloadTaskManagerTaskKey];
+    if (task.state != DownloadTaskStateCompleted ||
+        ![task.resourceType isEqualToString:DownloadTaskResourceTypeDataPack] ||
+        ![task.userInfo[@"profileName"] isEqualToString:self.profileName]) return;
+    [self refreshLocalList];
 }
 
 #pragma mark - UITableView DataSource & Delegate
