@@ -329,11 +329,9 @@ static BOOL PLUIIsKnownKind(NSString *kind) {
     // 叶子内容贴合自身 bounds
     if (self.textLabel) self.textLabel.frame = self.bounds;
     if (self.contentImageView) self.contentImageView.frame = self.bounds;
-    if (self.button) {
-        CGFloat side = MIN(self.bounds.size.width, self.bounds.size.height);
-        self.button.frame = CGRectMake((self.bounds.size.width - side) / 2,
-                                       (self.bounds.size.height - side) / 2, side, side);
-    }
+    // 按钮铺满节点：宽文字按钮（如 PCL2 启动按钮）与图标按钮都能正确渲染，
+    // UIButton 自身负责图文内容居中。此前按 min(宽,高) 居中裁切文字按钮。
+    if (self.button) self.button.frame = self.bounds;
 
     NSArray<PLUINodeView *> *children = [self.subviews isKindOfClass:NSArray.class] ? (NSArray *)self.subviews : nil;
     if (children.count == 0) return;
@@ -404,6 +402,8 @@ static BOOL PLUIIsKnownKind(NSString *kind) {
         UIImage *image = self.contentImageView.image;
         if (image) {
             CGSize s = image.size;
+            // 固有尺寸查询（双向无约束）：直接返回原始尺寸，避免 aspect-fit 比例溢出
+            if (size.width >= CGFLOAT_MAX && size.height >= CGFLOAT_MAX) return s;
             CGFloat scale = MIN(size.width / s.width, size.height / s.height);
             if (scale > 0 && !isinf(scale)) return CGSizeMake(s.width * scale, s.height * scale);
             return s;
@@ -411,6 +411,38 @@ static BOOL PLUIIsKnownKind(NSString *kind) {
         return CGSizeZero;
     }
     if ([self.kind isEqualToString:@"divider"]) return CGSizeMake(1, 1); // 主轴 1pt
+    // 容器（row/column/nav/panel）：按子节点聚合测量，嵌套容器在父栈中拿到合理首选尺寸。
+    // 此前容器返回 CGSizeZero，嵌套 row/column 在列/行里高度/宽度塌为 0。
+    if (self.horizontalStack || self.verticalStack) {
+        BOOL horizontal = self.horizontalStack;
+        UIEdgeInsets pad = self.padding;
+        CGFloat main = 0, cross = 0;
+        NSUInteger count = 0;
+        for (UIView *sub in self.subviews) {
+            if (![sub isKindOfClass:PLUINodeView.class]) continue;
+            PLUINodeView *child = (PLUINodeView *)sub;
+            count++;
+            // 权重子节点无法预知分配量，退化为固有尺寸作为估计值
+            CGSize intrinsic = [child sizeThatFits:CGSizeMake(CGFLOAT_MAX, CGFLOAT_MAX)];
+            CGFloat childMain, childCross;
+            if (horizontal) {
+                childMain = !isnan(child.fixedWidth) ? child.fixedWidth
+                          : [child preferredMainSizeForCrossSize:CGFLOAT_MAX horizontal:YES];
+                childCross = !isnan(child.fixedHeight) ? child.fixedHeight : intrinsic.height;
+            } else {
+                childMain = !isnan(child.fixedHeight) ? child.fixedHeight
+                          : [child preferredMainSizeForCrossSize:CGFLOAT_MAX horizontal:NO];
+                childCross = !isnan(child.fixedWidth) ? child.fixedWidth : intrinsic.width;
+            }
+            if (isnan(childMain)) childMain = 0;
+            main += childMain;
+            cross = MAX(cross, childCross);
+        }
+        if (count > 1) main += self.spacing * (CGFloat)(count - 1);
+        main += horizontal ? (pad.left + pad.right) : (pad.top + pad.bottom);
+        cross += horizontal ? (pad.top + pad.bottom) : (pad.left + pad.right);
+        return horizontal ? CGSizeMake(main, cross) : CGSizeMake(cross, main);
+    }
     return CGSizeZero;
 }
 

@@ -264,3 +264,21 @@ class ShellContracts(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UINodeLayoutContracts(unittest.TestCase):
+    """节点布局引擎契约：文字按钮铺满节点、嵌套容器可测量（PCL2 包前置修复）。"""
+
+    def test_button_fills_node_bounds(self):
+        # 此前按钮按 min(宽,高) 居中成正方形，宽文字按钮（启动按钮）文字被裁切
+        self.assertIn("if (self.button) self.button.frame = self.bounds;", NODE_VIEW)
+        self.assertNotIn("CGFloat side = MIN(self.bounds.size.width, self.bounds.size.height);", NODE_VIEW)
+
+    def test_nested_container_autosize(self):
+        # 嵌套 row/column 在父栈中必须能测出聚合首选尺寸，否则高度塌为 0
+        self.assertIn("if (self.horizontalStack || self.verticalStack) {", NODE_VIEW)
+        self.assertIn("main += self.spacing * (CGFloat)(count - 1);", NODE_VIEW)
+
+    def test_image_intrinsic_query_guard(self):
+        # 固有尺寸查询（双向 CGFLOAT_MAX）时直接返回原始尺寸，避免 aspect-fit 比例溢出
+        self.assertIn("if (size.width >= CGFLOAT_MAX && size.height >= CGFLOAT_MAX) return s;", NODE_VIEW)
