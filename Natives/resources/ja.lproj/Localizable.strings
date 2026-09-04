@@ -205,6 +205,18 @@
 "preference.detail.mod_mirror" = "选择模组/光影/资源包/数据包/整合包/世界的 API 与文件下载镜像源。MCIM镜像源（mod.mcimirror.top）提供国内加速，兼容 Modrinth 和 CurseForge 接口。";
 "preference.title.mod_mirror-official" = "官方源";
 "preference.title.mod_mirror-mcim" = "MCIM镜像源";
+"preference.title.ui_shell" = "UIシェル";
+"preference.detail.ui_shell" = "クラシックは内蔵ネイティブシェル。テーマパックエンジンは選択したテーマパックでランチャーを描画します（Lua UIパックでレイアウト・サイドバー・色・ボタンをカスタマイズ可能）。";
+"preference.title.ui_shell-legacy" = "クラシック（ネイティブ）";
+"preference.title.ui_shell-engine" = "テーマパックエンジン（実験的）";
+"preference.title.theme_pack" = "テーマ / UIパック";
+"uipack.welcome.title" = "新しいエンジンへようこそ";
+"uipack.welcome.import" = "UIパックを読み込む";
+"uipack.welcome.get" = "UIパックを入手";
+"uipack.welcome.legacy" = "旧エンジンに切替";
+"uipack.welcome.feedback" = "フィードバック";
+"uipack.welcome.soon_title" = "近日公開";
+"uipack.welcome.soon_msg" = "UIパックの入手ページは近日公開予定です。それまでは「ファイル」からUIパックを読み込めます。";
 "preference.title.debug_logging" = "デバッグログ";
 "preference.detail.debug_logging" = "内部設定とアクションをlatestlog.txtに記録します。 これにより、開発者は問題を簡単に見つけることができますが、ログがより頻繁に書き込まれるため、Minecraft の動作が遅くなる可能性があります。";
 "preference.title.jitstreamer_server" = "JitStreamer サーバー IP";
@@ -1953,3 +1965,5 @@
 
 "preference.auto" = "自动";
 "preference.auto_select" = "自动选择";
+
+"uipack.import.failed" = "読み込みに失敗しました";

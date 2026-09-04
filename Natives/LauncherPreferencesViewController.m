@@ -25,6 +25,7 @@
 #import "AI/AISessionListViewController.h"
 #import "AI/AISystemPromptEditorViewController.h"
 #import "AI/AiSettings.h"
+#import "PLThemeManager.h"
 
 @interface LauncherPreferencesViewController()
 @property(nonatomic) NSArray<NSString*> *rendererKeys, *rendererList;
@@ -341,6 +342,16 @@
     
     // -----------------------------------------------------------
 
+    // 主题/材质包选择列表（内置 + 外部，纯颜色包与 UI 包都可选）
+    NSMutableArray<NSString *> *themePackIds = [NSMutableArray array];
+    NSMutableArray<NSString *> *themePackNames = [NSMutableArray array];
+    for (NSDictionary *theme in [PLThemeManager.sharedManager availableThemes]) {
+        [themePackIds addObject:theme[@"id"]];
+        // UI 包（schemaVersion 2）加后缀标识其会接管布局
+        NSString *suffix = ([theme[@"schemaVersion"] integerValue] >= 2) ? @" ·UI" : @"";
+        [themePackNames addObject:[NSString stringWithFormat:@"%@%@", theme[@"name"], suffix]];
+    }
+
     self.prefContents = @[
         @[
             // General settings
@@ -381,6 +392,41 @@
                   localize(@"i18n_str_377", nil),
                   localize(@"i18n_str_378", nil)
               ]
+            },
+            // UI 壳双轨开关：legacy（旧壳）/ engine（Lua 材质包引擎）
+            @{@"key": @"ui_shell",
+              @"title": localize(@"preference.title.ui_shell", nil),
+              @"hasDetail": @YES,
+              @"icon": @"square.stack.3d.up.fill",
+              @"type": self.typePickField,
+              @"enableCondition": whenNotInGame,
+              @"pickKeys": @[
+                  @"legacy",
+                  @"engine"
+              ],
+              @"pickList": @[
+                  localize(@"preference.title.ui_shell-legacy", nil),
+                  localize(@"preference.title.ui_shell-engine", nil)
+              ],
+              @"action": ^(NSString *value){
+                  // 实时换壳，由 SceneDelegate 重建根控制器
+                  [[NSNotificationCenter defaultCenter] postNotificationName:@"UIShellChanged" object:value];
+              }
+            },
+            // 主题/材质包：纯颜色包（1）只换颜色；UI 包（2）同时接管布局
+            @{@"key": @"theme_pack",
+              @"title": localize(@"preference.title.theme_pack", nil),
+              @"hasDetail": @YES,
+              @"icon": @"paintbrush.fill",
+              @"type": self.typePickField,
+              @"enableCondition": whenNotInGame,
+              @"pickKeys": themePackIds,
+              @"pickList": themePackNames,
+              @"action": ^(NSString *value){
+                  // applyThemeIdentifier 内部会 setPrefObject 并发 PLThemeDidChangeNotification，
+                  // engine 壳收到通知后用新包即时重渲染
+                  [[PLThemeManager sharedManager] applyThemeIdentifier:value error:nil];
+              }
             },
             @{@"key": @"ui_theme",
               @"title": localize(@"i18n_str_379", nil),

@@ -205,6 +205,18 @@
 "preference.detail.mod_mirror" = "Choose the mirror source for mod/shader/resourcepack/datapack/modpack/world API and file downloads. MCIM mirror (mod.mcimirror.top) provides acceleration in China, compatible with both Modrinth and CurseForge APIs.";
 "preference.title.mod_mirror-official" = "Official Source";
 "preference.title.mod_mirror-mcim" = "MCIM Mirror";
+"preference.title.ui_shell" = "界面引擎";
+"preference.detail.ui_shell" = "经典为内置原生壳。材质包引擎用所选主题包渲染启动器（Lua 材质包可自定义布局、边栏、颜色与按钮）。";
+"preference.title.ui_shell-legacy" = "经典（原生）";
+"preference.title.ui_shell-engine" = "材质包引擎（实验性）";
+"preference.title.theme_pack" = "主题 / 材质包";
+"uipack.welcome.title" = "欢迎来到新引擎";
+"uipack.welcome.import" = "导入 UI 包";
+"uipack.welcome.get" = "获取 UI 包";
+"uipack.welcome.legacy" = "切换旧引擎";
+"uipack.welcome.feedback" = "问题反馈";
+"uipack.welcome.soon_title" = "即将推出";
+"uipack.welcome.soon_msg" = "UI 包获取页面即将上线，敬请期待。现阶段可先从「文件」导入 UI 包。";
 "preference.title.debug_logging" = "Debug logging";
 "preference.detail.debug_logging" = "Logs internal settings and actions to latestlog.txt. This helps the developers find issues easier, but Minecraft may run slower as the logs will be written to more often.";
 "preference.title.appicon" = "Set app icon";
@@ -1932,3 +1944,5 @@
 
 "preference.auto" = "Auto";
 "preference.auto_select" = "Auto";
+
+"uipack.import.failed" = "导入失败";

@@ -205,6 +205,18 @@
 "preference.detail.mod_mirror" = "选择模组/光影/资源包/数据包/整合包/世界的 API 与文件下载镜像源。MCIM镜像源（mod.mcimirror.top）提供国内加速，兼容 Modrinth 和 CurseForge 接口。";
 "preference.title.mod_mirror-official" = "官方源";
 "preference.title.mod_mirror-mcim" = "MCIM镜像源";
+"preference.title.ui_shell" = "界面引擎";
+"preference.detail.ui_shell" = "经典为内置原生壳。材质包引擎用所选主题包渲染启动器（Lua 材质包可自定义布局、边栏、颜色与按钮）。";
+"preference.title.ui_shell-legacy" = "经典（原生）";
+"preference.title.ui_shell-engine" = "材质包引擎（实验性）";
+"preference.title.theme_pack" = "主题 / 材质包";
+"uipack.welcome.title" = "欢迎来到新引擎";
+"uipack.welcome.import" = "导入 UI 包";
+"uipack.welcome.get" = "获取 UI 包";
+"uipack.welcome.legacy" = "切换旧引擎";
+"uipack.welcome.feedback" = "问题反馈";
+"uipack.welcome.soon_title" = "即将推出";
+"uipack.welcome.soon_msg" = "UI 包获取页面即将上线，敬请期待。现阶段可先从「文件」导入 UI 包。";
 "preference.title.debug_logging" = "调试日志";
 "preference.detail.debug_logging" = "完整的记录启动器的各种活动事件到latestlog.txt文件内,有助于开发者更容易的发现错误。但Minecraft游戏内FPS可能会降低(频繁的记录日志内容会使得CPU负载变高)";
 "preference.title.jitstreamer_server" = "JitStreamer的服务器地址";
@@ -1953,3 +1965,5 @@
 
 "preference.auto" = "自动";
 "preference.auto_select" = "自动选择";
+
+"uipack.import.failed" = "导入失败";

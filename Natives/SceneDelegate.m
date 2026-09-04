@@ -5,6 +5,7 @@
 #import "LauncherCardLayoutViewController.h"
 #import "LauncherPreferences.h"
 #import "BackgroundManager.h"
+#import "PLUIShellViewController.h"
 // Terracotta 暂时移除（排查启动崩溃）
 // #import "TerracottaManager.h"
 // #import "TerracottaBridge.h"
@@ -41,15 +42,13 @@ extern UIWindow *mainWindow;
     }
     mainWindow = self.window;
 
-    // 根据设置选择布局：默认 VS 三栏布局，可切换为卡片式便当盒布局
-    NSString *layout = getPrefObject(@"general.ui_layout");
-    UIViewController *rootVC;
-    if ([layout isEqualToString:@"card"]) {
-        rootVC = [[LauncherCardLayoutViewController alloc] init];
-    } else {
-        rootVC = [[LauncherRootViewController alloc] init];
-    }
-    self.window.rootViewController = rootVC;
+    [self installRootViewController];
+
+    // 监听 UI 壳切换（设置页 general.ui_shell 变更时实时换壳，无需重启）
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(uiShellChanged:)
+                                                 name:@"UIShellChanged"
+                                               object:nil];
 
     // 外观模式（浅色/深色/跟随系统）：读 general.ui_theme 偏好。
     //   light  -> UIUserInterfaceStyleLight
@@ -90,6 +89,41 @@ extern UIWindow *mainWindow;
                                              selector:@selector(applyUITheme:)
                                                  name:@"UIThemeChanged"
                                                object:nil];
+}
+
+#pragma mark - Root VC 安装（ui_shell 双轨开关）
+
+/// 根据 general.ui_shell 偏好安装根控制器：
+/// - legacy（默认）：旧壳（general.ui_layout 继续决定 vs / card 布局）
+/// - engine：PLUIShellViewController（Lua 材质包引擎）
+/// 引擎壳构建抛异常时写回 legacy 并换回旧壳，保证坏包/引擎 bug 都不会打不开启动器。
+- (void)installRootViewController {
+    UIViewController *rootVC = nil;
+    if ([getPrefObject(@"general.ui_shell") isEqualToString:@"engine"]) {
+        @try {
+            rootVC = [[PLUIShellViewController alloc] init];
+        } @catch (NSException *exception) {
+            NSLog(@"[SceneDelegate] engine shell failed (%@: %@), falling back to legacy",
+                  exception.name, exception.reason);
+            setPrefObject(@"general.ui_shell", @"legacy");
+            rootVC = nil;
+        }
+    }
+    if (!rootVC) {
+        // 旧壳：默认 VS 三栏布局，可切换为卡片式便当盒布局
+        NSString *layout = getPrefObject(@"general.ui_layout");
+        if ([layout isEqualToString:@"card"]) {
+            rootVC = [[LauncherCardLayoutViewController alloc] init];
+        } else {
+            rootVC = [[LauncherRootViewController alloc] init];
+        }
+    }
+    self.window.rootViewController = rootVC;
+    [[BackgroundManager sharedManager] applyBackgroundToWindow:self.window];
+}
+
+- (void)uiShellChanged:(NSNotification *)notification {
+    [self installRootViewController];
 }
 
 - (void)showTranslationNoticeIfNeeded {
@@ -143,6 +177,7 @@ extern UIWindow *mainWindow;
 
 - (void)sceneDidDisconnect:(UIScene *)scene {
     [[NSNotificationCenter defaultCenter] removeObserver:self name:@"UIThemeChanged" object:nil];
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:@"UIShellChanged" object:nil];
 }
 
 - (void)sceneDidBecomeActive:(UIScene *)scene {

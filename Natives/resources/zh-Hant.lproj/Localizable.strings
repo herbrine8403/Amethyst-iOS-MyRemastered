@@ -205,6 +205,18 @@
 "preference.detail.mod_mirror" = "选择模组/光影/资源包/数据包/整合包/世界的 API 与文件下载镜像源。MCIM镜像源（mod.mcimirror.top）提供国内加速，兼容 Modrinth 和 CurseForge 接口。";
 "preference.title.mod_mirror-official" = "官方源";
 "preference.title.mod_mirror-mcim" = "MCIM镜像源";
+"preference.title.ui_shell" = "介面引擎";
+"preference.detail.ui_shell" = "經典為內建原生殼。材質包引擎用所選主題包渲染啟動器（Lua 材質包可自訂佈局、側欄、顏色與按鈕）。";
+"preference.title.ui_shell-legacy" = "經典（原生）";
+"preference.title.ui_shell-engine" = "材質包引擎（實驗性）";
+"preference.title.theme_pack" = "主題 / 材質包";
+"uipack.welcome.title" = "歡迎來到新引擎";
+"uipack.welcome.import" = "匯入 UI 包";
+"uipack.welcome.get" = "取得 UI 包";
+"uipack.welcome.legacy" = "切換舊引擎";
+"uipack.welcome.feedback" = "問題回報";
+"uipack.welcome.soon_title" = "即將推出";
+"uipack.welcome.soon_msg" = "UI 包取得頁面即將上線，敬請期待。現階段可先從「檔案」匯入 UI 包。";
 "preference.title.debug_logging" = "除錯日誌";
 "preference.detail.debug_logging" = "把內部設定和動作記錄到lateslog.txt。這能幫助開發者更容易地找到問題，但由於日誌寫入的次數會增多，我的世界的運行速度可能會減慢。";
 "preference.title.jitstreamer_server" = "JitStreamer伺服器地址";
@@ -1953,3 +1965,5 @@
 
 "preference.auto" = "自动";
 "preference.auto_select" = "自动选择";
+
+"uipack.import.failed" = "匯入失敗";

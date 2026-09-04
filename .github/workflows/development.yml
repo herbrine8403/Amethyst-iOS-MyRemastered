@@ -104,15 +104,15 @@ jobs:
         uses: actions/upload-artifact@v4
         if: success()
         with:
-          name: com.air-devs.air-${{ matrix.platform_name }}.ipa
-          path: artifacts/com.air-devs.air-*-${{ matrix.platform_name }}.ipa
+          name: com.dev-pear.twoyears-${{ matrix.platform_name }}.ipa
+          path: artifacts/com.dev-pear.twoyears-*-${{ matrix.platform_name }}.ipa
 
       - name: Upload regular tipa
         uses: actions/upload-artifact@v4
         if: success()
         with:
-          name: com.air-devs.air-${{ matrix.platform_name }}-trollstore.tipa
-          path: artifacts/com.air-devs.air-*-${{ matrix.platform_name }}-trollstore.tipa
+          name: com.dev-pear.twoyears-${{ matrix.platform_name }}-trollstore.tipa
+          path: artifacts/com.dev-pear.twoyears-*-${{ matrix.platform_name }}-trollstore.tipa
 
       - name: Upload PojavLauncher.dSYM
         if: matrix.platform_name == 'ios' && success()

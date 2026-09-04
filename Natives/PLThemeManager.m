@@ -6,6 +6,8 @@ NSString * const PLDefaultThemeIdentifier = @"pcl-classic";
 
 static NSString * const PLThemeErrorDomain = @"PLThemeErrorDomain";
 static NSInteger const PLThemeManifestVersion = 1;
+// schemaVersion 2 = UI 材质包（含 main.lua 布局脚本）；1 = 纯颜色主题包。两者颜色格式一致。
+static NSInteger const PLThemeMaxManifestVersion = 2;
 
 @interface PLThemeManager ()
 @property (nonatomic, copy, readwrite) NSString *activeIdentifier;
@@ -87,8 +89,9 @@ static NSInteger const PLThemeManifestVersion = 1;
 
 - (nullable NSDictionary *)manifestAtRoot:(NSString *)root expectedIdentifier:(NSString *)identifier {
     NSDictionary *manifest = [self JSONDictionaryAtPath:[root stringByAppendingPathComponent:@"manifest.json"]];
-    if (![manifest[@"schemaVersion"] isKindOfClass:NSNumber.class] ||
-        [manifest[@"schemaVersion"] integerValue] != PLThemeManifestVersion ||
+    NSInteger version = [manifest[@"schemaVersion"] isKindOfClass:NSNumber.class]
+        ? [manifest[@"schemaVersion"] integerValue] : 0;
+    if (version < PLThemeManifestVersion || version > PLThemeMaxManifestVersion ||
         ![manifest[@"id"] isKindOfClass:NSString.class] ||
         ![manifest[@"id"] isEqualToString:identifier]) {
         return nil;
@@ -142,10 +145,14 @@ static NSInteger const PLThemeManifestVersion = 1;
             NSString *themeRoot = [root stringByAppendingPathComponent:identifier];
             NSDictionary *manifest = [self manifestAtRoot:themeRoot expectedIdentifier:identifier];
             if (!manifest) continue;
+            NSInteger version = [manifest[@"schemaVersion"] isKindOfClass:NSNumber.class]
+                ? [manifest[@"schemaVersion"] integerValue] : 0;
             themes[identifier] = @{
                 @"id": identifier,
                 @"name": [manifest[@"name"] isKindOfClass:NSString.class] ? manifest[@"name"] : identifier,
-                @"author": [manifest[@"author"] isKindOfClass:NSString.class] ? manifest[@"author"] : @""
+                @"author": [manifest[@"author"] isKindOfClass:NSString.class] ? manifest[@"author"] : @"",
+                // schemaVersion 供 PLUIPackManager 区分 UI 包（2）与纯颜色包（1）。
+                @"schemaVersion": @(version)
             };
         }
     }

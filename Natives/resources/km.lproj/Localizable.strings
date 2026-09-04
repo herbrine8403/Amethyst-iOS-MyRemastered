@@ -205,6 +205,18 @@
 "preference.detail.mod_mirror" = "选择模组/光影/资源包/数据包/整合包/世界的 API 与文件下载镜像源。MCIM镜像源（mod.mcimirror.top）提供国内加速，兼容 Modrinth 和 CurseForge 接口。";
 "preference.title.mod_mirror-official" = "官方源";
 "preference.title.mod_mirror-mcim" = "MCIM镜像源";
+"preference.title.ui_shell" = "UI Shell";
+"preference.detail.ui_shell" = "Legacy uses the built-in native shell. Engine renders the launcher with the selected theme pack (Lua UI packs can restyle layout, sidebar, colors and buttons).";
+"preference.title.ui_shell-legacy" = "Native (Legacy)";
+"preference.title.ui_shell-engine" = "Theme Pack Engine (Experimental)";
+"preference.title.theme_pack" = "Theme / UI Pack";
+"uipack.welcome.title" = "Welcome to the New Engine";
+"uipack.welcome.import" = "Import UI Pack";
+"uipack.welcome.get" = "Get UI Packs";
+"uipack.welcome.legacy" = "Switch to Legacy";
+"uipack.welcome.feedback" = "Feedback";
+"uipack.welcome.soon_title" = "Coming Soon";
+"uipack.welcome.soon_msg" = "The UI pack gallery is on its way. Stay tuned — you can import a pack from Files for now.";
 "preference.title.debug_logging" = "调试日志";
 "preference.detail.debug_logging" = "完整的记录启动器的各种活动事件到latestlog.txt文件内,有助于开发者更容易的发现错误。但Minecraft游戏内FPS可能会降低(频繁的记录日志内容会使得CPU负载变高)";
 "preference.title.jitstreamer_server" = "JitStreamer的服务器地址";
@@ -1953,3 +1965,5 @@
 
 "preference.auto" = "自动";
 "preference.auto_select" = "自动选择";
+
+"uipack.import.failed" = "Import Failed";

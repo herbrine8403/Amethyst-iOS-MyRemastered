@@ -35,6 +35,8 @@ include_directories(
   "external/ballpa1n"
   "external/ballpa1n/wrapped"
   "external/mach"
+  # vendored Lua 5.4（UI 材质包脚本引擎，沙箱裁剪版）
+  "external/lua"
   # "external/ZeroTierFramework/ios-example-app/zt.framework/Headers"  # ZeroTier 暂时移除
 )
 
@@ -91,6 +93,44 @@ target_link_libraries(awt_xawt
   "-L'${CMAKE_CURRENT_LIST_DIR}/build'"
   awt_headless
 )
+
+# ============================================================================
+# Lua 5.4 静态库（UI 材质包脚本引擎）
+# linit.c 已裁剪：仅加载 base/coroutine/table/string/math/utf8，
+# 不含 os/io/debug/package，脚本层无法触达文件与网络。
+# 未被引用前链接器不会拉入任何符号，空闲零开销。
+# ============================================================================
+add_library(lua STATIC
+  external/lua/lapi.c
+  external/lua/lcode.c
+  external/lua/lctype.c
+  external/lua/ldebug.c
+  external/lua/ldo.c
+  external/lua/ldump.c
+  external/lua/lfunc.c
+  external/lua/lgc.c
+  external/lua/llex.c
+  external/lua/lmem.c
+  external/lua/lobject.c
+  external/lua/lopcodes.c
+  external/lua/lparser.c
+  external/lua/lstate.c
+  external/lua/lstring.c
+  external/lua/ltable.c
+  external/lua/ltm.c
+  external/lua/lundump.c
+  external/lua/lvm.c
+  external/lua/lzio.c
+  external/lua/lauxlib.c
+  external/lua/lbaselib.c
+  external/lua/lcorolib.c
+  external/lua/ltablib.c
+  external/lua/lstrlib.c
+  external/lua/lmathlib.c
+  external/lua/lutf8lib.c
+  external/lua/linit.c
+)
+target_include_directories(lua PUBLIC "${CMAKE_CURRENT_LIST_DIR}/external/lua")
 
 # TouchController iOS native library
 # Provides JNI / C API for touch control communication between Minecraft mod and launcher
@@ -357,6 +397,12 @@ add_executable(AngelAuraAmethyst
   DownloadViewController.m
   LauncherPreferences.m
   PLThemeManager.m
+  PLUIPackManager.m
+  PLLuaRuntime.m
+  PLUINodeView.m
+  PLUILayoutEngine.m
+  PLUIActionRouter.m
+  PLUIShellViewController.m
   LauncherPreferencesViewController.m
   LauncherPrefContCfgViewController.m
   LauncherPrefGameDirViewController.m
@@ -556,6 +602,7 @@ endif()
 target_link_libraries(AngelAuraAmethyst
   PUBLIC AFNetworking
   lzma
+  lua
   "-F'${CMAKE_CURRENT_LIST_DIR}/build'"
   "-F'${CMAKE_CURRENT_LIST_DIR}/resources/Frameworks'"
   # ZeroTier 暂时移除："${ZT_FRAMEWORK_SEARCH_PATH}" "${ZT_FRAMEWORK_LINK}" "${ZT_CXX_LIB}"
