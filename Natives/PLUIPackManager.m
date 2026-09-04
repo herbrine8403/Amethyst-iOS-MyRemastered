@@ -14,7 +14,10 @@ static NSInteger const PLUIPackImportErrorCodeExtractFailed = 11;
 static NSInteger const PLUIPackImportErrorCodeReplaceFailed = 12;
 
 @interface PLUIPackManager ()
-@property (nonatomic, nullable, copy, readwrite) PLUIPack *activePack;
+// PLUIPack 未实现 NSCopying，copy 修饰会在赋值时调 copyWithZone: 直接崩
+// （默认主题 pcl-classic 即 schemaVersion 2，启动必走此赋值路径）；strong 足够——
+// PLUIPack 是构造时拷贝好所有字段的不可变值对象。
+@property (nonatomic, nullable, strong, readwrite) PLUIPack *activePack;
 @end
 
 @implementation PLUIPack
@@ -42,9 +45,11 @@ static NSInteger const PLUIPackImportErrorCodeReplaceFailed = 12;
 + (PLUIPackManager *)sharedManager {
     static PLUIPackManager *manager;
     static dispatch_once_t onceToken;
+    // 只做纯初始化，不在此调 reload：libdispatch 块内抛出的 ObjC 异常
+    // 无法被调用方（PLUIShellViewController buildShell 的 @try）捕获，
+    // 会击穿欢迎界面兜底直接闪退。reload 由壳在 @try 内显式调用。
     dispatch_once(&onceToken, ^{
         manager = [PLUIPackManager new];
-        [manager reload];
     });
     return manager;
 }

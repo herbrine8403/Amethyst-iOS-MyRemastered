@@ -282,3 +282,21 @@ class UINodeLayoutContracts(unittest.TestCase):
     def test_image_intrinsic_query_guard(self):
         # 固有尺寸查询（双向 CGFLOAT_MAX）时直接返回原始尺寸，避免 aspect-fit 比例溢出
         self.assertIn("if (size.width >= CGFLOAT_MAX && size.height >= CGFLOAT_MAX) return s;", NODE_VIEW)
+
+
+class UIPackCrashRegressionContracts(unittest.TestCase):
+    """启动闪退回归：activePack copy 崩溃 + dispatch_once 内异常不可捕获（Amethyst 5.0.0 实机日志）。"""
+
+    def test_active_pack_property_is_strong(self):
+        # PLUIPack 未实现 NSCopying：copy 修饰的 activePack 在 reload 赋值时
+        # 调 copyWithZone: 必崩（默认主题 pcl-classic 即 schemaVersion 2，启动必触发）
+        self.assertIn("@property (nonatomic, nullable, strong, readwrite) PLUIPack *activePack", UI_PACK_MANAGER)
+        self.assertNotIn("copy, readwrite) PLUIPack *activePack", UI_PACK_MANAGER)
+
+    def test_shared_manager_init_has_no_side_effects(self):
+        # dispatch_once 块内抛出的 ObjC 异常无法被调用方 @try 捕获，
+        # 会击穿欢迎界面兜底直接闪退：单例初始化只允许纯 new，reload 由壳显式调用
+        self.assertIn("manager = [PLUIPackManager new];", UI_PACK_MANAGER)
+        self.assertNotIn("[manager reload]", UI_PACK_MANAGER)
+        # 壳在 @try 内先 reload 再取 activePack（异常 → 欢迎界面兜底）
+        self.assertIn("[PLUIPackManager.sharedManager reload];", SHELL_VC)
