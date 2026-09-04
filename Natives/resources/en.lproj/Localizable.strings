@@ -3,9 +3,9 @@
   StringLocalization
 */
 
-"game.menu.force_close" = "Force close";
+"game.menu.force_close" = "Force Close";
 "game.menu.confirm.force_close" = "Are you sure you want to force close?";
-"game.menu.log_output" = "Log output";
+"game.menu.log_output" = "Log Output";
 "game.menu.custom_controls" = "Custom controls";
 "game.menu.multiplayer" = "Multiplayer";
 "game.menu.toggle_stats" = "Toggle FPS/Memory";
@@ -17,7 +17,7 @@
 
 "game.note.airplay" = "Minecraft is being displayed in AirPlay mirrored display";
 
-"game.title.exit_code" = "Game exited with code %d";
+"game.title.exit_code" = "Game has closed with Exit Code %d";
 
 // The play button
 "Play" = "Play";
@@ -38,8 +38,8 @@
 "Remove" = "Remove";
 "Resize" = "Resize";
 // Visibility
-"Always" = "Always";
-"In game" = "In game";
+"Always" = "Always On";
+"In game" = "In Game";
 "In menu" = "In menu";
 
 "custom_controls.button_edit.forward_lock" = "Forward lock";
@@ -50,8 +50,8 @@
 "custom_controls.button_edit.toggleable" = "Toggleable";
 "custom_controls.button_edit.mouse_pass" = "Mouse pass";
 "custom_controls.button_edit.swipeable" = "Swipeable";
-"custom_controls.button_edit.bg_color" = "Background color";
-"custom_controls.button_edit.stroke_width" = "Stroke width (dp)";
+"custom_controls.button_edit.bg_color" = "Background Color";
+"custom_controls.button_edit.stroke_width" = "Stroke Width (dp)";
 "custom_controls.button_edit.stroke_color" = "Stroke color";
 "custom_controls.button_edit.corner_radius" = "Corner radius (%)";
 "custom_controls.button_edit.opacity" = "Opacity (%)";
@@ -62,7 +62,7 @@
 "custom_controls.button_edit.section.appearance" = "Appearance";
 
 "custom_controls.button_menu.add_subbutton" = "Add sub-button";
-"custom_controls.control_menu.discard_changes" = "Discard changes";
+"custom_controls.control_menu.discard_changes" = "Discard Changes";
 "custom_controls.control_menu.exit" = "Exit";
 "custom_controls.control_menu.exit.warn" = "You are about to exit without saving changes.";
 "custom_controls.control_menu.save" = "Save";
@@ -77,26 +77,26 @@
 "custom_controls.error.incompatible" = "This control version (code %d) is not implemented in this launcher build.";
 "custom_controls.hint" = "Long-press anywhere on screen for more options";
 
-"init.migrateDir" = "The Amethyst data directory is now %@. All of your existing data has been moved to the new location.";
+"init.migrateDir" = "The Air data directory is now %@. All of your existing data has been moved to the new location.";
 
-"java.error.missing_main_class" = "%@ is missing main class attribute. If this is a mod, put it into the “mods” folder of your selected instance.";
+"java.error.missing_main_class" = "%@ is missing a main class attribute. If this is a mod, put it into the “mods” folder of your selected instance.";
 "java.error.missing_runtime" = "%@ requires Java %d or later to run. Please install it first and specify it in Manage Runtimes.";
 
 "launcher.mcl.downloading_file" = "Downloading %@";
 "launcher.mcl.error_download" = "Failed to download %@: %@";
 
 "launcher.menu.custom_controls" = "Custom controls";
-"launcher.menu.execute_jar" = "Execute .jar";
-"launcher.menu.import_modpack" = "Import modpack";
+"launcher.menu.execute_jar" = "Execute .jar File";
+"launcher.menu.import_modpack" = "Import Modpack";
 
 "launcher.wait_jit.title" = "Waiting for JIT";
-"launcher.wait_jit.message" = "Amethyst relies on Just-in-time compilation for Java to work at maximum performance.";
+"launcher.wait_jit.message" = "Air relies on Just-in-Time compilation for Java to work at maximum performance.";
 "launcher.wait_jit_trollstore.message" = "If you still see this message, please enable URL Scheme in TrollStore.";
 
-"login.error.username.outOfRange" = "Username must be at least 3 characters and a maximum of 16 characters";
+"login.error.username.outOfRange" = "The username must be between 3 and 16 characters long";
 "login.error.fields.empty" = "Please fill in all fields";
 "login.error.invalid_credentials" = "Invalid username or password";
-"login.error.token_missing" = "Access token or client token is missing";
+"login.error.token_missing" = "Access or client token is missing";
 "login.error.token_expired" = "Authentication token has expired, please log in again";
 "login.error.invalid_response" = "Invalid server response";
 
@@ -110,12 +110,12 @@
 "login.jit.fail" = "JIT could not be enabled.";
 "login.jit.fail.title" = "JIT could not be enabled on your device.";
 "login.jit.fail.description" = "No integrations could be used to automatically enable JIT on your device, and it must now be enabled manually. Errors have been logged to latestlog.txt.";
-"login.jit.fail.description_unsupported" = "An unsupported installation method has been detected. Please reinstall using one of supported methods.";
+"login.jit.fail.description_unsupported" = "An unsupported installation method has been detected. Please reinstall using one of the supported methods.";
 
 // Login buttons
 "login.menu.sendlogs" = "Send your logs";
-"login.option.add" = "Add account";
-"login.option.select" = "Select account";
+"login.option.add" = "Add Account";
+"login.option.select" = "Select Account";
 "login.option.demo" = "Demo account";
 "login.option.microsoft" = "Microsoft account";
 "login.option.local" = "Local account";
