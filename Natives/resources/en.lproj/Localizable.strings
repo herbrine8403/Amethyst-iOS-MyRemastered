@@ -5,7 +5,7 @@
 
 "game.menu.force_close" = "Force Close";
 "game.menu.confirm.force_close" = "Are you sure you want to force close?";
-"game.menu.log_output" = "Log output";
+"game.menu.log_output" = "Log Output";
 "game.menu.custom_controls" = "Custom controls";
 "game.menu.multiplayer" = "Multiplayer";
 "game.menu.toggle_stats" = "Toggle FPS/Memory";
@@ -17,7 +17,7 @@
 
 "game.note.airplay" = "Minecraft is being displayed in AirPlay mirrored display";
 
-"game.title.exit_code" = "Game exited with code %d";
+"game.title.exit_code" = "Game has closed with Exit Code %d";
 
 // The play button
 "Play" = "Play";
@@ -38,8 +38,8 @@
 "Remove" = "Remove";
 "Resize" = "Resize";
 // Visibility
-"Always" = "Always";
-"In game" = "In game";
+"Always" = "Always On";
+"In game" = "In Game";
 "In menu" = "In menu";
 
 "custom_controls.button_edit.forward_lock" = "Forward lock";
@@ -50,11 +50,11 @@
 "custom_controls.button_edit.toggleable" = "Toggleable";
 "custom_controls.button_edit.mouse_pass" = "Mouse pass";
 "custom_controls.button_edit.swipeable" = "Swipeable";
-"custom_controls.button_edit.bg_color" = "Background color";
-"custom_controls.button_edit.stroke_width" = "Stroke width (dp)";
+"custom_controls.button_edit.bg_color" = "Background Color";
+"custom_controls.button_edit.stroke_width" = "Stroke Width (dp)";
 "custom_controls.button_edit.stroke_color" = "Stroke color";
 "custom_controls.button_edit.corner_radius" = "Corner radius (%)";
-"custom_controls.button_edit.opacity" = "Opacity (%):";
+"custom_controls.button_edit.opacity" = "Opacity (%)";
 "custom_controls.button_edit.visibility" = "Visibility";
 "custom_controls.button_edit.section.basic" = "Basic";
 "custom_controls.button_edit.section.input" = "Input";
@@ -62,11 +62,10 @@
 "custom_controls.button_edit.section.appearance" = "Appearance";
 
 "custom_controls.button_menu.add_subbutton" = "Add sub-button";
-"custom_controls.control_menu.discard_changes" = "Discard changes";
+"custom_controls.control_menu.discard_changes" = "Discard Changes";
 "custom_controls.control_menu.exit" = "Exit";
 "custom_controls.control_menu.exit.warn" = "You are about to exit without saving changes.";
 "custom_controls.control_menu.save" = "Save";
-"custom_controls.control_menu.save.error.default" = "The control name cannot be \"default\" because it cannot be changed.";
 "custom_controls.control_menu.save.error.json" = "JSON error";
 "custom_controls.control_menu.save.error.write" = "Error saving file";
 "custom_controls.control_menu.load" = "Load";
@@ -78,27 +77,26 @@
 "custom_controls.error.incompatible" = "This control version (code %d) is not implemented in this launcher build.";
 "custom_controls.hint" = "Long-press anywhere on screen for more options";
 
-"init.migrateDir" = "The Amethyst data directory is now %@. All of your existing data has been moved to the new location.";
+"init.migrateDir" = "The Air data directory is now %@. All of your existing data has been moved to the new location.";
 
-"java.error.missing_main_class" = "%@ is missing main class attribute. If this is a mod, put it into the “mods” folder of your selected instance.";
+"java.error.missing_main_class" = "%@ is missing a main class attribute. If this is a mod, put it into the “mods” folder of your selected instance.";
 "java.error.missing_runtime" = "%@ requires Java %d or later to run. Please install it first and specify it in Manage Runtimes.";
 
 "launcher.mcl.downloading_file" = "Downloading %@";
 "launcher.mcl.error_download" = "Failed to download %@: %@";
 
 "launcher.menu.custom_controls" = "Custom controls";
-"launcher.menu.install_jar" = "Install .jar";
-"launcher.menu.execute_jar" = "Execute .jar";
-"launcher.menu.import_modpack" = "Import modpack";
+"launcher.menu.execute_jar" = "Execute .jar File";
+"launcher.menu.import_modpack" = "Import Modpack";
 
-"launcher.wait_jit.title" = "Waiting for JIT(Just-in-time)";
-"launcher.wait_jit.message" = "Amethyst relies on JIT(Just-in-time) compilation for Java to work at maximum performance";
+"launcher.wait_jit.title" = "Waiting for JIT";
+"launcher.wait_jit.message" = "Air relies on Just-in-Time compilation for Java to work at maximum performance.";
 "launcher.wait_jit_trollstore.message" = "If you still see this message, please enable URL Scheme in TrollStore.";
 
-"login.error.username.outOfRange" = "Username must be at least 3 characters and a maximum of 16 characters";
+"login.error.username.outOfRange" = "The username must be between 3 and 16 characters long";
 "login.error.fields.empty" = "Please fill in all fields";
 "login.error.invalid_credentials" = "Invalid username or password";
-"login.error.token_missing" = "Access token or client token is missing";
+"login.error.token_missing" = "Access or client token is missing";
 "login.error.token_expired" = "Authentication token has expired, please log in again";
 "login.error.invalid_response" = "Invalid server response";
 
@@ -112,12 +110,12 @@
 "login.jit.fail" = "JIT could not be enabled.";
 "login.jit.fail.title" = "JIT could not be enabled on your device.";
 "login.jit.fail.description" = "No integrations could be used to automatically enable JIT on your device, and it must now be enabled manually. Errors have been logged to latestlog.txt.";
-"login.jit.fail.description_unsupported" = "An unsupported installation method has been detected. Please reinstall using one of supported methods.";
+"login.jit.fail.description_unsupported" = "An unsupported installation method has been detected. Please reinstall using one of the supported methods.";
 
 // Login buttons
 "login.menu.sendlogs" = "Send your logs";
-"login.option.add" = "Add account";
-"login.option.select" = "Select account";
+"login.option.add" = "Add Account";
+"login.option.select" = "Select Account";
 "login.option.demo" = "Demo account";
 "login.option.microsoft" = "Microsoft account";
 "login.option.local" = "Local account";
@@ -129,27 +127,29 @@
 "login.warn.message.legacy_ios" = "To run the next major release, this device needs to be running iOS 14 or later.";
 "login.warn.title.limited_ram" = "This device has a limited amount of memory available.";
 "login.warn.message.limited_ram" = "We recommend leaving auto RAM enabled to prevent instability and performance issues.";
+"login.warn.title.ios19_jitdead" = "Amethyst is not supported on iOS 26 or later.";
+"login.warn.message.ios19_jitdead" = "Due to changes in iOS that inhibit the ability to enable JIT, Amethyst cannot work in its current state and requires heavy research to find a new path forward.\n\nPressing OK will close the app.";
 
 "login.warn.title.demomode" = "Your account is Demo";
 "login.warn.message.demomode" = "As a replacement to offline and local mode, demo mode will allow you to sign into a Microsoft account that does not own the game and play the Java Edition trial, introduced in 1.3.1 and newer versions. Older versions contain the full game, as the official launcher does not place these restrictions. See our website to learn more about this transition from offline mode.";
 
-"login.warn.title.localmode" = "About Local Mode";
-"login.warn.message.localmode" = "The updated launcher supports offline mode and can be used to download games. \nYou can still play with an offline account, but it is recommended to support the official version. \nYou can purchase the official Minecraft at https://minecraft.net.";
+"login.warn.title.localmode" = "Offline mode is now Local mode.";
+"login.warn.message.localmode" = "You can continue to play installed versions, but you can no longer download Minecraft without a paid account. No support will be provided for issues with local accounts, or other means of acquiring Minecraft.";
 
 "login.msa.error.xsts.noxboxacc" = "An Xbox profile is not registered for this Microsoft account. Please make sure that you have made an Xbox profile.\nError code: 2148916233";
 "login.msa.error.xsts.noxbox" = "Xbox Live is currently unavailable in your country.\nError code: 2148916235";
-"login.msa.error.xsts.krverify" = "Your account needs to be verified by your parents before you can continue.\nError code: 2148916236 or 2148916237";
+"login.msa.error.xsts.krverify" = "Your account needs to be verified by your parents before you can continue.\nError code: 2148916236 or 2148916237.";
 "login.msa.error.xsts.underage" = "Your account needs to be linked to a parent account before you can continue.\nError code: 2148916238";
 
-"login.msa.progress.acquireAccessToken" = "(1/6) Acquiring the Access token";
-"login.msa.progress.acquireXBLToken" = "(2/6) Acquiring the Xbox Live token";
-"login.msa.progress.acquireXSTS" = "(3/6) Acquiring XSTS";
-"login.msa.progress.acquireXboxProfile" = "(4/6) Acquiring the Xbox profile";
-"login.msa.progress.acquireMCToken" = "(5/6) Acquiring the Minecraft token";
-"login.msa.progress.checkMCProfile" = "(6/6) Checking the Minecraft profile";
+"login.msa.progress.acquireAccessToken" = "(1/5) Acquiring the Access token";
+"login.msa.progress.acquireXBLToken" = "(2/5) Acquiring the Xbox Live token";
+"login.msa.progress.acquireXSTS" = "Acquiring XSTS";
+"login.msa.progress.acquireXboxProfile" = "(3/5) Acquiring the Xbox profile";
+"login.msa.progress.acquireMCToken" = "(4/5) Acquiring the Minecraft token";
+"login.msa.progress.checkMCProfile" = "(5/5) Checking the Minecraft profile";
 
-"login.3rdparty.progress.auth" = "(1/2) Authenticating with third-party server";
-"login.3rdparty.progress.refresh" = "(2/2) Refreshing third-party authentication";
+"login.3rdparty.progress.auth" = "Authenticating with third-party server";
+"login.3rdparty.progress.refresh" = "Refreshing third-party authentication";
 "login.3rdparty.2fa.title" = "Two-Factor Authentication";
 "login.3rdparty.2fa.message" = "Please enter your two-factor authentication code";
 "login.3rdparty.2fa.code" = "Authentication code";
@@ -164,14 +164,14 @@
 "Settings" = "Settings";
 
 "preference.section.general" = "General Settings";
-"preference.section.ai" = "AI Agent";
+"preference.section.ai" = "AI Assistant";
 "preference.section.video" = "Video and Audio Settings";
 "preference.section.footer.video" = "Auto renderer allows Amethyst to choose the best option based on Minecraft version. Decreasing resolution reduces GPU workload for better performance.";
 "preference.section.mobileglues" = "MobileGlues Renderer";
-"preference.section.footer.mobileglues" = "These settings take effect when the renderer is set to MobileGlues or Vulkan. The Vulkan renderer's OpenGL fallback uses MobileGlues, so config.json is read. The Auto renderer resolves to ANGLE and does not load MobileGlues, so settings do not apply. The config is written to <POJAV_HOME>/MG/config.json at game launch.";
+"preference.section.footer.mobileglues" = "These settings take effect when the renderer is set to MobileGlues or Vulkan. The Vulkan renderer's OpenGL fallback uses MobileGlues (aligned with the Ynnyny repo), so config.json is read. The Auto renderer resolves to ANGLE and does not load MobileGlues, so settings do not apply. The config is written to <POJAV_HOME>/MG/config.json at game launch.";
 "preference.section.control" = "Control customization";
 "preference.section.debug" = "UI Debugging settings";
-"preference.section.footer.debug" = "In addition to debugging these settings may be useful for custom controls. You may need to restart the launcher to make the changes effective.";
+"preference.section.footer.debug" = "You may need to restart the launcher for changes to take effect.";
 //"preference.section.footer.control" = "";
 "preference.section.java" = "Java Tweaks";
 //"preference.section.footer.java" = "";
@@ -180,14 +180,14 @@
 
 "preference.title.game_directory" = "Game directory";
 "preference.title.confirm.delete_game_directory" = "The instance %@ will be deleted forever and cannot be restored.";
-"preference.multidir.add_directory" = "Add game directory";
+"preference.multidir.add_directory" = "add game directory";
 
 "preference.title.check_sha" = "Check files after downloading";
 "preference.detail.check_sha" = "This option forces launcher to check the file hash if it's available. Prevents broken downloads.";
 "preference.title.cosmetica" = "Cosmetica Capes";
-"preference.detail.cosmetica" = "Enable capes from Cosmetica (previously Arc). For more information please visit https://cosmetica.cc. Requires OptiFine.";
+"preference.detail.cosmetica" = "Enable capes from Cosmetica (previously Arc). For more information please visit https://cosmetica.cc. Requires OptiFine";
 "preference.title.download_source" = "Download Source";
-"preference.detail.download_source" = "Choose the download source for game resources. BMCLAPI mirror provides faster download speeds in Asia Countries.";
+"preference.detail.download_source" = "Choose the download source for game resources. BMCLAPI mirror provides faster download speeds in China.";
 "preference.title.download_source-official" = "Official Source";
 "preference.title.download_source-bmclapi" = "BMCLAPI Mirror";
 "preference.section.download" = "Download Mirror Policy";
@@ -202,15 +202,11 @@
 "preference.title.mirror_policy-official_first" = "Official First";
 "preference.title.mirror_policy-mirror_first" = "Mirror First";
 "preference.title.mod_mirror" = "Mod Mirror Source";
-"preference.detail.mod_mirror" = "Choose the mirror source for mod/shader/resourcepack/datapack/modpack/world API and file downloads.";
+"preference.detail.mod_mirror" = "Choose the mirror source for mod/shader/resourcepack/datapack/modpack/world API and file downloads. MCIM mirror (mod.mcimirror.top) provides acceleration in China, compatible with both Modrinth and CurseForge APIs.";
 "preference.title.mod_mirror-official" = "Official Source";
 "preference.title.mod_mirror-mcim" = "MCIM Mirror";
 "preference.title.debug_logging" = "Debug logging";
 "preference.detail.debug_logging" = "Logs internal settings and actions to latestlog.txt. This helps the developers find issues easier, but Minecraft may run slower as the logs will be written to more often.";
-"preference.title.jitstreamer_server" = "The server address of JitStreamer";
-"preference.detail.jitstreamer_server" = "This option gives custom access to JitStreamer servers for JIT addresses.";
-"preference.title.enable_altkit" = "Enable JIT using AltKit";
-"preference.detail.enable_altkit" = "When enabled, Air will try to connect to local AltServers to enable JIT.";
 "preference.title.appicon" = "Set app icon";
 "preference.detail.appicon" = "Allows you to choose between different Home Screen icons for Amethyst.";
 "preference.title.appicon-default" = "Familiar Amethyst light";
@@ -235,6 +231,7 @@
 "preference.title.renderer.release.auto" = "Auto";
 "preference.title.renderer.release.gl4es" = "holy gl4es";
 "preference.title.renderer.release.angle" = "ANGLE";
+"preference.title.renderer.release.mg" = "MobileGlues";
 "preference.title.renderer.release.zink" = "Zink";
 
 "preference.title.renderer.debug.auto" = "Auto: gl4es or ANGLE";
@@ -265,7 +262,7 @@
 "preference.title.allow_microphone" = "Allow microphone input";
 "preference.detail.allow_microphone" = "Enable this only if you are using voice chat mod. Silent switch option will be ignored, and audio quality from other apps will be affected.";
 
-/* MobileGlues 设置 */
+/* MobileGlues settings */
 "preference.title.enable_angle" = "ANGLE ES Driver";
 "preference.detail.enable_angle" = "Use ANGLE as the OpenGL ES driver instead of the system driver. May improve compatibility on some devices.";
 "preference.title.enable_no_error" = "GL No Error";
@@ -319,6 +316,10 @@
 "preference.detail.press_duration" = "Trigger press duration for destroying blocks and dropping items.";
 "preference.title.button_scale" = "On-screen button scale (%)";
 "preference.detail.button_scale" = "Upscale them if buttons are too small, usually needed for iPad users.";
+"preference.title.custom_mouse_pointer" = "Custom Mouse Pointer";
+"preference.detail.custom_mouse_pointer" = "Select a custom image as the in-game mouse pointer appearance.";
+"preference.title.reset_mouse_pointer" = "Reset Mouse Pointer";
+"preference.detail.reset_mouse_pointer" = "Reset the mouse pointer to its default appearance.";
 "preference.title.mouse_scale" = "Mouse scaling (%)";
 "preference.detail.mouse_scale" = "Change the size of the virtual mouse";
 "preference.title.mouse_speed" = "Mouse speed (%)";
@@ -328,11 +329,74 @@
 "preference.title.slideable_hotbar" = "Slideable hotbar";
 "preference.detail.slideable_hotbar" = "Make the hotbar slideable like the mouse wheel";
 
-// Custom mouse pointer
-"preference.title.custom_mouse_pointer" = "Custom Mouse Pointer";
-"preference.detail.custom_mouse_pointer" = "Select a custom image as the in-game mouse pointer appearance.";
-"preference.title.reset_mouse_pointer" = "Reset Mouse Pointer";
-"preference.detail.reset_mouse_pointer" = "Reset the mouse pointer to its default appearance.";
+"ai.fix.dash_title" = "AI Repair Dashboard";
+"ai.fix.dash_subtitle" = "Analyze first, then repair. All high-risk actions wait for confirmation.";
+"ai.fix.tile.analyze" = "Analyze";
+"ai.fix.tile.analyze_value" = "Logs & config";
+"ai.fix.tile.analyze_sub" = "Read crash logs";
+"ai.fix.tile.plan" = "Plan";
+"ai.fix.tile.plan_value" = "Step-by-step";
+"ai.fix.tile.plan_sub" = "Generate a low-risk fix plan";
+"ai.fix.tile.safe" = "Safe";
+"ai.fix.tile.safe_value" = "Manual confirm";
+"ai.fix.tile.safe_sub" = "Dangerous actions need approval";
+"ai.fix.history.title" = "Repair History";
+"ai.fix.history.sessions" = "Sessions";
+"ai.fix.history.sessions_value" = "Auto logged";
+"ai.fix.history.sessions_sub" = "Review every fix";
+"ai.fix.history.rollback" = "Rollback";
+"ai.fix.history.rollback_value" = "Undo once";
+"ai.fix.history.rollback_sub" = "Keep modification traces";
+"ai.fix.risk.title" = "Risk Notes";
+"ai.fix.risk.backup" = "Backed up before changes";
+"ai.fix.risk.backup_sub" = "Important files keep recovery data whenever possible";
+"ai.fix.risk.confirm" = "High-risk actions require approval";
+"ai.fix.risk.confirm_sub" = "Delete, rename, and Mod actions will not run silently";
+"ai.fix.risk.verify" = "Manual verification required";
+"ai.fix.risk.verify_sub" = "Please restart the game to confirm the result";
+"ai.fix.input_title" = "Instructions & notes";
+"ai.fix.input_placeholder" = "Describe the issue, add notes, or start a conversation...";
+"ai.fix.stop" = "Stop";
+"ai.fix.send" = "Send";
+"ai.fix.exit" = "Exit launcher";
+"ai.fix.model_config" = "Model Configuration";
+"ai.fix.config_subtitle" = "Connect to any OpenAI-compatible API service";
+"ai.fix.start_fix" = "Start repair";
+"ai.fix.model_name" = "Model name";
+"ai.fix.save" = "Save";
+"ai.fix.tool_requests" = "Tool Requests";
+"ai.fix.tool_subtitle" = "High-risk actions wait for your confirmation here";
+"ai.fix.ready" = "Ready";
+"ai.fix.ready_subtitle" = "Waiting for input or automatic analysis";
+"ai.fix.config_saved" = "Configuration saved";
+"ai.fix.configured" = "Configured";
+"ai.fix.not_configured" = "Not configured";
+"ai.fix.running" = "Running";
+"ai.fix.experimental_title" = "Experimental Feature";
+"ai.fix.experimental_message" = "AI crash repair is experimental and may be unstable. Make sure you have backups before continuing. Continue?";
+"ai.fix.continue" = "Continue";
+"ai.fix.cancel" = "Cancel";
+"ai.fix.please_configure" = "Please complete API configuration and tap \"Save\" first.";
+"ai.fix.settings_mode" = "You are in the AI repair settings screen. Tap \"Start repair\" to begin diagnosis, or send more notes directly.";
+"ai.fix.starting" = "Starting AI repair flow...";
+"ai.fix.start_failed" = "Failed to start";
+"ai.fix.tool_success" = "%@ executed successfully";
+"ai.fix.tool_failed" = "Execution failed";
+"ai.fix.error" = "Error";
+"ai.fix.completed" = "Repair completed!";
+"ai.fix.modifications" = "%lu files modified";
+"ai.fix.restart_hint" = "Repair is finished. Please restart the game manually to verify it: 1) close the current game instance; 2) return to the launcher and reopen the profile; 3) start the game normally and reproduce the original scenario; 4) if the issue still exists, send feedback or use rollback.";
+"ai.fix.waiting_confirm" = "Waiting for confirmation";
+"ai.fix.waiting_subtitle" = "This action needs your approval before execution";
+"ai.fix.executing" = "Executing tool...";
+"ai.fix.executing_subtitle" = "Performing a controlled repair step";
+"ai.fix.completed_subtitle" = "Please restart the game to verify the result";
+"ai.fix.error_subtitle" = "You can export the report or roll back changes";
+"ai.fix.stopped" = "Stopped";
+"ai.fix.stopped_subtitle" = "The session has ended; you can start again";
+"ai.fix.stopped_by_user" = "Repair stopped";
+"ai.fix.approve" = "Approve";
+"ai.fix.reject" = "Reject";
 
 "preference.title.gyroscope_enable" = "Enable gyroscope controls";
 "preference.detail.gyroscope_enable" = "Enabling this will allow you to turn in game by turning your device";
@@ -366,88 +430,17 @@
 "preference.title.custom_env" = "Environment variables";
 "preference.detail.custom_env" = "This option is under construction. Create and edit custom_env.txt in the meantime.";
 
+"preference.title.debug_universal_script_jit" = "Use Universal StikDebug Script";
+"preference.title.debug_always_attached_jit" = "Keep attached to StikDebug";
+"preference.detail.debug_always_attached_jit" = "Enable this if your mods require loading .dylib at runtime. When this is on, StikDebug's PiP should not be closed during gameplay. Requires Universal Script enabled";
 "preference.title.debug_skip_wait_jit" = "Skip \"Waiting for JIT\" dialog";
 "preference.detail.debug_skip_wait_jit" = "This does not allow you to launch without JIT, instead this skips debugger check, because check fails on certain jailbreaks.";
 "preference.title.debug_ipad_ui" = "Unlock iPadOS UI";
 "preference.detail.debug_ipad_ui" = "Unlock iPad-exclusive UI (alert, keyboard, etc.) if enabled or iPhone UI if disabled.";
-
-"ai.fix.dash_title" = "AI Repair Dashboard";
-"ai.fix.dash_subtitle" = "Analyze first, then repair. All high-risk actions wait for confirmation.";
-"ai.fix.tile.analyze" = "Analyze";
-"ai.fix.tile.analyze_value" = "Logs & config";
-"ai.fix.tile.analyze_sub" = "Read crash logs";
-"ai.fix.tile.plan" = "Plan";
-"ai.fix.tile.plan_value" = "Step-by-step";
-"ai.fix.tile.plan_sub" = "Generate a low-risk fix plan";
-"ai.fix.tile.safe" = "Safe";
-"ai.fix.tile.safe_value" = "Manual confirm";
-"ai.fix.tile.safe_sub" = "Dangerous actions need approval";
-"ai.fix.history.title" = "Repair History";
-"ai.fix.history.sessions" = "Sessions";
-"ai.fix.history.sessions_value" = "Auto logged";
-"ai.fix.history.sessions_sub" = "Review every fix";
-"ai.fix.history.rollback" = "Rollback";
-"ai.fix.history.rollback_value" = "Undo once";
-"ai.fix.history.rollback_sub" = "Keep modification traces";
-"ai.fix.risk.title" = "Risk Notes";
-"ai.fix.risk.backup" = "Backed up before changes";
-"ai.fix.risk.backup_sub" = "Important files keep recovery data whenever possible";
-"ai.fix.risk.confirm" = "High-risk actions require approval";
-"ai.fix.risk.confirm_sub" = "Delete, rename, and Mod actions will not run silently";
-"ai.fix.risk.verify" = "Manual verification required";
-"ai.fix.risk.verify_sub" = "Please restart the game to confirm the result";
-"ai.fix.input_title" = "Instructions & notes";
-"ai.fix.input_placeholder" = "Type something...";
-"ai.fix.stop" = "Stop";
-"ai.fix.send" = "Send";
-"ai.fix.exit" = "Exit Launcher";
-"ai.fix.restart" = "Restart Launcher";
-"ai.fix.model_config" = "Model Configuration";
-"ai.fix.config_subtitle" = "Connect to any OpenAI-compatible API service";
-"ai.fix.start_fix" = "Start repair";
-"ai.fix.model_name" = "Model Name";
-"ai.fix.save" = "Save";
-"ai.fix.tool_requests" = "Tool Requests";
-"ai.fix.tool_subtitle" = "High-risk actions wait for your confirmation here";
-"ai.fix.ready" = "Ready";
-"ai.fix.ready_subtitle" = "Waiting for input or automatic analysis";
-"ai.fix.config_saved" = "Configuration Saved";
-"ai.fix.configured" = "Configured";
-"ai.fix.not_configured" = "Not Configured";
-"ai.fix.running" = "Running";
-"ai.fix.experimental_title" = "Experimental Feature";
-"ai.fix.experimental_message" = "The AI crash fix feature is experimental and may be unstable. Please ensure you have made backups before using it. Continue?";
-"ai.fix.continue" = "Continue";
-"ai.fix.cancel" = "Cancel";
-"ai.fix.please_configure" = "Please complete the API configuration and click \"Save\" button first.";
-"ai.fix.settings_mode" = "You are in AI fix settings mode. After configuration, click the send button to start the conversation.";
-"ai.fix.starting" = "Starting AI fix process...";
-"ai.fix.start_failed" = "Start Failed";
-"ai.fix.tool_success" = "%@ executed successfully";
-"ai.fix.tool_failed" = "Execution failed";
-"ai.fix.error" = "Error";
-"ai.fix.completed" = "Completed";
-"ai.fix.modifications" = "Modified %lu file(s)";
-"ai.fix.restart_hint" = "Please restart the game to verify the fix. If the issue persists, you can continue the conversation or submit an issue on GitHub.";
-"ai.fix.waiting_confirm" = "Waiting for Confirmation";
-"ai.fix.waiting_subtitle" = "This action needs your approval before execution";
-"ai.fix.executing" = "Executing Tool...";
-"ai.fix.executing_subtitle" = "Performing a controlled repair step";
-"ai.fix.completed_subtitle" = "Please restart the game to verify the result";
-"ai.fix.error_subtitle" = "You can export the report or roll back changes";
-"ai.fix.stopped" = "Stopped";
-"ai.fix.stopped_subtitle" = "The session has ended; you can start again";
-"ai.fix.stopped_by_user" = "Fix stopped by user";
-"ai.fix.approve" = "Approve";
-"ai.fix.reject" = "Reject";
 "preference.title.debug_auto_correction" = "Auto correction";
 "preference.detail.debug_auto_correction" = "Enable auto correction when typing text in game.";
 "preference.title.debug_hide_home_indicator" = "Hide home indicator";
 "preference.detail.debug_hide_home_indicator" = "This will disable home indicator locking. You will need to use Guided Access to hide and lock home indicator at the same time.";
-"preference.title.debug_show_layout_bounds" = "Show Border Layout";
-"preference.detail.debug_show_layout_bounds" = "Show Clip Borders, Margins";
-"preference.title.debug_show_layout_overlap" = "Layout Overlay Display";
-"preference.detail.debug_show_layout_overlap" = "Override each view with light yellow colors, the deeper the color will overlay";
 
 "preference.profile.title.name" = "Name";
 "preference.profile.title.loader_type" = "Loader type";
@@ -515,28 +508,15 @@
 "preference.title.appicon-custom" = "Custom";
 "preference.title.custom_appicon" = "Custom App Icon";
 "preference.detail.custom_appicon" = "Select a custom image to use as the app icon";
-
-"preference.title.mod_touch_enable" = "Enable TouchController Mod Support";
-"preference.detail.mod_touch_enable" = "Enable TouchController mod support. Note that enabling：will disable \"Swipe shortcuts\".";
-
-"preference.title.custom_controls" = "Key tweaks";
-"preference.detail.custom_controls" = "Custom game control layout, drag and drop button position and size";
-
-
-
-"preference.popup.touch_info.title" = "TouchController Fit Description";
-"preference.popup.touch_info.message" = "This feature is an iOS compatible scheme for TouchController Mod.\n\nProject address：https://github.com/TouchController/TouchController\n\nTechnical Note：\nSince iOS is not supported by the mode, this feature provides a local UDP protocol (Localhost) to connect between launchers and game processes. This connection is used only for internal transfer of control data from the device and never connects the internet, please be careful.\nThis feature is made by WeiErLiTeo.";
-
-"preference.title.two_finger_keyboard" = "Two-finger call keyboard";
-"preference.detail.two_finger_keyboard" = "Pick up the keyboard in the game by pressing both fingers.";
-
 "提示" = "Notice";
 
+// Announcement messages
 "announcement.preview_version" = "Welcome to Amethyst iOS Remastered Preview Version!";
 "announcement.latest_version" = "Welcome to Amethyst iOS Remastered! This is the latest stable version.";
 "announcement.new_version_available" = "New version available: %@";
 "announcement.download_button" = "Download Now";
 
+// TouchController Preferences
 "preference.touchcontroller.title" = "TouchController";
 "preference.touchcontroller.section.mode" = "Communication Mode";
 "preference.touchcontroller.section.info" = "Information";
@@ -560,8 +540,6 @@
 "preference.touchcontroller.vibrate.intensity.medium" = "Medium";
 "preference.touchcontroller.vibrate.intensity.heavy" = "Heavy";
 "preference.touchcontroller.moveview.enable" = "Enable Move View";
-
-"spdt" = "";
 
 // Crash View
 "crash.title" = "Game Exited Unexpectedly";
@@ -599,7 +577,7 @@
 "crash.reason.java_version" = "Java version mismatch (UnsupportedClassVersionError)";
 "crash.reason.renderer" = "Renderer error (OpenGL/Metal/EGL initialization failed)";
 "crash.reason.mod_loading" = "Mod loading failure (Forge/Fabric/OptiFine)";
-// 快速修复建议文案
+// Quick fix suggestion texts
 "crash.suggestion.oom_ram" = "Reduce memory allocation (recommended 1024-2048MB)";
 "crash.suggestion.oom_getmoream" = "Use GetMoreRam (LiveContainer) to bypass iOS memory limit";
 "crash.suggestion.oom_mods" = "Remove heavy mods (shaders, high-res textures)";
@@ -628,7 +606,7 @@
 "crash.suggestion.java_mods" = "Check mod compatibility (remove recently added mods)";
 "crash.suggestion.java_restart" = "Restart launcher and retry";
 
-// 启动加载界面（参照 FCL/ZL2 风格）
+// Launch overlay (FCL/ZL2 style)
 "launch.title" = "Starting Minecraft";
 "launch.stage.init_env" = "Initializing environment...";
 "launch.stage.verify_files" = "Verifying game files...";
@@ -654,7 +632,7 @@
 
 // AI Fix Feature
 "ai.fix.conversation" = "Conversation";
-"ai.fix.input_placeholder" = "Ask me something...";
+"ai.fix.input_placeholder" = "Type something...";
 "ai.fix.send" = "Send";
 "ai.fix.stop" = "Stop";
 "ai.fix.exit" = "Exit Launcher";
@@ -681,14 +659,14 @@
 "ai.fix.continue" = "Continue";
 "ai.fix.cancel" = "Cancel";
 "ai.fix.please_configure" = "Please complete the API configuration and click \"Save\" button first.";
-"ai.fix.settings_mode" = "You have entered the AI Repair Settings interface. Once configured, click the Send button to start a conversation.";
+"ai.fix.settings_mode" = "You are in AI fix settings mode. After configuration, click the send button to start the conversation.";
 "ai.fix.starting" = "Starting AI fix process...";
 "ai.fix.start_failed" = "Start Failed";
 "ai.fix.stopped_by_user" = "Fix stopped by user";
 "ai.fix.tool_success" = "%@ executed successfully";
 "ai.fix.tool_failed" = "Execution failed";
 "ai.fix.modifications" = "Modified %lu file(s)";
-"ai.fix.restart_hint" = "Please restart the game to verification fix. If the problem remains unresolved, you can continue to talk or submit issues on GitHub";
+"ai.fix.restart_hint" = "Please restart the game to verify the fix. If the issue persists, you can continue the conversation or submit an issue on GitHub.";
 
 "preference.title.ai_crash_fix" = "AI Crash Fix";
 "preference.detail.ai_crash_fix" = "Configure and use AI assistant to automatically diagnose and fix game crash issues";
@@ -697,7 +675,7 @@
 "preference.title.check_update" = "Check for Updates";
 "preference.detail.check_update" = "Check GitHub Releases for the latest stable version of Amethyst iOS";
 
-// 检查更新
+// Check for updates
 "check_update" = "Check for Updates";
 "check_update.checking" = "Checking for updates…";
 "check_update.failed" = "Update check failed";
@@ -707,22 +685,22 @@
 "check_update.new_version_message" = "Tap \"Download\" to open the GitHub Releases page and get the latest version.";
 "check_update.download" = "Download";
 
-// Minecraft 新闻（参考 PCL-CE）
+// Minecraft news (ref. PCL-CE)
 "mc_news.title" = "Minecraft News";
 "mc_news.read_more" = "Read more";
 "mc_news.retry" = "Retry";
 "mc_news.load_failed" = "Failed to load";
 
-// 内存限制帮助弹窗
+// Memory limit help dialog
 "mem_help.title" = "About Memory Limit";
 "mem_help.message" = "iOS 18 / iOS 26 single-instance memory limit is about 1440MB. Large modpacks may crash due to insufficient memory.\n\nSolution:\nUse GetMoreRam (a LiveContainer plugin) to lift the memory limit.\nGetMoreRam repo: github.com/hugeBlack/GetMoreRam\n\nRestart the launcher after installation to take effect.\n\nIf you don't use LiveContainer, try lowering the memory allocation (Settings > Java > Memory Allocation), but some modpacks may not run under the memory limit.";
 
-// 下载进度与速率（Phase 6 Task 6.1）
+// Download progress & speed (Phase 6 Task 6.1)
 "download.speed.format" = "%@/s";
 "download.progress.file_count" = "%1$ld/%2$ld files · %3$@/%4$@";
 "download.progress.file_count_short" = "%1$ld/%2$ld · %3$@";
 
-// 下载历史（Phase 6 Task 6.2）
+// Download history (Phase 6 Task 6.2)
 "download.history.title" = "Download History";
 "download.history.entry" = "History";
 "download.history.clear" = "Clear";
@@ -732,7 +710,7 @@
 "download.history.result.success" = "Success";
 "download.history.result.failed" = "Failed";
 
-// 统一任务阶段标题（redesign-download-ui Phase 1 Task 1.4 / Phase 7 Task 7.1）
+// Unified task stage titles (redesign-download-ui Phase 1 Task 1.4 / Phase 7 Task 7.1)
 "taskStage.title.fetchVersionManifest" = "Fetch version manifest";
 "taskStage.title.downloadVersionJSON" = "Download version JSON";
 "taskStage.title.downloadClient" = "Download client";
@@ -752,7 +730,7 @@
 "taskStage.title.finalizeConfig" = "Finalize configuration";
 "taskStage.title.downloadFile" = "Download file";
 
-// 统一进度页（redesign-download-ui Phase 2 / Phase 7 Task 7.1）
+// Unified progress page (redesign-download-ui Phase 2 / Phase 7 Task 7.1)
 "taskProgress.stage.running" = "Running";
 "taskProgress.state.pending" = "Pending";
 "taskProgress.state.downloading" = "Downloading";
