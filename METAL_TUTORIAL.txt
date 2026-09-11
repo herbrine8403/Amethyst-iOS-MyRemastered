@@ -1,0 +1,73 @@
+Air (Amethyst) Metal 渲染集成包
+================================
+
+这是什么
+--------
+内置 metallum agent 的 Air 启动器(5.0.0 / 48a0202),让 MC Java 版在 iPhone/iPad 上
+走原生 Metal 渲染,无需 Fabric/Forge,vanilla 实例直接可用。
+
+本包已包含
+----------
+1. metallum_agent.jar
+   - agent: premain 注入 PreferredGraphicsApi.getBackendsToTry -> [Metal, Vulkan, GL]
+   - 提前 ensureSpvcLibraryConfigured(防止 Spvc 类先加载到 MoltenVK 阉割符号)
+   - Fabric 环境自动检测: 检测到 Fabric Loader 则跳过注入(交给内置 mod)
+   - MANIFEST: Premain-Class/Agent-Class 齐全,178 个类(metallum 后端 + ASM)
+2. MetalUniversal-1.0.4.jar (Fabric mod,内置 mods_preload/)
+   - 启动器首次启动自动拷贝到实例 mods/ 目录(Fabric 实例自动生效,vanilla 不加载无害)
+   - natives 已替换为 ad-hoc 签名版 libmetallum
+3. natives/ios/libmetallum.dylib (ad-hoc 签名,配合 DyldLVBypass 加载)
+4. natives/ios/libspvc.dylib (完整 MSL 后端,C API 宏 SPIRV_CROSS_C_API_MSL 编译)
+5. 启动器渲染器新增 "Metal (metallum)" 选项(选后 AMETHYST_METAL=1,EGL 回落 auto)
+
+开箱即用: vanilla 实例 -> agent 自动注入;Fabric 实例 -> 内置 mod 自动进 mods,
+agent 检测到 Fabric 自动让位。两个形态都不用手动配置。
+
+安装步骤
+--------
+1. iloader 安装本 ipa(覆盖安装同 bundle id,游戏数据保留)
+2. 启用 JIT:StikDebug 附加(或用 pymobiledevice3 debugserver lldb --launch)
+   启动器设置 -> 调试 -> 开启:
+   - Use Universal StikDebug Script
+   - Keep attached to StikDebug
+   (第三个 Skip 'Waiting for JIT' dialog 可选,等 JIT 卡转圈时开)
+3. 启动器 -> 游戏设置 -> 渲染器 -> 选 "Metal (metallum)"
+4. 启动游戏
+
+实测数据(iPhone 17 Pro / A19 Pro / iOS 27.0)
+---------------------------------------------
+- Metal: 32 区块稳定 105+ 帧(原生)
+- Zink: 32 区块约 50 帧(GL-on-Vulkan 翻译层)
+- MoltenVK: 个位数帧率(不可用)
+
+常见问题
+--------
+Q: 渲染器列表没有 Metal?
+A: 确认 libs/metallum_agent.jar 存在(本包已含)。渲染器选项在 游戏设置 里。
+
+Q: 游戏走了 OpenGL(日志 Using graphics backend OpenGL)?
+A: 确认 1) 渲染器选了 Metal 2) 日志有 "[JavaLauncher] Metal renderer selected:
+   AMETHYST_METAL=1" 3) 日志无 "defineMetallumClasses failed"(缺
+   --add-opens=java.base/java.lang=ALL-UNNAMED 时发生,本包已修复)。
+
+Q: missing code signature?
+A: 需要 DyldLVBypass(StikDebug 两个开关开启)+ dylib 带 ad-hoc 签名(本包 natives
+   已签)。未开启 bypass 时未签名 dylib 会被 AMFI 拒绝。
+
+Q: spvc_context_create_compiler 返回 -4 Invalid backend?
+A: 加载的 libspvc 缺 MSL 后端(C API 宏必须 SPIRV_CROSS_C_API_MSL,不是
+   SPIRV_CROSS_ENABLE_MSL)。本包 natives 为完整版,若自行替换请确认。
+
+Q: 覆盖安装后游戏数据还在吗?
+A: 同 bundle id 覆盖安装,数据容器(Documents:存档/mods/设置/日志)保留。
+   建议先备份 Documents 再升级。
+
+Q: Fabric 实例会和 agent 冲突吗?
+A: v23 起 agent 启动时自动检测 Fabric Loader:检测到 Fabric 环境则跳过注入,
+   由官方 MetalUniversal Fabric mod(mixin)接管;vanilla 环境才由 agent 注入。
+   两者改的是同一批方法(getBackendsToTry/caption),二选一,不混用。
+
+日志位置
+--------
+启动器 -> 调试日志;或 Documents/instances/default/logs/latestlog.txt
+崩溃报告: Documents/instances/default/crash-reports/

@@ -1,3 +1,52 @@
+# Air-Metal (Amethyst iOS Remastered + Metal Universal)
+
+**本 fork 基于官方 [Amethyst-iOS-MyRemastered](https://github.com/herbrine8403/Amethyst-iOS-MyRemastered) `48a0202`,集成 Metal Universal 原生 Metal 渲染(Minecraft **26.2**,vanilla / Fabric / Forge 三形态实测可玩)。**
+
+## 改版内容
+
+1. **启动器渲染器新增 "Metal (metallum)" 选项**(设置 → 游戏设置 → 渲染器)
+   - `Natives/utils.h` / `Natives/LauncherPreferences.m`: 渲染器列表加 Metal
+   - `Natives/JavaLauncher.m`: 选 Metal 时设 `AMETHYST_METAL=1`,EGL 渲染器回落 auto 提供 surface;选择该渲染器时弹出一次性注意事项(已知限制)
+2. **Metallum agent 注入(`-javaagent:metallum_agent.jar`)**
+   - premain 提前加载完整版 libspvc + `ensureSpvcLibraryConfigured`(防止 MoltenVK 阉割版符号 → -4)
+   - ASM 注入 `PreferredGraphicsApi.getBackendsToTry` → 返回 `[Metal, Vulkan, GL]`
+   - Fabric/Quilt 实例自动跳过 agent(避免与 fabric-loader 的 classpath 校验冲突),改由预置的 Metal mod 接管
+   - Forge 兼容: `ForgeLoadingOverlay.<init>` 注入(GOTO 跳过 logo 纹理强转)—— Forge 自带加载界面会被跳过,直接进入主菜单,属预期行为
+3. **预置 Metal 渲染 mod**
+   - bundle 内 `mods_preload/MetalUniversal-1.0.4.jar` 首次启动拷入实例 `mods/`(仅 Metal mod 自动预置,其他 mod 不受影响)
+   - Fabric/Quilt 实例自动生效(vanilla / Forge 不加载该 mod,无害)
+4. **Forge 模块冲突修复**: `com.apple.ios.audio` 从 `libs/lwjgl.jar` 移除(仅保留在 `launcher.jar`),修复 Forge 26.2 的 JPMS 双模块导出 `ResolutionException`
+
+## 支持矩阵(渲染后端 = Metal)
+
+| MC 版本 | vanilla | Fabric/Quilt | Forge |
+|---------|---------|--------------|-------|
+| **26.2** | ✅ 实测可玩 | ✅ 实测可玩 | ✅ 实测可玩 |
+
+## 已知限制
+
+- 光影包(Iris / OptiFine 风格)不支持(Metal 路径与 GL 架构差异)
+- 部分 mod 可能不兼容(如 Sodium 等性能优化 mod);游戏崩溃时先移除 mod 再试
+- Forge 实例的启动遮罩偶需手动关闭(听到音乐即已进入游戏);Forge 自带加载界面会被跳过
+- 首次选择 Metal 渲染器时,启动器会弹出一次性注意事项说明上述限制
+- 后端由 `metallum` 提供(上游 [MetalUniversal](https://github.com/EternityQwQ/MetalUniversal));shader 经 SPIRV-Cross 交叉编译至 Metal
+
+## 使用
+
+- 安装后: 启动器 → 游戏设置 → 渲染器 → **Metal (metallum)**
+- JIT: StikDebug 附加 + 调试设置两个开关(Use Universal StikDebug Script / Keep attached to StikDebug)
+- 实测环境: iPhone 17 Pro (A19 Pro) / iOS 27.0
+- 详细说明见 `METAL_TUTORIAL.txt`
+
+## 构建
+
+```bash
+# 研究机(Xcode 26.3): pip 装 cmake + gmake 软链 + BOOTJDK=JDK8, 然后
+cd Natives && cmake .. && make
+```
+
+---
+
 <div align="center">
   <img src="Natives/Assets.xcassets/AppIcon-Light.appiconset/1024x1024.png" alt="Air Icon" width="120" style="border-radius: 24px;">
 </div>

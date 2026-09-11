@@ -1954,3 +1954,6 @@
 
 "preference.auto" = "Auto";
 "preference.auto_select" = "Auto";
+
+"metal.renderer.notice.title" = "Metal Renderer (Experimental)";
+"metal.renderer.notice.body" = "You are using the native Metal renderer (metallum) for Minecraft 26.2.\n\nKnown limitations:\n- Shader packs (Iris / OptiFine-style) are NOT supported on the Metal path.\n- Some mods may be incompatible (e.g. Sodium and other performance mods). If the game crashes, remove your mods and try again.\n- Forge instances: the Forge loading overlay is skipped by design (the game goes straight to the main menu). This is expected, not a freeze.\n- If the game hangs or renders incorrectly, switch back to the default (OpenGL/ANGLE) renderer.\n\nWhen reporting an issue, please attach the log.";
