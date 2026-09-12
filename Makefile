@@ -305,7 +305,10 @@ jre: native
 	echo '[Amethyst v$(VERSION)] jre - end'
 
 dep_mg:
-	@echo '[Amethyst v$(VERSION)] dep_mg - skipped (MobileGlues-cpp source absent; optional renderer only, metallum/Metal path unaffected)'
+	# MobileGlues 构建链已移除。Metal 渲染所需的完整版 SPIRV-Cross(带 MSL backend)
+	# 已预置在 Natives/resources/Frameworks/libspirv-cross-c-shared.0.dylib,
+	# 由 payload 阶段统一拷入 bundle(-> Frameworks/)。此处不再做 cmake 构建。
+	@echo '[Amethyst v$(VERSION)] dep_mg - skipped (SPIRV-Cross prebuilt in Natives/resources/Frameworks)'
 dep_mobilegl:
 	# MobileGL（Vulkan/GLES 后端渲染器）集成已完全移除：
 	# - 构建链中的 perl 补丁（Range1D/BufferChange/is_aggregate_v）不再需要
