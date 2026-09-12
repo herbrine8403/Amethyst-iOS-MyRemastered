@@ -1932,3 +1932,6 @@
 
 "preference.auto" = "Auto";
 "preference.auto_select" = "Auto";
+
+"metal.renderer.notice.title" = "Metal 渲染器(实验性)";
+"metal.renderer.notice.body" = "你正在为 Minecraft 26.2 使用原生 Metal 渲染器(metallum)。\n\n已知限制:\n- 不支持光影包(Iris / OptiFine 风格)。\n- 部分 mod 可能不兼容(如 Sodium 等性能优化 mod);若游戏崩溃,请先移除 mod 再试。\n- Forge 实例:Forge 的加载界面会被跳过(直接进入主菜单),这是预期行为,不是卡死。\n- 若游戏卡住或渲染异常,请切回默认(OpenGL/ANGLE)渲染器。\n\n反馈问题时请附带日志。";

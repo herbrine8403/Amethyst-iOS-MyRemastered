@@ -470,6 +470,18 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
 
         // Setup AMETHYST_RENDERER
         NSString *renderer = [PLProfiles resolveKeyForCurrentProfile:@"renderer"];
+        // Metal 渲染器：图形后端由 metallum agent 走原生 Metal（直接 MTLDevice），
+        // 不经过 EGL 渲染器。渲染器回落 auto（→ANGLE）仅为 Surface 提供 GL 上下文，
+        // 与 metallum 官方集成一致（渲染器只管 GL/Vulkan 回退）。
+        if ([renderer isEqualToString:@ RENDERER_NAME_METAL]) {
+            setenv("AMETHYST_METAL", "1", 1);
+            NSLog(@"[JavaLauncher] Metal renderer selected: AMETHYST_METAL=1 (EGL renderer falls back to auto for surface)");
+            renderer = @"auto";
+            // Metal (metallum) 渲染器注意事项: 提示已知限制
+            showDialog(localize(@"metal.renderer.notice.title", @"Metal Renderer"),
+                       localize(@"metal.renderer.notice.body", @""));
+
+        }
         NSLog(@"[JavaLauncher] RENDERER is set to %@\n", renderer);
         setenv("AMETHYST_RENDERER", renderer.UTF8String, 1);
 
@@ -525,6 +537,27 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
             getenv("POJAV_HOME"), getPrefObject(@"general.game_directory"),
             [PLProfiles resolveKeyForCurrentProfile:@"gameDir"]]
             .stringByStandardizingPath;
+
+        // 预置 Metal 渲染 mod(MetalUniversal, bundle 的 mods_preload/ 内):
+        // 首次启动拷入实例 mods/ —— 仅 Metal mod 自动进入实例, 其他辅助 mod 不再自动拷贝。
+        NSString *preloadDir = [[NSBundle mainBundle] pathForResource:@"mods_preload" ofType:nil];
+        if (preloadDir) {
+            NSString *modsDir = [gameDir stringByAppendingPathComponent:@"mods"];
+            [[NSFileManager defaultManager] createDirectoryAtPath:modsDir
+                                      withIntermediateDirectories:YES attributes:nil error:nil];
+            NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:preloadDir error:nil];
+            for (NSString *f in files) {
+                if ([f.lowercaseString rangeOfString:@"metal"].location == NSNotFound) continue;  // 仅预置 Metal mod
+                NSString *srcPath = [preloadDir stringByAppendingPathComponent:f];
+                NSString *dstPath = [modsDir stringByAppendingPathComponent:f];
+                if (![[NSFileManager defaultManager] fileExistsAtPath:dstPath]) {
+                    if ([[NSFileManager defaultManager] copyItemAtPath:srcPath toPath:dstPath error:nil]) {
+                        NSLog(@"[JavaLauncher] Preloaded Metal mod: %@", f);
+                    }
+                }
+            }
+        }
+
     } else {
         defaultJRETag = @"execute_jar";
         gameDir = @(getenv("POJAV_GAME_DIR"));
@@ -828,6 +861,30 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
   
     NSString *librariesPath = [NSString stringWithFormat:@"%@/libs", NSBundle.mainBundle.bundlePath];
     PUSH_MARGV_FORMAT(@"-javaagent:%@/patchjna_agent.jar=", librariesPath);
+    // Metallum (MetalUniversal) agent: only inject on vanilla (and Forge-style)
+    // instances. Fabric/Quilt instances use the bundled MetalUniversal mod (mixin),
+    // and adding the agent would duplicate ASM classes on the classpath
+    // (fabric-loader's verifyClasspath refuses to start).
+    BOOL isFabricOrQuilt =
+        [[NSFileManager defaultManager] fileExistsAtPath:
+            [@(getenv("POJAV_HOME")) stringByAppendingPathComponent:@"libraries/net/fabricmc/fabric-loader"]]
+        || [[NSFileManager defaultManager] fileExistsAtPath:
+            [@(getenv("POJAV_HOME")) stringByAppendingPathComponent:@"libraries/net/quiltmc/quilt-loader"]];
+    if (!isFabricOrQuilt
+        && [[NSFileManager defaultManager] fileExistsAtPath:
+            [librariesPath stringByAppendingPathComponent:@"metallum_agent.jar"]]) {
+        PUSH_MARGV_FORMAT(@"-javaagent:%@/metallum_agent.jar=", librariesPath);
+        // 把 MC 版本 id 传给 agent(agent 按版本选择对应的 metallum 类映射)
+        NSString *mcVersionId = nil;
+        if ([launchTarget isKindOfClass:NSDictionary.class]) {
+            mcVersionId = launchTarget[@"id"];
+        } else {
+            mcVersionId = launchTarget;
+        }
+        if (mcVersionId && mcVersionId.length > 0) {
+            PUSH_MARGV_FORMAT(@"-Dmetallum.mc.version=%@", mcVersionId);
+        }
+    }
     if(getPrefBool(@"general.cosmetica")) {
         PUSH_MARGV_FORMAT(@"-javaagent:%@/arc_dns_injector.jar=23.95.137.176", librariesPath);
     }
@@ -949,6 +1006,7 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         // 类的初始化顺序。
 
         // Required by Cosmetica to inject DNS
+        PUSH_MARGV_LITERAL("--add-opens=java.base/java.lang=ALL-UNNAMED");
         PUSH_MARGV_LITERAL("--add-opens=java.base/java.net=ALL-UNNAMED");
 
         // Setup Caciocavallo

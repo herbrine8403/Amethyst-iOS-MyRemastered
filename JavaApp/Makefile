@@ -64,10 +64,11 @@ $(OUTPUTDIR)/lwjgl.jar: $(CLASSES) check_empty_classes
 	@cd $(OUTPUTDIR)/lwjgl_lib && find ../../libs/lwjgl -name 'lwjgl*.jar' -exec $(BOOTJDK)/jar -xf {} \; && rm -rf META-INF
 	@cd $(OUTPUTDIR)/lwjgl_lib && $(BOOTJDK)/jar -xf "../../../lwjgl.jar" && rm -rf META-INF
 	@cp -R $(OUTPUTDIR)/lwjgl/* $(OUTPUTDIR)/lwjgl_lib/
-	@mkdir -p $(OUTPUTDIR)/lwjgl_lib/com/apple/ios/audio
-	@cp -R $(OUTPUTDIR)/launcher/com/apple/ios/audio/*.class $(OUTPUTDIR)/lwjgl_lib/com/apple/ios/audio/
-	@mkdir -p $(OUTPUTDIR)/lwjgl_lib/META-INF/services
-	@cp $(SOURCEDIR)/launcher/META-INF/services/javax.sound.sampled.spi.MixerProvider $(OUTPUTDIR)/lwjgl_lib/META-INF/services/
+	# NOTE: com.apple.ios.audio stays in launcher.jar only.  Packing it into
+	# lwjgl.jar as well makes modules "lwjgl" and "launcher" both export the same
+	# package, and Forge's bootstrap module resolver aborts with
+	# ResolutionException ("Modules lwjgl and launcher export package
+	# com.apple.ios.audio").  Keep the audio SPI provider out of this jar too.
 	@$(BOOTJDK)/jar -cf $@ -C $(OUTPUTDIR)/lwjgl_lib .
 
 $(OUTPUTDIR)/patchjna_agent.jar: $(CLASSES)

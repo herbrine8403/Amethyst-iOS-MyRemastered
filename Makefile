@@ -305,25 +305,10 @@ jre: native
 	echo '[Amethyst v$(VERSION)] jre - end'
 
 dep_mg:
-	echo '[Amethyst v$(VERSION)] dep_mg - start'
-	mkdir -p $(WORKINGDIR)/mobileglues
-	cd $(WORKINGDIR)/mobileglues && cmake \
-		-DMACOS="1" \
-		-DCMAKE_CROSSCOMPILING=true \
-		-DCMAKE_SYSTEM_NAME=Darwin \
-		-DCMAKE_SYSTEM_PROCESSOR=aarch64 \
-		-DCMAKE_OSX_SYSROOT="$(SDKPATH)" \
-		-DCMAKE_OSX_ARCHITECTURES=arm64 \
-		-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
-		-DCMAKE_C_FLAGS="-arch arm64" \
-		-DSPIRV_CROSS_SHARED="ON" \
-		$(SOURCEDIR)/Natives/external/MobileGlues/MobileGlues-cpp/
-
-	cmake --build $(WORKINGDIR)/mobileglues --config RelWithDebInfo -j$(JOBS) --target mobileglues
-	cp $(WORKINGDIR)/mobileglues/libmobileglues*.dylib $(WORKINGDIR)/
-	cp $(WORKINGDIR)/mobileglues/libspirv-cross*.dylib $(WORKINGDIR)/ 2>/dev/null || true
-	echo '[Amethyst v$(VERSION)] dep_mg - end'
-
+	# MobileGlues 构建链已移除。Metal 渲染所需的完整版 SPIRV-Cross(带 MSL backend)
+	# 已预置在 Natives/resources/Frameworks/libspirv-cross-c-shared.0.dylib,
+	# 由 payload 阶段统一拷入 bundle(-> Frameworks/)。此处不再做 cmake 构建。
+	@echo '[Amethyst v$(VERSION)] dep_mg - skipped (SPIRV-Cross prebuilt in Natives/resources/Frameworks)'
 dep_mobilegl:
 	# MobileGL（Vulkan/GLES 后端渲染器）集成已完全移除：
 	# - 构建链中的 perl 补丁（Range1D/BufferChange/is_aggregate_v）不再需要

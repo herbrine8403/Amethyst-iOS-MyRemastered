@@ -183,7 +183,11 @@
     [ControllerInput tick];
     // 动态判定：仅当 MC 真实走 Vulkan 路径时才递增 FPS 计数器
     BOOL actualVulkanPath = pojavIsActualVulkanPath();
-    if (actualVulkanPath) {
+    // Metal (metallum) 渲染器同样不经过 EGL 的 pojavSwapBuffers 路径(也不走
+    // MoltenVK 的 vkQueuePresentKHR)，因此首帧只能由 displayLink 检测；
+    // 否则 PojavFirstFrameRendered 永不发出，启动遮罩不会自动撤除。
+    BOOL metalPath = (getenv("AMETHYST_METAL") != NULL);
+    if (actualVulkanPath || metalPath) {
         pojavIncrementFpsCounter();
     }
     _tickCount++;

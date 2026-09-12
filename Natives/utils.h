@@ -48,6 +48,7 @@
 //     persistent mapped buffers / texture buffers 正常工作
 //   - Fragment shader 编译失败时忽略错误，让 BSL/Mellow 等光影包能运行
 #define RENDERER_NAME_LTW "libltw.dylib"
+#define RENDERER_NAME_METAL "libmetallum.dylib"
 
 #define SPECIALBTN_KEYBOARD -1
 #define SPECIALBTN_TOGGLECTRL -2
