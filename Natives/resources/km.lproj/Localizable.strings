@@ -241,6 +241,9 @@
 "preference.title.renderer.debug.zink" = "Zink (Mesa 25.0.7) - exports OpenGL 4.1";
 "preference.title.renderer.debug.ltw" = "LTW - OpenGL Core→ES wrapper (1.17+)";
 "preference.title.renderer.debug.vulkan" = "MoltenVK (26.2+) - exports vulkan 1.4";
+"preference.title.renderer.debug.mithril" = "Mithril（1.17+）- OpenGL 3.3 核心，经 Vulkan/Metal，实验性";
+"preference.title.renderer.debug.mobilegl" = "MobileGL Vulkan（1.17+）- OpenGL 3.3 核心，实验性";
+"preference.title.renderer.debug.mobilegl_gles" = "MobileGL GLES（1.17+）- OpenGL 3.3 核心，经 OpenGL ES，实验性";
 
 "preference.detail.renderer" = "Change the OpenGL render engine to use. Zink is temporarily disabled on iOS 16 and later to diagnose issues.";
 
