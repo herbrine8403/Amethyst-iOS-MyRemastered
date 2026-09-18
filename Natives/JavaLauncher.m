@@ -167,6 +167,15 @@ void init_loadCustomEnv() {
 ///   config.json 会被 MobileGlues 读取并生效。
 void init_loadMobileGluesConfig() {
     NSString *renderer = [PLProfiles resolveKeyForCurrentProfile:@"renderer"];
+        // [AMETHYST-METAL] 原生 Metal 渲染器(metallum):图形后端由 agent 直接走 MTLDevice,
+        // 不经过 EGL/GL 渲染器;渲染器回落 auto(->ANGLE)仅为 Surface 提供 GL 上下文。
+        if ([renderer isEqualToString:@ RENDERER_NAME_METAL]) {
+            setenv("AMETHYST_METAL", "1", 1);
+            NSLog(@"[JavaLauncher] Metal renderer selected: AMETHYST_METAL=1 (EGL falls back to auto for surface)");
+            renderer = @"auto";
+            showDialog(localize(@"metal.renderer.notice.title", @"Metal Renderer"),
+                       localize(@"metal.renderer.notice.body", @""));
+        }
     NSLog(@"[JavaLauncher] init_loadMobileGluesConfig: renderer=%@", renderer);
 
     BOOL usesMobileGlues = [renderer isEqualToString:@ RENDERER_NAME_MOBILEGLUES] ||
@@ -1183,6 +1192,24 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
   
     NSString *librariesPath = [NSString stringWithFormat:@"%@/libs", NSBundle.mainBundle.bundlePath];
     PUSH_MARGV_FORMAT(@"-javaagent:%@/patchjna_agent.jar=", librariesPath);
+    // [AMETHYST-METAL] Metallum agent 注入:仅 vanilla / Forge 类实例;
+    // Fabric/Quilt 实例改用内置 mod(mixin),否则 ASM 类重复,fabric-loader 拒绝启动。
+    if (getenv("AMETHYST_METAL") != NULL) {
+                if ([[NSFileManager defaultManager] fileExistsAtPath:
+                [librariesPath stringByAppendingPathComponent:@"metallum_agent.jar"]]) {
+            PUSH_MARGV_FORMAT(@"-javaagent:%@/metallum_agent.jar=", librariesPath);
+            // 把 MC 版本 id 传给 agent(按版本选 metallum 类映射)
+            NSString *mcVersionId = nil;
+            if ([launchTarget isKindOfClass:NSDictionary.class]) {
+                mcVersionId = launchTarget[@"id"];
+            } else {
+                mcVersionId = launchTarget;
+            }
+            if (mcVersionId && mcVersionId.length > 0) {
+                PUSH_MARGV_FORMAT(@"-Dmetallum.mc.version=%@", mcVersionId);
+            }
+        }
+    }
     if(getPrefBool(@"general.cosmetica")) {
         PUSH_MARGV_FORMAT(@"-javaagent:%@/arc_dns_injector.jar=23.95.137.176", librariesPath);
     }

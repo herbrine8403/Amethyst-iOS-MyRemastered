@@ -57,6 +57,10 @@
 // 参考：Uniaball/Mithril-Wrapper 仓库 launcher-patch/ 下对 Air 的接入方式。
 #define RENDERER_NAME_MITHRIL "libmithril.dylib"
 
+// 原生 Metal 渲染器(metallum agent 直接 MTLDevice,零转译):
+// GL/Vulkan 运行时不参与,着色器由 SPIRV-Cross 编译为 MSL。
+#define RENDERER_NAME_METAL "libmetallum.dylib"
+
 // MobileGL - MobileGL-Dev 的桌面 OpenGL 实现（LGPL-3.0）。
 // 两个变体共用同一个 libMobileGL.dylib 二进制，由环境变量
 // MOBILEGL_BACKEND_TYPE 在运行时选择后端：
