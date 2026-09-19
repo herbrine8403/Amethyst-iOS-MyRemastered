@@ -131,9 +131,16 @@ static void *ProgressObserverContext = &ProgressObserverContext;
     // 监听背景 UI 效果变化通知：当用户在背景设置中切换毛玻璃/半透明或调整透明度时，
     // 重新调用 makeViewControllerTransparent 以应用最新的视觉效果，保证背景始终正确透出。
     [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(reapplyBackgroundEffect)
-                                                 name:@"BackgroundUIEffectChanged"
-                                               object:nil];
+                                              selector:@selector(reapplyBackgroundEffect)
+                                                  name:@"BackgroundUIEffectChanged"
+                                                object:nil];
+
+    // 从 StikDebug/NB助手启用 JIT 后跳回本 App 时 viewWillAppear 不会触发，
+    // 需在前台恢复时刷新 JIT 状态指示，否则 detach 后的过期 YES 状态会误导用户直接启动。
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                              selector:@selector(updateJITStatus)
+                                                  name:UIApplicationWillEnterForegroundNotification
+                                                object:nil];
 }
 
 - (void)viewWillAppear:(BOOL)animated {
@@ -1212,10 +1219,16 @@ static void *ProgressObserverContext = &ProgressObserverContext;
         handler();
         return;
     } else if (@available(iOS 17.4, *)) {
+        // script-data 仅 TXM 设备需要（见 LauncherNavigationController.m 同处注释）。
+        // NB助手用户若未装 StikDebug需手动去 NB助手启用 JIT 后返回等待。
         NSString *scriptDataString = @"";
-        if (DeviceNeedsDebugJITMapping()) {
+        if (DeviceNeedsStikScript()) {
             NSData *scriptData = [NSData dataWithContentsOfFile:[NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"UniversalJIT26.js"]];
-            scriptDataString = [@"&script-data=" stringByAppendingString:[scriptData base64EncodedStringWithOptions:0]];
+            if (scriptData) {
+                scriptDataString = [@"&script-data=" stringByAppendingString:[scriptData base64EncodedStringWithOptions:0]];
+            } else {
+                NSLog(@"[JIT] WARNING: UniversalJIT26.js not found in bundle, sending plain stikjit attach");
+            }
         }
         [UIApplication.sharedApplication openURL:[NSURL URLWithString:[NSString stringWithFormat:@"stikjit://enable-jit?bundle-id=%@&pid=%d%@", NSBundle.mainBundle.bundleIdentifier, getpid(), scriptDataString]] options:@{} completionHandler:nil];
     } else {

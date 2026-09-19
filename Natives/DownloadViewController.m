@@ -3730,10 +3730,15 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
         handler();
         return;
     } else if (@available(iOS 17.4, *)) {
+        // script-data 仅 TXM 设备需要（见 LauncherNavigationController.m 同处注释）。
         NSString *scriptDataString = @"";
-        if (DeviceNeedsDebugJITMapping()) {
+        if (DeviceNeedsStikScript()) {
             NSData *scriptData = [NSData dataWithContentsOfFile:[NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"UniversalJIT26.js"]];
-            scriptDataString = [@"&script-data=" stringByAppendingString:[scriptData base64EncodedStringWithOptions:0]];
+            if (scriptData) {
+                scriptDataString = [@"&script-data=" stringByAppendingString:[scriptData base64EncodedStringWithOptions:0]];
+            } else {
+                NSLog(@"[JIT] WARNING: UniversalJIT26.js not found in bundle, sending plain stikjit attach");
+            }
         }
         [UIApplication.sharedApplication openURL:[NSURL URLWithString:[NSString stringWithFormat:@"stikjit://enable-jit?bundle-id=%@&pid=%d%@", NSBundle.mainBundle.bundleIdentifier, getpid(), scriptDataString]] options:@{} completionHandler:nil];
     } else {

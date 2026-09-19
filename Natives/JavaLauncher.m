@@ -641,11 +641,13 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
     init_loadDefaultEnv();
     init_loadCustomEnv();
 
-    // 同步自 catsruledogs：刷新 JIT flags，决定是否需要 Debug JIT Mapping
-    // 使用 DeviceNeedsDebugJITMapping() 基于 JIT_FLAG_IS_IOS_26 | JIT_FLAG_FORCE_MIRRORED
-    // 而非 TXM 固件检测，确保 iOS 26+ 无 TXM 设备也能正确设置 JIT 脚本
+    // 刷新 JIT flags，决定是否需要 StikDebug Universal 脚本流程（仅 TXM 设备）。
+    // 使用 DeviceNeedsStikScript()（HAS_TXM && (IS_IOS_26 || FORCE_MIRRORED)）：
+    // 遵循 StikJIT 集成指南，非 TXM 设备普通 attach 即可启用 JIT，无需 script-data；
+    // TXM 设备（含 iOS 26+ 无 FORCE 的新组合）必须先经 Universal 脚本建立 mirrored 映射。
+    // 注意：此 brk 测试要求调试器已附加，调用方必须先经 invokeAfterJITEnabled 等待 isJITEnabled。
     DeviceGetJITFlags(YES);
-    BOOL requiresDebugJITMapping = DeviceNeedsDebugJITMapping();
+    BOOL requiresDebugJITMapping = DeviceNeedsStikScript();
     BOOL jit26AlwaysAttached = getPrefBool(@"debug.debug_always_attached_jit");
     if (requiresDebugJITMapping) {
         // 检测是否在使用 legacy JIT script（brk #0x69 由 UniversalJIT26.js 处理）
@@ -1625,9 +1627,9 @@ int launchHeadlessJVM(NSString *mainClass, NSArray<NSString *> *args, int minJav
     init_loadDefaultEnv();
     init_loadCustomEnv();
 
-    // 与 launchJVM 相同的 JIT26 处理（iOS 26+ 无 TXM 设备需要 Debug JIT Mapping）
+    // 与 launchJVM 相同的 TXM 脚本处理（仅 TXM 设备需要 Universal 脚本）
     DeviceGetJITFlags(YES);
-    BOOL requiresDebugJITMapping = DeviceNeedsDebugJITMapping();
+    BOOL requiresDebugJITMapping = DeviceNeedsStikScript();
     BOOL jit26AlwaysAttached = getPrefBool(@"debug.debug_always_attached_jit");
     if (requiresDebugJITMapping) {
         static void *result;

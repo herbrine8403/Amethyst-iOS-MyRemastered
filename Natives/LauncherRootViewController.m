@@ -1,4 +1,5 @@
 #import "LauncherRootViewController.h"
+#import "ALTServerConnection.h"
 #import "LauncherMenuViewController.h"
 #import "LauncherNewsViewController.h"
 #import "LauncherRightPanelViewController.h"
@@ -95,10 +96,64 @@ static CGFloat LauncherRootLayoutRightPanelWidth(UITraitCollection *trait) {
 
     // 监听外观变更（字体颜色 / 卡片颜色），与 Card 布局保持一致
     [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(applyCustomAppearance)
-                                                 name:@"LauncherAppearanceChanged"
-                                               object:nil];
+                                              selector:@selector(applyCustomAppearance)
+                                                  name:@"LauncherAppearanceChanged"
+                                                object:nil];
     [self applyCustomAppearance];
+
+    // 启动时 JIT 环境自检（还原原版 LauncherMenuViewController.viewDidLoad 的安全网，
+    // Bento 重构时被误删）：无 get-task-allow 签名的包 StikDebug/NB助手无法附加，
+    // 必须尽早明确提示而不是让用户在启动游戏时才闪退。
+    [self checkJITEnvironmentAtStartup];
+}
+
+#pragma mark - JIT 启动自检（同步自原版）
+
+- (void)checkJITEnvironmentAtStartup {
+    if (getEntitlementValue(@"get-task-allow")) {
+        NSLog(@"[JIT] %@...", localize(@"login.jit.checking", nil));
+        if (isJITEnabled(false)) {
+            NSLog(@"[JIT] %@", localize(@"login.jit.enabled", nil));
+        } else if (@available(iOS 17.0, *)) {
+            // iOS 17+ 的 JIT 在实际启动游戏时经 StikDebug/NB助手按需获取，此处仅记录
+            NSLog(@"[JIT] JIT not yet enabled; will request via StikDebug/NB助手 at game launch (TXM script needed: %@)",
+                DeviceNeedsStikScript() ? @"YES" : @"NO");
+        } else {
+            [self enableJITWithAltKit];
+        }
+    } else if (!NSProcessInfo.processInfo.macCatalystApp && !getenv("SIMULATOR_DEVICE_NAME")) {
+        NSLog(@"[JIT] %@", localize(@"login.jit.fail", nil));
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:localize(@"login.jit.fail.title", nil)
+            message:localize(@"login.jit.fail.description_unsupported", nil)
+            preferredStyle:UIAlertControllerStyleAlert];
+        UIAlertAction *okAction = [UIAlertAction actionWithTitle:localize(@"OK", nil) style:UIAlertActionStyleDefault handler:^(id action){
+            exit(-1);
+        }];
+        [alert addAction:okAction];
+        // viewDidLoad 时视图尚未入栈，投递到下一轮 runloop 再弹，避免 "view not in hierarchy" 警告
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self presentViewController:alert animated:YES completion:nil];
+        });
+    }
+}
+
+- (void)enableJITWithAltKit {
+    [ALTServerManager.sharedManager startDiscovering];
+    [ALTServerManager.sharedManager autoconnectWithCompletionHandler:^(ALTServerConnection *connection, NSError *error) {
+        if (error) {
+            NSLog(@"[AltKit] Could not auto-connect to server. %@", error.localizedRecoverySuggestion);
+            return;
+        }
+        [connection enableUnsignedCodeExecutionWithCompletionHandler:^(BOOL success, NSError *error) {
+            if (success) {
+                NSLog(@"[AltKit] Successfully enabled JIT compilation!");
+            } else {
+                NSLog(@"[AltKit] Error enabling JIT: %@", error.localizedRecoverySuggestion);
+            }
+            [ALTServerManager.sharedManager stopDiscovering];
+            [connection disconnect];
+        }];
+    }];
 }
 
 - (BOOL)prefersStatusBarHidden {

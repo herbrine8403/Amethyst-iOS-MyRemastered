@@ -24,6 +24,14 @@ BOOL getEntitlementValue(NSString *key) {
     return ![(__bridge id)value isKindOfClass:NSNumber.class] || [(__bridge id)value boolValue];
 }
 
+BOOL JIT26IsLikelyDebuggerKeepAttached(void) {
+    // getppid() 正常情况下返回 launchd 的 PID (1)，仅当调试器仍在附加时才不是 1
+    // （同步自原版 AngelAuraMC/Amethyst-iOS）。
+    // StikDebug 默认 DetachAfterFirstBr、NB助手/Jitterbug 类工具 attach 后 detach 都会导致
+    // CS_DEBUGGED 残留，此时若误判 JIT 就绪并启动游戏，后续 mirrored JIT 的 brk 将无人处理而闪退。
+    return getppid() != 1;
+}
+
 BOOL isJITEnabled(BOOL checkCSFlags) {
     if (!checkCSFlags && (getEntitlementValue(@"dynamic-codesigning") || isJailbroken)) {
         return YES;
@@ -31,7 +39,17 @@ BOOL isJITEnabled(BOOL checkCSFlags) {
 
     int flags;
     csops(getpid(), 0, &flags, sizeof(flags));
-    return (flags & CS_DEBUGGED) != 0;
+    if ((flags & CS_DEBUGGED) == 0) {
+        return NO;
+    }
+    if (!DeviceNeedsStikScript()) {
+        // 无 TXM 的设备：CS_DEBUGGED 即表示 JIT 可用
+        return YES;
+    }
+    // TXM 设备需要调试器保持附加以处理后续 mirrored JIT 请求（HotSpot code cache、
+    // dyld bypass patching 等）。若已 detach（getppid 回到 1），必须视为 JIT 未就绪，
+    // 让等待循环继续等待用户在 StikDebug 中保持附加/NB助手重新附加，而不是带病启动。
+    return JIT26IsLikelyDebuggerKeepAttached();
 }
 
 void openLink(UIViewController* sender, NSURL* link) {
@@ -303,6 +321,18 @@ BOOL DeviceNeedsDebugJITMapping(void) {
     // MirrorMappedCodeCache now means that the Universal JIT script has been
     // installed and HotSpot may request its RX mapping from the debugger.
     return DeviceHasJITFlags(JIT_FLAG_IS_IOS_26 | JIT_FLAG_FORCE_MIRRORED);
+}
+
+BOOL DeviceNeedsStikScript(void) {
+    // StikDebug Universal 脚本是否必需：仅 TXM 设备需要（遵循 StikJIT 集成指南：
+    // "When TXM/SPTM is not present, omit both script parameters because debugger
+    // attachment alone enables JIT"）。
+    // 原版条件为 FORCE_MIRRORED|HAS_TXM；此处扩展覆盖 iOS 26+ TXM 但尚未 FORCE_MIRRORED
+    // 的情况（dyld bypass 已对该情况选用 mirrored，见 dyld_bypass_validation.m 注释），
+    // 避免原版在该组合下漏发 script-data 导致 TXM JIT 失败。
+    // 非 TXM 的 iOS 26+ mirrored（HWBreakpoint 路径）不需要 script-data，普通 attach 即可。
+    return DeviceHasJITFlags(JIT_FLAG_HAS_TXM) &&
+        (DeviceHasJITFlags(JIT_FLAG_IS_IOS_26) || DeviceHasJITFlags(JIT_FLAG_FORCE_MIRRORED));
 }
 
 void dismissModalViewController(UIViewController *viewController) {

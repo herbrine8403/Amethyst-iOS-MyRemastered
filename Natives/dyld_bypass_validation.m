@@ -68,7 +68,9 @@ bool redirectFunctionDirect(char *name, void *patchAddr, void *target) {
 }
 // redirectFunction for iOS 26+ (TXM)
 bool redirectFunctionMirrored(char *name, void *patchAddr, void *target) {
-    if (DeviceHasJITFlags(JIT_FLAG_FORCE_MIRRORED | JIT_FLAG_HAS_TXM)) {
+    // 与 init_bypassDyldLibValidation 的 mirrored 选中条件保持一致：
+    // HAS_TXM && (IS_IOS_26 || FORCE_MIRRORED)，覆盖 iOS 26+ TXM 无 FORCE 的新组合。
+    if (DeviceNeedsStikScript()) {
         JIT26PrepareRegionForPatching(patchAddr, sizeof(patch));
     }
     // mirror `addr` (rx, JIT applied) to `mirrored` (rw)
@@ -171,7 +173,8 @@ void* hooked_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off
     if (map == MAP_FAILED) {
         //printf("[DyldLVBypass] mmap(prot=%d, flags=%d, fd=%d)\n", prot, flags, fd);
         map = __mmap(addr, len, prot, flags | MAP_PRIVATE | MAP_ANON, 0, 0);
-        if (DeviceHasJITFlags(JIT_FLAG_FORCE_MIRRORED | JIT_FLAG_HAS_TXM)) {
+        // 与 init_bypassDyldLibValidation 的 mirrored 选中条件保持一致（见上）。
+        if (DeviceNeedsStikScript()) {
             JIT26PrepareRegion(map, len);
         }
         
