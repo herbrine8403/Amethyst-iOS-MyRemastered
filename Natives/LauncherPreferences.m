@@ -216,7 +216,7 @@ NSString* getExactJavaHome(int version) {
     NSDictionary *pref = getPrefObject(@"java.java_homes");
     NSString *key = [@(version) stringValue];
     id dir = pref[key];
-    if (![dir isKindOfClass:[NSString class]] || dir.length == 0) {
+    if (![dir isKindOfClass:[NSString class]] || [(NSString *)dir length] == 0) {
         NSLog(@"[JavaPin] Java %d is not configured in java_homes, falling back", version);
         return nil;
     }
