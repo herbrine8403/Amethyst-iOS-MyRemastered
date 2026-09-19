@@ -106,6 +106,9 @@ BOOL debugLogEnabled, isJailbroken;
 #define CS_DEBUGGED 0x10000000
 int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
 BOOL isJITEnabled(BOOL checkCSOps);
+// StikDebug/NB助手 detach 后 CS_DEBUGGED 仍可能残留，需用 getppid 判断调试器是否仍在附加
+// （同步自原版 AngelAuraMC/Amethyst-iOS，用于 TXM/mirrored 设备防误判带病启动）
+BOOL JIT26IsLikelyDebuggerKeepAttached(void);
 // legacy method used to check if we're using universal script
 void* JIT26CreateRegionLegacy(size_t len);
 // used for large memory regions
@@ -126,6 +129,9 @@ typedef enum {
 JITFlags DeviceGetJITFlags(BOOL refresh);
 BOOL DeviceHasJITFlags(JITFlags flags);
 BOOL DeviceNeedsDebugJITMapping(void);
+// TXM 设备需要 StikDebug Universal 脚本 + 调试器保持附加（原版条件 FORCE_MIRRORED|HAS_TXM
+// 扩展覆盖 iOS 26+ TXM 无 FORCE 的情况；非 TXM 设备按 StikJIT 指南只需普通 attach，无需 script-data）
+BOOL DeviceNeedsStikScript(void);
 
 // Init functions
 void init_bypassDyldLibValidation();

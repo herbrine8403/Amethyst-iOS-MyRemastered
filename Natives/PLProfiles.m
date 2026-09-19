@@ -54,7 +54,7 @@ static PLProfiles* current;
 
     NSDictionary *valueDefaults = @{
         @"javaVersion": @"0",
-        // LWJGL 版本："auto" = MC 26.x 及以上用 3.4.1，其余用 3.3.3。
+        // LWJGL 版本："auto" = MC 25.x 及以上用 3.4.1，25 以下用 3.3.3。
         // profile 里显式存 "333"/"341" 时以显式值为准。
         @"lwjglVersion": @"auto",
         @"gameDir": @"."
