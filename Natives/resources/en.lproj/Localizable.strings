@@ -92,7 +92,7 @@
 "launcher.menu.import_modpack" = "Import modpack";
 
 "launcher.wait_jit.title" = "Waiting for JIT(Just-in-time)";
-"launcher.wait_jit.message" = "Amethyst relies on JIT(Just-in-time) compilation for Java to work at maximum performance";
+"launcher.wait_jit.message" = "Amethyst relies on JIT(Just-in-time) compilation for Java to work at maximum performance. Enable JIT for this app in StikDebug/NB助手/SideStore, then return here and wait. On TXM devices use the Universal script in StikDebug and keep it attached.";
 "launcher.wait_jit_trollstore.message" = "If you still see this message, please enable URL Scheme in TrollStore.";
 
 "login.error.username.outOfRange" = "Username must be at least 3 characters and a maximum of 16 characters";
