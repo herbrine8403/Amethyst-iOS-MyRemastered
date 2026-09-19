@@ -38,6 +38,9 @@ CGRect getSafeArea(CGRect screenBounds);
 void setSafeArea(CGSize screenSize, CGRect safeArea);
 
 NSString* getSelectedJavaHome(NSString* defaultJRETag, int minVersion);
+// 按精确版本号取 JRE home（profile javaVersion pin 用）：只查 java_homes[version]，
+// 不看全局 "0" 槽默认。未配置或目录缺失返回 nil，调用方回退到 getSelectedJavaHome。
+NSString* getExactJavaHome(int version);
 
 NSArray* getRendererKeys(BOOL containsDefault);
 NSArray* getRendererNames(BOOL containsDefault);

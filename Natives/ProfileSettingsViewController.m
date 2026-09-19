@@ -24,6 +24,9 @@
 @property (nonatomic, strong) NSString *selectedRenderer;
 @property (nonatomic, strong) NSString *selectedGraphicsApi;  // MC 26.2+ 图形 API: default/prefer_vulkan/prefer_opengl
 @property (nonatomic, strong) NSString *selectedJavaVersion;
+// LWJGL 版本 pin：@"auto"（默认，按 MC 主版本自动：<25 用 3.3.3，>=25 用 3.4.1）
+// 或 @"333" / @"341"（强制）。对应 profile key @"lwjglVersion"，auto 时删 key 回退默认。
+@property (nonatomic, strong) NSString *selectedLwjglVersion;
 @property (nonatomic, assign) NSInteger allocatedMemory;
 @property (nonatomic, assign) NSInteger maxMemory;
 // 服务器地址（FCL 风格：留空则不自动加入）
@@ -65,6 +68,7 @@ static NSString * localizeProfileTitle(NSString *title) {
             @"渲染器": @"preference.title.renderer",
             @"图形 API": @"i18n_str_2057",
             @"Java版本": @"i18n_str_2036",
+            @"LWJGL版本": @"preference.profile.title.lwjgl_version",
             @"内存分配": @"i18n_str_2037",
             @"JVM 启动参数": @"preference.title.java_args",
             @"清除JVM参数": @"i18n_str_2038",
@@ -484,6 +488,14 @@ static NSString * localizeProfileTitle(NSString *title) {
         self.selectedJavaVersion = [javaVerRaw isKindOfClass:[NSString class]] ? javaVerRaw : @"0";
     }
 
+    // LWJGL 版本：仅认 auto/333/341，其余（含旧编辑器残留的 "(default)"）一律归一为 auto
+    id lwjglRaw = self.profile[@"lwjglVersion"];
+    if ([lwjglRaw isEqualToString:@"333"] || [lwjglRaw isEqualToString:@"341"]) {
+        self.selectedLwjglVersion = lwjglRaw;
+    } else {
+        self.selectedLwjglVersion = @"auto";
+    }
+
     // 内存分配 (MB)
     self.allocatedMemory = [self.profile[@"allocatedMemory"] integerValue];
     if (self.allocatedMemory == 0) {
@@ -516,7 +528,7 @@ static NSString * localizeProfileTitle(NSString *title) {
     if ([self isCurrentProfileModernVersion]) {
         [advancedRows addObject:@"图形 API"];
     }
-    [advancedRows addObjectsFromArray:@[@"Java版本", @"内存分配", @"JVM 启动参数", @"清除JVM参数"]];
+    [advancedRows addObjectsFromArray:@[@"Java版本", @"LWJGL版本", @"内存分配", @"JVM 启动参数", @"清除JVM参数"]];
 
     // 重构（Air-Design v1.2）：5 个 Bento 分组
     // 顺序与横屏布局对应：左侧（0,1）+ 右侧（2,3,4）
@@ -619,6 +631,12 @@ static NSString * localizeProfileTitle(NSString *title) {
     existing[@"renderer"] = self.selectedRenderer;
     existing[@"graphicsApi"] = self.selectedGraphicsApi;
     existing[@"javaVersion"] = self.selectedJavaVersion;
+    // LWJGL：auto 时删 key（回退 PLProfiles 默认 auto），显式值才存，与旧编辑器语义一致
+    if ([self.selectedLwjglVersion isEqualToString:@"333"] || [self.selectedLwjglVersion isEqualToString:@"341"]) {
+        existing[@"lwjglVersion"] = self.selectedLwjglVersion;
+    } else {
+        [existing removeObjectForKey:@"lwjglVersion"];
+    }
     existing[@"allocatedMemory"] = @(self.allocatedMemory);
     existing[@"serverIp"] = self.serverIp ?: @"";
     // 参照 main 分支：javaArgs 为空时移除 key，让 profile 回退到全局 java.java_args
@@ -770,6 +788,10 @@ static NSString * localizeProfileTitle(NSString *title) {
                 cell.imageView.image = [UIImage systemImageNamed:@"j.square"];
                 cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
                 cell.detailTextLabel.text = [self.selectedJavaVersion isEqualToString:@"0"] ? localize(@"preference.auto", nil) : [NSString stringWithFormat:@"Java %@", self.selectedJavaVersion];
+            } else if ([title isEqualToString:@"LWJGL版本"]) {
+                cell.imageView.image = [UIImage systemImageNamed:@"shippingbox"];
+                cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+                cell.detailTextLabel.text = [self lwjglDisplayName:self.selectedLwjglVersion];
             } else if ([title isEqualToString:@"内存分配"]) {
                 cell.imageView.image = [UIImage systemImageNamed:@"memorychip"];
                 cell.accessoryType = UITableViewCellAccessoryNone;
@@ -1161,6 +1183,8 @@ static NSString * localizeProfileTitle(NSString *title) {
                 [self showGraphicsApiSelector];
             } else if ([title isEqualToString:@"Java版本"]) {
                 [self showJavaVersionSelector];
+            } else if ([title isEqualToString:@"LWJGL版本"]) {
+                [self showLwjglVersionSelector];
             } else if ([title isEqualToString:@"内存分配"]) {
                 [self showMemoryAllocator];
             } else if ([title isEqualToString:@"JVM 启动参数"]) {
@@ -2110,6 +2134,42 @@ static NSString * localizeProfileTitle(NSString *title) {
         UITableViewCell *cell = [self cellForGlobalSection:3 row:1];
         alert.popoverPresentationController.sourceView = cell ?: self.view;
         alert.popoverPresentationController.sourceRect = cell ? cell.bounds : self.view.bounds;
+    }
+
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (NSString *)lwjglDisplayName:(NSString *)value {
+    if ([value isEqualToString:@"333"]) return @"3.3.3";
+    if ([value isEqualToString:@"341"]) return @"3.4.1";
+    return localize(@"preference.auto", nil);
+}
+
+- (void)showLwjglVersionSelector {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:localize(@"preference.profile.title.lwjgl_version", nil)
+                                                                   message:nil
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+
+    // 与 ResolveLwjglVersion（JavaLauncher.m）同口径：auto = MC 主版本 <25 用 3.3.3，>=25 用 3.4.1
+    NSArray *values = @[@"auto", @"333", @"341"];
+    for (NSString *ver in values) {
+        [alert addAction:[UIAlertAction actionWithTitle:[self lwjglDisplayName:ver]
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction * _Nonnull action) {
+            self.selectedLwjglVersion = ver;
+            [self saveSettings];
+            [self reloadAllTableViews];
+        }]];
+    }
+
+    [alert addAction:[UIAlertAction actionWithTitle:localize(@"resman.common.cancel", nil) style:UIAlertActionStyleCancel handler:nil]];
+
+    if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad) {
+        // LWJGL 行在高级区的位置随“图形 API”行显隐而变化，不用固定 index 取 cell，
+        // 直接锚定本 view 中央，避免 popover 无锚点崩溃。
+        alert.popoverPresentationController.sourceView = self.view;
+        CGFloat w = self.view.bounds.size.width, h = self.view.bounds.size.height;
+        alert.popoverPresentationController.sourceRect = CGRectMake(w / 2 - 1, h / 2 - 1, 2, 2);
     }
 
     [self presentViewController:alert animated:YES completion:nil];

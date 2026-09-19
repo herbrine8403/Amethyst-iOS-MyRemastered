@@ -1953,3 +1953,4 @@
 
 "preference.auto" = "自动";
 "preference.auto_select" = "自动选择";
+"preference.profile.title.lwjgl_version" = "LWJGL 版本";

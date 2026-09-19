@@ -403,7 +403,7 @@ static void ame97_alignProcessCwdToGameDir(NSString *gameDir) {
 //
 // 解析口径两层：
 //   1) 1.x 谱系短路：命中 "(?:^|[-_])1\.\d" 即返回 1（挡住
-//      "1.20.1-forge-47.3.0" 的 forge 构建号 47 被年份正则误读为 >= 26）。
+//      "1.20.1-forge-47.3.0" 的 forge 构建号 47 被年份正则误读为 >= 25）。
 //   2) 年份制主版本："(?:^|[-_])(\d{2})(?=[.w])"
 //      "26.3"→26，"26w14a"→26，"fabric-loader-0.19.5-26.3-e4ecd7db"→26，
 //      "25w45a"→25。[-_] 锚定 + 后随 [.w] 排除 loader 版本段与十六进制哈希段。
@@ -432,17 +432,18 @@ NSInteger ame98_mcMajorFromVersionId(NSString *versionId) {
 
 // 解析 profile 的 lwjglVersion 设置为具体的 LWJGL 版本：
 //   "333" / "341" -> 原样使用
-//   "auto"        -> MC 26.x 及以上用 3.4.1，其余用 3.3.3
+//   "auto"        -> MC 25.x 及以上用 3.4.1，25 以下（含 1.x）用 3.3.3
 //
 // MC 26.3 起窗口与键盘系统从 GLFW 迁到 SDL3，只有 3.4.1 带真正的 SDL3 绑定
-// （lwjgl-sdl.jar 加载真实 libSDL3），因此 26.x 及以上必须选 341。
+// （lwjgl-sdl.jar 加载真实 libSDL3）。阈值取 25 而非 26，一劳永逸覆盖 25.x
+// 快照/正式版，避免每次 Mojang 换大版本都要再调一次阈值。
 // Task98：版本号提取改用 ame98_mcMajorFromVersionId。
 static NSString *ResolveLwjglVersion(NSString *profileValue, NSString *mcVersionId) {
     if ([profileValue isEqualToString:@"333"] || [profileValue isEqualToString:@"341"]) {
         return profileValue;
     }
     NSInteger mcMajor = ame98_mcMajorFromVersionId(mcVersionId);
-    if (mcMajor >= 26) {
+    if (mcMajor >= 25) {
         NSLog(@"[LWJGLSel] Task98: MC major %ld extracted from version id \"%@\" -> LWJGL 341 (SDL3 bindings)",
               (long)mcMajor, mcVersionId);
         return @"341";
@@ -712,6 +713,8 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
     BOOL launchJar = NO;
     NSString *gameDir;
     NSString *defaultJRETag;
+    // Profile JRE 精确 pin（块外使用，见下方 getExactJavaHome 调用处）
+    int pinnedJavaVersion = 0;
     if ([launchTarget isKindOfClass:NSDictionary.class]) {
         // Get preferred Java version from current profile
         // 26.x 官方强制要求 Java 25（Mojang 自 26.x 起将 javaVersion.majorVersion 设为 25），
@@ -720,12 +723,17 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         // - Java 8     → libs_caciocavallo（1.10-SNAPSHOT）
         // - Java 17/21 → libs_caciocavallo17（1.18-SNAPSHOT 纯 Java 17 编译）
         // - Java 25    → libs_caciocavallo25（1.18-SNAPSHOT 含 Java 24 class，catsruledogs iOS）
+        // Profile JRE 精确 pin：合法偏好（>= 游戏最低要求）直接锁定该版本，而不只是抬高 floor。
+        // 背景：旧逻辑只把 preferred 当 floor 传给 getSelectedJavaHome，而该函数永远从全局
+        // "0" 槽默认起步、只向上搜索，导致 profile 想用比全局默认更低的版本（如全局 21、
+        // profile 17）时被静默吞掉。pinnedJavaVersion > 0 表示用户有明确指定且满足最低要求。
         int preferredJavaVersion = [PLProfiles resolveKeyForCurrentProfile:@"javaVersion"].intValue;
         if (preferredJavaVersion > 0) {
             if (minVersion > preferredJavaVersion) {
                 NSLog(@"[JavaLauncher] Profile's preferred Java version (%d) does not meet the minimum version (%d), dropping request", preferredJavaVersion, minVersion);
             } else {
                 NSDebugLog(@"[PLProfiles] Applying javaVersion (%d)", preferredJavaVersion);
+                pinnedJavaVersion = preferredJavaVersion;
                 minVersion = preferredJavaVersion;
             }
         }
@@ -854,7 +862,18 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
     //   class version 68 仅 Java 24+ 可加载，故 Java 17/21 不能共用，需用 caciocavallo17 目录的纯 Java 17 jar。
 
     NSLog(@"[JavaLauncher] Looking for Java %d or later", minVersion);
-    NSString *javaHome = getSelectedJavaHome(defaultJRETag, minVersion);
+    // Profile 精确 pin 优先：直接按版本号取 home（绕开全局默认），未配置/目录缺失
+    // 则回退到原 floor 逻辑，保证旧行为不受影响。
+    NSString *javaHome = nil;
+    if (pinnedJavaVersion > 0) {
+        javaHome = getExactJavaHome(pinnedJavaVersion);
+        if (javaHome) {
+            NSLog(@"[JavaLauncher] Using profile-pinned Java %d at %@", pinnedJavaVersion, javaHome);
+        }
+    }
+    if (!javaHome) {
+        javaHome = getSelectedJavaHome(defaultJRETag, minVersion);
+    }
 
     if (javaHome == nil) {
         UIKit_returnToSplitView();
@@ -1448,8 +1467,8 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
     // 故提前到此处（JLI_Launch 之前）以 RTLD_LOCAL 载入：LWJGL 此后的 dlopen 会
     // 命中这份已加载镜像，可见性保持 RTLD_LOCAL，glslang 符号不再进全局空间。
     //
-    // 不做 lwjglVersion 筛选，也不区分后端：26.2 与 26.3 同样使用 LWJGL 341
-    // （ResolveLwjglVersion 注释写的是「26.3 起」，实际判定为 major >= 26），
+    // 不做 lwjglVersion 筛选，也不区分后端：25.x 及以上同样使用 LWJGL 341
+    // （ResolveLwjglVersion 实际判定为 major >= 25），
     // 二者区别只在 26.2 走 GLFW、26.3 走 SDL3。但渲染器都是被 LWJGL 在 JVM 内
     // bootstrap 阶段 dlopen 的，上述「预载太晚」问题对两条路径同样存在，
     // 因此这里不按版本或后端分流，一律提前预载。
