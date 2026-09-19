@@ -67,6 +67,10 @@ static CGFloat LauncherRootLayoutRightPanelWidth(UITraitCollection *trait) {
 // 在 tmpRootVC 保留场景下，缓存复用的子 VC 反复激活约束，layout 解算时 leading/trailing
 // 约束叠加导致 contentContainer 内容区左右变宽。现持有当前约束并先 deactivate 再激活。
 @property(nonatomic, strong) NSArray<NSLayoutConstraint *> *currentContentConstraints;
+// Bento 卡片浮起切换：持有的 animator 实现可打断（打断时 stop + finish 到当前位置冻结，
+// 新 animator 从冻结进度接管）。contentSwitchOutVC 记录正在淡出的旧 VC，打断时补做清理。
+@property(nonatomic, strong, nullable) UIViewPropertyAnimator *contentSwitchAnimator;
+@property(nonatomic, weak, nullable) UIViewController *contentSwitchOutVC;
 
 @property(nonatomic, assign) BOOL isShowingProfileEditor;
 @property(nonatomic, strong) ProfileSettingsViewController *profileEditorVC;
@@ -774,30 +778,71 @@ static CGFloat LauncherRootLayoutRightPanelWidth(UITraitCollection *trait) {
     ];
 
     if (animated && oldVC) {
-        // 修复问题5：原实现用两个独立的 UIView transitionWithView:（一个移除旧视图、一个添加新视图），
-        // 两个 crossDissolve 同时作用于 contentContainer 会导致视觉冲突和残影（旧画面未完全消失就覆盖新界面）。
-        // 改为单个 transition：在同一个 animations block 内完成"移除旧视图 + 添加新视图"，
-        // crossDissolve 会正确抓取前后快照做交叉渐变，completion 中清理旧 VC 父子关系。
+        // Bento 卡片浮起（可打断）：彻底抛弃 transitionWithView 快照路径——UIKit 在 animations
+        // block 返回后立即对容器做 snapshot，此时新视图 frame 仍是 (0,0,0,0)，配合圆角裁剪
+        // 呈现"从左上角小点扩展出来"的怪异效果。改用持有的 UIViewPropertyAnimator 直接对
+        // alpha/transform 做动画，与 HTML 原型（temp/content-switch-proto.html B 模式）同参数：
+        // 起播前先 addSubview + 约束 + layoutIfNeeded（首帧已撑满，杜绝 0×0），
+        // 新页 0.32s 浮起（alpha 0→1 / 上移 12pt / .96→1，cubic-bezier(.22,.9,.28,1) 无反弹），
+        // 旧页同步淡出 + 轻微缩小到 .985。所用 API 均为 iOS 10+，14.5 可用。
         //
-        // 关键修复（入场动画从左上角弹出）：UIKit 在 animations block 返回后立即对容器做 snapshot，
-        // 此时新视图虽然已 addSubview + activateConstraints，但尚未经历 layout pass，frame 仍是
-        // (0,0,0,0)。配合 contentContainer 子视图（contentCard）的 masksToBounds+圆角裁剪，
-        // crossDissolve 渐变呈现"从左上角小点扩展出来"的怪异效果。
-        // 在 animations block 内显式 layoutIfNeeded 强制立即布局，让 snapshot B 时 frame 已撑满，
-        // crossDissolve 就是标准的淡入淡出。duration 由 0.25 调整为 0.3 让过渡更柔和自然。
-        [UIView transitionWithView:self.contentContainer
-                          duration:0.3
-                           options:UIViewAnimationOptionTransitionCrossDissolve
-                        animations:^{
-                            [oldVC willMoveToParentViewController:nil];
-                            [oldVC.view removeFromSuperview];
-                            [self.contentContainer addSubview:viewController.view];
-                            [NSLayoutConstraint activateConstraints:newConstraints];
-                            [self.contentContainer layoutIfNeeded];
-                        } completion:^(BOOL finished) {
-                            [oldVC removeFromParentViewController];
-                            [viewController didMoveToParentViewController:self];
-                        }];
+        // 打断语义：新切换来时先 stop + finish 到当前位置冻结旧 animator（其 completion 凭
+        // animator 身份自废），补做上一轮旧 VC 的移除清理，新 animator 从冻结进度直接接管，
+        // 快速连点无闪跳。子 VC 会被缓存复用，丢弃/落定的视图都要恢复 alpha/transform。
+        if (self.contentSwitchAnimator) {
+            UIViewPropertyAnimator *running = self.contentSwitchAnimator;
+            self.contentSwitchAnimator = nil;
+            [running stopAnimation:YES];
+            [running finishAnimationAtPosition:UIViewAnimatingPositionCurrent];
+            UIViewController *orphan = self.contentSwitchOutVC;
+            self.contentSwitchOutVC = nil;
+            if (orphan && orphan != oldVC && orphan != viewController) {
+                [orphan.view removeFromSuperview];
+                [orphan removeFromParentViewController];
+                orphan.view.alpha = 1.0;
+                orphan.view.transform = CGAffineTransformIdentity;
+            }
+        }
+
+        [oldVC willMoveToParentViewController:nil];
+        // 旧视图暂留做交叉淡出，新视图盖在上层
+        [self.contentContainer addSubview:viewController.view];
+        [NSLayoutConstraint activateConstraints:newConstraints];
+        [self.contentContainer layoutIfNeeded];
+
+        viewController.view.alpha = 0.0;
+        viewController.view.transform = CGAffineTransformConcat(
+            CGAffineTransformMakeTranslation(0, 12),
+            CGAffineTransformMakeScale(0.96, 0.96));
+
+        UICubicTimingParameters *timing = [[UICubicTimingParameters alloc]
+            initWithControlPoint1:CGPointMake(0.22, 0.9)
+                    controlPoint2:CGPointMake(0.28, 1.0)];
+        UIViewPropertyAnimator *animator = [[UIViewPropertyAnimator alloc]
+            initWithDuration:0.32 timingParameters:timing];
+        self.contentSwitchAnimator = animator;
+        self.contentSwitchOutVC = oldVC;
+        __weak typeof(self) weakSelf = self;
+        [animator addAnimations:^{
+            oldVC.view.alpha = 0.0;
+            oldVC.view.transform = CGAffineTransformMakeScale(0.985, 0.985);
+            viewController.view.alpha = 1.0;
+            viewController.view.transform = CGAffineTransformIdentity;
+        }];
+        [animator addCompletion:^(UIViewAnimatingPosition position) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf || strongSelf.contentSwitchAnimator != animator) return;
+            strongSelf.contentSwitchAnimator = nil;
+            strongSelf.contentSwitchOutVC = nil;
+            [oldVC.view removeFromSuperview];
+            [oldVC removeFromParentViewController];
+            oldVC.view.alpha = 1.0;
+            oldVC.view.transform = CGAffineTransformIdentity;
+            viewController.view.alpha = 1.0;
+            viewController.view.transform = CGAffineTransformIdentity;
+            [viewController didMoveToParentViewController:strongSelf];
+        }];
+        [animator startAnimation];
     } else {
         if (oldVC) {
             [oldVC willMoveToParentViewController:nil];
