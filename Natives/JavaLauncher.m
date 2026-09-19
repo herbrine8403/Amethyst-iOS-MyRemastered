@@ -167,6 +167,15 @@ void init_loadCustomEnv() {
 ///   config.json 会被 MobileGlues 读取并生效。
 void init_loadMobileGluesConfig() {
     NSString *renderer = [PLProfiles resolveKeyForCurrentProfile:@"renderer"];
+        // [AMETHYST-METAL] 原生 Metal 渲染器(metallum):图形后端由 agent 直接走 MTLDevice,
+        // 不经过 EGL/GL 渲染器;渲染器回落 auto(->ANGLE)仅为 Surface 提供 GL 上下文。
+        if ([renderer isEqualToString:@ RENDERER_NAME_METAL]) {
+            setenv("AMETHYST_METAL", "1", 1);
+            NSLog(@"[JavaLauncher] Metal renderer selected: AMETHYST_METAL=1 (EGL falls back to auto for surface)");
+            renderer = @"auto";
+            showDialog(localize(@"metal.renderer.notice.title", @"Metal Renderer"),
+                       localize(@"metal.renderer.notice.body", @""));
+        }
     NSLog(@"[JavaLauncher] init_loadMobileGluesConfig: renderer=%@", renderer);
 
     BOOL usesMobileGlues = [renderer isEqualToString:@ RENDERER_NAME_MOBILEGLUES] ||
@@ -735,6 +744,16 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
 
         // Setup AMETHYST_RENDERER
         NSString *renderer = [PLProfiles resolveKeyForCurrentProfile:@"renderer"];
+        // [AMETHYST-METAL] 与 init_loadMobileGluesConfig() 保持一致:metallum 的图形后端由 agent
+        //   走原生 Metal(MTLDevice),launcher 侧绝不能把 libmetallum.dylib 交给 egl_bridge 当
+        //   GL 渲染器去 dlopen —— 该文件不在 Frameworks(在 agent jar 内),dlopen 得到空句柄后
+        //   br_init() 的 GL 函数指针全为 NULL,调用即 SIGSEGV at 0x0(pojavInitOpenGLInternal+0x78c)。
+        //   这里回落 auto(->ANGLE) 只为 Surface 提供 GL 上下文;仅对 metallum 生效,不影响其他渲染器。
+        if ([renderer isEqualToString:@ RENDERER_NAME_METAL]) {
+            setenv("AMETHYST_METAL", "1", 1);
+            NSLog(@"[JavaLauncher] AMETHYST_RENDERER falls back to auto for metallum (native Metal via agent)");
+            renderer = @"auto";
+        }
         NSLog(@"[JavaLauncher] RENDERER is set to %@\n", renderer);
         setenv("AMETHYST_RENDERER", renderer.UTF8String, 1);
 
@@ -1183,6 +1202,24 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
   
     NSString *librariesPath = [NSString stringWithFormat:@"%@/libs", NSBundle.mainBundle.bundlePath];
     PUSH_MARGV_FORMAT(@"-javaagent:%@/patchjna_agent.jar=", librariesPath);
+    // [AMETHYST-METAL] Metallum agent 注入:仅 vanilla / Forge 类实例;
+    // Fabric/Quilt 实例改用内置 mod(mixin),否则 ASM 类重复,fabric-loader 拒绝启动。
+    if (getenv("AMETHYST_METAL") != NULL) {
+                if ([[NSFileManager defaultManager] fileExistsAtPath:
+                [librariesPath stringByAppendingPathComponent:@"metallum_agent.jar"]]) {
+            PUSH_MARGV_FORMAT(@"-javaagent:%@/metallum_agent.jar=", librariesPath);
+            // 把 MC 版本 id 传给 agent(按版本选 metallum 类映射)
+            NSString *mcVersionId = nil;
+            if ([launchTarget isKindOfClass:NSDictionary.class]) {
+                mcVersionId = launchTarget[@"id"];
+            } else {
+                mcVersionId = launchTarget;
+            }
+            if (mcVersionId && mcVersionId.length > 0) {
+                PUSH_MARGV_FORMAT(@"-Dmetallum.mc.version=%@", mcVersionId);
+            }
+        }
+    }
     if(getPrefBool(@"general.cosmetica")) {
         PUSH_MARGV_FORMAT(@"-javaagent:%@/arc_dns_injector.jar=23.95.137.176", librariesPath);
     }
@@ -1326,6 +1363,11 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         PUSH_MARGV_LITERAL("--add-opens=java.desktop/sun.font=ALL-UNNAMED");
         PUSH_MARGV_LITERAL("--add-opens=java.desktop/sun.java2d=ALL-UNNAMED");
         PUSH_MARGV_LITERAL("--add-opens=java.base/java.lang.reflect=ALL-UNNAMED");
+        // ★ metallum agent(元数据/dyn-uniforms)需要反射调用 java.lang.ClassLoader.defineClass
+        //   来定义 metallum 类集。java.lang 默认不向 unnamed module 开放 ⇒ 会抛
+        //   InaccessibleObjectException,日志表现为 "1.21.x metallum classes defined ()" 一个类都没定义,
+        //   后果是渲染器完全不出画面。这里补上 java.lang 的 opens(仅此一条,不动原生访问参数)。
+        PUSH_MARGV_LITERAL("--add-opens=java.base/java.lang=ALL-UNNAMED");
         // 参照 catsruledogs/Amethyst-iOS-25：不添加 sun.awt / sun.awt.image / java.awt.peer 的
         // add-opens。catsruledogs 不加这些 opens 也能正常启动 26.2 + Java 25。
         // workspace 之前多加这 3 条 opens 会导致 Java 25 上 GE 提前初始化，

@@ -258,7 +258,10 @@ static NSArray<NSDictionary *> *rendererCandidates(void) {
           @"file": @ RENDERER_NAME_MOBILEGL},
         @{@"key": @ RENDERER_NAME_MOBILEGL_GLES,
           @"name": localize(@"preference.title.renderer.debug.mobilegl_gles", nil),
-          @"file": @ RENDERER_NAME_MOBILEGL_GLES}
+          @"file": @ RENDERER_NAME_MOBILEGL_GLES},
+        @{@"key": @ RENDERER_NAME_METAL,
+          @"name": @"Metal (metallum)",
+          @"file": @""}   // 空 = 始终可用(metallum 的 dylib 在 agent jar 内,不在 Frameworks)
     ];
 }
 
