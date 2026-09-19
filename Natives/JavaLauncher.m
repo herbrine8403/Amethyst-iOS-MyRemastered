@@ -744,6 +744,16 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
 
         // Setup AMETHYST_RENDERER
         NSString *renderer = [PLProfiles resolveKeyForCurrentProfile:@"renderer"];
+        // [AMETHYST-METAL] 与 init_loadMobileGluesConfig() 保持一致:metallum 的图形后端由 agent
+        //   走原生 Metal(MTLDevice),launcher 侧绝不能把 libmetallum.dylib 交给 egl_bridge 当
+        //   GL 渲染器去 dlopen —— 该文件不在 Frameworks(在 agent jar 内),dlopen 得到空句柄后
+        //   br_init() 的 GL 函数指针全为 NULL,调用即 SIGSEGV at 0x0(pojavInitOpenGLInternal+0x78c)。
+        //   这里回落 auto(->ANGLE) 只为 Surface 提供 GL 上下文;仅对 metallum 生效,不影响其他渲染器。
+        if ([renderer isEqualToString:@ RENDERER_NAME_METAL]) {
+            setenv("AMETHYST_METAL", "1", 1);
+            NSLog(@"[JavaLauncher] AMETHYST_RENDERER falls back to auto for metallum (native Metal via agent)");
+            renderer = @"auto";
+        }
         NSLog(@"[JavaLauncher] RENDERER is set to %@\n", renderer);
         setenv("AMETHYST_RENDERER", renderer.UTF8String, 1);
 
