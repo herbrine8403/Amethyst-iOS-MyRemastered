@@ -1353,6 +1353,11 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         PUSH_MARGV_LITERAL("--add-opens=java.desktop/sun.font=ALL-UNNAMED");
         PUSH_MARGV_LITERAL("--add-opens=java.desktop/sun.java2d=ALL-UNNAMED");
         PUSH_MARGV_LITERAL("--add-opens=java.base/java.lang.reflect=ALL-UNNAMED");
+        // ★ metallum agent(元数据/dyn-uniforms)需要反射调用 java.lang.ClassLoader.defineClass
+        //   来定义 metallum 类集。java.lang 默认不向 unnamed module 开放 ⇒ 会抛
+        //   InaccessibleObjectException,日志表现为 "1.21.x metallum classes defined ()" 一个类都没定义,
+        //   后果是渲染器完全不出画面。这里补上 java.lang 的 opens(仅此一条,不动原生访问参数)。
+        PUSH_MARGV_LITERAL("--add-opens=java.base/java.lang=ALL-UNNAMED");
         // 参照 catsruledogs/Amethyst-iOS-25：不添加 sun.awt / sun.awt.image / java.awt.peer 的
         // add-opens。catsruledogs 不加这些 opens 也能正常启动 26.2 + Java 25。
         // workspace 之前多加这 3 条 opens 会导致 Java 25 上 GE 提前初始化，
