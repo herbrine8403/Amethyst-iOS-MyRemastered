@@ -26,13 +26,15 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
 // LTW × 26.x 预检门共用，保证两处口径一致（详见 JavaLauncher.m 内实现头注释）。
 NSInteger ame98_mcMajorFromVersionId(NSString *versionId);
 
-// Headless JVM：在当前进程内以最小参数（无 caciocavallo/LWJGL/渲染）启动 JVM，
-// 运行指定 main 类。用于 Forge/NeoForge 直装执行 install_profile 的 processors。
-// 返回 JLI_Launch 的返回值（0 = 成功）；负数为启动器侧错误：
+// Headless JVM：在当前进程内以最小参数（无 caciocavallo/LWJGL/渲染）创建 JVM，
+// 经 JNI 反射运行指定 main 类，返回后进程继续存活。用于 Forge/NeoForge 直装
+// 执行 install_profile 的 processors（必须可返回，禁止走 JLI_Launch——后者在
+// main 返回后调用 exit() 终结进程）。
+// 返回 0 = 成功（最终成败以 processor 的 status.json 为准）；负数为启动器侧错误：
 //   -1 JIT 未启用 / legacy JIT 脚本需要重启
-//   -2 JLI_Launch 符号缺失
+//   -2 JVM 创建失败（JNI_CreateJavaVM 符号缺失或返回非 JNI_OK）
 //   -3 无可用 JRE 运行时
-//   -4 dlopen libjli 失败
+//   -4 VM 库/运行类加载失败（libjvm 缺失、ForgeProcessorRunner/main 方法/参数构造失败）
 //   -5 进程内 JVM 已创建过（需重启 app）
 int launchHeadlessJVM(NSString *mainClass, NSArray<NSString *> *args, int minJavaVersion);
 

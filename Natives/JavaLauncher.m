@@ -1597,7 +1597,11 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
 // 但官方 Forge/NeoForge installer 本身就是在单个 JVM 内以 IsolatedClassLoader
 // 逐个执行 processor 的（ForgeProcessorRunner 复刻该行为）。
 //
-// 注意：调用后进程内 JVM 已创建，游戏启动必须重启 app（见 gJvmUsedInProcess）。
+// 关键：必须经 JNI_CreateJavaVM + 反射调 main，禁止走 JLI_Launch——后者在 main
+// 返回后调用 exit() 终结进程，安装器收尾（写 version.json / 注册 profile）
+// 永远执行不到（Forge 1.20.1 装到 0.85 闪退即此因）。
+//
+// 注意：调用成功后进程内 JVM 已创建，游戏启动必须重启 app（见 gJvmUsedInProcess）。
 int launchHeadlessJVM(NSString *mainClass, NSArray<NSString *> *args, int minJavaVersion) {
     NSLog(@"[JavaLauncher] Beginning headless JVM launch: %@ (minJava=%d)", mainClass, minJavaVersion);
 
@@ -1688,71 +1692,57 @@ int launchHeadlessJVM(NSString *mainClass, NSArray<NSString *> *args, int minJav
                                                attributes:nil
                                                     error:nil];
 
-    // dlopen libjli（Java 8 与 Java 11+ 双路径，对齐 launchJVM）
-    NSString *libjlipath8 = [NSString stringWithFormat:@"%@/lib/jli/libjli.dylib", javaHome];
-    NSString *libjlipath11 = [NSString stringWithFormat:@"%@/lib/libjli.dylib", javaHome];
-    BOOL isJava8 = [fm fileExistsAtPath:libjlipath8];
-    setenv("INTERNAL_JLI_PATH", (isJava8 ? libjlipath8 : libjlipath11).UTF8String, 1);
-    void *libjli = dlopen(getenv("INTERNAL_JLI_PATH"), RTLD_GLOBAL);
-    if (!libjli) {
-        const char *error = dlerror();
-        NSLog(@"[JavaLauncher] launchHeadlessJVM: JLI lib = NULL: %s", error ?: "unknown");
+    // dlopen libjvm（Java 8 与 17/21 的 iOS 移植包布局不同，逐个尝试）。
+    // 注意：不能用 JLI_Launch 跑安装器——标准 OpenJDK launcher 在 main() 返回后会
+    // 调用 exit() 终结进程，安装器收尾（写 version.json / 注册 profile）永远执行不到，
+    // 表现为 processors 全跑完（0.85）后直接 exit(0) 闪退。改用 JNI Invocation API
+    //（JNI_CreateJavaVM + 反射调用 ForgeProcessorRunner.main），返回后进程继续存活，
+    // 对齐 ZL2「processor 跑在独立 JVM、退出不影响主进程」的语义（iOS 禁止 fork/exec，
+    // 以进程内 VM + 可返回调用来等价实现）。
+    NSArray<NSString *> *libJvmCandidates = @[
+        [NSString stringWithFormat:@"%@/lib/server/libjvm.dylib", javaHome],
+        [NSString stringWithFormat:@"%@/lib/client/libjvm.dylib", javaHome],
+        [NSString stringWithFormat:@"%@/lib/aarch64/server/libjvm.dylib", javaHome],
+        [NSString stringWithFormat:@"%@/jre/lib/aarch64/server/libjvm.dylib", javaHome],
+        [NSString stringWithFormat:@"%@/jre/lib/server/libjvm.dylib", javaHome]
+    ];
+    void *libjvm = NULL;
+    for (NSString *candidate in libJvmCandidates) {
+        libjvm = dlopen(candidate.UTF8String, RTLD_GLOBAL);
+        if (libjvm) {
+            NSLog(@"[JavaLauncher] Headless libjvm loaded: %@", candidate);
+            break;
+        }
+    }
+    if (!libjvm) {
+        NSLog(@"[JavaLauncher] launchHeadlessJVM: libjvm not found under %@", javaHome);
         return -4;
     }
-    pJLI_Launch = (JLI_Launch_func *)dlsym(libjli, "JLI_Launch");
-    if (pJLI_Launch == NULL) {
-        NSLog(@"[JavaLauncher] launchHeadlessJVM: JLI_Launch = NULL");
+
+    // 双重防御：进程内 JVM 只能创建一次（入口处已查 gJvmUsedInProcess，
+    // 这里再以 JNI_GetCreatedJavaVMs 为准，防止标记与实际不一致时崩溃）。
+    typedef jint (*AME_JNI_GetCreatedVMs_t)(JavaVM **, jsize, jsize *);
+    AME_JNI_GetCreatedVMs_t pGetCreatedVMs =
+        (AME_JNI_GetCreatedVMs_t)dlsym(libjvm, "JNI_GetCreatedJavaVMs");
+    if (pGetCreatedVMs) {
+        JavaVM *existingVMs[1];
+        jsize nVMs = 0;
+        if (pGetCreatedVMs(existingVMs, 1, &nVMs) == JNI_OK && nVMs > 0) {
+            NSLog(@"[JavaLauncher] launchHeadlessJVM: JVM already created in this process, restart required");
+            return -5;
+        }
+    }
+
+    typedef jint (*AME_JNI_CreateVM_t)(JavaVM **, JNIEnv **, void *);
+    AME_JNI_CreateVM_t pCreateVM = (AME_JNI_CreateVM_t)dlsym(libjvm, "JNI_CreateJavaVM");
+    if (!pCreateVM) {
+        NSLog(@"[JavaLauncher] launchHeadlessJVM: JNI_CreateJavaVM = NULL");
         return -2;
     }
 
-    // 构造最小化 JVM 参数
-    int margc = -1;
-    const char *margv[256];
+    // JVM 参数字符串容器：JavaVMOption.optionString 指针必须在 JNI_CreateJavaVM
+    // 返回前保持有效，全部 NSString 由 retainedStrings 强引用（函数返回前不释放）。
     NSMutableArray<NSString *> *retainedStrings = [NSMutableArray array];
-
-    #define PUSH_HARGV_LITERAL(literal) do { \
-        if (margc + 1 < 256) { \
-            margv[++margc] = (literal); \
-        } else { \
-            NSLog(@"[JavaLauncher] launchHeadlessJVM: margv limit reached, discarding %s", (literal)); \
-        } \
-    } while (0)
-
-    #define PUSH_HARGV_FORMAT(ns_fmt, ...) do { \
-        if (margc + 1 < 256) { \
-            NSString *_tmpStr = [NSString stringWithFormat:(ns_fmt), ##__VA_ARGS__]; \
-            [retainedStrings addObject:_tmpStr]; \
-            margv[++margc] = _tmpStr.UTF8String; \
-        } else { \
-            NSLog(@"[JavaLauncher] launchHeadlessJVM: margv limit reached, discarding formatted argument"); \
-        } \
-    } while (0)
-
-    PUSH_HARGV_FORMAT(@"%@/bin/java", javaHome);
-    PUSH_HARGV_LITERAL("-XstartOnFirstThread");
-    // headless：无 AWT/Swing 图形环境
-    PUSH_HARGV_LITERAL("-Djava.awt.headless=true");
-    PUSH_HARGV_LITERAL("-Xms64M");
-    PUSH_HARGV_LITERAL("-Xmx1G");
-    PUSH_HARGV_FORMAT(@"-Djava.library.path=%@/Frameworks", NSBundle.mainBundle.bundlePath);
-    PUSH_HARGV_FORMAT(@"-Duser.dir=%@", gameDir);
-    PUSH_HARGV_FORMAT(@"-Duser.home=%@", procHome);
-    PUSH_HARGV_FORMAT(@"-Duser.timezone=%@", NSTimeZone.localTimeZone.name);
-    PUSH_HARGV_LITERAL("-Dlog4j2.formatMsgNoLookups=true");
-    // Workaround random stack guard allocation crashes（对齐 launchJVM）
-    PUSH_HARGV_LITERAL("-XX:+UnlockExperimentalVMOptions");
-    PUSH_HARGV_LITERAL("-XX:+DisablePrimordialThreadGuardPages");
-    // CodeCache 参数（对齐 launchJVM：避免 CodeCache 满导致 SIGILL；
-    // iOS 26+ mirror mapped JIT 需要 64m 以内避免 SIGBUS）
-    PUSH_HARGV_LITERAL("-XX:ReservedCodeCacheSize=64m");
-    PUSH_HARGV_LITERAL("-XX:InitialCodeCacheSize=16m");
-    PUSH_HARGV_LITERAL("-XX:CodeCacheExpansionSize=4m");
-    if (@available(iOS 26.0, *)) {
-        PUSH_HARGV_LITERAL("-XX:+MirrorMappedCodeCache");
-    }
-    if (!getEntitlementValue(@"com.apple.developer.kernel.extended-virtual-addressing")) {
-        PUSH_HARGV_LITERAL("-XX:-UseCompressedClassPointers");
-    }
 
     // classpath：bundle libs 下全部 jar（launcher.jar 含 ForgeProcessorRunner，gson 等也在其中）
     // + 版本化 LWJGL 目录（lwjgl-333/ 或 lwjgl-341/）
@@ -1776,19 +1766,55 @@ int launchHeadlessJVM(NSString *mainClass, NSArray<NSString *> *args, int minJav
     if (classpathBuilder.length > 0 && [classpathBuilder hasSuffix:@":"]) {
         [classpathBuilder deleteCharactersInRange:NSMakeRange(classpathBuilder.length - 1, 1)];
     }
-    PUSH_HARGV_LITERAL("-cp");
-    PUSH_HARGV_FORMAT(@"%@", classpathBuilder);
-
-    // main class 与其参数
-    PUSH_HARGV_FORMAT(@"%@", mainClass);
-    for (NSString *arg in args) {
-        if (margc + 1 < 256) {
-            [retainedStrings addObject:arg];
-            margv[++margc] = arg.UTF8String;
-        } else {
-            NSLog(@"[JavaLauncher] launchHeadlessJVM: margv limit reached, discarding extra argument");
-        }
+    // 最小化 JVM 参数（与原 headless 参数对等；-XstartOnFirstThread 是 launcher
+    // 进程参数，对 VM 本体无意义，不再传递；ignoreUnrecognized=JNI_TRUE 兜底
+    // 不同大版本对 -XX 标志的差异）。
+    // headless：无 AWT/Swing 图形环境
+    NSMutableArray<NSString *> *jvmOptions = [NSMutableArray array];
+    [jvmOptions addObject:@"-Djava.awt.headless=true"];
+    [jvmOptions addObject:@"-Xms64M"];
+    [jvmOptions addObject:@"-Xmx1G"];
+    [jvmOptions addObject:[NSString stringWithFormat:@"-Djava.class.path=%@", classpathBuilder]];
+    [jvmOptions addObject:[NSString stringWithFormat:@"-Djava.library.path=%@/Frameworks", NSBundle.mainBundle.bundlePath]];
+    [jvmOptions addObject:[NSString stringWithFormat:@"-Duser.dir=%@", gameDir]];
+    [jvmOptions addObject:[NSString stringWithFormat:@"-Duser.home=%@", procHome]];
+    [jvmOptions addObject:[NSString stringWithFormat:@"-Duser.timezone=%@", NSTimeZone.localTimeZone.name]];
+    [jvmOptions addObject:@"-Dlog4j2.formatMsgNoLookups=true"];
+    // ForgeProcessorRunner 内以 SecurityManager 拦截 processor 的 System.exit，
+    // 18+ 的 JDK 需显式 allow 才允许安装 SecurityManager（8/17 下仅为普通属性，无害）。
+    [jvmOptions addObject:@"-Djava.security.manager=allow"];
+    // Workaround random stack guard allocation crashes（对齐 launchJVM）
+    [jvmOptions addObject:@"-XX:+UnlockExperimentalVMOptions"];
+    [jvmOptions addObject:@"-XX:+DisablePrimordialThreadGuardPages"];
+    // CodeCache 参数（对齐 launchJVM：避免 CodeCache 满导致 SIGILL；
+    // iOS 26+ mirror mapped JIT 需要 64m 以内避免 SIGBUS）
+    [jvmOptions addObject:@"-XX:ReservedCodeCacheSize=64m"];
+    [jvmOptions addObject:@"-XX:InitialCodeCacheSize=16m"];
+    [jvmOptions addObject:@"-XX:CodeCacheExpansionSize=4m"];
+    if (@available(iOS 26.0, *)) {
+        [jvmOptions addObject:@"-XX:+MirrorMappedCodeCache"];
     }
+    if (!getEntitlementValue(@"com.apple.developer.kernel.extended-virtual-addressing")) {
+        [jvmOptions addObject:@"-XX:-UseCompressedClassPointers"];
+    }
+
+    [retainedStrings addObjectsFromArray:jvmOptions];
+    JavaVMOption vmOptions[32];
+    jint nOptions = 0;
+    for (NSString *opt in jvmOptions) {
+        if (nOptions >= 32) {
+            NSLog(@"[JavaLauncher] launchHeadlessJVM: JVM option limit reached, discarding %@", opt);
+            break;
+        }
+        vmOptions[nOptions].optionString = opt.UTF8String;
+        vmOptions[nOptions].extraInfo = NULL;
+        nOptions++;
+    }
+    JavaVMInitArgs vmArgs;
+    vmArgs.version = JNI_VERSION_1_8;
+    vmArgs.nOptions = nOptions;
+    vmArgs.options = vmOptions;
+    vmArgs.ignoreUnrecognized = JNI_TRUE;
 
     // Cr4shed known issue（对齐 launchJVM）：重置信号处理器让 JVM 能捕获崩溃信号
     signal(SIGSEGV, SIG_DFL);
@@ -1801,19 +1827,80 @@ int launchHeadlessJVM(NSString *mainClass, NSArray<NSString *> *args, int minJav
     // 共用 -Duser.dir=<gameDir> 语义，桌面端安装器也总以 CWD == 游戏目录运行）。
     ame97_alignProcessCwdToGameDir(gameDir);
 
-    NSLog(@"[JavaLauncher] Calling JLI_Launch (headless, %d args)", margc + 1);
+    NSLog(@"[JavaLauncher] Creating headless JVM via JNI_CreateJavaVM (%d options)", nOptions);
+    JavaVM *headlessVM = NULL;
+    JNIEnv *headlessEnv = NULL;
+    jint createRes = pCreateVM(&headlessVM, &headlessEnv, &vmArgs);
+    if (createRes != JNI_OK || !headlessVM || !headlessEnv) {
+        NSLog(@"[JavaLauncher] launchHeadlessJVM: JNI_CreateJavaVM failed: %d", createRes);
+        return -2;
+    }
 
-    // 标记进程内 JVM 已创建（此后任何 JLI_Launch 都会崩溃，需重启 app）
+    // 标记进程内 JVM 已创建（VM 创建成功后才置位：创建失败不再污染状态，
+    // 用户可直接重试安装；此后游戏启动仍需重启 app，语义不变）。
     gJvmUsedInProcess = YES;
 
-    int ret = pJLI_Launch(++margc, margv,
-                   0, NULL,
-                   0, NULL,
-                   "1.8.0-internal",
-                   "1.8",
-                   "java", "openjdk",
-                   JNI_FALSE,
-                   JNI_TRUE, JNI_FALSE, JNI_TRUE);
-    NSLog(@"[JavaLauncher] Headless JLI_Launch returned %d", ret);
-    return ret;
+    jclass runnerClass = (*headlessEnv)->FindClass(headlessEnv, "net/kdt/pojavlaunch/tools/ForgeProcessorRunner");
+    if (!runnerClass) {
+        NSLog(@"[JavaLauncher] launchHeadlessJVM: ForgeProcessorRunner not found on classpath");
+        if ((*headlessEnv)->ExceptionOccurred(headlessEnv)) {
+            (*headlessEnv)->ExceptionDescribe(headlessEnv);
+            (*headlessEnv)->ExceptionClear(headlessEnv);
+        }
+        return -4;
+    }
+    jmethodID runnerMain = (*headlessEnv)->GetStaticMethodID(headlessEnv, runnerClass, "main", "([Ljava/lang/String;)V");
+    if (!runnerMain) {
+        NSLog(@"[JavaLauncher] launchHeadlessJVM: ForgeProcessorRunner.main([Ljava/lang/String;)V not found");
+        if ((*headlessEnv)->ExceptionOccurred(headlessEnv)) {
+            (*headlessEnv)->ExceptionDescribe(headlessEnv);
+            (*headlessEnv)->ExceptionClear(headlessEnv);
+        }
+        return -4;
+    }
+    jclass stringClass = (*headlessEnv)->FindClass(headlessEnv, "java/lang/String");
+    if (!stringClass) {
+        NSLog(@"[JavaLauncher] launchHeadlessJVM: java/lang/String not found");
+        if ((*headlessEnv)->ExceptionOccurred(headlessEnv)) {
+            (*headlessEnv)->ExceptionDescribe(headlessEnv);
+            (*headlessEnv)->ExceptionClear(headlessEnv);
+        }
+        return -4;
+    }
+    jobjectArray mainArgs = (*headlessEnv)->NewObjectArray(headlessEnv, (jsize)args.count, stringClass, NULL);
+    if (!mainArgs) {
+        NSLog(@"[JavaLauncher] launchHeadlessJVM: failed to allocate main args array");
+        if ((*headlessEnv)->ExceptionOccurred(headlessEnv)) {
+            (*headlessEnv)->ExceptionDescribe(headlessEnv);
+            (*headlessEnv)->ExceptionClear(headlessEnv);
+        }
+        return -4;
+    }
+    for (NSUInteger ai = 0; ai < args.count; ai++) {
+        jstring jstr = (*headlessEnv)->NewStringUTF(headlessEnv, [args[ai] UTF8String]);
+        if (!jstr) {
+            NSLog(@"[JavaLauncher] launchHeadlessJVM: failed to convert main arg %lu", (unsigned long)ai);
+            if ((*headlessEnv)->ExceptionOccurred(headlessEnv)) {
+                (*headlessEnv)->ExceptionDescribe(headlessEnv);
+                (*headlessEnv)->ExceptionClear(headlessEnv);
+            }
+            return -4;
+        }
+        (*headlessEnv)->SetObjectArrayElement(headlessEnv, mainArgs, (jsize)ai, jstr);
+        (*headlessEnv)->DeleteLocalRef(headlessEnv, jstr);
+    }
+
+    NSLog(@"[JavaLauncher] Invoking %@.main (headless, %lu args)", mainClass, (unsigned long)args.count);
+    (*headlessEnv)->CallStaticVoidMethod(headlessEnv, runnerClass, runnerMain, mainArgs);
+    if ((*headlessEnv)->ExceptionOccurred(headlessEnv)) {
+        // ForgeProcessorRunner 内部已捕获全部 Throwable 并写入 status.json（ok=false），
+        // 此处仅记录真正逃逸的致命错误；最终成败以 status.json 为准，不在此误报。
+        NSLog(@"[JavaLauncher] launchHeadlessJVM: uncaught exception escaped processor runner");
+        (*headlessEnv)->ExceptionDescribe(headlessEnv);
+        (*headlessEnv)->ExceptionClear(headlessEnv);
+    }
+    // 注意：不调用 DestroyJavaVM（iOS 上销毁后重建不稳定），进程内 VM 保留，
+    // 游戏启动前需重启 app（gJvmUsedInProcess 语义不变）。
+    NSLog(@"[JavaLauncher] Headless processor VM returned to ObjC");
+    return 0;
 }

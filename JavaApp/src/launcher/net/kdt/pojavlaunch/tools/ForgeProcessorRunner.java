@@ -48,8 +48,14 @@ import java.util.Map;
  *       "error": "...", "failedCommand": "..." }
  *
  * Notes:
- *  - Never calls System.exit(); main() returns normally so JLI_Launch can return
- *    cleanly and the ObjC caller reads the terminal status.json.
+ *  - main() 正常返回（自身从不调用 System.exit），调用方（iOS 经 JNI Invocation
+ *    API 反射调用）返回后继续执行安装器收尾（写 version.json / 注册 profile）。
+ *    注意：不可改回 JLI_Launch 方式启动——标准 OpenJDK launcher 在 main 返回后会
+ *    调用 exit() 终结进程，收尾永远执行不到（Forge 1.20.1 安装到 0.85 闪退即此因）。
+ *  - processor 经反射调用，其内部的 System.exit 会被下方的 exit 陷阱拦截：
+ *    exit(0) 视为成功（最终以 outputs 校验为准），非 0 视为失败，避免杀掉启动器。
+ *    这对齐官方 installer「processor 跑在独立子 JVM、退出不影响主进程」的语义
+ *   （iOS 禁止 fork/exec，以进程内 VM + 拦截等价实现，参照 ZL2 的独立进程模型）。
  *  - Each processor runs in its own URLClassLoader whose parent is the *platform*
  *    class loader (not the app class loader). This mirrors the official installer's
  *    IsolatedClassLoader: bundle libs (gson/guava/...) never leak into, nor
@@ -75,6 +81,16 @@ public final class ForgeProcessorRunner {
         List<String> args;
         @SerializedName("outputs")
         Map<String, String> outputs;
+    }
+
+    /** Thrown by the exit-trapping SecurityManager instead of terminating the VM. */
+    private static final class ExitTrappedException extends SecurityException {
+        final int status;
+
+        ExitTrappedException(int status) {
+            super("System.exit(" + status + ") trapped");
+            this.status = status;
+        }
     }
 
     /** status.json model. Null fields are omitted by Gson. */
@@ -103,6 +119,8 @@ public final class ForgeProcessorRunner {
         }
         File commandsFile = new File(args[0]);
         File statusFile = new File(args[1]);
+
+        installExitTrap();
 
         Status status = new Status();
         status.ok = false;
@@ -172,6 +190,31 @@ public final class ForgeProcessorRunner {
         }
     }
 
+    /**
+     * 安装 System.exit 陷阱：processor 跑在进程内 VM，其 exit 调用会被转为
+     * ExitTrappedException 抛回调用栈，而非终结整个启动器进程。
+     * 需要 VM 参数 -Djava.security.manager=allow（Java 17 无需，18+ 必需）；
+     * 安装失败时降级为无拦截（仅记录，不阻断安装）。
+     */
+    private static void installExitTrap() {
+        try {
+            System.setSecurityManager(new SecurityManager() {
+                @Override
+                public void checkPermission(java.security.Permission perm) {
+                    // 全部放行，只拦截 exit
+                }
+
+                @Override
+                public void checkExit(int status) {
+                    throw new ExitTrappedException(status);
+                }
+            });
+        } catch (Throwable t) {
+            System.err.println("[ForgeProcessorRunner] Exit trap unavailable,"
+                    + " processors calling System.exit will terminate the app: " + t);
+        }
+    }
+
     private static Command[] readCommands(File file) throws IOException {
         if (!file.isFile()) {
             throw new IOException("commands.json not found: " + file.getAbsolutePath());
@@ -218,6 +261,26 @@ public final class ForgeProcessorRunner {
         } catch (InvocationTargetException e) {
             // Unwrap the real processor exception; rethrow so the caller records it.
             Throwable cause = e.getCause() != null ? e.getCause() : e;
+            // 官方 installer 的 processor 跑在独立子 JVM，System.exit 无影响；
+            // iOS 上跑在进程内 VM，processor 的 exit 会直接杀掉启动器。以
+            // outputs 校验为最终依据：exit(0) 视为成功，非 0 视为失败。
+            Throwable root = cause;
+            while (root != null) {
+                if (root instanceof ExitTrappedException) {
+                    int exitStatus = ((ExitTrappedException) root).status;
+                    System.out.println("[ForgeProcessorRunner] Processor called System.exit("
+                            + exitStatus + "): " + command.mainClass);
+                    if (exitStatus == 0) {
+                        return;
+                    }
+                    throw new Exception("Processor " + command.mainClass
+                            + " exited with status " + exitStatus, cause);
+                }
+                if (root.getCause() == null || root.getCause() == root) {
+                    break;
+                }
+                root = root.getCause();
+            }
             throw new Exception("Processor " + command.mainClass + " threw: "
                     + describeThrowable(cause), cause);
         } catch (NoSuchMethodException e) {
