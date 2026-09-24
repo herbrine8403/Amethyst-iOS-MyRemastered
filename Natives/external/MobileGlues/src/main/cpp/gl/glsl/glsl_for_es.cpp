@@ -1168,107 +1168,35 @@ struct BigStackJob {
 };
 
 // ---------------------------------------------------------------------------
-// SIGSEGV safety net for the conversion thread.
+// SIGSEGV safety net -- REMOVED (Amethyst, 2026-09).
 //
-// History: three device builds in a row (2.0.1 .. 2.0.3) died with SIGSEGV at
-// glslang::TParseContext::lValueErrorCheck+0x264 while parsing Minecraft
-// 26.x's position_color vertex shader on iOS/arm64 -- an input that parses
-// fine under x86_64 with the same pinned glslang and is clean under ASan.
-// The fatal fault turned a per-shader GLSL problem into a whole-process kill
-// during startup.
+// This file used to install a process-wide SIGSEGV handler for the duration of
+// a conversion and siglongjmp() out of any fault inside glslang/SPIRV-Cross.
+// That net is gone for two reasons:
 //
-// The guard below confines that blast radius: while a conversion runs on the
-// dedicated big-stack thread, a SIGSEGV in it unwinds back to the conversion
-// entry via siglongjmp, the failure is logged, and the shader simply fails to
-// convert (a per-shader GLSL error -- Minecraft 26.x can cope with that).
-// Faults on any other thread (or outside a conversion) are forwarded to
-// whatever handler was installed before us (HotSpot, PLCrashReporter, ...).
+//   * It poisons process-global glslang state.  siglongjmp skips every C++
+//     destructor and every glslang cleanup, so the built-in symbol table and
+//     the pool that glslang::InitializeProcess() set up stay corrupted for the
+//     rest of the process.  Minecraft 26.x converts hundreds of shaders during
+//     resource reload, so one recovered fault becomes a cascade.
+//
+//   * It made the process undiagnosable.  The handler replaced HotSpot's
+//     SIGSEGV handler with SA_SIGINFO only -- no SA_ONSTACK, and no
+//     sigaltstack() anywhere in this file -- so a fault on any other thread
+//     re-entered the previous handler on an already-blown stack, faulted
+//     again, and the process died before HotSpot could write hs_err.  That is
+//     the "silent quit, no crash report, no .ips" symptom.
+//
+// Air (Gsjsjzhznsz) has none of this: its GLSLtoGLSLES_2 runs the conversion
+// straight through with no signal handling and no dispatch thread.  It relies
+// on the glslang lvalue-nullguard patch instead, which removes the root cause
+// rather than catching the symptom.  We keep the big-stack dispatch thread
+// (glslang's recursive descent genuinely needs it on iOS) but let faults be
+// faults: HotSpot will now report them properly.
+//
+// Removing the net does NOT re-introduce the Task 37 deadlock: no cross-engine
+// master compile lock is taken anywhere on this path.
 // ---------------------------------------------------------------------------
-static thread_local sigjmp_buf t_conv_jmp;
-static thread_local bool t_in_conversion = false;
-static sigjmp_buf dummy_jmp;
-static struct sigaction g_prev_sigsegv{};
-static bool g_prev_sigsegv_valid = false;
-
-// Best-effort crash-site report from inside the signal handler. We are
-// already past the point of caring about strict async-signal-safety (the
-// longjmp below aborts a corrupted computation anyway); what matters is
-// that the offsets land in the log so the arm64 fault can be symbolicated
-// offline against the exact CI dylib, the way lValueErrorCheck+0x264 was.
-static void report_crash_site(siginfo_t* info, void* uctx) {
-    uint64_t pc = 0, lr = 0, far_addr = 0;
-#if defined(__APPLE__) && defined(__aarch64__)
-    ucontext_t* uc = (ucontext_t*)uctx;
-    mcontext_t mc = uc ? uc->uc_mcontext : nullptr;
-    if (uc && mc && uc->uc_mcsize >= sizeof(*mc)) {
-        pc = mc->__ss.__pc;
-        lr = mc->__ss.__lr;
-        far_addr = mc->__es.__far;
-    }
-#elif defined(__APPLE__) && defined(__x86_64__)
-    ucontext_t* uc = (ucontext_t*)uctx;
-    mcontext_t mc = uc ? uc->uc_mcontext : nullptr;
-    if (uc && mc && uc->uc_mcsize >= sizeof(*mc)) {
-        pc = mc->__ss.__rip;
-        lr = mc->__ss.__rip;
-        far_addr = mc->__es.__faultvaddr;
-    }
-#else
-    (void)uctx;
-#endif
-    if (pc != 0) {
-        Dl_info dli{};
-        if (dladdr((void*)pc, &dli) && dli.dli_fbase) {
-            uint64_t base = (uint64_t)dli.dli_fbase;
-            const char* img = dli.dli_fname ? strrchr(dli.dli_fname, '/') : nullptr;
-            img = img ? img + 1 : dli.dli_fname;
-            LOG_W_FORCE("[MG] crash site: stage='%s' pc=0x%llx (pc-%s+0x%llx) lr=0x%llx far=0x%llx si_addr=0x%p",
-                        t_conv_stage, (unsigned long long)pc, img ? img : "?",
-                        (unsigned long long)(pc - base), (unsigned long long)lr,
-                        (unsigned long long)far_addr, info ? info->si_addr : nullptr)
-        } else {
-            LOG_W_FORCE("[MG] crash site: stage='%s' pc=0x%llx lr=0x%llx far=0x%llx si_addr=0x%p (module unknown)",
-                        t_conv_stage, (unsigned long long)pc, (unsigned long long)lr,
-                        (unsigned long long)far_addr, info ? info->si_addr : nullptr)
-        }
-    } else {
-        LOG_W_FORCE("[MG] crash site: stage='%s' si_addr=0x%p (pc unavailable)",
-                    t_conv_stage, info ? info->si_addr : nullptr)
-    }
-}
-
-static void conversion_sigsegv_handler(int sig, siginfo_t* info, void* uctx) {
-    if (t_in_conversion) {
-        t_in_conversion = false;
-        report_crash_site(info, uctx);
-        siglongjmp(t_conv_jmp, 1);
-    }
-    // Not ours: forward to the previous handler chain (JVM, PLCrash, ...).
-    if (g_prev_sigsegv_valid && (g_prev_sigsegv.sa_flags & SA_SIGINFO) && g_prev_sigsegv.sa_sigaction) {
-        g_prev_sigsegv.sa_sigaction(sig, info, uctx);
-        return;
-    }
-    if (g_prev_sigsegv_valid && g_prev_sigsegv.sa_handler &&
-        g_prev_sigsegv.sa_handler != SIG_DFL && g_prev_sigsegv.sa_handler != SIG_IGN) {
-        g_prev_sigsegv.sa_handler(sig);
-        return;
-    }
-    signal(sig, SIG_DFL);
-    raise(sig);
-}
-
-// Called once per process, at the first conversion. By that time the JVM and
-// PLCrashReporter have already installed their handlers, which we chain to.
-static void install_conversion_sigsegv_guard() {
-    static std::once_flag once;
-    std::call_once(once, [] {
-        struct sigaction sa{};
-        sa.sa_sigaction = conversion_sigsegv_handler;
-        sa.sa_flags = SA_SIGINFO;
-        sigemptyset(&sa.sa_mask);
-        g_prev_sigsegv_valid = (sigaction(SIGSEGV, &sa, &g_prev_sigsegv) == 0);
-    });
-}
 
 static void* big_stack_trampoline(void* p) {
     BigStackJob* job = (BigStackJob*)p;
@@ -1344,19 +1272,11 @@ static void GLSLtoGLSLES_2_entry(void* p) {
     // No cross-engine master compile lock is taken anywhere on this path.
     // spvc_shim serialises its own work and shaderc_shim owns that lock;
     // MG touching it deadlocked the game (see the Task 37 note above).
-    if (sigsetjmp(t_conv_jmp, 1) != 0) {
-        // SIGSEGV inside glslang/SPIRV-Cross on this dedicated thread (see
-        // the guard notes above). Report a clean per-shader failure instead
-        // of dying: -999 marks "conversion crashed" for the caller's log.
-        LOG_W_FORCE("[MG] shader conversion CRASHED (SIGSEGV recovered on 32MB-stack thread, stage='%s', len=%zu, head='%.96s') -- reporting conversion failure",
-                    t_conv_stage, strlen(a->glsl_code), a->glsl_code)
-        *a->return_code = -999;
-        a->out->clear();
-        return;
-    }
-    t_in_conversion = true;
+    //
+    // No sigsetjmp/SIGSEGV net either (see the note above): a fault inside
+    // glslang now propagates and is reported by HotSpot instead of being
+    // swallowed into a corrupted, half-torn-down glslang state.
     GLSLtoGLSLES_2_impl(a->glsl_code, a->glsl_type, a->essl_version, *a->return_code, *a->out, a->safe_mode);
-    t_in_conversion = false;
 #else
     GLSLtoGLSLES_2_impl(a->glsl_code, a->glsl_type, a->essl_version, *a->return_code, *a->out);
 #endif
@@ -1372,10 +1292,9 @@ std::string GLSLtoGLSLES_2(const char* glsl_code, GLenum glsl_type, uint essl_ve
     // concurrently and corrupt each other's AST -- the on-device
     // "l-value of swizzle / selector read garbage" family that has killed
     // this process since MobileGlues 2.0.1 (x86_64 + ASan clean, arm64
-    // device only). The lock lives on the CALLING thread around the hop:
-    // the dedicated conversion thread always runs to completion (siglongjmp
-    // lands inside the entry function, which then returns), so the join
-    // returns and the lock releases even after a recovered SIGSEGV.
+    // device only). The lock lives on the CALLING thread around the hop,
+    // never inside it, so the join always returns and the lock always
+    // releases -- no cross-thread acquisition, no deadlock.
     // Recursive so any future re-entrant conversion path degrades to
     // sequential instead of deadlocking.
     static std::recursive_mutex g_conv_serial;
@@ -1393,31 +1312,9 @@ std::string GLSLtoGLSLES_2(const char* glsl_code, GLenum glsl_type, uint essl_ve
     // Log BEFORE the conversion so a crash inside glslang is attributable:
     // if the next log shows this line but no completion, the SEGV happened on
     // the dedicated 32 MB stack (=> a real glslang bug, not a stack overflow).
-#if defined(__APPLE__)
-    install_conversion_sigsegv_guard();
-#endif
     LOG_V("[MG] shader conversion dispatched to dedicated 32MB-stack thread (len=%zu, head='%.96s')",
           strlen(glsl_code), glsl_code)
     if (run_on_big_stack_if_needed(&GLSLtoGLSLES_2_entry, &args)) {
-        if (rc == -999) {
-            // One recovery shot in safe mode: the SPIR-V optimizer is an
-            // optional pass, and if the arm64 fault lives inside it, running
-            // without it turns a dead pipeline back into a working shader.
-            // Each run_on_big_stack_if_needed() call spawns a fresh pthread,
-            // so the retry also starts from clean glslang state.
-            int rc2 = 0;
-            std::string out2;
-            GLSLtoGLSLES_2_Args args2{glsl_code, glsl_type, essl_version, &rc2, &out2, true};
-            LOG_W_FORCE("[MG] conversion crashed -- retrying once with SPIR-V optimizer disabled (len=%zu, head='%.96s')",
-                        strlen(glsl_code), glsl_code)
-            if (run_on_big_stack_if_needed(&GLSLtoGLSLES_2_entry, &args2) && rc2 == 0 && !out2.empty()) {
-                LOG_W_FORCE("[MG] conversion SUCCEEDED on optimizer-disabled retry (len=%zu) -- the SPIR-V optimizer path is the crasher",
-                            strlen(glsl_code))
-                return_code = rc2;
-                return out2;
-            }
-            LOG_W_FORCE("[MG] optimizer-disabled retry did not produce a usable shader (rc=%d) -- reporting conversion failure", rc2)
-        }
         return_code = rc;
         return out;
     }
