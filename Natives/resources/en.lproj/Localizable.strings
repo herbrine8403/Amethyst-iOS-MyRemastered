@@ -201,6 +201,7 @@
 "preference.detail.modLoaderSource" = "Source policy for Fabric / Forge / NeoForge meta, maven and installer downloads. Mirror first uses the BMCLAPI mirror.";
 "preference.title.mirror_policy-official_first" = "Official First";
 "preference.title.mirror_policy-mirror_first" = "Mirror First";
+"preference.title.mirror_policy-auto" = "Auto (mirror first in mainland China)";
 "preference.title.mod_mirror" = "Mod Mirror Source";
 "preference.detail.mod_mirror" = "Choose the mirror source for mod/shader/resourcepack/datapack/modpack/world API and file downloads. MCIM mirror (mod.mcimirror.top) provides acceleration in China, compatible with both Modrinth and CurseForge APIs.";
 "preference.title.mod_mirror-official" = "Official Source";
