@@ -562,6 +562,8 @@ NSString *const ForgeDirectInstallerErrorDomain = @"ForgeDirectInstallerErrorDom
     // Write version JSON
     NSLog(@"[ForgeDirect] Writing version JSON to: %@", versionJsonPath);
     reportProgress(0.9, localize(@"i18n_str_1263", nil));
+    // 参照 ZL2 progressIgnoreList：bootstraplauncher 0.1.17+ 需要 -DignoreList 包含 ${primary_jar_name}
+    [MinecraftResourceUtils applyBootstrapLauncherIgnoreListFix:mutableVersionInfo];
     NSError *writeError = saveJSONToFile(mutableVersionInfo, versionJsonPath);
     if (writeError) {
         if (error) {
@@ -720,6 +722,8 @@ NSString *const ForgeDirectInstallerErrorDomain = @"ForgeDirectInstallerErrorDom
     // Write version JSON
     NSLog(@"[ForgeDirect] Writing version JSON to: %@", versionJsonPath);
     reportProgress(0.9, localize(@"i18n_str_1263", nil));
+    // 参照 ZL2 progressIgnoreList：bootstraplauncher 0.1.17+ 需要 -DignoreList 包含 ${primary_jar_name}
+    [MinecraftResourceUtils applyBootstrapLauncherIgnoreListFix:versionJson];
     NSError *writeError = saveJSONToFile(versionJson, versionJsonPath);
     if (writeError) {
         if (error) {

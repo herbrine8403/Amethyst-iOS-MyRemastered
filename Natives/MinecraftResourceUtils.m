@@ -6,8 +6,159 @@
 #import "MinecraftResourceUtils.h"
 #import "ios_uikit_bridge.h"
 #import "utils.h"
+#import "PLMirrorCenter.h"
+#import "UZKArchive.h"
 
 @implementation MinecraftResourceUtils
+
+#pragma mark - Forge/NeoForge 启动修复（参照 ZL2 Install.ForgeLike.progressIgnoreList）
+
+/// 判断点分版本号 a 是否 >= b（仅用于 bootstraplauncher 版本判断）
++ (BOOL)pl_version:(NSString *)a isBiggerOrEqualTo:(NSString *)b {
+    NSArray<NSString *> *aParts = [a componentsSeparatedByString:@"."];
+    NSArray<NSString *> *bParts = [b componentsSeparatedByString:@"."];
+    NSUInteger count = MAX(aParts.count, bParts.count);
+    for (NSUInteger i = 0; i < count; i++) {
+        NSInteger aValue = i < aParts.count ? aParts[i].integerValue : 0;
+        NSInteger bValue = i < bParts.count ? bParts[i].integerValue : 0;
+        if (aValue != bValue) return aValue > bValue;
+    }
+    return YES;
+}
+
++ (void)applyBootstrapLauncherIgnoreListFix:(NSMutableDictionary *)json {
+    NSArray *libraries = json[@"libraries"];
+    if (![libraries isKindOfClass:[NSArray class]]) return;
+
+    BOOL hasNewBootstrapLauncher = NO;
+    for (id item in libraries) {
+        if (![item isKindOfClass:[NSDictionary class]]) continue;
+        NSString *name = item[@"name"];
+        if (![name isKindOfClass:[NSString class]]) continue;
+        NSArray<NSString *> *parts = [name componentsSeparatedByString:@":"];
+        if (parts.count >= 3 &&
+            [parts[0] isEqualToString:@"cpw.mods"] &&
+            [parts[1] isEqualToString:@"bootstraplauncher"] &&
+            [self pl_version:parts[2] isBiggerOrEqualTo:@"0.1.17"]) {
+            hasNewBootstrapLauncher = YES;
+            break;
+        }
+    }
+    if (!hasNewBootstrapLauncher) return;
+
+    NSDictionary *arguments = json[@"arguments"];
+    if (![arguments isKindOfClass:[NSDictionary class]]) return;
+    NSArray *jvm = arguments[@"jvm"];
+    if (![jvm isKindOfClass:[NSArray class]]) return;
+
+    NSInteger ignoreListIndex = NSNotFound;
+    for (NSInteger i = (NSInteger)jvm.count - 1; i >= 0; i--) {
+        id arg = jvm[(NSUInteger)i];
+        if ([arg isKindOfClass:[NSString class]] && [arg hasPrefix:@"-DignoreList="]) {
+            ignoreListIndex = i;
+            break;
+        }
+    }
+    if (ignoreListIndex == NSNotFound) return;
+
+    NSMutableArray *mutableJvm = [jvm mutableCopy];
+    NSString *originalArg = mutableJvm[(NSUInteger)ignoreListIndex];
+    mutableJvm[(NSUInteger)ignoreListIndex] = [originalArg stringByAppendingString:@",${primary_jar_name}"];
+
+    NSMutableDictionary *mutableArguments = [arguments mutableCopy];
+    mutableArguments[@"jvm"] = mutableJvm;
+    json[@"arguments"] = mutableArguments;
+    NSLog(@"[MCDL] bootstraplauncher >= 0.1.17: 已向 -DignoreList 追加 ${primary_jar_name}");
+}
+
+#pragma mark - OptiFine launchwrapper（参照 ZL2 Install.OptiFine.checkOFLaunchWrapper）
+
++ (NSArray *)optifineLaunchWrapperLibrariesWithOptiFineJarPath:(NSString *)optifineJarPath
+                                                  librariesDir:(NSString *)librariesDir {
+    // 1. OptiFine 1.13+：安装包内嵌 launchwrapper-of（OptiFine 自带的 launchwrapper 分支）
+    NSError *archiveError = nil;
+    UZKArchive *archive = [[UZKArchive alloc] initWithPath:optifineJarPath error:&archiveError];
+    if (archive && !archiveError) {
+        NSData *versionData = [archive extractDataFromFile:@"launchwrapper-of.txt" error:nil];
+        if (versionData) {
+            NSString *lwVersion = [[[NSString alloc] initWithData:versionData encoding:NSUTF8StringEncoding]
+                                   stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (lwVersion.length > 0 &&
+                [lwVersion rangeOfString:@"^[0-9]+(\\.[0-9]+)*$" options:NSRegularExpressionSearch].location != NSNotFound) {
+                NSString *fileName = [NSString stringWithFormat:@"launchwrapper-of-%@.jar", lwVersion];
+                NSData *lwData = [archive extractDataFromFile:fileName error:nil];
+                if (lwData.length > 0) {
+                    NSString *relativePath = [NSString stringWithFormat:@"optifine/launchwrapper-of/%@/%@", lwVersion, fileName];
+                    NSString *absolutePath = [librariesDir stringByAppendingPathComponent:relativePath];
+                    [[NSFileManager defaultManager] createDirectoryAtPath:[absolutePath stringByDeletingLastPathComponent]
+                                              withIntermediateDirectories:YES attributes:nil error:nil];
+                    [lwData writeToFile:absolutePath options:NSDataWritingAtomic error:nil];
+                    NSLog(@"[MCDL] OptiFine launchwrapper-of %@ -> %@", lwVersion, relativePath);
+                    return @[@{
+                        @"name": [NSString stringWithFormat:@"optifine:launchwrapper-of:%@", lwVersion],
+                        @"downloads": @{@"artifact": @{
+                            @"path": relativePath,
+                            @"url": @"",
+                            @"size": @(lwData.length),
+                            @"sha1": @""
+                        }}
+                    }];
+                }
+            }
+        }
+    }
+
+    // 2. 旧版 OptiFine（1.12 及以下）：net.minecraft:launchwrapper:1.12
+    NSString *relativePath = @"net/minecraft/launchwrapper/1.12/launchwrapper-1.12.jar";
+    NSString *absolutePath = [librariesDir stringByAppendingPathComponent:relativePath];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:absolutePath]) {
+        NSURL *officialURL = [NSURL URLWithString:@"https://libraries.minecraft.net/net/minecraft/launchwrapper/1.12/launchwrapper-1.12.jar"];
+        NSData *data = nil;
+        for (NSURL *candidate in [PLMirrorCenter candidateURLsForOriginalURL:officialURL
+                                                                resourceType:PLMirrorResourceTypeModLoader]) {
+            data = [self pl_synchronousDownload:candidate];
+            if (data.length > 0) break;
+        }
+        if (data.length == 0) {
+            NSLog(@"[MCDL] OptiFine launchwrapper 1.12 下载失败");
+            return nil;
+        }
+        [[NSFileManager defaultManager] createDirectoryAtPath:[absolutePath stringByDeletingLastPathComponent]
+                                  withIntermediateDirectories:YES attributes:nil error:nil];
+        [data writeToFile:absolutePath options:NSDataWritingAtomic error:nil];
+    }
+    NSDictionary *attributes = [[NSFileManager defaultManager] attributesOfItemAtPath:absolutePath error:nil];
+    return @[@{
+        @"name": @"net.minecraft:launchwrapper:1.12",
+        @"downloads": @{@"artifact": @{
+            @"path": relativePath,
+            @"url": @"",
+            @"size": attributes[NSFileSize] ?: @(0),
+            @"sha1": @""
+        }}
+    }];
+}
+
+/// 同步下载（带移动端浏览器 UA，BMCLAPI 镜像校验 UA）
++ (NSData *)pl_synchronousDownload:(NSURL *)url {
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    [request setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1" forHTTPHeaderField:@"User-Agent"];
+    request.timeoutInterval = 120;
+    __block NSData *result = nil;
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession]
+        dataTaskWithRequest:request
+          completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (!error && [response isKindOfClass:[NSHTTPURLResponse class]] &&
+            ((NSHTTPURLResponse *)response).statusCode == 200) {
+            result = data;
+        }
+        dispatch_semaphore_signal(semaphore);
+    }];
+    [task resume];
+    dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(180 * NSEC_PER_SEC)));
+    return result;
+}
 
 // Handle inheritsFrom
 + (void)processVersion:(NSMutableDictionary *)json inheritsFrom:(NSMutableDictionary *)inheritsFrom {
