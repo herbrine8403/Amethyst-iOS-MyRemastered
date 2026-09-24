@@ -326,6 +326,54 @@ jre: native
 
 dep_mg:
 	echo '[Amethyst v$(VERSION)] dep_mg - start'
+	# ---------------------------------------------------------------------------
+	# 3rdparty 版本对齐 —— 对齐参考仓库 Air 的 .gitmodules pin
+	#
+	# Air 的 Makefile 原文警告：
+	#   "The shader conversion pipeline (desktop GLSL -> ESSL) is only validated
+	#    against the submodule commits pinned in .gitmodules. A 3rdparty/ tree
+	#    populated from arbitrary master snapshots produced ESSL that ANGLE-Metal
+	#    rejects as empty (ERROR 1:1 syntax error on every shader, MC 26.x black
+	#    screen). Force the pinned versions before configuring cmake, and fail
+	#    loudly if they are still missing afterwards."
+	#
+	# 本仓库该目录是 vendored 而非 submodule，且 blob SHA 逐文件比对证明与 pin
+	# 版本不同源：SPIRV-Cross 的 spirv_cross.cpp / spirv_cross.hpp /
+	# spirv_glsl.cpp / spirv_glsl.hpp / spirv_cfg.cpp 全部不同；glslang 的
+	# CHANGES.md / localintermediate.h / Versions.cpp / InfoSink.h /
+	# CMakeLists.txt 也不同；xxhash 已一致故跳过。这是 MG + 26.3 黑屏与静默
+	# 闪退的根因（转换产物 ESSL 不被 ANGLE-Metal 接受）。
+	#
+	# 与 Air 的 git submodule update --init 等价：构建期把这两个目录整体替换为
+	# pin 快照（tar 直接解压到目标目录，规避 BSD cp -R 的目录覆盖陷阱）。哨兵
+	# 文件 .air_pin_<sha> 避免重复下载；glslang 目录内的两个 .patch 先备份、替换
+	# 后放回，交由紧随其后的补丁块应用（pin 版本本身不带防护补丁）。
+	# 逃生阀：AMETHYST_MG_PIN_ALIGN=0 可跳过（离线调试用，产物未经验证）。
+	# ---------------------------------------------------------------------------
+	@mg3=$(SOURCEDIR)/Natives/external/MobileGlues/src/main/cpp/3rdparty; \
+	if [ "$${AMETHYST_MG_PIN_ALIGN:-1}" = "0" ]; then \
+		echo '[dep_mg] WARNING: 3rdparty pin alignment skipped (AMETHYST_MG_PIN_ALIGN=0) -- MG build NOT validated'; \
+	else \
+		mkdir -p /tmp/mgpin_patches; \
+		cp "$$mg3"/glslang/*.patch /tmp/mgpin_patches/ 2>/dev/null; \
+		align3rd() { \
+			mg_name=$$1; mg_url=$$2; mg_sha=$$3; \
+			if [ -f "$$mg3/$$mg_name/.air_pin_$$mg_sha" ]; then \
+				echo "[dep_mg] $$mg_name already pinned to $$mg_sha"; return 0; \
+			fi; \
+			echo "[dep_mg] $$mg_name: replacing vendored tree with pinned snapshot $$mg_sha"; \
+			rm -rf "$$mg3/$$mg_name"; \
+			mkdir -p "$$mg3/$$mg_name" || return 1; \
+			curl -fsSL -o "/tmp/mgpin_$$mg_name.tgz" "$$mg_url" || { echo "ERROR: [dep_mg] $$mg_name pinned tarball download failed"; return 1; }; \
+			tar -xzf "/tmp/mgpin_$$mg_name.tgz" -C "$$mg3/$$mg_name" --strip-components=1 || return 1; \
+			touch "$$mg3/$$mg_name/.air_pin_$$mg_sha"; \
+			echo "[dep_mg] $$mg_name pinned OK"; \
+		}; \
+		align3rd SPIRV-Cross https://codeload.github.com/KhronosGroup/SPIRV-Cross/tar.gz/a0fba56c34a6700f1724bf9b751da5b488a3775c a0fba56 || { echo 'ERROR: [dep_mg] 3rdparty pin alignment failed - cannot build a validated MobileGlues'; exit 1; }; \
+		align3rd glslang https://codeload.github.com/KhronosGroup/glslang/tar.gz/f5f664dee8146676b04a332a7233959fc3ce9681 f5f664d || { echo 'ERROR: [dep_mg] 3rdparty pin alignment failed - cannot build a validated MobileGlues'; exit 1; }; \
+		cp /tmp/mgpin_patches/*.patch "$$mg3/glslang/" 2>/dev/null; \
+		echo '[dep_mg] 3rdparty pinned: SPIRV-Cross=a0fba56 glslang=f5f664d (xxhash already matches c2866db)'; \
+	fi
 	mkdir -p $(WORKINGDIR)/mobileglues
 	# MG 自带 3rdparty/glslang（CMakeLists 里 add_subdirectory 从源码构建）。参考仓库在 cmake
 	# 配置前对这份 glslang 打两个防护补丁（本仓库该目录是 vendored 而非 submodule，故用
