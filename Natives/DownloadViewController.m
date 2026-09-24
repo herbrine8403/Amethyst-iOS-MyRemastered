@@ -19,6 +19,7 @@
 #import "LauncherPreferences.h"
 #import "VersionCardCell.h"
 #import "MinecraftResourceDownloadTask.h"
+#import "MinecraftResourceUtils.h"
 #import "ModItem.h"
 #import "ModVersionViewController.h"
 #import "ModVersion.h"
@@ -4203,7 +4204,7 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
         // 这样做的目的：
         //   1. 让原版 client.jar 仍可被 inheritsFrom 引用（保留原版 jar）
         //   2. OptiFine jar 作为 launchwrapper 的 tweakClass 输入
-        //   3. mainClass 设为 net.minecraft.launchwrapper.Launcher，通过 --tweakClass optifine.OptiFineTweaker 加载
+        //   3. mainClass 设为 net.minecraft.launchwrapper.Launch，通过 --tweakClass optifine.OptiFineTweaker 加载
         NSString *optifineJarPath = [NSString stringWithFormat:@"optifine/OptiFine/%@/%@.jar", gameVersion, versionId];
         NSString *optifineJarAbsPath = [NSString stringWithFormat:@"%s/libraries/%@", getenv("POJAV_GAME_DIR"), optifineJarPath];
         // 确保 jar 文件写入到正确的 libraries 路径
@@ -4224,30 +4225,47 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
             return;
         }
 
-        // 4. 创建 version.json（参照 FCL OptiFineInstallTask / HMCL OptiFineInstallTask）
-        // OptiFine 使用 launchwrapper 作为入口，通过 tweaker 加载
-        // 关键：mainClass 必须是 net.minecraft.launchwrapper.Launcher
-        //       必须添加 --tweakClass optifine.OptiFineTweaker
-        //       OptiFine jar 必须加入 libraries 列表
+        // 4. 创建 version.json（参照 ZL2 Install.OptiFine）
+        // OptiFine 使用 launchwrapper 作为入口，通过 tweaker 加载：
+        //   - mainClass 必须是 net.minecraft.launchwrapper.Launch（launchwrapper 中可执行 main 的类；
+        //     net.minecraft.launchwrapper.Launcher 并不存在，会导致 "Could not find or load main class"）
+        //   - libraries 必须包含 launchwrapper：OptiFine 1.13+ 使用安装包内嵌的 launchwrapper-of，
+        //     旧版使用 net.minecraft:launchwrapper:1.12，否则启动时报 ClassNotFoundException
+        //   - OptiFine jar 必须加入 libraries 列表
+        NSString *librariesDir = [gameDir stringByAppendingPathComponent:@"libraries"];
+        NSArray *launchWrapperLibraries = [MinecraftResourceUtils optifineLaunchWrapperLibrariesWithOptiFineJarPath:optifineJarAbsPath
+                                                                                                         librariesDir:librariesDir];
+        if (!launchWrapperLibraries) {
+            NSError *err = [NSError errorWithDomain:@"OptiFineInstall" code:4
+                                         userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_97", nil)}];
+            [optiManager updateTaskWithId:taskId stageAtIndex:kOptiFineStageInstall status:PLTaskStageStatusFailed];
+            [optiManager updateTaskWithId:taskId stageAtIndex:kOptiFineStageInstall progress:0 message:err.localizedDescription];
+            [[DownloadTaskManager sharedManager] setTaskWithId:taskId completedWithError:err];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                __strong typeof(weakSelf) strongSelf = weakSelf;
+                if (!strongSelf) return;
+                [strongSelf finishInstallerProgressWithError:err.localizedDescription];
+            });
+            return;
+        }
+        NSArray *optifineLibraries = [launchWrapperLibraries arrayByAddingObject:@{
+            @"name": [NSString stringWithFormat:@"optifine:OptiFine:%@", versionId],
+            @"downloads": @{
+                @"artifact": @{
+                    @"path": optifineJarPath,
+                    @"url": @"",  // 已下载，URL 留空
+                    @"size": @(jarData.length),
+                    @"sha1": @""
+                }
+            }
+        }];
         NSDictionary *versionJson = @{
             @"id": versionId,
             @"inheritsFrom": gameVersion,
             @"type": @"release",
-            @"mainClass": @"net.minecraft.launchwrapper.Launcher",
+            @"mainClass": @"net.minecraft.launchwrapper.Launch",
             @"minecraftArguments": @"--username ${auth_player_name} --version ${version_name} --gameDir ${game_directory} --assetsDir ${assets_root} --assetIndex ${assets_index_name} --uuid ${auth_uuid} --accessToken ${auth_access_token} --userType ${user_type} --versionType ${version_type} --tweakClass optifine.OptiFineTweaker",
-            @"libraries": @[
-                @{
-                    @"name": [NSString stringWithFormat:@"optifine:OptiFine:%@", gameVersion],
-                    @"downloads": @{
-                        @"artifact": @{
-                            @"path": optifineJarPath,
-                            @"url": @"",  // 已下载，URL 留空
-                            @"size": @(jarData.length),
-                            @"sha1": @""
-                        }
-                    }
-                }
-            ],
+            @"libraries": optifineLibraries,
             @"jar": gameVersion,  // 使用原版 jar
             @"minimumLauncherVersion": @21
         };
