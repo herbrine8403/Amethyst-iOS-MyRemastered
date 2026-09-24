@@ -646,10 +646,12 @@
               @"type": self.typePickField,
               @"enableCondition": whenNotInGame,
               @"pickKeys": @[
+                  @"auto",
                   @"official_first",
                   @"mirror_first"
               ],
               @"pickList": @[
+                  localize(@"preference.title.mirror_policy-auto", nil),
                   localize(@"preference.title.mirror_policy-official_first", nil),
                   localize(@"preference.title.mirror_policy-mirror_first", nil)
               ]
@@ -660,10 +662,12 @@
               @"type": self.typePickField,
               @"enableCondition": whenNotInGame,
               @"pickKeys": @[
+                  @"auto",
                   @"official_first",
                   @"mirror_first"
               ],
               @"pickList": @[
+                  localize(@"preference.title.mirror_policy-auto", nil),
                   localize(@"preference.title.mirror_policy-official_first", nil),
                   localize(@"preference.title.mirror_policy-mirror_first", nil)
               ]
@@ -674,10 +678,12 @@
               @"type": self.typePickField,
               @"enableCondition": whenNotInGame,
               @"pickKeys": @[
+                  @"auto",
                   @"official_first",
                   @"mirror_first"
               ],
               @"pickList": @[
+                  localize(@"preference.title.mirror_policy-auto", nil),
                   localize(@"preference.title.mirror_policy-official_first", nil),
                   localize(@"preference.title.mirror_policy-mirror_first", nil)
               ]
@@ -688,10 +694,12 @@
               @"type": self.typePickField,
               @"enableCondition": whenNotInGame,
               @"pickKeys": @[
+                  @"auto",
                   @"official_first",
                   @"mirror_first"
               ],
               @"pickList": @[
+                  localize(@"preference.title.mirror_policy-auto", nil),
                   localize(@"preference.title.mirror_policy-official_first", nil),
                   localize(@"preference.title.mirror_policy-mirror_first", nil)
               ]

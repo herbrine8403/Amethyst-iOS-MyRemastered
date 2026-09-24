@@ -201,6 +201,7 @@
 "preference.detail.modLoaderSource" = "Fabric / Forge / NeoForge 的 meta、maven 與安裝器下載策略。鏡像優先使用 BMCLAPI 鏡像。";
 "preference.title.mirror_policy-official_first" = "官方優先";
 "preference.title.mirror_policy-mirror_first" = "鏡像優先";
+"preference.title.mirror_policy-auto" = "自動（大陸鏡像優先）";
 "preference.title.mod_mirror" = "模组镜像源";
 "preference.detail.mod_mirror" = "选择模组/光影/资源包/数据包/整合包/世界的 API 与文件下载镜像源。MCIM镜像源（mod.mcimirror.top）提供国内加速，兼容 Modrinth 和 CurseForge 接口。";
 "preference.title.mod_mirror-official" = "官方源";
