@@ -31,7 +31,6 @@
 #include "../../version.h"
 
 #if defined(__APPLE__)
-#include <dlfcn.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -1319,9 +1318,32 @@ struct GLSLtoGLSLES_2_Args {
 static void GLSLtoGLSLES_2_impl(const char* glsl_code, GLenum glsl_type, uint essl_version,
                                 int& return_code, std::string& out, bool safe_mode = false);
 
+// ---- Amethyst Task 37 (RETRACTED): no cross-engine master lock here ----
+// Air (Gsjsjzhznsz) has no master-lock participation in MobileGlues at all:
+// its GLSLtoGLSLES_2 runs the conversion straight through.  Holding the
+// cross-engine compile lock across the spirv-cross hop deadlocked the game:
+//
+//   render thread -> GLSLtoGLSLES_2 -> 32MB conversion thread T1
+//     -> lock(master)                     [held by T1]
+//     -> spirv_to_essl -> spvc_context_parse_spirv
+//        -> spvc-shim 32MB-stack wrapper -> pthread T2
+//           -> lock(master)               [T2 blocks: master is
+//                                          PTHREAD_MUTEX_RECURSIVE, i.e.
+//                                          re-entrant for the SAME thread
+//                                          only]
+//     -> T1 join(T2)                      [never returns]
+//
+// On-device log (iPhone X, 26.3 + MG): "shader conversion dispatched to
+// dedicated 32MB-stack thread" + "GLSL parse OK", then nothing -- exactly
+// this deadlock.  spvc_shim already serialises itself and shaderc_shim
+// owns the lock; MG must not touch it.
+
 static void GLSLtoGLSLES_2_entry(void* p) {
     GLSLtoGLSLES_2_Args* a = (GLSLtoGLSLES_2_Args*)p;
 #if defined(__APPLE__)
+    // No cross-engine master compile lock is taken anywhere on this path.
+    // spvc_shim serialises its own work and shaderc_shim owns that lock;
+    // MG touching it deadlocked the game (see the Task 37 note above).
     if (sigsetjmp(t_conv_jmp, 1) != 0) {
         // SIGSEGV inside glslang/SPIRV-Cross on this dedicated thread (see
         // the guard notes above). Report a clean per-shader failure instead
@@ -1360,48 +1382,11 @@ std::string GLSLtoGLSLES_2(const char* glsl_code, GLenum glsl_type, uint essl_ve
     std::lock_guard<std::recursive_mutex> conv_guard(g_conv_serial);
 
     // ---- Amethyst Task 37: cross-engine master compile lock ----
-    // On-device evidence (latestlog 2026-09-06 18:42, GL renderer path):
-    // while this converter ran, RenderPearl's shaderc compiles of complex
-    // shaders (terrain/entity/clouds) crashed deterministically in the
-    // SAME time window -- four shader engines were running concurrently
-    // (this converter's embedded glslang+SPIRV-Cross vs shaderc/spvc shims,
-    // with three independent locks). Negotiate the master lock exported by
-    // libshaderc.dylib (the shaderc_shim forwarder, RTLD-safe dlopen of an
-    // already-loaded image -> same instance) and hold it across the whole
-    // conversion hop so shaderc compiles, spvc cross-compiles and MG
-    // conversions are fully serialized. Lock order is one-way
-    // (g_conv_serial -> master; the shims never take g_conv_serial), no
-    // cycles. Failure to negotiate (shim absent, standalone MG build)
-    // degrades to the Task-30 behavior above -- a no-op guard.
-    //
-    // Held on the CALLING thread across the pthread_create/join hop: MG now
-    // statically links its own SPIRV-Cross (see CMakeLists), so the
-    // conversion never re-enters spvc_shim on a different thread -- the
-    // Task-37 retraction-era deadlock (T2 blocking on a recursive mutex held
-    // by the caller) cannot recur.
-    struct MasterLockGuard {
-        pthread_mutex_t* m;
-        explicit MasterLockGuard(pthread_mutex_t* mm) : m(mm) {
-            if (m) pthread_mutex_lock(m);
-        }
-        ~MasterLockGuard() { if (m) pthread_mutex_unlock(m); }
-    };
-    static pthread_mutex_t* ame_master = (pthread_mutex_t*)1; // 1 = not yet negotiated
-    if (ame_master == (pthread_mutex_t*)1) {
-        ame_master = nullptr;
-        // dlopen an already-loaded image only bumps its refcount and returns
-        // the same handle, so this never creates a second shaderc instance.
-        // "ame_master_compile_lock" is not in the launcher's fishhook prefix
-        // list, so dlsym resolves it unhooked.
-        void* h = dlopen("libshaderc.dylib", RTLD_LAZY);
-        if (h) {
-            if (auto fn = (pthread_mutex_t* (*)())dlsym(h, "ame_master_compile_lock"))
-                ame_master = fn();
-        }
-        LOG_I("[MG] amethyst master compile lock %s (shaderc/spvc/MG full serialization)",
-              ame_master ? "negotiated" : "unavailable -- conversion serialized within MG only")
-    }
-    MasterLockGuard master_guard(ame_master);
+    // Taken inside GLSLtoGLSLES_2_entry() on the conversion thread, NOT here.
+    // The mutex is PTHREAD_MUTEX_RECURSIVE (same-thread re-entrant only), so
+    // holding it across the pthread_create/join hop deadlocked any nested
+    // acquisition from the worker (spvc_shim negotiates the same mutex) and
+    // the join never returned -- the on-device MG stall after "GLSL parse OK".
     std::string out;
     int rc = 0;
     GLSLtoGLSLES_2_Args args{glsl_code, glsl_type, essl_version, &rc, &out};
