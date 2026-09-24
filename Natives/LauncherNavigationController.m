@@ -672,10 +672,19 @@ static void *ProgressObserverContext = &ProgressObserverContext;
         handler();
         return;
     } else if (@available(iOS 17.4, *)) {
+        // script-data 仅 TXM 设备需要（StikJIT 指南：非 TXM 省略 script 参数，普通 attach 即可）。
+        // 用 DeviceNeedsStikScript()（HAS_TXM && (IS_IOS_26 || FORCE_MIRRORED)）替代旧的
+        // IS_IOS_26|FORCE_MIRRORED，还原 iOS 17/18 TXM 设备的脚本分发，并避免给非 TXM 设备多发脚本。
+        // NB助手用户：若未安装 StikDebug，此 openURL 无效果，请手动去 NB助手/StikDebug 中对本 App 启用 JIT
+        // 后返回，等待循环检测到调试器保持附加才会放行（见 isJITEnabled 的 getppid 守卫）。
         NSString *scriptDataString = @"";
-        if (DeviceNeedsDebugJITMapping()) {
+        if (DeviceNeedsStikScript()) {
             NSData *scriptData = [NSData dataWithContentsOfFile:[NSBundle.mainBundle.bundlePath stringByAppendingPathComponent:@"UniversalJIT26.js"]];
-            scriptDataString = [@"&script-data=" stringByAppendingString:[scriptData base64EncodedStringWithOptions:0]];
+            if (scriptData) {
+                scriptDataString = [@"&script-data=" stringByAppendingString:[scriptData base64EncodedStringWithOptions:0]];
+            } else {
+                NSLog(@"[JIT] WARNING: UniversalJIT26.js not found in bundle, sending plain stikjit attach");
+            }
         }
         [UIApplication.sharedApplication openURL:[NSURL URLWithString:[NSString stringWithFormat:@"stikjit://enable-jit?bundle-id=%@&pid=%d%@", NSBundle.mainBundle.bundleIdentifier, getpid(), scriptDataString]] options:@{} completionHandler:nil];
     } else {

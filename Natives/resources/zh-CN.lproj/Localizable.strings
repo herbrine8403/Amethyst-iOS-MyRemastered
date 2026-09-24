@@ -92,7 +92,7 @@
 "launcher.menu.import_modpack" = "导入整合包";
 
 "launcher.wait_jit.title" = "请等待应用获取到JIT(Just-in-time)";
-"launcher.wait_jit.message" = "Amethyst启动器必须要JIT (Just-in-time) 权限才能启动游戏";
+"launcher.wait_jit.message" = "Amethyst启动器必须要JIT (Just-in-time) 权限才能启动游戏。请去 StikDebug/NB助手/SideStore 中对本 App 启用 JIT 后返回等待；TXM 设备请在 StikDebug 中选用 Universal 脚本并保持附加，不要关闭 StikDebug 悬浮窗";
 "launcher.wait_jit_trollstore.message" = "如果仍然看到此消息，请在 TrollStore 中启用 URL Scheme。";
 
 "login.error.username.outOfRange" = "用户名必须在 3-16 个字符以内";
@@ -1954,3 +1954,4 @@
 
 "preference.auto" = "自动";
 "preference.auto_select" = "自动选择";
+"preference.profile.title.lwjgl_version" = "LWJGL 版本";

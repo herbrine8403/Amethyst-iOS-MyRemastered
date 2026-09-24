@@ -207,6 +207,32 @@ NSString* getSelectedJavaHome(NSString* defaultJRETag, int minVersion) {
     }
 }
 
+NSString* getExactJavaHome(int version) {
+    // Profile JRE 精确 pin：绕开全局 "0" 槽默认，直接按版本号取 home。
+    // 背景：getSelectedJavaHome 永远从全局默认起步、只向上搜索，导致 profile 想用
+    // 比全局默认更低的版本（如全局 21、profile 17）时被静默吞掉。调用方须先自行校验
+    // version >= 游戏最低要求；此处只做存在性校验。
+    if (version <= 0) return nil;
+    NSDictionary *pref = getPrefObject(@"java.java_homes");
+    NSString *key = [@(version) stringValue];
+    id dir = pref[key];
+    if (![dir isKindOfClass:[NSString class]] || [(NSString *)dir length] == 0) {
+        NSLog(@"[JavaPin] Java %d is not configured in java_homes, falling back", version);
+        return nil;
+    }
+    NSString *selectedDir;
+    if ([dir isEqualToString:@"internal"]) {
+        selectedDir = [NSString stringWithFormat:@"%@/java_runtimes/java-%@-openjdk", NSBundle.mainBundle.bundlePath, key];
+    } else {
+        selectedDir = [NSString stringWithFormat:@"%s/java_runtimes/%@", getenv("POJAV_HOME"), dir];
+    }
+    if ([NSFileManager.defaultManager fileExistsAtPath:selectedDir]) {
+        return selectedDir;
+    }
+    NSLog(@"[JavaPin] Java %d directory does not exist: %@, falling back", version, selectedDir);
+    return nil;
+}
+
 #pragma mark Renderer
 
 // 可选渲染器是否真的可用：对应的 dylib 必须已经打进 app 的 Frameworks 目录。

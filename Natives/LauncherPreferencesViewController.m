@@ -1123,9 +1123,10 @@
                 @"type": self.typeSwitch,
                 @"requestReload": @YES,
                 @"enableCondition": ^BOOL(){
-                    // 同步自 catsruledogs：用 DeviceNeedsDebugJITMapping() 替代旧的 TXM 标志组合
-                    // 基于 JIT_FLAG_IS_IOS_26 | JIT_FLAG_FORCE_MIRRORED，确保 iOS 26+ 无 TXM 设备也显示此开关
-                    return DeviceNeedsDebugJITMapping() && whenNotInGame();
+                    // Universal 脚本开关仅 TXM 设备需要（原版条件 FORCE_MIRRORED|HAS_TXM，
+                    // 此处用 DeviceNeedsStikScript() 扩展覆盖 iOS 26+ TXM 无 FORCE 的新组合）。
+                    // 非 TXM 设备按 StikJIT 指南无需脚本，隐藏此开关避免误导。
+                    return DeviceNeedsStikScript() && whenNotInGame();
                 },
             },
             @{@"key": @"debug_always_attached_jit",
