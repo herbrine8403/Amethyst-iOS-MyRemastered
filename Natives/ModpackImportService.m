@@ -2428,7 +2428,10 @@ static NSString * const kImportedModpacksKey = @"ImportedModpacks";
     }
 
     NSMutableDictionary *profile = [@{
-        @"name": name.length > 0 ? name : profileName,
+        // 必须使用去重后的 profileName：profiles 字典以 profileName 为 key，
+        // 且 PLProfiles 以 selectedProfileName（即 key）回查 profile，
+        // 用原始 name 会导致重名时 key 与 name 字段不一致（列表出现两个同名项、选中项错乱）
+        @"name": profileName,
         @"lastVersionId": versionId ?: @"",
         @"gameDir": gameDirRelative,
         @"created": [self iso8601StringFromDate:[NSDate date]],
