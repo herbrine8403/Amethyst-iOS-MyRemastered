@@ -1235,7 +1235,17 @@ static void ame_noteDroppedMinimized(void) {
 /// 真正的后台切换由 SDL_APP_WILL_ENTER_BACKGROUND 等事件表达，语义完整。
 static unsigned int ame_SDL_GetWindowFlags(void *window) {
     unsigned int f = ame_real_GetWindowFlags ? ame_real_GetWindowFlags(window) : 0;
-    return f & ~AME_SDL_WINDOW_MINIMIZED;
+    // Amethyst Task 110（对齐 Air Gsjsjz）：
+    // 0x200 = SDL_WINDOW_INPUT_FOCUS 置 1；0x40 = MINIMIZED、0x4 = HIDDEN 剥离。
+    // 根因：dynamic_fps 3.11.10（26.3 整合包自带）的 WindowObserver 构造函数直接查
+    // SDL_GetWindowFlags & SDL_WINDOW_INPUT_FOCUS，不走 vanilla 的 Window.focused。
+    // 我们的嵌入模式里隐藏的 SDL UIWindow 既无输入焦点（0x200=0）、也无鼠标焦点、
+    // 还被标记 HIDDEN，于是模组判定窗口未聚焦进入限帧档（观测到的 30fps）。
+    // Task 50 只剥离了 MINIMIZED，焦点位是漏网之鱼。
+    // 安全性：vanilla 唯一的 flag 消费点是 Window.isFullscreen（& 1 FULLSCREEN），
+    // 不受影响；renderpearl 依赖的 MINIMIZED 剥离保留。iOS 在后台会冻结 App，
+    // 所以"前台恒有焦点"这个无害的谎言始终成立。
+    return (f | 0x200u) & ~AME_SDL_WINDOW_MINIMIZED & ~0x4u;
 }
 
 /// Air Task 32 移植：嵌入后绝不让 SDL 自己的 UIWindow 保持可见。
