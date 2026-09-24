@@ -355,7 +355,7 @@ dep_mg:
 		echo '[dep_mg] WARNING: 3rdparty pin alignment skipped (AMETHYST_MG_PIN_ALIGN=0) -- MG build NOT validated'; \
 	else \
 		mkdir -p /tmp/mgpin_patches; \
-		cp "$$mg3"/glslang/*.patch /tmp/mgpin_patches/ 2>/dev/null; \
+		cp "$$mg3"/*.patch /tmp/mgpin_patches/ 2>/dev/null; \
 		align3rd() { \
 			mg_name=$$1; mg_url=$$2; mg_sha=$$3; \
 			if [ -f "$$mg3/$$mg_name/.air_pin_$$mg_sha" ]; then \
@@ -371,7 +371,7 @@ dep_mg:
 		}; \
 		align3rd SPIRV-Cross https://codeload.github.com/KhronosGroup/SPIRV-Cross/tar.gz/a0fba56c34a6700f1724bf9b751da5b488a3775c a0fba56 || { echo 'ERROR: [dep_mg] 3rdparty pin alignment failed - cannot build a validated MobileGlues'; exit 1; }; \
 		align3rd glslang https://codeload.github.com/KhronosGroup/glslang/tar.gz/f5f664dee8146676b04a332a7233959fc3ce9681 f5f664d || { echo 'ERROR: [dep_mg] 3rdparty pin alignment failed - cannot build a validated MobileGlues'; exit 1; }; \
-		cp /tmp/mgpin_patches/*.patch "$$mg3/glslang/" 2>/dev/null; \
+		cp /tmp/mgpin_patches/*.patch "$$mg3/" 2>/dev/null; \
 		echo '[dep_mg] 3rdparty pinned: SPIRV-Cross=a0fba56 glslang=f5f664d (xxhash already matches c2866db)'; \
 	fi
 	mkdir -p $(WORKINGDIR)/mobileglues
@@ -384,13 +384,14 @@ dep_mg:
 	#   * glslang-pool-zero-and-size-guards.patch —— GlslangToSpv::convertSwizzle 的
 	#     constArray 尺寸判，必须打在 nullguard 之上。
 	# 幂等：先 --check 正向，失败再 --check 反向（判定已打过），两种情况都继续构建。
-	@mg_glrel=Natives/external/MobileGlues/MobileGlues-cpp/3rdparty/glslang; \
-	mg_gldir=$(SOURCEDIR)/$$mg_glrel; \
+	@mg_3prel=Natives/external/MobileGlues/MobileGlues-cpp/3rdparty; \
+	mg_glrel=$$mg_3prel/glslang; \
+	mg_pdir=$(SOURCEDIR)/$$mg_3prel; \
 	for p in glslang-lvalue-nullguard.patch glslang-pool-zero-and-size-guards.patch; do \
-		if [ ! -f "$$mg_gldir/$$p" ]; then echo "[dep_mg] glslang patch $$p missing - skip"; continue; fi; \
-		if git -C $(SOURCEDIR) apply --check -p1 --directory=$$mg_glrel "$$mg_gldir/$$p" >/dev/null 2>&1; then \
-			git -C $(SOURCEDIR) apply -p1 --directory=$$mg_glrel "$$mg_gldir/$$p" && echo "[dep_mg] glslang patch $$p APPLIED" || echo "[dep_mg] WARNING: $$p apply failed"; \
-		elif git -C $(SOURCEDIR) apply --check -R -p1 --directory=$$mg_glrel "$$mg_gldir/$$p" >/dev/null 2>&1; then \
+		if [ ! -f "$$mg_pdir/$$p" ]; then echo "[dep_mg] ERROR: glslang patch $$p MISSING under $$mg_3prel -- MG built WITHOUT the MC 26.x position_color SIGSEGV guards"; continue; fi; \
+		if git -C $(SOURCEDIR) apply --check -p1 --directory=$$mg_glrel "$$mg_pdir/$$p" >/dev/null 2>&1; then \
+			git -C $(SOURCEDIR) apply -p1 --directory=$$mg_glrel "$$mg_pdir/$$p" && echo "[dep_mg] glslang patch $$p APPLIED" || echo "[dep_mg] WARNING: $$p apply failed"; \
+		elif git -C $(SOURCEDIR) apply --check -R -p1 --directory=$$mg_glrel "$$mg_pdir/$$p" >/dev/null 2>&1; then \
 			echo "[dep_mg] glslang patch $$p already applied"; \
 		else \
 			echo "[dep_mg] WARNING: $$p neither applies nor is applied -- MG glslang left UNPATCHED"; \
@@ -429,7 +430,6 @@ dep_mg:
 	fi; \
 	echo "[shaderc-impl] glslang static libs OK (spirv=$$mg_spirv_a glslang=$$mg_glslang_a rl=$$mg_rl_a)"
 	cp $(WORKINGDIR)/mobileglues/libmobileglues*.dylib $(WORKINGDIR)/
-	cp $(WORKINGDIR)/mobileglues/libspirv-cross*.dylib $(WORKINGDIR)/ 2>/dev/null || true
 	echo '[Amethyst v$(VERSION)] dep_mg - end'
 # ---------------------------------------------------------------------------
 # shaderc / spirv-cross 串行化垫片（对齐 Air Task 39/42/47/54）

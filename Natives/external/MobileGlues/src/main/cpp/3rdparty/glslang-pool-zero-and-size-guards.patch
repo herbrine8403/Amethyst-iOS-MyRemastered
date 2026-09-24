@@ -1,0 +1,72 @@
+diff --git a/SPIRV/GlslangToSpv.cpp b/SPIRV/GlslangToSpv.cpp
+index 36c513e0..25bcac45 100644
+--- a/SPIRV/GlslangToSpv.cpp
++++ b/SPIRV/GlslangToSpv.cpp
+@@ -5368,6 +5368,10 @@ bool TGlslangToSpvTraverser::convertSwizzle(const glslang::TIntermAggregate& nod
+             swizzleSequence[i] ? swizzleSequence[i]->getAsConstantUnion() : nullptr;
+         if (cu == nullptr)
+             return false;
++        // Task 45: same family as the lValueErrorCheck guard -- empty (zeroed
++        // or stale) constArray -> unusable selector -> identity swizzle.
++        if (cu->getConstArray().size() < 1)
++            return false;
+         const int value = cu->getConstArray()[0].getIConst();
+         if (value < 0 || value >= 4)
+             return false;
+diff --git a/glslang/MachineIndependent/ParseHelper.cpp b/glslang/MachineIndependent/ParseHelper.cpp
+index 42ccc9de..5b1fc29e 100644
+--- a/glslang/MachineIndependent/ParseHelper.cpp
++++ b/glslang/MachineIndependent/ParseHelper.cpp
+@@ -4097,6 +4097,11 @@ bool TParseContext::lValueErrorCheck(const TSourceLoc& loc, const char* op, TInt
+                         TIntermConstantUnion* cu = typed ? typed->getAsConstantUnion() : nullptr;
+                         if (cu == nullptr)
+                             continue;
++                        // Task 45: a zeroed/stale pool reads as an empty
++                        // constArray (TConstUnionArray::size() is null-safe).
++                        // Skip the element instead of dereferencing garbage.
++                        if (cu->getConstArray().size() < 1)
++                            continue;
+                         int value = cu->getConstArray()[0].getIConst();
+                         if (value < 0 || value >= 4)
+                             continue;
+diff --git a/glslang/MachineIndependent/PoolAlloc.cpp b/glslang/MachineIndependent/PoolAlloc.cpp
+index 93a3b0d1..3f1b18cb 100644
+--- a/glslang/MachineIndependent/PoolAlloc.cpp
++++ b/glslang/MachineIndependent/PoolAlloc.cpp
+@@ -35,6 +35,8 @@
+ #include "../Include/Common.h"
+ #include "../Include/PoolAlloc.h"
+ 
++#include <cstring> // Task 45: pool block zero-fill
++
+ // Mostly here for target that do not support threads such as WASI.
+ #ifdef DISABLE_THREAD_SUPPORT
+ #define THREAD_LOCAL 
+@@ -267,6 +269,14 @@ void* TPoolAllocator::allocate(size_t numBytes)
+ 
+         currentPageOffset = pageSize;  // make next allocation come from a new page
+ 
++        // Task 45: zero the usable region of every fresh pool block. The
++        // backing ::new char[] comes straight from the malloc recycler and
++        // may contain recycled source-text / AST bytes; an un-initialized
++        // or stale field read inside the pool must observe 0/NULL (the
++        // nullguard family then degrades gracefully) -- never garbage
++        // pointers (the 15-task SIGSEGV family).
++        memset(reinterpret_cast<unsigned char*>(memory) + headerSkip, 0, allocationSize);
++
+         // No guard blocks for multi-page allocations (yet)
+         return reinterpret_cast<void*>(reinterpret_cast<UINT_PTR>(memory) + headerSkip);
+     }
+@@ -288,6 +298,12 @@ void* TPoolAllocator::allocate(size_t numBytes)
+     new(memory) tHeader(inUseList, 1);
+     inUseList = memory;
+ 
++    // Task 45: zero the usable region -- covers BOTH freelist-reused pages
++    // (stale AST bytes from a previous compile) and freshly malloc'd pages
++    // (recycled source-text bytes). Same rationale as the multi-page branch.
++    if (pageSize > headerSkip)
++        memset(reinterpret_cast<unsigned char*>(inUseList) + headerSkip, 0, pageSize - headerSkip);
++
+     unsigned char* ret = reinterpret_cast<unsigned char*>(inUseList) + headerSkip;
+     currentPageOffset = (headerSkip + allocationSize + alignmentMask) & ~alignmentMask;
+ 

@@ -1,0 +1,131 @@
+diff --git a/glslang/MachineIndependent/ParseHelper.cpp b/glslang/MachineIndependent/ParseHelper.cpp
+index 33eecf6..42ccc9d 100644
+--- a/glslang/MachineIndependent/ParseHelper.cpp
++++ b/glslang/MachineIndependent/ParseHelper.cpp
+@@ -4077,16 +4077,35 @@ bool TParseContext::lValueErrorCheck(const TSourceLoc& loc, const char* op, TInt
+                 int offset[4] = {0,0,0,0};
+ 
+                 TIntermTyped* rightNode = binaryNode->getRight();
+-                TIntermAggregate *aggrNode = rightNode->getAsAggregate();
+-
+-                for (TIntermSequence::iterator p = aggrNode->getSequence().begin();
+-                                               p != aggrNode->getSequence().end(); p++) {
+-                    int value = (*p)->getAsTyped()->getAsConstantUnion()->getConstArray()[0].getIConst();
+-                    offset[value]++;
+-                    if (offset[value] > 1) {
+-                        error(loc, " l-value of swizzle cannot have duplicate components", op, "", "");
+-
+-                        return true;
++                TIntermAggregate *aggrNode = rightNode ? rightNode->getAsAggregate() : nullptr;
++
++                // Defensive null guards (iOS/arm64 process kill, 2026-08):
++                // The selector index list is expected to be an aggregate of
++                // constant unions, but the dereference chain below assumed it
++                // unconditionally. A SIGSEGV was observed in this exact chain
++                // (getAsAggregate() -> getSequence()) while parsing Minecraft
++                // 26.x's position_color vertex shader on iOS/arm64, taking the
++                // whole process down. When the shape is unexpected, skip the
++                // duplicate-component check instead of crashing: the parse
++                // must complete so any complaint stays a per-shader GLSL
++                // error. Individual sequence elements are guarded for the
++                // same reason.
++                if (aggrNode != nullptr) {
++                    for (TIntermSequence::iterator p = aggrNode->getSequence().begin();
++                                                   p != aggrNode->getSequence().end(); p++) {
++                        TIntermTyped* typed = (*p) ? (*p)->getAsTyped() : nullptr;
++                        TIntermConstantUnion* cu = typed ? typed->getAsConstantUnion() : nullptr;
++                        if (cu == nullptr)
++                            continue;
++                        int value = cu->getConstArray()[0].getIConst();
++                        if (value < 0 || value >= 4)
++                            continue;
++                        offset[value]++;
++                        if (offset[value] > 1) {
++                            error(loc, " l-value of swizzle cannot have duplicate components", op, "", "");
++
++                            return true;
++                        }
+                     }
+                 }
+             }
+diff --git a/SPIRV/GlslangToSpv.cpp b/SPIRV/GlslangToSpv.cpp
+index ff9c8b0..36c513e
+--- a/SPIRV/GlslangToSpv.cpp
++++ b/SPIRV/GlslangToSpv.cpp
+@@ -165,7 +165,7 @@ protected:
+     spv::Id getSampledType(const glslang::TSampler&);
+     spv::Id getInvertedSwizzleType(const glslang::TIntermTyped&);
+     spv::Id createInvertedSwizzle(spv::Decoration precision, const glslang::TIntermTyped&, spv::Id parentResult);
+-    void convertSwizzle(const glslang::TIntermAggregate&, std::vector<unsigned>& swizzle);
++    bool convertSwizzle(const glslang::TIntermAggregate&, std::vector<unsigned>& swizzle);
+     spv::Id convertGlslangToSpvType(const glslang::TType& type, bool forwardReferenceOnly = false);
+     spv::Id convertGlslangToSpvType(const glslang::TType& type, glslang::TLayoutPacking, const glslang::TQualifier&,
+         bool lastBufferBlockMember, bool forwardReferenceOnly = false);
+@@ -2557,7 +2557,22 @@ bool TGlslangToSpvTraverser::visitBinary(glslang::TVisit /* visit */, glslang::T
+         {
+             node->getLeft()->traverse(this);
+             std::vector<unsigned> swizzle;
+-            convertSwizzle(*node->getRight()->getAsAggregate(), swizzle);
++            // Defensive null guard (iOS/arm64, same family as the
++            // lValueErrorCheck selector kill in ParseHelper.cpp): the selector
++            // aggregate and its elements read as missing or malformed on
++            // device for inputs that parse cleanly elsewhere. convertSwizzle
++            // reports an unusable selector instead of dereferencing it, and
++            // the identity swizzle of the RESULT's component count keeps the
++            // access chain shape valid -- degraded component order, never a
++            // process kill.
++            glslang::TIntermTyped* swzRight = node->getRight();
++            glslang::TIntermAggregate* swzAgg = swzRight ? swzRight->getAsAggregate() : nullptr;
++            if (swzAgg == nullptr || !convertSwizzle(*swzAgg, swizzle)) {
++                const int swzSize = node->getType().getVectorSize();
++                swizzle.clear();
++                for (int c = 0; c < swzSize; ++c)
++                    swizzle.push_back(static_cast<unsigned>(c));
++            }
+             int dummySize;
+             builder.accessChainPushSwizzle(swizzle, convertGlslangToSpvType(node->getLeft()->getType()),
+                                            TranslateCoherent(node->getLeft()->getType()),
+@@ -5326,16 +5341,39 @@ spv::Id TGlslangToSpvTraverser::createInvertedSwizzle(spv::Decoration precision,
+     spv::Id parentResult)
+ {
+     std::vector<unsigned> swizzle;
+-    convertSwizzle(*node.getAsBinaryNode()->getRight()->getAsAggregate(), swizzle);
++    // Defensive null guard, same family as the EOpVectorSwizzle call site: the
++    // whole deref chain may read as null on device. Identity of the result's
++    // component count keeps the builder's shape expectations valid.
++    const glslang::TIntermBinary* invBin = node.getAsBinaryNode();
++    const glslang::TIntermTyped* invRight = invBin ? invBin->getRight() : nullptr;
++    const glslang::TIntermAggregate* invAgg = invRight ? invRight->getAsAggregate() : nullptr;
++    if (invAgg == nullptr || !convertSwizzle(*invAgg, swizzle)) {
++        const int invSize = node.getType().getVectorSize();
++        for (int c = 0; c < invSize; ++c)
++            swizzle.push_back(static_cast<unsigned>(c));
++    }
+     return builder.createRvalueSwizzle(precision, convertGlslangToSpvType(node.getType()), parentResult, swizzle);
+ }
+ 
+ // Convert a glslang AST swizzle node to a swizzle vector for building SPIR-V.
+-void TGlslangToSpvTraverser::convertSwizzle(const glslang::TIntermAggregate& node, std::vector<unsigned>& swizzle)
++// Returns false when the selector is unusable (null/non-constant element or an
++// out-of-range index); swizzle is then left partially filled and the caller
++// falls back to the identity swizzle. Defensive against the iOS/arm64
++// selector-read corruption documented in lValueErrorCheck's guard.
++bool TGlslangToSpvTraverser::convertSwizzle(const glslang::TIntermAggregate& node, std::vector<unsigned>& swizzle)
+ {
+     const glslang::TIntermSequence& swizzleSequence = node.getSequence();
+-    for (int i = 0; i < (int)swizzleSequence.size(); ++i)
+-        swizzle.push_back(swizzleSequence[i]->getAsConstantUnion()->getConstArray()[0].getIConst());
++    for (int i = 0; i < (int)swizzleSequence.size(); ++i) {
++        const glslang::TIntermConstantUnion* cu =
++            swizzleSequence[i] ? swizzleSequence[i]->getAsConstantUnion() : nullptr;
++        if (cu == nullptr)
++            return false;
++        const int value = cu->getConstArray()[0].getIConst();
++        if (value < 0 || value >= 4)
++            return false;
++        swizzle.push_back(static_cast<unsigned>(value));
++    }
++    return true;
+ }
+ 
+ // Convert from a glslang type to an SPV type, by calling into a
