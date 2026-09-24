@@ -2,6 +2,7 @@
 #import "ios_uikit_bridge.h"
 #import "utils.h"
 #include "glfw_keycodes.h"
+#include <mach/mach_time.h>
 
 extern bool isUseStackQueueCall;
 
@@ -15,7 +16,22 @@ extern bool isUseStackQueueCall;
 @interface TrackedTextField()
 @property(nonatomic) int lastTextPos;
 @property(nonatomic) CGFloat lastPointX;
+// Task156：最近一次经私有路径（insertFilteredText:/replaceRangeWithText-
+// WithoutClosingTyping:/paste:）送达游戏的文本 + 时间戳——公有 insertText:
+// 兑底路径用它做短窗去重，避免同一次提交被双发。
+@property(nonatomic, copy, nullable) NSString *ame156_lastDeliveredText;
+@property(nonatomic) uint64_t ame156_lastDeliveredTick;
 @end
+
+static uint64_t ame156_mach_ms(void) {
+    static mach_timebase_info_data_t tb;
+    static BOOL inited = NO;
+    if (!inited) {
+        mach_timebase_info(&tb);
+        inited = YES;
+    }
+    return mach_absolute_time() * tb.numer / tb.denom / 1000000ull;
+}
 
 @implementation TrackedTextField
 
@@ -30,6 +46,23 @@ extern bool isUseStackQueueCall;
 - (void)paste:(id)sender {
     [super paste:sender];
     [self sendText:UIPasteboard.generalPasteboard.string];
+}
+
+// Task156：短窗去重记录——私有路径送达后登记；公有 insertText: 兑底在
+// 80ms 内遇到同文本则跳过（同一提交不会被双发，不同键击间隔远大于 80ms）。
+- (void)ame156_recordDelivery:(NSString *)text {
+    self.ame156_lastDeliveredText = text;
+    self.ame156_lastDeliveredTick = ame156_mach_ms();
+}
+
+- (BOOL)ame156_recentlyDelivered:(NSString *)text {
+    if (self.ame156_lastDeliveredText == nil) return NO;
+    uint64_t now = ame156_mach_ms();
+    if (now < self.ame156_lastDeliveredTick ||
+        now - self.ame156_lastDeliveredTick > 80) {
+        return NO;
+    }
+    return [self.ame156_lastDeliveredText isEqualToString:text];
 }
 
 - (void)sendText:(NSString *)text {
@@ -133,6 +166,7 @@ extern bool isUseStackQueueCall;
     self.lastTextPos = cursorPos + text.length;
 
     [self sendText:text];
+    [self ame156_recordDelivery:text];
 
     NSRange range = [super insertFilteredText:text];
     return range;
@@ -147,20 +181,56 @@ extern bool isUseStackQueueCall;
 
     // Insert the autocompleted text
     [self sendText:text];
+    [self ame156_recordDelivery:text];
     self.lastTextPos += text.length - oldLength;
 
     return [super replaceRangeWithTextWithoutClosingTyping:range replacementText:text];
 }
 
+// ============================================================================
+// Task 156：iOS 27 输入法兼容兑底（公有 UIKeyInput 路径）。
+//
+// 病历：设备 iPadOS 27.0（24A437）报告“输入法无法正常输入”。本类的字符
+// 送达链全部建筑在 UIKit 私有 API 上（insertFilteredText: /
+// replaceRangeWithTextWithoutClosingTyping: / setAttributedMarkedText:）
+// ——多年版本一直回肩，但 iOS 26+ 引入 UIAsyncTextInput 异步输入管线后，
+// 部分键盘提交不再经过这些私有入口，直接走公有 UIKeyInput.insertText:，
+// 于是提交文本（拼音候选上屏、联想词、普通键入）永远到不了游戏。
+//
+// 兑底策略：override 公有 insertText:（UIKit 对 first responder 的键入
+// 提交路径）——私有路径未在短窗内送过同文本时补发。两路径共存时
+// 80ms 同文本去重防双发；私有路径已死时这里是唯一送达通道。
+// marked text（拼音组字）不走 insertText:，仍由 setAttributedMarkedText:
+// 镜像（见下方 Task156 加固）。
+// ============================================================================
+- (void)insertText:(NSString *)text {
+    if (text.length > 0 && ![self ame156_recentlyDelivered:text]) {
+        [self sendText:text];
+        [self ame156_recordDelivery:text];
+    }
+    [super insertText:text];
+}
+
 - (void)setAttributedMarkedText:(NSAttributedString *)markedText selectedRange:(NSRange)selectedRange {
-    // Delete the marked range
-    NSInteger markedLength = [self offsetFromPosition:self.markedTextRange.start toPosition:self.markedTextRange.end];
+    // Task156 加固：markedTextRange 可能为 nil（首次组字/输入法重置后），
+    // offsetFromPosition:toPosition: 对 nil 位置的返回值在 iOS 27 上不再
+    // 可靠（NSNotFound → 百万级退格风暴，IME 输入直接异常）。先判空、
+    // 再把长度夹到当前文本长度内。
+    NSInteger markedLength = 0;
+    if (self.markedTextRange != nil) {
+        markedLength = [self offsetFromPosition:self.markedTextRange.start
+                                     toPosition:self.markedTextRange.end];
+        if (markedLength < 0 || (NSUInteger)markedLength > self.text.length) {
+            markedLength = 0;
+        }
+    }
     [self sendMultiBackspaces:markedLength];
 
     [super setAttributedMarkedText:markedText selectedRange:selectedRange];
 
     // Insert the new text
     [self sendText:markedText.string];
+    self.lastTextPos = self.text.length;
 }
 
 - (void)setText:(NSString *)text {
