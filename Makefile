@@ -350,7 +350,7 @@ dep_mg:
 	# 后放回，交由紧随其后的补丁块应用（pin 版本本身不带防护补丁）。
 	# 逃生阀：AMETHYST_MG_PIN_ALIGN=0 可跳过（离线调试用，产物未经验证）。
 	# ---------------------------------------------------------------------------
-	@mg3=$(SOURCEDIR)/Natives/external/MobileGlues/src/main/cpp/3rdparty; \
+	@mg3=$(SOURCEDIR)/Natives/external/MobileGlues/MobileGlues-cpp/3rdparty; \
 	if [ "$${AMETHYST_MG_PIN_ALIGN:-1}" = "0" ]; then \
 		echo '[dep_mg] WARNING: 3rdparty pin alignment skipped (AMETHYST_MG_PIN_ALIGN=0) -- MG build NOT validated'; \
 	else \
@@ -384,7 +384,7 @@ dep_mg:
 	#   * glslang-pool-zero-and-size-guards.patch —— GlslangToSpv::convertSwizzle 的
 	#     constArray 尺寸判，必须打在 nullguard 之上。
 	# 幂等：先 --check 正向，失败再 --check 反向（判定已打过），两种情况都继续构建。
-	@mg_glrel=Natives/external/MobileGlues/src/main/cpp/3rdparty/glslang; \
+	@mg_glrel=Natives/external/MobileGlues/MobileGlues-cpp/3rdparty/glslang; \
 	mg_gldir=$(SOURCEDIR)/$$mg_glrel; \
 	for p in glslang-lvalue-nullguard.patch glslang-pool-zero-and-size-guards.patch; do \
 		if [ ! -f "$$mg_gldir/$$p" ]; then echo "[dep_mg] glslang patch $$p missing - skip"; continue; fi; \

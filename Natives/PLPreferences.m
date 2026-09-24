@@ -133,10 +133,7 @@ NSString *const PREF_MOD_MIRROR = @"general.mod_mirror";
         // Vulkan 渲染器的 OpenGL 回退使用 MobileGlues（对齐 Ynnyny 仓库），设置生效。
         // Auto 渲染器实际使用 ANGLE，不会加载 MobileGlues，这些设置不生效。
         @"mobileglues": @{
-            // 默认启用 ANGLE（GLES 档）：MG 在 enableANGLE=0 + customGLVersion=40 时
-            // 走自带的 glslang->SPIRV->ESSL 转译链，该链在 26.3 资源重载期崩溃（闪退）。
-            // ANGLE 档由 JavaLauncher 配套降至 GL 3.2，避开该转译链。
-            @"enable_angle": @YES,
+            @"enable_angle": @NO,
             @"enable_no_error": @(0),
             @"enable_ext_timer_query": @YES,
             @"enable_ext_compute_shader": @NO,
@@ -159,10 +156,7 @@ NSString *const PREF_MOD_MIRROR = @"general.mod_mirror";
         }.mutableCopy,
         @"internal": @{
             @"isolated": @NO,
-            @"latest_version": [NSDictionary new],
-            // 一次性迁移标记：enable_angle 默认改 YES 后，存量设备 plist 已存有 @NO，
-            // 默认值只填空缺键、覆盖不了已有值，需迁移一次。
-            @"mg_angle_default_v2": @NO
+            @"latest_version": [NSDictionary new]
         }.mutableCopy
     }.mutableCopy;
 
@@ -292,22 +286,6 @@ NSString *const PREF_MOD_MIRROR = @"general.mod_mirror";
             id value = defaults[section][key];
             NSDebugLog(@"[PLPreferences] Set default vaule: %@", key, value);
             pref[section][key] = value;
-        }
-    }
-    // 一次性迁移（仅全局偏好）：enable_angle 默认改 YES 后，存量设备 plist 里
-    // 已持久化的 @NO 会挡住新默认值（上面循环只填空缺键）。此处在
-    // internal.mg_angle_default_v2 未置位时把 NO 提升为 YES，然后置位，幂等。
-    if (global) {
-        NSMutableDictionary *internal = pref[@"internal"];
-        if ([internal isKindOfClass:[NSMutableDictionary class]] && ![internal[@"mg_angle_default_v2"] boolValue]) {
-            NSMutableDictionary *mg = pref[@"mobileglues"];
-            if ([mg isKindOfClass:[NSMutableDictionary class]] &&
-                [mg[@"enable_angle"] isKindOfClass:[NSNumber class]] &&
-                ![mg[@"enable_angle"] boolValue]) {
-                NSLog(@"[PLPreferences] Migrating mobileglues.enable_angle NO -> YES (ANGLE/GLES default)");
-                mg[@"enable_angle"] = @YES;
-            }
-            internal[@"mg_angle_default_v2"] = @YES;
         }
     }
     return pref;

@@ -218,18 +218,6 @@ void init_loadMobileGluesConfig() {
         config[@"enableANGLE"] = [enableAngle boolValue] ? @3 : @0;
         NSLog(@"[JavaLauncher]   mobileglues.enable_angle = %@ -> enableANGLE = %@ (3=ForceEnable, 0=DisableIfPossible)",
               enableAngle, config[@"enableANGLE"]);
-
-        // ANGLE 在 iOS 上实际只支持 OpenGL ES 3.0/3.1。
-        // customGLVersion=4.0 + ANGLE 时，Sodium 生成桌面端 GLSL 着色器（#version 400 core），
-        // 但 ANGLE 的 GLES 编译器只接受 #version 300 es，导致方块不渲染。
-        // 修复：ANGLE 启用时，将 GL 版本降至 3.2（ANGLE 在 iOS 上的实际上限）。
-        // 同时关闭 GL 4.3 扩展宣称：ANGLE/GLES 3.1 不具备 compute shader 等 4.3 能力，
-        // 继续宣称会让 Sodium 生成 ANGLE 无法编译的着色器（对齐参考仓库写法）。
-        if ([enableAngle boolValue]) {
-            config[@"customGLVersion"] = @32;
-            config[@"enableExtGL43"] = @0;
-            NSLog(@"[JavaLauncher]   ANGLE enabled: override customGLVersion=32 (ANGLE iOS max is GLES 3.0/3.1)");
-        }
     }
 
     id enableNoError = getPrefObject(@"mobileglues.enable_no_error");
