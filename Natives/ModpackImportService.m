@@ -260,6 +260,28 @@ static NSString * const kImportedModpacksKey = @"ImportedModpacks";
         return nil;
     }
 
+    // 关键修复（参照 ZL2：选中文件先复制到应用私有目录再解析/导入）：
+    // iOS 文档选择器返回的是 security-scoped URL（iCloud Drive、其他 App 容器、外置存储等），
+    // 调用方在解析完成后立即调用 -stopAccessingSecurityScopedResource，
+    // 之后该路径即不可读 —— 导致后续 importModpack: 里的 fileExistsAtPath: 检查失败，
+    // 报出"整合包文件不存在"。这里先把文件复制进沙盒，modpackInfo[@"filePath"] 指向副本，
+    // 后续导入/重新导入/导出都不再依赖外部授权。
+    // 已位于应用沙盒内的路径（如在线下载的临时 zip）不复制，避免无谓的大文件拷贝。
+    if (![filePath hasPrefix:NSHomeDirectory()]) {
+        NSString *inboxDir = [[NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject
+                               stringByAppendingPathComponent:@"modpack_import"]
+                              stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
+        NSString *inboxPath = [inboxDir stringByAppendingPathComponent:(filePath.lastPathComponent.length > 0 ? filePath.lastPathComponent : @"modpack.zip")];
+        NSError *copyError = nil;
+        if ([[NSFileManager defaultManager] createDirectoryAtPath:inboxDir withIntermediateDirectories:YES attributes:nil error:nil] &&
+            [[NSFileManager defaultManager] copyItemAtPath:filePath toPath:inboxPath error:&copyError]) {
+            NSLog(@"[ModpackImport] 外部整合包已复制进沙盒: %@", inboxPath);
+            filePath = inboxPath;
+        } else {
+            NSLog(@"[ModpackImport] 外部整合包复制沙盒失败（沿用原路径）: %@", copyError.localizedDescription);
+        }
+    }
+
     NSError *archiveError = nil;
     UZKArchive *archive = [[UZKArchive alloc] initWithPath:filePath error:&archiveError];
     if (archiveError || !archive) {
