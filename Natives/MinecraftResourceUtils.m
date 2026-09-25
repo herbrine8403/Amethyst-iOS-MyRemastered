@@ -63,12 +63,31 @@
 
     NSMutableArray *mutableJvm = [jvm mutableCopy];
     NSString *originalArg = mutableJvm[(NSUInteger)ignoreListIndex];
-    mutableJvm[(NSUInteger)ignoreListIndex] = [originalArg stringByAppendingString:@",${primary_jar_name}"];
+    NSString *updatedArg = originalArg;
+
+    // ${primary_jar_name}（ZL2 progressIgnoreList 原逻辑，幂等）
+    if (![updatedArg containsString:@"${primary_jar_name}"]) {
+        updatedArg = [updatedArg stringByAppendingString:@",${primary_jar_name}"];
+    }
+
+    // iOS 特有：JavaApp/Makefile 在合成 lwjgl-<ver>.jar 时把 launcher 的
+    // com/apple/ios/audio/*.class 一并复制进去，导致 launcher.jar 与 lwjgl.jar
+    // 两个自动模块导出同一个包。Forge/NeoForge 的 bootstraplauncher 走 JPMS
+    // (Configuration.resolveAndBind) 时直接失败：
+    //   java.lang.module.ResolutionException:
+    //   Modules launcher and lwjgl export package com.apple.ios.audio to module brigadier
+    // 把 lwjgl 加入 ignoreList：它仍留在 classpath 上供游戏正常调用，但不再被
+    // 当作模块解析，重复导出消失，模块图得以构建。
+    if (![updatedArg containsString:@"lwjgl"]) {
+        updatedArg = [updatedArg stringByAppendingString:@",lwjgl"];
+    }
+
+    mutableJvm[(NSUInteger)ignoreListIndex] = updatedArg;
 
     NSMutableDictionary *mutableArguments = [arguments mutableCopy];
     mutableArguments[@"jvm"] = mutableJvm;
     json[@"arguments"] = mutableArguments;
-    NSLog(@"[MCDL] bootstraplauncher >= 0.1.17: 已向 -DignoreList 追加 ${primary_jar_name}");
+    NSLog(@"[MCDL] bootstraplauncher >= 0.1.17: 已向 -DignoreList 追加 ${primary_jar_name} 与 lwjgl（消除 launcher/lwjgl 重复导出 com.apple.ios.audio）");
 }
 
 #pragma mark - OptiFine launchwrapper（参照 ZL2 Install.OptiFine.checkOFLaunchWrapper）
