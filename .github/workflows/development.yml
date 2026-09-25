@@ -209,6 +209,28 @@ jobs:
           path: mobilegl-build.log
           if-no-files-found: ignore
 
+      - name: Publish SFPEW build log to repo (diagnosis)
+        # dep_sfpew 用 `-$(MAKE)` 调用，失败不阻断主构建，失败细节会被静默吞掉；
+        # 而 CI 的 job log / artifact 走 blob storage，外部取不回来。
+        # 这里在 SFPEW 没产出 dylib 时把构建日志提交回仓库（raw 可读），
+        # 便于直接定位，无需再手工下载产物。
+        if: matrix.platform_name == 'ios' && always() && hashFiles('Natives/build/libSimpleFPEWrapper.dylib') == ''
+        continue-on-error: true
+        run: |
+          set -e
+          if [ ! -f Natives/build/sfpew_build.log ]; then
+            echo "[ci] SFPEW: no build log -- dep_sfpew did not reach cmake"; exit 0
+          fi
+          BRANCH_NAME="${GITHUB_REF#refs/heads/}"
+          mkdir -p ci-logs
+          cp Natives/build/sfpew_build.log ci-logs/sfpew-build.log
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ci-logs/sfpew-build.log
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "ci(sfpew): 提交构建日志用于定位 [skip ci]"
+          git push origin HEAD:"$BRANCH_NAME" || { git pull --rebase origin "$BRANCH_NAME"; git push origin HEAD:"$BRANCH_NAME"; }
+
       - name: Upload regular ipa
         uses: actions/upload-artifact@v4
         if: success()
