@@ -618,6 +618,38 @@ dep_sdl3_guard:
 		$(SOURCEDIR)/Natives/resources/Frameworks/libSDL3.dylib || exit 1
 	echo '[Amethyst v$(VERSION)] dep_sdl3_guard - end'
 
+# ---------------------------------------------------------------------------
+# dep_sfpew —— SimpleFPEWrapper（MobileGL-Dev，LGPL-3.0）
+#
+# 与安卓 AngelAuraMC/Amethyst-Android @ feat/sfpew_angle 同款接入：SFPEW 位于
+# 渲染器之上，为固定管线（GL 1.x）提供仿真，并把 GL 调用转发给真正的后端。
+# 安卓侧＝Tools.useSFPEW 开关 + SFPEW_EGL 指向后端 EGL + 把 LWJGL 实际加载的库
+# 换成 libSimpleFPEWrapper.so；iOS 侧渲染器列表里多一项 libSimpleFPEWrapper.dylib，
+# JavaLauncher 把 SFPEW_EGL 设为被包裹的真后端（默认 libmobileglues.dylib）。
+#
+# 依赖 dep_mg：glslang / SPIRV-Cross / glm 直接复用 MobileGlues 的 vendored
+# 3rdparty 树，而 dep_mg 会在同一棵树上做 pin 对齐并打两个防护补丁 —— 串行化
+# 保证 SFPEW 编到的是同一份源码。
+# ---------------------------------------------------------------------------
+dep_sfpew: dep_mg
+	echo '[Amethyst v$(VERSION)] dep_sfpew - start'
+	mkdir -p $(WORKINGDIR)/sfpew
+	cd $(WORKINGDIR)/sfpew && cmake \
+		-DCMAKE_CROSSCOMPILING=true \
+		-DCMAKE_SYSTEM_NAME=Darwin \
+		-DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+		-DCMAKE_OSX_SYSROOT="$(SDKPATH)" \
+		-DCMAKE_OSX_ARCHITECTURES=arm64 \
+		-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+		-DCMAKE_C_FLAGS="-arch arm64" \
+		-DCMAKE_CXX_FLAGS="-arch arm64" \
+		-DCMAKE_BUILD_TYPE=RelWithDebInfo \
+		-DSFPEW_MG_3RDPARTY="$(SOURCEDIR)/Natives/external/MobileGlues/src/main/cpp/3rdparty" \
+		$(SOURCEDIR)/Natives/external/SimpleFPEWrapper/ || exit 1
+	cmake --build $(WORKINGDIR)/sfpew --config RelWithDebInfo -j$(JOBS) --target SimpleFPEWrapper || exit 1
+	cp $(WORKINGDIR)/sfpew/libSimpleFPEWrapper.dylib $(WORKINGDIR)/ || exit 1
+	echo '[Amethyst v$(VERSION)] dep_sfpew - end'
+
 dep_mobilegl:
 	@{ echo '== MobileGL build diagnostics =='; \
 	  echo "  BUILD_MOBILEGL      = $(BUILD_MOBILEGL)"; \
@@ -774,7 +806,7 @@ assets:
 	fi
 	echo '[Amethyst v$(VERSION)] assets - end'
 
-payload: native dep_mg dep_shader_shims dep_openal_shim dep_angle_freeze dep_sdl3_guard java jre assets
+payload: native dep_mg dep_shader_shims dep_openal_shim dep_angle_freeze dep_sdl3_guard dep_sfpew java jre assets
 	echo '[Amethyst v$(VERSION)] payload - start'
 	# Mithril / MobileGL 都是可选渲染器：这里用 - 前缀，任一失败都不阻断主构建。
 	# 缺库时对应渲染器会在设置里自动隐藏（见 LauncherPreferences.m 的存在性过滤）。

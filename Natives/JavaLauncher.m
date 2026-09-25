@@ -838,6 +838,24 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
             unsetenv("MOBILEGL_LOG_FILE_PATH");
         }
 
+        // SimpleFPEWrapper（MobileGL-Dev，LGPL-3.0）—— 固定管线 (GL 1.x) 仿真层。
+        // 与安卓 feat/sfpew_angle 同款接入：安卓把 LWJGL 实际加载的 renderLibrary
+        // 换成 libSimpleFPEWrapper.so 并用 SFPEW_EGL 指向真后端（默认 MobileGlues）；
+        // iOS 侧 AMETHYST_RENDERER 已经是最终被 dlopen 的库名，所以这里只需要把
+        // 后端 EGL 路径写进 SFPEW_EGL —— SFPEW 的 init 会 dlopen 它并通过
+        // eglGetProcAddress 取回全部 GL 入口点。
+        // 后端可用 AMETHYST_SFPEW_BACKEND 覆盖，缺省 libmobileglues.dylib。
+        if ([renderer isEqualToString:@ RENDERER_NAME_SFPEW]) {
+            const char *backend = getenv("AMETHYST_SFPEW_BACKEND");
+            if (backend == NULL || backend[0] == '\0') backend = RENDERER_NAME_MOBILEGLUES;
+            NSString *bPath = [NSString stringWithFormat:@"@rpath/%s", backend];
+            setenv("SFPEW_EGL", bPath.UTF8String, 1);
+            NSLog(@"[JavaLauncher] SimpleFPEWrapper active: backend EGL=%s (%@)", backend, bPath);
+        } else {
+            // 切换渲染器后清掉，避免残留影响后续启动
+            unsetenv("SFPEW_EGL");
+        }
+
         // Mithril 渲染器（libmithril.dylib）自带 EGL + GL 3.3 Core（Vulkan backend），
         // 不需要额外的环境变量：EGL 符号由 gl_bridge.m 的 dlsym_EGL() 从自身 dylib 解析，
         // GL 上下文由 gl_init_context 用 EGL_OPENGL_BIT + EGL_OPENGL_API 创建。
