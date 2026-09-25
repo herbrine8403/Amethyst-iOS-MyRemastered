@@ -640,11 +640,13 @@ dep_sfpew: dep_mg
 	#   2. fpe/fpe_shadergen.cpp: std::format 依赖 std::to_chars(float)，该重载在
 	#      SDK 里标了 introduced=iOS 16.3，deployment target 14.0 下 "unavailable"。
 	#      两层修复缺一不可：
-	#        a) 编译期 —— CMakeLists 里的 -Wno-unguarded-availability{,-new}。
-	#           必须做在编译旗标上：std::format 的模板展开**无条件**拉进
-	#           formatter_floating_point.h，哪怕实参全是整数/字符串（实测
-	#           fpe_shadergen.cpp:1384 的 std::format<unsigned,string,string>
-	#           照样 error），所以改掉浮点格式说明符挡不住它。
+	#        a) 编译期 —— 补丁第 3 步把全树 std::format 换成自研的
+	#           fpefmt::format（写 fpe/fpe_format_compat.h，纯 ostringstream，
+	#           不引用 <format> / to_chars）。必须整个换掉而不是只改浮点说明符：
+	#           std::format 的模板展开**无条件**拉进 formatter_floating_point.h，
+	#           实测 fpe_shadergen.cpp 的 std::format<unsigned,string,string>
+	#           照样 error。CI 实测 -Wno-unguarded-availability{,-new} 压不住它
+	#           （那两个旗标只管 warn 级，这条是 err 级），仅作顺手保留。
 	#        b) 运行期 —— 补丁把唯一的 {:.1f} 换成 snprintf。保持 deployment
 	#           target 14.0 使 to_chars 引用成为**弱**引用，旧系统解析为 NULL；
 	#           不走到该路径就不会 NULL 解引用。（反过来把 target 抬到 16.3
