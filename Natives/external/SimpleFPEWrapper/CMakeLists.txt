@@ -39,8 +39,24 @@ endforeach()
 
 # ---------------------------------------------------------------------------
 # Apple 编译旗标（沿用上游 APPLE 分支）
+#
+# -Wno-unguarded-availability{,-new}：deployment target 14.0 下 std::format 的
+# 编译期拦路虎。libc++ 的 std::format 无论实参是不是浮点，模板展开都会拉进
+# __format/formatter_floating_point.h，而该头的实现调 std::to_chars(float) ——
+# 这个重载在新版 SDK 里标了 availability(introduced=iOS 16.3)，低于该版本即
+# "unavailable"，clang 默认按 error 报：
+#   error: 'to_chars' is unavailable: introduced in iOS 16.3
+#   （fpe_shadergen.cpp 哪怕是 std::format<unsigned, string, string> 也照样炸）
+#
+# 为什么是"压诊断"而不是"把 deployment target 抬到 16.3"：
+#   * 抬 target 会让 clang 生成对 to_chars 的**强**引用，iOS 14~16.2 真机上
+#     dyld 找不到该符号 → 启动即崩（libc++ 是系统 dylib，随 OS 更新才有）。
+#   * 保持 14.0 时，availability 机制让该引用成为**弱**引用，旧系统上解析为
+#     NULL；而 SFPEW 全树唯一的浮点格式化（{:.1f}）已由
+#     scripts/patch_sfpew_ios.py 改成 snprintf，运行期根本不会走到该路径。
+#   两者叠加：编译得过 + 旧机不崩。
 # ---------------------------------------------------------------------------
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fvisibility=default -funwind-tables -g -D_THREAD_SAFE -fPIC -stdlib=libc++")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fvisibility=default -funwind-tables -g -D_THREAD_SAFE -fPIC -stdlib=libc++ -Wno-unguarded-availability -Wno-unguarded-availability-new")
 set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   -g -std=gnu99 -funwind-tables -O3 -fvisibility=hidden")
 
 # ---------------------------------------------------------------------------

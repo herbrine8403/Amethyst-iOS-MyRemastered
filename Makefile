@@ -637,8 +637,18 @@ dep_sfpew: dep_mg
 	# Linux/GCC 与 Android NDK 都不触发，故上游源码里没有处理）：
 	#   1. fpe/types.h: glstate_t 的默认构造函数被隐式删除（匿名 union 内含
 	#      带 NSDMI 的匿名 struct），fpe.cpp 的 no_context_state / make_unique 会炸
-	#   2. fpe/fpe_shadergen.cpp: std::format 的 {:.1f} 依赖 std::to_chars(float)，
-	#      该重载在 SDK 里标了 introduced=iOS 16.3，deployment target 14.0 下不可用
+	#   2. fpe/fpe_shadergen.cpp: std::format 依赖 std::to_chars(float)，该重载在
+	#      SDK 里标了 introduced=iOS 16.3，deployment target 14.0 下 "unavailable"。
+	#      两层修复缺一不可：
+	#        a) 编译期 —— CMakeLists 里的 -Wno-unguarded-availability{,-new}。
+	#           必须做在编译旗标上：std::format 的模板展开**无条件**拉进
+	#           formatter_floating_point.h，哪怕实参全是整数/字符串（实测
+	#           fpe_shadergen.cpp:1384 的 std::format<unsigned,string,string>
+	#           照样 error），所以改掉浮点格式说明符挡不住它。
+	#        b) 运行期 —— 补丁把唯一的 {:.1f} 换成 snprintf。保持 deployment
+	#           target 14.0 使 to_chars 引用成为**弱**引用，旧系统解析为 NULL；
+	#           不走到该路径就不会 NULL 解引用。（反过来把 target 抬到 16.3
+	#           会变成强引用，iOS 14~16.2 真机 dyld 找不到符号直接启动崩。）
 	# 与 patch_mobilegl_ios.py 同款约定：幂等 + 锚点校验，锚点不匹配即 exit 1，
 	# 绝不静默打歪补丁编出坏库。必须在 cmake 之前跑（cmake 直接编译树内源码）。
 	python3 $(SOURCEDIR)/Natives/patch_sfpew_ios.py $(SOURCEDIR)/Natives/external/SimpleFPEWrapper || exit 1
@@ -823,9 +833,11 @@ payload: native dep_mg dep_shader_shims dep_openal_shim dep_angle_freeze dep_sdl
 	# 缺库时对应渲染器会在设置里自动隐藏（见 LauncherPreferences.m 的存在性过滤）。
 	-$(MAKE) dep_mithril
 	-$(MAKE) dep_mobilegl
-	# SimpleFPEWrapper 同样是可选渲染器：构建失败时只丢这一个选项，不阻断主构建。
+	# SimpleFPEWrapper：不再用 - 前缀吞失败。之前"可选"开关把编译错误静默成
+	# 绿色，产出的 IPA 里根本没有 libSimpleFPEWrapper.dylib（假绿）。现在 iOS
+	# 适配补丁 + 编译旗标都已就位，构建失败必须响亮红 —— 与 dep_mg 同款约定。
 	# dep_sfpew 内部会把 cmake/编译输出落盘并在失败时 tail 出来，方便定位。
-	-$(MAKE) dep_sfpew
+	$(MAKE) dep_sfpew
 	$(call METHOD_DIRCHECK,$(WORKINGDIR)/AngelAuraAmethyst.app/libs)
 	$(call METHOD_DIRCHECK,$(WORKINGDIR)/AngelAuraAmethyst.app/libs_caciocavallo)
 	$(call METHOD_DIRCHECK,$(WORKINGDIR)/AngelAuraAmethyst.app/libs_caciocavallo17)

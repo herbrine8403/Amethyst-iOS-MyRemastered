@@ -42,10 +42,18 @@
 #   "unavailable"：
 #     "error: 'to_chars' is unavailable: introduced in iOS 16.3"
 #
-#   全树只用了一处浮点格式说明符（fpe_shadergen.cpp 的 `{:.1f}`，格式化
-#   env.rgb_scale / env.alpha_scale）。改用 snprintf 先把 GLfloat 转成字符串，
-#   再交给 std::format 的 `{}`，从而不实例化该 formatter。<cstdio> 已在文件里
-#   include，且 %.1f 与原 `{:.1f}` 的输出逐字符一致。
+#   重要：光把浮点格式说明符换掉**不够**。std::format 的模板展开无条件拉进
+#   formatter_floating_point.h —— 实测 fpe_shadergen.cpp 里一句
+#   std::format<unsigned, string, string>（整数+字符串，毫无浮点）照样触发
+#   同一个 error。所以编译期必须靠 CMakeLists 里的
+#   -Wno-unguarded-availability{,-new} 压诊断（见该文件注释）。
+#
+#   本补丁做的是**运行期保险**：全树唯一的浮点格式化是 `{:.1f}`（env.rgb_scale
+#   / env.alpha_scale），改成 snprintf 预转字符串再交给 `{}`。这样即使某个
+#   编译器把弱引用解析成了真调用，也绝不会落进 to_chars 浮点路径 —— 而弱
+#   引用（deployment target 保持 14.0 的自然结果）在 iOS 14~16.2 上解析为
+#   NULL，一旦被调用就是 NULL 解引用。两层保险缺一不可。
+#   <cstdio> 已在文件里 include，且 %.1f 与原 `{:.1f}` 的输出逐字符一致。
 
 import sys
 from pathlib import Path
