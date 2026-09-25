@@ -28,29 +28,15 @@
 
 + (void)applyBootstrapLauncherIgnoreListFix:(NSMutableDictionary *)json {
     NSArray *libraries = json[@"libraries"];
-    if (![libraries isKindOfClass:[NSArray class]]) return;
-
-    BOOL hasNewBootstrapLauncher = NO;
-    for (id item in libraries) {
-        if (![item isKindOfClass:[NSDictionary class]]) continue;
-        NSString *name = item[@"name"];
-        if (![name isKindOfClass:[NSString class]]) continue;
-        NSArray<NSString *> *parts = [name componentsSeparatedByString:@":"];
-        if (parts.count >= 3 &&
-            [parts[0] isEqualToString:@"cpw.mods"] &&
-            [parts[1] isEqualToString:@"bootstraplauncher"] &&
-            [self pl_version:parts[2] isBiggerOrEqualTo:@"0.1.17"]) {
-            hasNewBootstrapLauncher = YES;
-            break;
-        }
-    }
-    if (!hasNewBootstrapLauncher) return;
+    if (![libraries isKindOfClass:[NSArray class]]) libraries = @[];
 
     NSDictionary *arguments = json[@"arguments"];
     if (![arguments isKindOfClass:[NSDictionary class]]) return;
     NSArray *jvm = arguments[@"jvm"];
     if (![jvm isKindOfClass:[NSArray class]]) return;
 
+    // -DignoreList= 只出现在 Forge/NeoForge 的 bootstrap 版本 JSON 里，
+    // 找不到就没有 bootstraplauncher 的 JPMS 构建步骤，无需处理。
     NSInteger ignoreListIndex = NSNotFound;
     for (NSInteger i = (NSInteger)jvm.count - 1; i >= 0; i--) {
         id arg = jvm[(NSUInteger)i];
@@ -61,33 +47,52 @@
     }
     if (ignoreListIndex == NSNotFound) return;
 
-    NSMutableArray *mutableJvm = [jvm mutableCopy];
-    NSString *originalArg = mutableJvm[(NSUInteger)ignoreListIndex];
-    NSString *updatedArg = originalArg;
-
-    // ${primary_jar_name}（ZL2 progressIgnoreList 原逻辑，幂等）
-    if (![updatedArg containsString:@"${primary_jar_name}"]) {
-        updatedArg = [updatedArg stringByAppendingString:@",${primary_jar_name}"];
+    // 识别 bootstrap 类库。groupId 不固定（cpw.mods / net.minecraftforge /
+    // net.neoforged 都出现过），因此只按 artifactId 判定，不再写死 cpw.mods。
+    BOOL hasBootstrap = NO;
+    for (id item in libraries) {
+        if (![item isKindOfClass:[NSDictionary class]]) continue;
+        NSString *name = item[@"name"];
+        if (![name isKindOfClass:[NSString class]]) continue;
+        NSArray<NSString *> *parts = [name componentsSeparatedByString:@":"];
+        if (parts.count < 3) continue;
+        NSString *artifactId = parts[1];
+        if ([artifactId rangeOfString:@"bootstrap" options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
+        // cpw.mods:bootstraplauncher 0.1.17 以下不支持按名忽略，跳过
+        if ([parts[0] isEqualToString:@"cpw.mods"] &&
+            [artifactId isEqualToString:@"bootstraplauncher"] &&
+            ![self pl_version:parts[2] isBiggerOrEqualTo:@"0.1.17"]) {
+            continue;
+        }
+        hasBootstrap = YES;
+        break;
     }
+    if (!hasBootstrap) {
+        NSLog(@"[MCDL] 检测到 -DignoreList= 但未匹配到 bootstrap 库，仍按 Forge/NeoForge 处理");
+    }
+
+    NSMutableArray *mutableJvm = [jvm mutableCopy];
+    NSString *updatedArg = mutableJvm[(NSUInteger)ignoreListIndex];
 
     // iOS 特有：JavaApp/Makefile 在合成 lwjgl-<ver>.jar 时把 launcher 的
     // com/apple/ios/audio/*.class 一并复制进去，导致 launcher.jar 与 lwjgl.jar
-    // 两个自动模块导出同一个包。Forge/NeoForge 的 bootstraplauncher 走 JPMS
+    // 两个自动模块导出同一个包。Forge/NeoForge 的 bootstrap 走 JPMS
     // (Configuration.resolveAndBind) 时直接失败：
     //   java.lang.module.ResolutionException:
     //   Modules launcher and lwjgl export package com.apple.ios.audio to module brigadier
     // 把 lwjgl 加入 ignoreList：它仍留在 classpath 上供游戏正常调用，但不再被
-    // 当作模块解析，重复导出消失，模块图得以构建。
-    if (![updatedArg containsString:@"lwjgl"]) {
+    // 当作模块解析，重复导出消失，模块图得以构建（幂等）。
+    if ([updatedArg rangeOfString:@"lwjgl" options:NSCaseInsensitiveSearch].location == NSNotFound) {
         updatedArg = [updatedArg stringByAppendingString:@",lwjgl"];
+    } else {
+        return;
     }
 
     mutableJvm[(NSUInteger)ignoreListIndex] = updatedArg;
-
     NSMutableDictionary *mutableArguments = [arguments mutableCopy];
     mutableArguments[@"jvm"] = mutableJvm;
     json[@"arguments"] = mutableArguments;
-    NSLog(@"[MCDL] bootstraplauncher >= 0.1.17: 已向 -DignoreList 追加 ${primary_jar_name} 与 lwjgl（消除 launcher/lwjgl 重复导出 com.apple.ios.audio）");
+    NSLog(@"[MCDL] Forge/NeoForge: 已向 -DignoreList 追加 lwjgl（消除 launcher/lwjgl 重复导出 com.apple.ios.audio 导致的 JPMS ResolutionException）");
 }
 
 #pragma mark - OptiFine launchwrapper（参照 ZL2 Install.OptiFine.checkOFLaunchWrapper）
@@ -351,6 +356,10 @@
     client[@"downloads"][@"artifact"][@"path"] = [NSString stringWithFormat:@"../versions/%1$@/%1$@.jar", json[@"id"]];
     client[@"name"] = [NSString stringWithFormat:@"%@.jar", json[@"id"]];
     [json[@"libraries"] addObject:client];
+
+    // Forge/NeoForge：把 lwjgl 追加进 -DignoreList。
+    // 必须在 jvm_processed 构建之前执行，否则改的是 arguments.jvm 而实际生效的是 jvm_processed。
+    [self applyBootstrapLauncherIgnoreListFix:json];
 
     // 解析所有版本的官方 JVM Arguments（包括 vanilla 26.x）。
     // 原代码仅在 inheritsFrom 存在时解析，导致 vanilla 版本的 arguments.jvm
