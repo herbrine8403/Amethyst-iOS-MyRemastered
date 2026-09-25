@@ -1062,7 +1062,15 @@ static bool ame_pushWindowResized(void *window) {
 // 一旦发现已正确立即永久停用（正常启动几乎零开销，因为 MC 自己设对了）。
 // 保留起始帧判定（跳过第 1 帧）：此刻 MC 的渲染管线尚未跑完首轮，viewport 可能
 // 还是上下文默认值，据此补发会产生一次无谓的窗口重建。
-static int ame_resizeNudgeBudget = 12;
+// 对齐 Air Task 60（664f58a3）定案：本「自动补发 WINDOW_RESIZED」机制是
+// 本仓库独有、Air 侧不存在（Air 的 sdl3_hook 无 nudge 调用点，尺寸同步只靠
+// Task51 钳制 + Task60 单一事实源 + Task61 事件出口改写三件套）。
+// 病历：MC 26.3 启动期的静默闪退，崩溃点紧随一条 WINDOW_RESIZED 之后落在
+// unifont 字体图集构建处——补发在资源重载窗口内注入额外的窗口重建事件，
+// MC 收到即重建 framebuffer/重载资源，与正在进行的字体图集加载重入。
+// Air 不补发，故其 26.3 + MobileGlues 会话从不触发这条重建路径。
+// 预算置 0 = 停用补发（代码保留，改回 12 即可恢复，便于 A/B 回退）。
+static int ame_resizeNudgeBudget = 0;
 static int ame_swapFrames = 0;
 typedef void (*ame_fn_glGetIntegerv)(uint32_t pname, int32_t *params);
 static ame_fn_glGetIntegerv ame_nudge_glGetIntegerv = NULL;
