@@ -269,8 +269,35 @@ void init_loadMobileGluesConfig() {
 
     id multidrawMode = getPrefObject(@"mobileglues.multidraw_mode");
     if (multidrawMode) {
-        config[@"multidrawMode"] = @([multidrawMode intValue]);
-        NSLog(@"[JavaLauncher]   mobileglues.multidraw_mode = %@ -> multidrawMode = %@", multidrawMode, config[@"multidrawMode"]);
+        // Task 79（对齐参考仓库）：MG 2.0.16 起多重绘制后端选择改为"优先序"
+        // 机制——config 键 multidrawOrder（逗号分隔、best-first，全局序可含
+        // 伪项 native=各入口同形的 GLES core/EXT 函数；每入口可用
+        // multidrawOrder<EntryPoint> 覆盖）。旧的 multidrawMode 整数键已被
+        // 弃用：settings.cpp 只打 legacy 警告、从不读取——此前这里写进去的
+        // 值一直是静默 no-op（用户在 UI 里切"间接/模拟"毫无效果，实际永远
+        // 走 MG 默认序，含 compute 后端）。
+        // 三个既有档位映射为等价的优先序（与 settings.cpp 默认序对齐）：
+        //   0 Auto     = MG 默认序：native/EXT 优先，单调用批量后端优先于
+        //                逐子绘制循环，compute 垫底
+        //   1 Indirect = 间接族优先：multiindirect/indirect 打头（GPU 整批
+        //                提交，转译开销最小），不用 native 伪项
+        //   2 Emulated = CPU 循环优先：unroll/basevertex 打头（最保守，驱动
+        //                缺扩展时的兜底形态）
+        NSString *mdOrder = nil;
+        switch ([multidrawMode intValue]) {
+            case 1:
+                mdOrder = @"multiindirect,indirect,multibasevertex,multiarrays,basevertex,unroll,compute";
+                break;
+            case 2:
+                mdOrder = @"unroll,basevertex,indirect,multiindirect,multibasevertex,multiarrays,compute";
+                break;
+            default:
+                mdOrder = @"native,multiindirect,multibasevertex,multiarrays,indirect,basevertex,unroll,compute";
+                break;
+        }
+        config[@"multidrawOrder"] = mdOrder;
+        NSLog(@"[JavaLauncher]   mobileglues.multidraw_mode = %@ -> multidrawOrder = %@ (旧键 multidrawMode 已被 MG 2.0.16+ 弃用，不再写入)",
+              multidrawMode, mdOrder);
     }
 
     id angleDepthClearFixMode = getPrefObject(@"mobileglues.angle_depth_clear_fix_mode");

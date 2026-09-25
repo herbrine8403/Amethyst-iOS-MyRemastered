@@ -138,7 +138,12 @@ NSString *const PREF_MOD_MIRROR = @"general.mod_mirror";
             @"enable_ext_timer_query": @YES,
             @"enable_ext_compute_shader": @NO,
             @"enable_ext_direct_state_access": @NO,
-            @"max_glsl_cache_size": @(32),
+            // Task129d（对齐参考仓库）：着色器缓存 128MB。旧默认 32MB 对重型
+            // 整合包偏小——MG 的 Cache::put 是标准 LRU，容量耗尽即逐出，
+            // 逐出意味着资源重载时整条 glslang→SPIRV→ESSL 链要重跑。
+            // 26.3 的着色器规模远大于 26.2，整合包更是成倍，32MB 下
+            // 重编译压力集中爆发。用户仍可在偏好分区改回。
+            @"max_glsl_cache_size": @(128),
             @"multidraw_mode": @(0),
             @"angle_depth_clear_fix_mode": @(0),
             @"custom_gl_version": @(0),
@@ -156,7 +161,12 @@ NSString *const PREF_MOD_MIRROR = @"general.mod_mirror";
         }.mutableCopy,
         @"internal": @{
             @"isolated": @NO,
-            @"latest_version": [NSDictionary new]
+            @"latest_version": [NSDictionary new],
+            // Task129d 迁移哨兵：YES 表示旧的 32MB 着色器缓存默认已治愈为 128MB。
+            // 默认值只在键缺失时写入，而 @(32) 也会占住键——存量设备的 plist
+            // 里那个 32 必须迁移一次才吃得到新默认；本哨兵保证只跑一次，
+            // 不会覆盖用户手动改过的值（仅当值 <= 32 才迁移）。
+            @"task129d_mg_cache_default_migrated": @NO
         }.mutableCopy
     }.mutableCopy;
 
@@ -286,6 +296,27 @@ NSString *const PREF_MOD_MIRROR = @"general.mod_mirror";
             id value = defaults[section][key];
             NSDebugLog(@"[PLPreferences] Set default vaule: %@", key, value);
             pref[section][key] = value;
+        }
+    }
+
+    // Task129d 一次性治愈迁移：把历史持久化下来的 32MB 着色器缓存抬到 128MB。
+    // 只在 global 偏好上跑一次；值已被用户改大过（> 32）则不动。
+    if (global) {
+        NSMutableDictionary *internal = pref[@"internal"];
+        if (![internal isKindOfClass:[NSMutableDictionary class]]) {
+            internal = [internal mutableCopy];
+            pref[@"internal"] = internal;
+        }
+        if (![internal[@"task129d_mg_cache_default_migrated"] boolValue]) {
+            NSMutableDictionary *mg = pref[@"mobileglues"];
+            if ([mg isKindOfClass:[NSMutableDictionary class]] && mg[@"max_glsl_cache_size"]) {
+                int cached = [mg[@"max_glsl_cache_size"] intValue];
+                if (cached <= 32) {
+                    mg[@"max_glsl_cache_size"] = @(128);
+                    NSLog(@"[PLPreferences] Task129d: migrating mobileglues.max_glsl_cache_size %d -> 128 (heavy modpack shader recompilation pressure)", cached);
+                }
+            }
+            internal[@"task129d_mg_cache_default_migrated"] = @YES;
         }
     }
     return pref;
