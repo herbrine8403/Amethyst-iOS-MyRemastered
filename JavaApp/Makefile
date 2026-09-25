@@ -88,24 +88,10 @@ $(OUTPUTDIR)/lwjgl-%.jar: $(CLASSES) check_empty_classes
 	@cd $(OUTPUTDIR)/lwjgl_lib_$* && find org/lwjgl/openal -maxdepth 1 -name 'SOFTSystemEvent*.class' -delete 2>/dev/null || true
 	@cd $(OUTPUTDIR)/lwjgl_lib_$* && find ../../libs/lwjgl-$* -name 'lwjgl*.jar' -exec $(BOOTJDK)/jar -xf {} \; && rm -rf META-INF
 	@cp -R $(OUTPUTDIR)/lwjgl/* $(OUTPUTDIR)/lwjgl_lib_$*/
-	@# Forge / NeoForge 的 bootstraplauncher 会把整条 classpath 交给 JPMS 解析，
-	@# classpath 上每个 jar 各自成为一个自动模块。任何同时存在于 launcher.jar 与
-	@# lwjgl-<ver>.jar 的包都会让模块解析以 split package 失败，进程被直接杀掉：
-	@#   java.lang.module.ResolutionException:
-	@#     Modules launcher and lwjgl export package com.apple.ios.audio to module brigadier
-	@# 原版 MC 不经过 bootstrap，所以只有 Forge / NeoForge 直装会触发。
-	@# 历史做法是在这里主动把 com/apple/ios/audio 注入 lwjgl jar，但 launcher.jar
-	@# 本来就带有这些类和 META-INF/services/javax.sound.sampled.spi.MixerProvider，
-	@# 注入只是制造重复。改为通用地剔除所有与 launcher.jar 重叠的包：既不丢功能，
-	@# 也能挡住以后新加进来的重复包。
-	@cd $(OUTPUTDIR)/launcher && find . -name '*.class' -print | sed 's:/[^/]*$$::' | sed 's:^\./::' | grep -v '^\.$$' | grep -v '^$$' | sort -u > $(OUTPUTDIR)/launcher_pkgs_$*.txt
-	@while IFS= read -r pkg; do \
-		if [ -d "$(OUTPUTDIR)/lwjgl_lib_$*/$$pkg" ]; then \
-			echo "[JavaApp] lwjgl-$*.jar: dropping split package $$pkg (also in launcher.jar)"; \
-			rm -rf "$(OUTPUTDIR)/lwjgl_lib_$*/$$pkg"; \
-		fi; \
-	done < $(OUTPUTDIR)/launcher_pkgs_$*.txt
-	@rm -f $(OUTPUTDIR)/launcher_pkgs_$*.txt
+	@mkdir -p $(OUTPUTDIR)/lwjgl_lib_$*/com/apple/ios/audio
+	@cp -R $(OUTPUTDIR)/launcher/com/apple/ios/audio/*.class $(OUTPUTDIR)/lwjgl_lib_$*/com/apple/ios/audio/
+	@mkdir -p $(OUTPUTDIR)/lwjgl_lib_$*/META-INF/services
+	@cp $(SOURCEDIR)/launcher/META-INF/services/javax.sound.sampled.spi.MixerProvider $(OUTPUTDIR)/lwjgl_lib_$*/META-INF/services/
 	@$(BOOTJDK)/jar -cf $@ -C $(OUTPUTDIR)/lwjgl_lib_$* .
 
 # lwjgl.jar 仅作占位：all 目标因 src/lwjgl 是源码目录而列出它，但运行时使用
