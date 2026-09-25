@@ -383,20 +383,38 @@ dep_mg:
 	#     SIGSEGV，启动/资源重载阶段直接杀进程（无 .ips、无 hs_err，表现为静默闪退）。
 	#   * glslang-pool-zero-and-size-guards.patch —— GlslangToSpv::convertSwizzle 的
 	#     constArray 尺寸判，必须打在 nullguard 之上。
-	# 幂等：先 --check 正向，失败再 --check 反向（判定已打过），两种情况都继续构建。
-	@mg_3prel=Natives/external/MobileGlues/MobileGlues-cpp/3rdparty; \
+	# Task 170 —— 补丁必须打在 src/main/cpp 这条真实路径上，不能走 MobileGlues-cpp。
+	# MobileGlues-cpp 是 symlink -> src/main/cpp（本仓库 vendored 布局；参考仓库 Air 该处
+	# 是实体目录）。git apply 拒绝穿过符号链接：
+	#   error: affected file '.../MobileGlues-cpp/3rdparty/glslang/...' is beyond a symbolic link
+	# 于是正向 --check 与反向 --check 双双失败，两个 MC 26.x position_color SIGSEGV 防护
+	# 补丁被静默跳过 —— 构建日志里的
+	#   "[dep_mg] WARNING: ... neither applies nor is applied -- MG glslang left UNPATCHED"
+	# 正是它。pin 对齐又把已内置防护的 vendored 树整体换成上游 f5f664d（无防护），
+	# 于是 libmobileglues 长期是在"零防护"状态下编出来的：26.3 资源重载期解析
+	# position_color 顶点着色器时 SIGSEGV，无 hs_err、无 .ips、表现为静默闪退；
+	# 26.2 不走这条链故不受影响。参考仓库 Air 因是实体目录，补丁正常落地，故其
+	# MG + 26.3 全程可玩。
+	# 顺序有依赖：nullguard 必须先于 pool-zero/size-guard（后者基于前者）。
+	# 现在任一环失败即 exit 1 —— 绝不再静默产出无防护的 MG。
+	@mg_3prel=Natives/external/MobileGlues/src/main/cpp/3rdparty; \
 	mg_glrel=$$mg_3prel/glslang; \
 	mg_pdir=$(SOURCEDIR)/$$mg_3prel; \
+	mg_guard_src=$(SOURCEDIR)/$$mg_glrel/glslang/MachineIndependent/ParseHelper.cpp; \
+	if grep -q "Defensive null guards" "$$mg_guard_src" 2>/dev/null; then \
+		echo "[dep_mg] glslang guards already baked into the tree -- skip patches"; \
+	else \
 	for p in glslang-lvalue-nullguard.patch glslang-pool-zero-and-size-guards.patch; do \
-		if [ ! -f "$$mg_pdir/$$p" ]; then echo "[dep_mg] ERROR: glslang patch $$p MISSING under $$mg_3prel -- MG built WITHOUT the MC 26.x position_color SIGSEGV guards"; continue; fi; \
+		if [ ! -f "$$mg_pdir/$$p" ]; then echo "[dep_mg] ERROR: glslang patch $$p MISSING under $$mg_3prel -- MG would be built WITHOUT the MC 26.x position_color SIGSEGV guards"; exit 1; fi; \
 		if git -C $(SOURCEDIR) apply --check -p1 --directory=$$mg_glrel "$$mg_pdir/$$p" >/dev/null 2>&1; then \
-			git -C $(SOURCEDIR) apply -p1 --directory=$$mg_glrel "$$mg_pdir/$$p" && echo "[dep_mg] glslang patch $$p APPLIED" || echo "[dep_mg] WARNING: $$p apply failed"; \
+			git -C $(SOURCEDIR) apply -p1 --directory=$$mg_glrel "$$mg_pdir/$$p" && echo "[dep_mg] glslang patch $$p APPLIED" || { echo "[dep_mg] ERROR: $$p apply failed after a successful --check"; exit 1; }; \
 		elif git -C $(SOURCEDIR) apply --check -R -p1 --directory=$$mg_glrel "$$mg_pdir/$$p" >/dev/null 2>&1; then \
 			echo "[dep_mg] glslang patch $$p already applied"; \
 		else \
-			echo "[dep_mg] WARNING: $$p neither applies nor is applied -- MG glslang left UNPATCHED"; \
+			echo "[dep_mg] ERROR: glslang patch $$p neither applies nor is applied -- MG glslang would be left UNPATCHED (MC 26.x position_color SIGSEGV guards missing)"; exit 1; \
 		fi; \
-	done
+	done; \
+	fi
 	# CMAKE_BUILD_TYPE 必须显式给出：--config 对单配置生成器无效。缺失时 CMake 不追加
 	# -O2/-DNDEBUG，整库 -O0 且 glslang/SPIRV-Cross/MG 的 assert() 全部激活 —— assert
 	# 触发即 __assert_rtn->abort()，表现为直接进启动器错误界面且无 .ips/hs_err。
@@ -554,6 +572,11 @@ dep_openal_shim:
 	# - 与 dep_shader_shims 同款模式：re-export 必须指向 impl 名（LC_ID 先修正），
 	#   否则加载递归；本地函数定义优先于 re-export 符号（shaderc 先例）。
 	echo '[Amethyst v$(VERSION)] dep_openal_shim - start'
+	# Task 170：dep_openal_shim 与 dep_mg 同为 payload 前置、并行执行（gmake -j），
+	# 而 $(WORKINGDIR) 由 dep_mg 内的 cmake 步骤创建 —— 本目标先跑到时该目录还不存在，
+	# cp 直接失败（ci: "cp: directory .../Natives/build does not exist"）。
+	# dep_shader_shims 有 dep_mg 依赖故不受影响；这里显式建目录即可，无副作用。
+	mkdir -p $(WORKINGDIR)
 	cp $(SOURCEDIR)/Natives/resources/Frameworks/libopenal_impl.dylib $(WORKINGDIR)/ || exit 1
 	install_name_tool -id @rpath/libopenal_impl.dylib $(WORKINGDIR)/libopenal_impl.dylib || exit 1
 	xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
