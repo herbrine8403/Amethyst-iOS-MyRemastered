@@ -1200,11 +1200,20 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
   
     NSString *librariesPath = [NSString stringWithFormat:@"%@/libs", NSBundle.mainBundle.bundlePath];
     PUSH_MARGV_FORMAT(@"-javaagent:%@/patchjna_agent.jar=", librariesPath);
-    // [AMETHYST-METAL] Metallum agent 注入:仅 vanilla / Forge 类实例;
-    // Fabric/Quilt 实例改用内置 mod(mixin),否则 ASM 类重复,fabric-loader 拒绝启动。
+    // [AMETHYST-METAL] Metallum agent 注入(单通道,与加载器无关):
+    //   用户选 Metal 渲染器时(init_loadMobileGluesConfig / 渲染器初始化里 setenv
+    //   AMETHYST_METAL=1),vanilla / Forge / NeoForge / Fabric / Quilt 一律通过
+    //   -javaagent 注入 IPA 内的 libs/metallum_agent.jar。
+    //   ★ 旧的"仅 vanilla / Forge 注入 agent、Fabric/Quilt 不注入而改由预置 Metal mod
+    //   (Natives/resources/mods_preload/MetalUniversal-*.jar)接管"的做法已废弃:
+    //   真机实际加载的 metallum 类只来自 agent,mods/ 下的同名类会被 agent 遮蔽,
+    //   且两条通道改的是同一批方法(重复注入/类冲突),只保留 agent 一条口径才一致。
+    //   注意:launcher 侧不再按加载器分支;Fabric/Quilt 能否真正生效由 agent 自身决定
+    //   (agent premain 内会探测 net.fabricmc.loader.api.FabricLoader)。
     if (getenv("AMETHYST_METAL") != NULL) {
-                if ([[NSFileManager defaultManager] fileExistsAtPath:
-                [librariesPath stringByAppendingPathComponent:@"metallum_agent.jar"]]) {
+        NSString *metallumAgentPath =
+            [librariesPath stringByAppendingPathComponent:@"metallum_agent.jar"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:metallumAgentPath]) {
             PUSH_MARGV_FORMAT(@"-javaagent:%@/metallum_agent.jar=", librariesPath);
             // 把 MC 版本 id 传给 agent(按版本选 metallum 类映射)
             NSString *mcVersionId = nil;
@@ -1216,6 +1225,12 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
             if (mcVersionId && mcVersionId.length > 0) {
                 PUSH_MARGV_FORMAT(@"-Dmetallum.mc.version=%@", mcVersionId);
             }
+            NSLog(@"[JavaLauncher] metallum agent injected (loader-agnostic: vanilla/Forge/NeoForge/Fabric/Quilt) mc=%@",
+                  mcVersionId.length > 0 ? mcVersionId : @"(unset)");
+        }
+        else {
+            NSLog(@"[JavaLauncher] metallum agent NOT found at %@ - Metal renderer will not be active",
+                  metallumAgentPath);
         }
     }
     if(getPrefBool(@"general.cosmetica")) {
