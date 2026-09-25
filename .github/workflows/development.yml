@@ -178,6 +178,25 @@ jobs:
           fi
           echo "[ci] MobileGL dylibs committed: libMobileGL.dylib (DirectVulkan), libMobileGL-gles.dylib (DirectGLES)"
 
+      - name: Upload SFPEW build log
+        # dep_sfpew 用 `-$(MAKE)` 调用，失败不阻断主构建，失败细节会被静默吞掉。
+        # 这里无条件上传落盘的 cmake/编译日志，便于定位。
+        if: matrix.platform_name == 'ios' && always() && hashFiles('Natives/build/sfpew_build.log') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: sfpew-build.log
+          path: Natives/build/sfpew_build.log
+          if-no-files-found: ignore
+
+      - name: Upload SFPEW dylib
+        # dylib 是否存在，是判断 SFPEW 是否真的编出来的唯一硬证据。
+        if: matrix.platform_name == 'ios' && always() && hashFiles('Natives/build/libSimpleFPEWrapper.dylib') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: libSimpleFPEWrapper.dylib
+          path: Natives/build/libSimpleFPEWrapper.dylib
+          if-no-files-found: ignore
+
       - name: Upload MobileGL build log
         # MobileGL 从源码编译，Air 仓库历史上 9 个提交都没编过。
         # payload 里用 `-$(MAKE) dep_mobilegl` 调用，失败不阻断主构建，
