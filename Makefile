@@ -542,6 +542,59 @@ dep_shader_shims: dep_mg
 	echo '[Amethyst v$(VERSION)] dep_shader_shims - end'
 
 
+dep_openal_shim:
+	# Task 129：OpenAL ALC_SOFT_system_events 兼容垫片（26.1.2 整合包崩溃修复）。
+	# - 真库已 git mv 为 libopenal_impl.dylib（openal-soft 1.20.1 iOS 构建，无
+	#   ALC_SOFT_system_events 扩展）；本目标构建同名垫片 libopenal.dylib：
+	#   re-export impl 全部符号 + 覆盖 alcGetString/alcIsExtensionPresent 宣称扩展
+	#   + 提供 alcEventIsSupportedSOFT/alcEventControlSOFT/alcEventCallbackSOFT 桩。
+	# - 根因：MC 26.1.2 CallbackDeviceTracker.isSupported 无扩展守卫，直接调
+	#   LWJGL 绑定 -> ICD 槽位 0 -> NPE 崩溃（26.3 有守卫故存活）。
+	#   桩返回 ALC_FALSE 使 MC 干净回退 PollingDeviceTracker。
+	# - 与 dep_shader_shims 同款模式：re-export 必须指向 impl 名（LC_ID 先修正），
+	#   否则加载递归；本地函数定义优先于 re-export 符号（shaderc 先例）。
+	echo '[Amethyst v$(VERSION)] dep_openal_shim - start'
+	cp $(SOURCEDIR)/Natives/resources/Frameworks/libopenal_impl.dylib $(WORKINGDIR)/ || exit 1
+	install_name_tool -id @rpath/libopenal_impl.dylib $(WORKINGDIR)/libopenal_impl.dylib || exit 1
+	xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
+		-install_name @rpath/libopenal.dylib \
+		-Wl,-reexport_library,$(WORKINGDIR)/libopenal_impl.dylib \
+		-o $(WORKINGDIR)/libopenal.dylib \
+		$(SOURCEDIR)/Natives/openal_shim.c || exit 1
+	echo '[Amethyst v$(VERSION)] dep_openal_shim - end'
+
+dep_angle_freeze:
+	echo '[Amethyst v$(VERSION)] dep_angle_freeze - start'
+	# Task 57 (画面分裂根治): 8-byte machine-code patch -- ANGLE Metal
+	# WindowSurfaceMtl::checkIfLayerResized: expected size source switched from
+	# bounds*contentsScale (poisoned by windowed-mode background-thread portrait
+	# geometry, CALayer cross-thread split-brain) to the surface's own latched
+	# mWidth/mHeight ([x19,#0x430/0x438]) -- surface size frozen at creation
+	# geometry (creation reads always clean); transposition becomes physically
+	# impossible; on drawableSize drift the enforcement branch re-writes the
+	# frozen value back onto the layer. Idempotent; loud failure on byte
+	# mismatch (ANGLE version drift guard); full root-cause chain in script
+	# header comments (scripts/patch_angle_surface_freeze.py).
+	# 补丁改写源文件后签名哈希失效 —— 打包时 ldid -S 全 app 递归重签覆盖。
+	python3 $(SOURCEDIR)/scripts/patch_angle_surface_freeze.py \
+		$(SOURCEDIR)/Natives/resources/Frameworks/libGLESv2.framework/libGLESv2 || exit 1
+	echo '[Amethyst v$(VERSION)] dep_angle_freeze - end'
+
+dep_sdl3_guard:
+	echo '[Amethyst v$(VERSION)] dep_sdl3_guard - start'
+	# Task 135 (controlify/JNA closure SIGBUS 源头根治): libSDL3.dylib
+	# 入口机器码守卫 -- SDL_SetEventFilter / SDL_AddEventWatch 的非空回调指针
+	# 一律置空/拒绝注册。controlify 经 JNA 回退加载本 Frameworks 的 iOS 版 SDL3
+	# 后, 把 JNA/libffi closure (RW 不可执行 trampoline 页) 注册进 SDL 事件过滤
+	# 器, SDL 调用即 SIGBUS。dlsym 层守卫对 LWJGL/FFM 解析路径有效, 但 JNA 解析
+	# 路径仍可绕行; 本补丁把守卫下沉到 SDL 二进制自身, 与符号解析链路完全无关。
+	# 启动器自身与 MC/LWJGL 均不使用 SDL 事件过滤器 (全仓 grep 验证), 零误伤;
+	# 签名由打包时 ldid -S 全 app 重签覆盖 (dep_angle_freeze 同款流程)。
+	# 幂等; 字节不匹配 (SDL3 版本漂移) 响亮失败。
+	python3 $(SOURCEDIR)/scripts/patch_sdl3_eventfilter_guard.py \
+		$(SOURCEDIR)/Natives/resources/Frameworks/libSDL3.dylib || exit 1
+	echo '[Amethyst v$(VERSION)] dep_sdl3_guard - end'
+
 dep_mobilegl:
 	@{ echo '== MobileGL build diagnostics =='; \
 	  echo "  BUILD_MOBILEGL      = $(BUILD_MOBILEGL)"; \
@@ -698,7 +751,7 @@ assets:
 	fi
 	echo '[Amethyst v$(VERSION)] assets - end'
 
-payload: native dep_mg dep_shader_shims java jre assets
+payload: native dep_mg dep_shader_shims dep_openal_shim dep_angle_freeze dep_sdl3_guard java jre assets
 	echo '[Amethyst v$(VERSION)] payload - start'
 	# Mithril / MobileGL 都是可选渲染器：这里用 - 前缀，任一失败都不阻断主构建。
 	# 缺库时对应渲染器会在设置里自动隐藏（见 LauncherPreferences.m 的存在性过滤）。
@@ -716,7 +769,7 @@ payload: native dep_mg dep_shader_shims java jre assets
 		ln -sf libspirv-cross-c-shared.0.dylib $(WORKINGDIR)/AngelAuraAmethyst.app/Frameworks/libspirv-cross.dylib; \
 	fi
 		cp -R $(SOURCEDIR)/JavaApp/libs/others/* $(WORKINGDIR)/AngelAuraAmethyst.app/libs/ || exit 1
-	cp $(SOURCEDIR)/JavaApp/build/launcher.jar $(SOURCEDIR)/JavaApp/build/patchjna_agent.jar $(SOURCEDIR)/JavaApp/build/patchsvc.jar $(WORKINGDIR)/AngelAuraAmethyst.app/libs/ || exit 1
+	cp $(SOURCEDIR)/JavaApp/build/launcher.jar $(SOURCEDIR)/JavaApp/build/patchjna_agent.jar $(SOURCEDIR)/JavaApp/build/patchsvc.jar $(SOURCEDIR)/JavaApp/build/mojang-stubs.jar $(WORKINGDIR)/AngelAuraAmethyst.app/libs/ || exit 1
 	# LWJGL 以双版本 jar 发布，由启动器按 MC 版本在运行时选择其一。
 	# 必须放进各自的 libs/lwjgl-<ver>/ 子目录：若平铺进 libs/，会被 classpath 中
 	# 的 libs/* 一并加载，使 3.3.3 与 3.4.1 的同名类同时进入 classpath 造成冲突。

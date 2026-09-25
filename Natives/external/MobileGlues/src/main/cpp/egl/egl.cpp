@@ -17,6 +17,8 @@
 #include "trace.h"
 #include <EGL/eglext.h>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <memory>
@@ -1070,5 +1072,57 @@ extern "C"
         }
 
         return reinterpret_cast<__eglMustCastToProperFunctionPointerType>(glXGetProcAddress(procname));
+    }
+
+    // Task 165 (Amethyst fork): serve the lookup Task154's jar patch dead-named.
+    //
+    // History: the LWJGL GL$1 Delegate (GL.create(SharedLibrary)'s function
+    // provider, lwjgl-341 only) used to look up "eglGetProcAddress" in the
+    // provider library -- for this layer that was the frontend's own entry
+    // above, so every gl* name the application asked for went through
+    // glXGetProcAddress's own-image resolution and landed on THIS layer's
+    // hooks (the 5.1.0-healthy sessions: "[MG] 2.0.16 own-image resolution"
+    // + SYMBOL THEFT canary lines in the device log are exactly this route
+    // firing). Task154 renamed that constant-pool string to
+    // "xglGetProcAddress" so Mithril's broken indirect layer could never be
+    // found -- correct for Mithril, but it silently changed THIS layer's
+    // sessions too: the Delegate fell back to per-name dlsym, the flat
+    // namespace handed glDrawArrays/glTexImage2D/glFramebufferTexture2D (the
+    // exact trio the canary warns about) to the raw ANGLE image, and the
+    // application's draws bypassed gl/framebuffer.cpp's framebuffer-0
+    // redirect. With FSR1 engaged the upscale then read a render texture
+    // nobody had drawn into and painted sharpened zeros over the real frame
+    // every swap -- the ES/4.0 "black screen with a perfectly healthy swap
+    // counter" (cc9bfe4 forensics: glXGetProcAddress never called at all,
+    // 10x LWJGL "No context is current or a function not available", Task164
+    // fb0 probe rgba=000000ff). The mixed-resolution sessions were invisible
+    // until Task161 fixed the renderer linkage and FSR1 started engaging on
+    // the GLES/4.0 backends again.
+    //
+    // Exporting the dead name restores the 5.1.0 route for this layer only:
+    // the Delegate asks the provider library (libmobileglues.dylib, pinned by
+    // -Dorg.lwjgl.opengl.libname) for "xglGetProcAddress", finds this export,
+    // and gl* resolution owns the layer again. Mithril / MobileGL / gl4es /
+    // ANGLE do not export the name, so their Task154 semantics (dlsym
+    // fallback) are untouched; OSMesa's separate OSMesaGetProcAddress lookup
+    // was never renamed.
+    EGL_API EGLAPI __eglMustCastToProperFunctionPointerType EGLAPIENTRY xglGetProcAddress(const char* procname) {
+        // Defense-in-depth gate: this image is only ever loaded in a
+        // MobileGlues session (gl_bridge's dlsym_EGL dlopens it exclusively
+        // for RENDERER_NAME_MOBILEGLUES), but a hypothetical flat-namespace
+        // hit from some other renderer's process must not route that
+        // renderer's GL through this layer. "obileglues" matches
+        // libmobileglues.dylib and cannot match libMobileGL.dylib.
+        const char* ame165_renderer = getenv("AMETHYST_RENDERER");
+        if (ame165_renderer == nullptr || strstr(ame165_renderer, "obileglues") == nullptr) {
+            return nullptr;
+        }
+        static bool s_ame165_routed = false;
+        if (!s_ame165_routed) {
+            s_ame165_routed = true;
+            LOG_I("[MG] Task165 xglGetProcAddress: LWJGL delegate resolution routed through the frontend (renderer=%s) -- gl* names own the layer again, flat-namespace theft neutralized",
+                  ame165_renderer);
+        }
+        return eglGetProcAddress(procname);
     }
 }

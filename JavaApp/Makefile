@@ -16,7 +16,7 @@ TARGETS := $(TARGETS:$(SOURCEDIR)/%=$(OUTPUTDIR)/%.jar)
 # 运行时只使用 lwjgl-333.jar / lwjgl-341.jar，不依赖 libs/lwjgl。
 JCFLAGS := -cp "$(subst $() $(),:,$(wildcard $(SOURCEDIR)/*/):$(wildcard libs/*/*.jar))" -XDignore.symbol.file
 
-all: $(TARGETS)
+all: $(TARGETS) $(OUTPUTDIR)/mojang-stubs.jar
 
 # Sometimes the CI produces empty class file resulting in broken jar, so we check and abort here
 # 改进：发现空 class 文件时先从 classes/ 目录重新复制（修复 cp 与 javac 并行竞态
@@ -117,6 +117,30 @@ $(OUTPUTDIR)/patchsvc.jar: $(CLASSES)
 	@rm -rf $(basename $@)/de/maxhenkel/*/*.class
 	@echo "Creating $@"
 	@$(BOOTJDK)/jar -cfm $@ $(SOURCEDIR)/patchsvc.txt -C $(basename $@) .
+
+# Task 158（Forge 模块层 mojang 桩）：Forge 的 MC-BOOTSTRAP/GAME 模块层对
+# 系统类加载器完全不可见（securejarhandler ModuleClassLoader 的父链是
+# boot/platform 层），而 launcher.jar 被 -DignoreList 排除在模块层外
+#（Task154 的 split-package 根治）——模块层内 GameNarrator 需要的
+# com.mojang.text2speech 桩必须由一个【会被 BootstrapLauncher 模块化】的
+# jar 提供。本 jar 只含 com/mojang/text2speech 桩类（与 launcher.jar 同源
+# 同字节，getNarrator() 恒返回 NarratorDummy，iOS 无叙述器副作用），随包放
+# app/libs/ → 恒在 -cp → 恒在 java.class.path → 自动成为 MC-BOOTSTRAP 层的
+# 自动模块（文件名不含任何 ignoreList 前缀）。真实 text2speech 库继续被
+# Java 侧 preProcessLibraries _skip（进 classpath 会与桩 split-package）。
+# 装机锚点：Forge 1.20.1 过 GameNarrator（NoClassDefFoundError: Narrator 消失）。
+$(OUTPUTDIR)/mojang-stubs.jar: $(OUTPUTDIR)/launcher.jar
+	@set -e
+	@rm -rf $(OUTPUTDIR)/mojang-stubs
+	@mkdir -p $(OUTPUTDIR)/mojang-stubs/com/mojang
+	@if [ ! -d "$(OUTPUTDIR)/launcher/com/mojang/text2speech" ]; then \
+		echo "ERROR: launcher classes missing com/mojang/text2speech (Task158 mojang-stubs)"; \
+		exit 1; \
+	fi
+	@cp -R $(OUTPUTDIR)/launcher/com/mojang/text2speech $(OUTPUTDIR)/mojang-stubs/com/mojang/
+	@cd $(OUTPUTDIR)/mojang-stubs && $(BOOTJDK)/jar -cf ../mojang-stubs.jar com
+	@echo "Created $(OUTPUTDIR)/mojang-stubs.jar (Forge module-layer com.mojang.text2speech stubs, Task158)"
+
 
 clean:
 	rm -rf $(OUTPUTDIR)
