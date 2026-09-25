@@ -633,6 +633,15 @@ dep_sdl3_guard:
 # ---------------------------------------------------------------------------
 dep_sfpew: dep_mg
 	echo '[Amethyst v$(VERSION)] dep_sfpew - start'
+	# iOS 适配补丁（AppleClang 15 + deployment target 14.0 下才暴露的两个问题，
+	# Linux/GCC 与 Android NDK 都不触发，故上游源码里没有处理）：
+	#   1. fpe/types.h: glstate_t 的默认构造函数被隐式删除（匿名 union 内含
+	#      带 NSDMI 的匿名 struct），fpe.cpp 的 no_context_state / make_unique 会炸
+	#   2. fpe/fpe_shadergen.cpp: std::format 的 {:.1f} 依赖 std::to_chars(float)，
+	#      该重载在 SDK 里标了 introduced=iOS 16.3，deployment target 14.0 下不可用
+	# 与 patch_mobilegl_ios.py 同款约定：幂等 + 锚点校验，锚点不匹配即 exit 1，
+	# 绝不静默打歪补丁编出坏库。必须在 cmake 之前跑（cmake 直接编译树内源码）。
+	python3 $(SOURCEDIR)/Natives/patch_sfpew_ios.py $(SOURCEDIR)/Natives/external/SimpleFPEWrapper || exit 1
 	mkdir -p $(WORKINGDIR)/sfpew
 	cd $(WORKINGDIR)/sfpew && cmake \
 		-DCMAKE_CROSSCOMPILING=true \
