@@ -189,6 +189,10 @@ BOOL CallbackBridge_nativeSendChar(jchar codepoint /* jint codepoint */);
 BOOL CallbackBridge_nativeSendCharMods(jchar codepoint, int mods);
 void CallbackBridge_nativeSendCursorPos(char event, CGFloat x, CGFloat y);
 void CallbackBridge_nativeSendKey(int key, int scancode, int action, int mods);
+// Task83：控件按钮键盘打字——按下时按 US ANSI 布局补发一个字符事件
+// （MC 1.13+ 聊天框只认 charTyped/text-input，纯 key 事件不进文本）。
+// 仅由按钮路径调用（SurfaceViewController executebtn），硬件键盘不走这里。
+BOOL CallbackBridge_buttonKeySynthesizeText(int key);
 void CallbackBridge_nativeSendMouseButton(int button, int action, int mods);
 void CallbackBridge_nativeSendScreenSize(int width, int height);
 void CallbackBridge_nativeSendScroll(CGFloat xoffset, CGFloat yoffset);
