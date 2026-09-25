@@ -508,6 +508,11 @@ static void ame_log_impl_bases(void);
 
 __attribute__((constructor))
 static void ame_shaderc_shim_init(void) {
+    // 幂等：本函数既作 constructor，又被惰性入口重复调用；重复
+    // pthread_mutex_init 同一块内存会重置锁状态，必须挡掉。
+    static int ame_shim_init_done = 0;
+    if (ame_shim_init_done) return;
+    ame_shim_init_done = 1;
     pthread_mutexattr_t lock_attr;
     pthread_mutexattr_init(&lock_attr);
     pthread_mutexattr_settype(&lock_attr, PTHREAD_MUTEX_RECURSIVE);
@@ -520,6 +525,25 @@ static void ame_shaderc_shim_init(void) {
         fprintf(stderr, "[shaderc-shim] FATAL: cannot obtain unhooked dlsym\n");
         return;
     }
+    // 注意：此处【不】dlopen impl。见下方 ame_shaderc_shim_load_impl()。
+}
+
+// ---- impl 惰性加载（构造期不加载）----
+// 实证依据（本仓库 latestlog / Task 43 回退记录）：任何把 libshaderc_impl
+// 的加载提前的动作，都会让崩溃提前且加剧——12d789d 在 main() 早期 dlopen
+// impl 后，崩溃点从"进世界"前移到"加载界面"，并波及 26.2。
+// 机理：libshaderc_impl.dylib 静态链接了一份 glslang，而 MobileGlues 静态
+// 链接了另一份（add_subdirectory(3rdparty/glslang)）。两份各有自己的进程级
+// 全局状态（内置符号表 / 字符串池 / 池分配器）。RTLD_NOW 在 dylib 构造期
+// 就跑完 impl 的 C++ 静态初始化，等于在 JVM 早期凭空建起第二份 glslang 池；
+// 两侧同时活跃即池串台，后续堆分配（26.3 资源重载期的 unifont 图集是启动
+// 期最大的一次分配）踩到坏元数据 -> 静默闪退，无 hs_err。
+// 垫片前的行为是【惰性】：shaderc_include_hook / main_hook 只 hook dlsym，
+// 从不主动 dlopen impl，因此 26.3 缓存命中时 impl 根本不进进程。此处恢复
+// 该语义——impl 只在第一次真正要解析 shaderc 符号（即第一次真实编译）时加载。
+static void ame_shaderc_shim_load_impl(void) {
+    if (ame_shaderc_shim_impl != NULL) return;
+    if (ame_shaderc_shim_real_dlsym == NULL) return;
     static const char *const kCandidates[] = {
         "@loader_path/libshaderc_impl.dylib",
         "@rpath/libshaderc_impl.dylib",
@@ -529,7 +553,8 @@ static void ame_shaderc_shim_init(void) {
     for (int i = 0; kCandidates[i] != NULL; ++i) {
         ame_shaderc_shim_impl = dlopen(kCandidates[i], RTLD_NOW | RTLD_LOCAL);
         if (ame_shaderc_shim_impl != NULL) {
-            fprintf(stderr, "[shaderc-shim] impl loaded via %s\n", kCandidates[i]);
+            fprintf(stderr, "[shaderc-shim] impl loaded (lazy) via %s\n",
+                    kCandidates[i]);
             ame_log_impl_bases();
             return;
         }
@@ -567,7 +592,10 @@ static void ame_log_impl_bases(void) {
 
 // 每次调用惰性重试（构造期 dyld 环境尚未就绪等极端场景的兜底）
 static void *ame_shaderc_shim_impl_handle(void) {
-    if (ame_shaderc_shim_impl == NULL) ame_shaderc_shim_init();
+    if (ame_shaderc_shim_impl == NULL) {
+        ame_shaderc_shim_init();
+        ame_shaderc_shim_load_impl();
+    }
     return ame_shaderc_shim_impl;
 }
 
