@@ -645,8 +645,10 @@ dep_sfpew: dep_mg
 		-DCMAKE_CXX_FLAGS="-arch arm64" \
 		-DCMAKE_BUILD_TYPE=RelWithDebInfo \
 		-DSFPEW_MG_3RDPARTY="$(SOURCEDIR)/Natives/external/MobileGlues/src/main/cpp/3rdparty" \
-		$(SOURCEDIR)/Natives/external/SimpleFPEWrapper/ || exit 1
-	cmake --build $(WORKINGDIR)/sfpew --config RelWithDebInfo -j$(JOBS) --target SimpleFPEWrapper || exit 1
+		$(SOURCEDIR)/Natives/external/SimpleFPEWrapper/ > $(WORKINGDIR)/sfpew_build.log 2>&1 \
+		|| { echo '[dep_sfpew] cmake configure FAILED -- tail:'; tail -n 120 $(WORKINGDIR)/sfpew_build.log; exit 1; }
+	cmake --build $(WORKINGDIR)/sfpew --config RelWithDebInfo -j$(JOBS) --target SimpleFPEWrapper >> $(WORKINGDIR)/sfpew_build.log 2>&1 \
+		|| { echo '[dep_sfpew] build FAILED -- tail:'; tail -n 200 $(WORKINGDIR)/sfpew_build.log; exit 1; }
 	cp $(WORKINGDIR)/sfpew/libSimpleFPEWrapper.dylib $(WORKINGDIR)/ || exit 1
 	echo '[Amethyst v$(VERSION)] dep_sfpew - end'
 
@@ -806,12 +808,15 @@ assets:
 	fi
 	echo '[Amethyst v$(VERSION)] assets - end'
 
-payload: native dep_mg dep_shader_shims dep_openal_shim dep_angle_freeze dep_sdl3_guard dep_sfpew java jre assets
+payload: native dep_mg dep_shader_shims dep_openal_shim dep_angle_freeze dep_sdl3_guard java jre assets
 	echo '[Amethyst v$(VERSION)] payload - start'
 	# Mithril / MobileGL 都是可选渲染器：这里用 - 前缀，任一失败都不阻断主构建。
 	# 缺库时对应渲染器会在设置里自动隐藏（见 LauncherPreferences.m 的存在性过滤）。
 	-$(MAKE) dep_mithril
 	-$(MAKE) dep_mobilegl
+	# SimpleFPEWrapper 同样是可选渲染器：构建失败时只丢这一个选项，不阻断主构建。
+	# dep_sfpew 内部会把 cmake/编译输出落盘并在失败时 tail 出来，方便定位。
+	-$(MAKE) dep_sfpew
 	$(call METHOD_DIRCHECK,$(WORKINGDIR)/AngelAuraAmethyst.app/libs)
 	$(call METHOD_DIRCHECK,$(WORKINGDIR)/AngelAuraAmethyst.app/libs_caciocavallo)
 	$(call METHOD_DIRCHECK,$(WORKINGDIR)/AngelAuraAmethyst.app/libs_caciocavallo17)
