@@ -42,6 +42,10 @@
 #define SDL3_EVENT_MOUSE_BUTTON_DOWN 0x401
 #define SDL3_EVENT_MOUSE_BUTTON_UP   0x402
 #define SDL3_EVENT_MOUSE_WHEEL     0x403
+// Task 82：SDL_EVENT_TEXT_INPUT（0x303=771）。MC 26.3 的
+// SDLEventHandler.pollEvents 里 case 771 → handleTextInputEvent →
+// keyboardHandler.textInput → charTyped，虚拟键盘字符的唯一入口。
+#define SDL3_EVENT_TEXT_INPUT      0x303
 
 typedef uint32_t SDL3_WindowID;
 typedef uint32_t SDL3_MouseID;
@@ -103,6 +107,18 @@ typedef struct {
     bool repeat;
 } SDL3_KeyboardEvent;
 
+// Task 82：SDL3 TextInputEvent layout（与 SDL3 ABI 对齐：
+// type@0 reserved@4 timestamp@8 windowID@16 pad@20 text@24，sizeof=32）。
+// text 是指针而非内联数组（SDL3 改动），指向的 UTF-8 字符串必须在
+// MC 轮询该事件时仍然存活——用下方的静态环形槽位保证。
+typedef struct {
+    uint32_t type;
+    uint32_t reserved;
+    uint64_t timestamp;
+    SDL3_WindowID windowID;
+    const char *text;
+} SDL3_TextInputEvent;
+
 // Union large enough to hold any SDL3 event
 typedef union {
     uint32_t type;
@@ -111,11 +127,13 @@ typedef union {
 
 typedef bool SDL_PushEvent_func(void *event);
 typedef uint32_t SDL_GetWindowID_func(void *window);
+typedef unsigned short SDL_GetModState_func(void);   // Task83: 读 SDL 虚拟修饰键态
 typedef bool SDL_HideCursor_func(void);
 typedef bool SDL_ShowCursor_func(void);
 
 static SDL_PushEvent_func     *pSDL_PushEvent     = NULL;
 static SDL_GetWindowID_func   *pSDL_GetWindowID   = NULL;
+static SDL_GetModState_func   *pSDL_GetModState   = NULL;   // Task83
 static void *g_sdlWindow = NULL;  // The real SDL3 window pointer
 
 static void initSDLEventFuncs(void) {
@@ -124,6 +142,7 @@ static void initSDLEventFuncs(void) {
     inited = YES;
     pSDL_PushEvent   = dlsym(RTLD_DEFAULT, "SDL_PushEvent");
     pSDL_GetWindowID = dlsym(RTLD_DEFAULT, "SDL_GetWindowID");
+    pSDL_GetModState = dlsym(RTLD_DEFAULT, "SDL_GetModState");   // Task83
     NSLog(@"[InputDiag] initSDLEventFuncs: PushEvent=%p GetWindowID=%p g_sdlWindow=%p",
         (void*)pSDL_PushEvent, (void*)pSDL_GetWindowID, g_sdlWindow);
 }
@@ -224,6 +243,218 @@ static void pushSDLKeyboardEvent(SDL3_Scancode scancode, bool down) {
     ev.down = down;
     ev.repeat = false;
     pSDL_PushEvent((void*)&ev);
+}
+
+// ============================================================================
+// Task 82：虚拟键盘文本输入（MC 26.3 / SDL3 路径）
+//
+// 根因：CallbackBridge_nativeSendChar 只有 GLFW 路径（GLFW_invoke_Char），
+// 而 26.3 走 SDL3，GLFW_invoke_Char 恒为 NULL → 左上角 Keyboard 控件按钮
+// 唤起的虚拟键盘打字全部被静默丢弃。修法：照 sendKey 的 Path B 模式，
+// 把字符编成 UTF-8 后直接推 SDL_EVENT_TEXT_INPUT 事件，MC 26.3 的
+// SDLEventHandler 会把它送进 keyboardHandler.textInput → charTyped
+// （聊天框/搜索框等 Screen 打开时生效）。
+// ============================================================================
+
+// 每个 codepoint 的 UTF-8 最长 4 字节 + NUL = 5，取 8 对齐。
+// 1024 个槽位：MC 每帧 pollEvents 排空队列，上千字符的积压只可能发生在
+// 帧循环冻结时——那本身已是更大的故障。槽位复用只会覆盖早已被消费的事件。
+#define AME82_TEXT_RING_SLOTS 1024
+static char ame82_textRing[AME82_TEXT_RING_SLOTS][8];
+static uint32_t ame82_textRingIdx = 0;
+// UTF-16 代理对合并状态：TrackedTextField.sendText 按 UTF-16 码元逐个发送，
+// emoji 等增补平面字符会拆成 high/low 两个码元，先记 high 再与 low 合并。
+static uint32_t ame82_pendingHighSurrogate = 0;
+
+static int ame82_utf8_encode(uint32_t cp, char out[8]) {
+    if (cp < 0x80) {
+        out[0] = (char)cp;
+        return 1;
+    }
+    if (cp < 0x800) {
+        out[0] = (char)(0xC0 | (cp >> 6));
+        out[1] = (char)(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        out[0] = (char)(0xE0 | (cp >> 12));
+        out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    out[0] = (char)(0xF0 | (cp >> 18));
+    out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    out[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    out[3] = (char)(0x80 | (cp & 0x3F));
+    return 4;
+}
+
+// Push a text input event into SDL's event queue (one UTF-16 code unit,
+// surrogate halves are merged into a single codepoint)
+static void pushSDLTextInput(jchar codepoint) {
+    if (!pSDL_PushEvent || !g_sdlWindow) return;
+
+    uint32_t cp;
+    if (codepoint >= 0xD800 && codepoint <= 0xDBFF) {
+        // 高代理：等配对的低代理一起合成码点，暂不发事件
+        ame82_pendingHighSurrogate = (uint32_t)codepoint;
+        return;
+    }
+    if (codepoint >= 0xDC00 && codepoint <= 0xDFFF) {
+        if (ame82_pendingHighSurrogate != 0) {
+            cp = 0x10000 + ((ame82_pendingHighSurrogate - 0xD800) << 10) + ((uint32_t)codepoint - 0xDC00);
+        } else {
+            cp = 0xFFFD;   // 孤立低代理：替换字符，不向游戏注入乱码
+        }
+        ame82_pendingHighSurrogate = 0;
+    } else {
+        // 普通码元：若之前挂着一个未配对的高代理，就地丢弃（保持 UTF-16 语义）
+        ame82_pendingHighSurrogate = 0;
+        cp = (uint32_t)codepoint;
+    }
+
+    char *slot = ame82_textRing[ame82_textRingIdx];
+    ame82_textRingIdx = (ame82_textRingIdx + 1) % AME82_TEXT_RING_SLOTS;
+    const int len = ame82_utf8_encode(cp, slot);
+    slot[len] = '\0';
+
+    // 用 128 字节的 SDL3_Event 联合体承载，避免 SDL_PushEvent 拷贝整个
+    // union 时读到栈上未初始化的尾部（32 字节的 TextInputEvent 单独声明
+    // 会被越界读）。
+    SDL3_Event ev;
+    memset(&ev, 0, sizeof(ev));
+    SDL3_TextInputEvent *te = (SDL3_TextInputEvent *)&ev;
+    te->type = SDL3_EVENT_TEXT_INPUT;
+    te->windowID = getSDLWindowID();
+    te->text = slot;
+    pSDL_PushEvent((void *)&ev);
+
+    static int s_task82_textPushed = 0;
+    s_task82_textPushed++;
+    if (s_task82_textPushed <= 10 || s_task82_textPushed % 100 == 0) {
+        NSLog(@"[InputDiag] Task82 SDL text input #%d: U+%04X -> \"%s\" (virtual keyboard chars now reach MC 26.3)",
+              s_task82_textPushed, cp, slot);
+    }
+}
+
+// ============================================================================
+// Task 83：控件按钮键盘（custom 布局的 QWERTY 抽屉面板）打字支持
+//
+// 根因：SurfaceViewController executebtn 的 keycode>0 分支只发 GLFW key 事件
+// （nativeSendKey → SDL3 key down/up 或 GLFW key 回调），而 MC 1.13+ 的
+// 聊天框/书与笔/搜索框只消费 charTyped（GLFW char 回调 / SDL3
+// SDL_EVENT_TEXT_INPUT）事件——纯 key 事件一律不进文本。所以"键盘图标"
+// 抽屉里的字母/数字/符号按钮在聊天框里完全没有反应；而系统软键盘正常
+// （inputTextField → nativeSendChar 链路，Task82 已修好 SDL3 分支）。
+//
+// 修法：executebtn 在按键按下（ACTION_DOWN）时对本键补发一个字符事件。
+// - 映射按 US ANSI 布局（与 GLFW/CPredefinedProcGetKey 惯例一致）；
+// - SHIFT 状态：SDL3 路径读 SDL_GetModState，GLFW 路径读 nativeSendKey
+//   维护的 currMods；
+// - Ctrl/Alt/Super 按住时抑制字符（与真实键盘一致：Ctrl+W 是快捷键不产文本，
+//   也避免"持续奔跑"[CTRL,W] 组合键往聊天框里灌字符）；
+// - CAPS_LOCK 按钮自管理虚拟大写状态（SDL 不为注入事件维护 KMOD_CAPS）；
+// - 硬件键盘不受影响：pressesBegan → KeyboardInput.sendKeyEvent 同时发
+//   key+char，不经过 executebtn，无重复字符风险。
+// ============================================================================
+
+static bool ame83_virtualCaps = false;
+
+// GLFW 键码 → US ANSI 布局字符；不可打印键返回 0。
+// shift/caps 仅对字母异或生效（真实键盘语义），数字/符号只看 shift。
+static jchar ame83_keycodeToChar(int key, bool shift, bool caps) {
+    if (key >= GLFW_KEY_A && key <= GLFW_KEY_Z) {
+        bool upper = shift != caps;
+        return (jchar)((key - GLFW_KEY_A) + (upper ? 'A' : 'a'));
+    }
+    if (key >= GLFW_KEY_0 && key <= GLFW_KEY_9) {
+        if (!shift) return (jchar)('0' + (key - GLFW_KEY_0));
+        static const jchar shifted[10] = {')','!','@','#','$','%','^','&','*','('};
+        return shifted[key - GLFW_KEY_0];
+    }
+    if (key >= GLFW_KEY_NUMPAD_0 && key <= GLFW_KEY_NUMPAD_9) {
+        return (jchar)('0' + (key - GLFW_KEY_NUMPAD_0));   // 小键盘不受 shift 影响
+    }
+    if (!shift) {
+        switch (key) {
+            case GLFW_KEY_SPACE:            return ' ';
+            case GLFW_KEY_APOSTROPHE:       return '\'';
+            case GLFW_KEY_COMMA:            return ',';
+            case GLFW_KEY_MINUS:            return '-';
+            case GLFW_KEY_PERIOD:           return '.';
+            case GLFW_KEY_SLASH:            return '/';
+            case GLFW_KEY_SEMICOLON:        return ';';
+            case GLFW_KEY_EQUAL:            return '=';
+            case GLFW_KEY_LEFT_BRACKET:     return '[';
+            case GLFW_KEY_BACKSLASH:        return '\\';
+            case GLFW_KEY_RIGHT_BRACKET:    return ']';
+            case GLFW_KEY_GRAVE_ACCENT:     return '`';
+            case GLFW_KEY_NUMPAD_DECIMAL:   return '.';
+            case GLFW_KEY_NUMPAD_DIVIDE:    return '/';
+            case GLFW_KEY_NUMPAD_MULTIPLY:  return '*';
+            case GLFW_KEY_NUMPAD_SUBTRACT:  return '-';
+            case GLFW_KEY_NUMPAD_ADD:       return '+';
+            case GLFW_KEY_NUMPAD_EQUAL:     return '=';
+        }
+    } else {
+        switch (key) {
+            case GLFW_KEY_SPACE:            return ' ';
+            // 34 = ASCII 双引号字符。不写成字面量形式：历史校验脚本
+            // （括号计数器）先剥字符串再剥字符字面量，字面量里的双引号会被
+            // 误当字符串起点，翻转全文件引号配对。
+            case GLFW_KEY_APOSTROPHE:       return 34;
+            case GLFW_KEY_COMMA:            return '<';
+            case GLFW_KEY_MINUS:            return '_';
+            case GLFW_KEY_PERIOD:           return '>';
+            case GLFW_KEY_SLASH:            return '?';
+            case GLFW_KEY_SEMICOLON:        return ':';
+            case GLFW_KEY_EQUAL:            return '+';
+            case GLFW_KEY_LEFT_BRACKET:     return '{';
+            case GLFW_KEY_BACKSLASH:        return '|';
+            case GLFW_KEY_RIGHT_BRACKET:    return '}';
+            case GLFW_KEY_GRAVE_ACCENT:     return '~';
+        }
+    }
+    return 0;
+}
+
+// executebtn 专用：按键按下时补发字符事件（Task83）。
+// 返回 YES 表示发出了字符。仅由按钮路径调用，硬件键盘不走这里。
+char getKeyModifiers(int key, int action);   // 定义于本文件 nativeSendKey 段
+
+BOOL CallbackBridge_buttonKeySynthesizeText(int key) {
+    if (key == GLFW_KEY_CAPS_LOCK) {
+        ame83_virtualCaps = !ame83_virtualCaps;
+        NSLog(@"[InputDiag] Task83 virtual caps-lock -> %d (button keyboard)", ame83_virtualCaps ? 1 : 0);
+        return NO;
+    }
+
+    bool shift, ctrlLike;
+    if (!GLFW_invoke_Char && g_sdlWindow && pSDL_GetModState != NULL) {
+        // SDL3 路径（MC 26.3+）：修饰键态读 SDL 当前 mod state
+        unsigned short m = pSDL_GetModState();
+        shift = (m & 0x0003) != 0;                       // KMOD_LSHIFT|KMOD_RSHIFT
+        ctrlLike = (m & (0x00C0 | 0x0300 | 0x0C00)) != 0; // Ctrl|Alt|GUI
+    } else {
+        // GLFW 路径（旧版 MC）：nativeSendKey 维护的 currMods（key=0 纯查询）
+        char m = getKeyModifiers(0, 0);
+        shift = (m & GLFW_MOD_SHIFT) != 0;
+        ctrlLike = (m & (GLFW_MOD_CONTROL | GLFW_MOD_ALT | GLFW_MOD_SUPER)) != 0;
+    }
+
+    if (ctrlLike) return NO;   // Ctrl/Alt/Super 组合 = 快捷键语义，不产文本
+
+    jchar ch = ame83_keycodeToChar(key, shift, ame83_virtualCaps);
+    if (ch == 0) return NO;
+
+    CallbackBridge_nativeSendChar(ch);
+    static int s_task83_chars = 0;
+    s_task83_chars++;
+    if (s_task83_chars <= 10 || s_task83_chars % 100 == 0) {
+        NSLog(@"[InputDiag] Task83 button text #%d: glfwKey=%d -> '%C' (button keyboard types in chat now)",
+              s_task83_chars, key, ch);
+    }
+    return YES;
 }
 
 // Push a mouse wheel event into SDL's event queue
@@ -1132,6 +1363,13 @@ BOOL CallbackBridge_nativeSendChar(jchar codepoint /* jint codepoint */) {
             GLFW_invoke_Char((void*) showingWindow, (unsigned int) codepoint);
             // return lwjgl2_triggerCharEvent(codepoint);
         }
+        return YES;
+    }
+    // Path B: SDL3 text-input events (MC 26.3+) -- Task 82
+    // 虚拟键盘字符在 26.3 下的唯一通道：GLFW_invoke_Char 为 NULL 时改推
+    // SDL_EVENT_TEXT_INPUT，MC 的 SDLEventHandler.handleTextInputEvent 消费。
+    if (!GLFW_invoke_Char && g_sdlWindow) {
+        pushSDLTextInput(codepoint);
         return YES;
     }
     return NO;

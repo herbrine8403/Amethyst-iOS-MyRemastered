@@ -2207,6 +2207,13 @@ static BOOL ame87_mcVersionRequiresTextureBuffer(NSString *mcVersionId) {
             }
         } else if (keycode > 0) {
             CallbackBridge_nativeSendKey(keycode, 0, held, 0);
+            // Task83：按钮键盘打字支持。custom 布局“键盘图标”抽屉里的
+            // 字母/数字/符号按钮只发 key 事件，而 MC 1.13+ 聊天框只消费
+            // charTyped（text-input）事件 → 此前完全打不了字。按下时补发
+            // 字符；Ctrl/Alt 按住时由助手抑制（快捷键语义，组合键不灌字符）。
+            if (held) {
+                CallbackBridge_buttonKeySynthesizeText(keycode);
+            }
         }
     }
 }
