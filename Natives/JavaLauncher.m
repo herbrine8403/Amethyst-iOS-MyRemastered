@@ -173,8 +173,6 @@ void init_loadMobileGluesConfig() {
             setenv("AMETHYST_METAL", "1", 1);
             NSLog(@"[JavaLauncher] Metal renderer selected: AMETHYST_METAL=1 (EGL falls back to auto for surface)");
             renderer = @"auto";
-            showDialog(localize(@"metal.renderer.notice.title", @"Metal Renderer"),
-                       localize(@"metal.renderer.notice.body", @""));
         }
     NSLog(@"[JavaLauncher] init_loadMobileGluesConfig: renderer=%@", renderer);
 
