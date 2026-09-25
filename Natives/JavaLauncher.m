@@ -200,25 +200,42 @@ void init_loadMobileGluesConfig() {
     // customGLVersion 约束（settings.cpp 第 71-79 行）：>46 截断为 46，<32 且非 0 截断为 32，
     // 33-39 截断为 33，0 使用默认值 40。
     // 因此必须写入十进制数（40, 41, 42, ..., 46），不能写入十六进制 0x040000。
-    config[@"enableExtGL43"] = @1;
     config[@"enableExtDirectStateAccess"] = @1;
     config[@"maxGlslCacheSize"] = @128;
     config[@"customGLVersion"] = @40;  // 十进制 40 = GL 4.0
 
+    // Task158 等价实现（对齐 Air 的 ame158_mg_mobileglues_mode 两档）：
+    //   mode 1（GLES 档）：enableANGLE=3 + customGLVersion=32
+    //   mode 2（OpenGL 4.0 档）：enableANGLE=0 + customGLVersion=40
+    //
+    // 关键前提（读 MobileGlues 的 config/settings.cpp 实证）：
+    // iOS 分支（#if defined(__APPLE__)）在 init_settings() 开头就硬编码
+    // global_settings.angle = AngleMode::Disabled，并且整个分支从不读
+    // enableANGLE 键。也就是说：ANGLE 在 iOS 上恒不生效，
+    // 两个仓库都一样。因此两档之间唯一真正生效的
+    // 差异是 customGLVersion：
+    //   * GL 4.0 → MC/Sodium 生成桌面 GLSL（#version 400 core），必须经 MG 自有的
+    //     glslang→SPIR-V→ESSL 转译链；MC 26.x 的 position_color 顶点着色器
+    //     正是在这条链上 SIGSEGV（无 .ips、无 hs_err，表现为静默闪退）。
+    //   * GL 3.2 → 走 ES 档路径，绕开该转译链。
+    //
+    // 另外：删掉了原写的 enableExtGL43（值 1）。MG 的 Apple 分支
+    // 不读该键，写了也是无效键；而且它与 GL 3.2 档自相
+    // 矛盾（宣称 GL 4.3 能力）。Air 从不写这个键。
+    //
+    // 开关语义：用户开启 mobileglues.enable_angle 即选 GLES 档（GL 3.2），
+    // 关闭即选 OpenGL 4.0 档（GL 4.0）——与 Air 的两档一一对应，
+    // 可直接切换回退。
     id enableAngle = getPrefObject(@"mobileglues.enable_angle");
-    if (enableAngle) {
-        // MobileGlues AngleConfig 枚举（settings.h）：
-        //   0 = DisableIfPossible
-        //   1 = EnableIfPossible  ← iOS 上 hasVulkan12() 永远返回 0（#ifndef __APPLE__
-        //                            块被跳过），导致 checkIfANGLESupported 返回 false，
-        //                            ANGLE 被禁用。不能使用此值。
-        //   2 = ForceDisable
-        //   3 = ForceEnable       ← 强制启用，绕过 GPU 检测
-        // 用户启用 enable_angle 时写入 3 (ForceEnable)，禁用时写入 0 (DisableIfPossible)
-        config[@"enableANGLE"] = [enableAngle boolValue] ? @3 : @0;
-        NSLog(@"[JavaLauncher]   mobileglues.enable_angle = %@ -> enableANGLE = %@ (3=ForceEnable, 0=DisableIfPossible)",
-              enableAngle, config[@"enableANGLE"]);
+    BOOL angleOn = [enableAngle respondsToSelector:@selector(boolValue)] && [enableAngle boolValue];
+    config[@"enableANGLE"] = angleOn ? @3 : @0;
+    if (angleOn) {
+        config[@"customGLVersion"] = @32;
     }
+    NSLog(@"[JavaLauncher] Task158: mg backend -> MobileGlues (enableANGLE=%@, customGLVersion=%@; "
+          @"ANGLE is inert on iOS -- MG settings.cpp Apple branch hardcodes Disabled and never reads the key; "
+          @"customGLVersion is the only live knob)",
+          config[@"enableANGLE"], config[@"customGLVersion"]);
 
     id enableNoError = getPrefObject(@"mobileglues.enable_no_error");
     if (enableNoError) {
