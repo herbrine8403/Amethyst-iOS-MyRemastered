@@ -24,6 +24,12 @@ if (MSVC)
         target_compile_options(PipeCatalogueTest PRIVATE /Zc:preprocessor)
 endif()
 
+# P7 B4 aggregate-wait regression control shares the production selector; no device is needed.
+add_executable(MagmaAggregateWaitTest MagmaAggregateWaitTest.cpp)
+target_include_directories(MagmaAggregateWaitTest PRIVATE ${MGL_ROOT}/include ${MGL_ROOT}/MobileGL)
+target_link_libraries(MagmaAggregateWaitTest PRIVATE GTest::gtest_main ${LINK_LIBRARIES})
+gtest_discover_tests(MagmaAggregateWaitTest DISCOVERY_TIMEOUT 30 PROPERTIES LABELS unit)
+
 # The P1 poison and verify shapes at the block level: a fake GLContext, the real filler and
 # accessors out of the static library. Links gtest (not gtest_main): the suite needs its own
 # main() to point MOBILEGL_LOG_FILE_PATH at a temp file before anything logs, because its
@@ -141,7 +147,10 @@ endif()
 # have to come back to this file to add a case.
 #
 # P4a's six are FramebufferEmitTest, TextureEmitTest, SamplerEmitTest, ImageEmitTest,
-# ProgramEmitTest and CompositeResolverTest. Each lands from the contract commit with one case
+# ProgramEmitTest and CompositeResolverTest; P5e's one is ShaderBufferEmitTest (package sb, the
+# indexed buffer binding points), which takes the same shape because it has the same needs - a
+# live frontend context, a route that reaches the applier, and refusals that are a log line in
+# a shipped push build. Each lands from the contract commit with one case
 # that pins the shape its later cases depend on - the emitter is one never-destroyed process
 # singleton, or the composite band has exactly one door - so none of them is an empty file
 # waiting for a package, and none of them can be registered wrongly without a red test.
@@ -153,7 +162,8 @@ endif()
 # HERE is what keeps the later packages out of this file.
 foreach(pipeTest ResourceEmitTest VertexInputEmitTest
                  FramebufferEmitTest TextureEmitTest SamplerEmitTest ImageEmitTest
-                 ProgramEmitTest CompositeResolverTest)
+                 ProgramEmitTest CompositeResolverTest
+                 ShaderBufferEmitTest)
         add_executable(${pipeTest} ${pipeTest}.cpp)
 
         target_include_directories(${pipeTest} PRIVATE
@@ -209,10 +219,22 @@ endif()
 
 include(GoogleTest)
 gtest_discover_tests(PipeCatalogueTest DISCOVERY_TIMEOUT 30 PROPERTIES LABELS unit)
+# This source scanner must inspect the configured checkout, including in out-of-tree builds.
+# Apply the override after GoogleTest's deferred discovery, and only to this one test.
+file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/PipeCatalogueSourceRoot.cmake" CONTENT
+"if(\"PipeCatalogue.FrontendNeverTakesAnApplierAddress\" IN_LIST PipeCatalogueTest_TESTS)
+    set_tests_properties(PipeCatalogue.FrontendNeverTakesAnApplierAddress PROPERTIES
+        WORKING_DIRECTORY [==[${MGL_ROOT}]==])
+endif()
+")
+set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/PipeCatalogueSourceRoot.cmake")
+
 gtest_discover_tests(FieldOwnershipTest DISCOVERY_TIMEOUT 30 PROPERTIES LABELS unit)
 foreach(pipeTest ResourceEmitTest VertexInputEmitTest
                  FramebufferEmitTest TextureEmitTest SamplerEmitTest ImageEmitTest
-                 ProgramEmitTest CompositeResolverTest)
+                 ProgramEmitTest CompositeResolverTest
+                 ShaderBufferEmitTest)
         gtest_discover_tests(${pipeTest} DISCOVERY_TIMEOUT 30 PROPERTIES LABELS unit)
 endforeach()
 gtest_discover_tests(MagmaPipeIdentityTest DISCOVERY_TIMEOUT 30 PROPERTIES LABELS unit)

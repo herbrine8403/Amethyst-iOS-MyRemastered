@@ -7,8 +7,12 @@
 // End of Source File Header
 
 #include "GpuWritePending.h"
+#include <MG_Remote/FatalFunnel.h>
 
 #include "ClientSession.h"
+// RunsAsTheServerRole: declared beside the wire emitters that need the same predicate, so this
+// TU does not pull a server header in for it.
+#include "WireTables.h"
 
 #include <MG_Pipe/PipeMutation.h>
 #include <MG_State/GLState/BufferState/BufferObject.h>
@@ -199,6 +203,36 @@ namespace MobileGL::MG_Remote::Client {
         return static_cast<SizeT>(slice < 4096 ? 4096 : slice);
     }
 
+    SizeT MGPipeStageChunkBytesFor(Uint64 stageCapacityBytes) {
+        if (stageCapacityBytes == 0) return 0;
+        // A quarter of the arena, not all of it, for the readback slice's reason one ring over
+        // (above): the pieces of one range are staged one after another, an allocation is only
+        // reclaimable once the record carrying it has retired, and the allocator skips a
+        // remainder it cannot fill contiguously. A quarter leaves room for the pieces still in
+        // flight, so an ordinary whole-buffer upload never waits on a retirement it could have
+        // avoided.
+        const Uint64 quarter = stageCapacityBytes / 4;
+        // A floor so a pathologically small operator-supplied segment cannot make the piece
+        // width zero, which the walk reads as "refuse" (ResourceTracker.h:254); such a segment
+        // is broken anyway, and the producer's Fatal{RingOverrun} names it on the first stage.
+        const Uint64 chunk = quarter < 4096 ? 4096 : quarter;
+        return static_cast<SizeT>(chunk > stageCapacityBytes ? stageCapacityBytes : chunk);
+    }
+
+    SizeT MGPipeStageChunkBytes() {
+        // The server role's own uploads run the monolith adapter (RunsAsTheServerRole's comment
+        // in WireTables.h): cutting them would change how many calls the server's own backend
+        // sees for one application call, which is a monolith behaviour change on the apply
+        // thread and not this emitter's to make.
+        if (MG_Config::Transport == MG_Config::TransportMode::Monolith) return 0;
+        if (RunsAsTheServerRole()) return 0;
+        ClientSession* session = ClientSession::Active();
+        // No session: the emission WAS the application (every unit gate, and a monolith-shaped
+        // lane in a split build), so there is no arena to fit and the record's own bound stands.
+        if (session == nullptr) return 0;
+        return MGPipeStageChunkBytesFor(session->StageCapacityBytes());
+    }
+
     void AwaitBufferWriteback(BufferObject& buffer) {
         // THE WAIT IS THE BARRIER'S WAIT (R-3). The reply-slot id IS the record's seq, so
         // "appliedSeq reached my readback" and "my answer is back" are one condition, and
@@ -219,12 +253,11 @@ namespace MobileGL::MG_Remote::Client {
         // UnmigratedVerbFatal), and it is what gives the hole a red spelling before the
         // transport arrives.
         if (!buffer.HasOutstandingGpuWrite()) return;
-        MGLOG_F("MGPipe: Fatal{UnimplementedWritebackWait} - a ClientSession is active and buffer %u "
+        SessionFail(MGFatalFamily::UnimplementedWritebackWait, "MGPipe: Fatal{UnimplementedWritebackWait} - a ClientSession is active and buffer %u "
                 "still has an outstanding GPU write after its readback was emitted. The wait is "
                 "ClientSession::EmitAndWait's (R-3: the reply slot id IS the record seq); P5 package "
                 "b1 landed the third state and s1/c1 own the wait itself.",
                 buffer.GetExternalIndex());
-        std::abort();
     }
 
 } // namespace MobileGL::MG_Remote::Client

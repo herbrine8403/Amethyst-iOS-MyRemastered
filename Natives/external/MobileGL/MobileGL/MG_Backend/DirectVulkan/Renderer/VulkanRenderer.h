@@ -22,6 +22,9 @@
 #include "VkSamplerManager.h"
 #include "VkTextureManager.h"
 #include "VkTimerQueryManager.h"
+#if MOBILEGL_BUILD_DISAGGREGATED
+#include "WireRenderPassCompatibility.h"
+#endif
 #include "MG_Util/Math/VectorTypes.h"
 #include <Includes.h>
 #include <MG_Backend/BackendObject.h>
@@ -141,6 +144,23 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         // IBufferCopyCommandProvider: recording command buffer, outside any
         // render pass, for immediate staged buffer copies.
         VkCommandBuffer AcquireBufferCopyCommandBuffer() override;
+#if MOBILEGL_BUILD_DISAGGREGATED
+        VkBufferManager& GetWireBufferManager() { return m_bufferManager; }
+        Bool FlushWirePendingCommandsForTextureUpdate() {
+            // A new texture upload must not race graphics work that samples
+            // the old texels. No current recording does not imply no in-flight
+            // submission: finish the recorded work, then wait its whole prefix.
+            if (HasPendingRecordedWork() && !FlushPendingCommands()) return false;
+            return WaitForSubmitsUpTo(m_submitCounter, UINT64_MAX);
+        }
+        // P7 wave 2 package B3: the submission that will carry whatever is recorded NEXT.
+        // RetireWireObjects (WireDraw.inc) already tags future objects with exactly this, and
+        // for the same reason: a draw being set up now is not in any submission yet, so the
+        // index that names it is one past the counter. Deliberately NOT
+        // GetSyncPointSubmitIndex(), which answers m_submitCounter when nothing is recorded -
+        // true for a fence taken at that instant, wrong for work about to be recorded.
+        Uint64 GetWireNextSubmitIndex() const { return m_submitCounter + 1; }
+#endif
 
         // FrameContext::IRecordingObserver: prepares the frame's timer-query
         // pool (harvest + reset) right after the frame command buffer begins
@@ -213,6 +233,11 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                               GLsizei srcWidth, GLsizei srcHeight, GLsizei srcDepth);
         void GenerateMipmap(GLenum target);
         void ReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, void* pixels);
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // Server resource handle in, tightly packed owned bytes out. No frontend
+        // texture, pixel-pack state or PBO is consulted by this readback.
+        Bool ReadTextureImageWire(const MG_Pipe::MGPReadbackInfo& info, Vector<Uint8>& ownedBytes);
+#endif
         // GL_DEPTH_COMPONENT / GL_DEPTH_STENCIL / GL_STENCIL_INDEX readback from the
         // read framebuffer's depth/stencil attachment (per-aspect buffer copies with
         // CPU repacking into the requested client layout).
@@ -242,6 +267,16 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                                     Uint32 dstMipLevel, Uint32 dstBaseArrayLayer, GLint srcX, GLint srcY, GLint dstX,
                                     GLint dstY, GLint width, GLint height, VkImageLayout srcRestoreLayout,
                                     VkImageLayout dstRestoreLayout, Bool stencilAspect);
+        // One depth/stencil copy whose source and destination are the same format and whose region
+        // is a same-size, same-layer rectangle: the aspect named by `aspect` is staged through a
+        // device-local buffer so the destination's other aspect cannot be overwritten by the
+        // packed native word a whole-image copy moves.
+        Bool CopyDepthStencilAspectThroughBuffer(FrameContext::FrameData& frame, VkImage srcImage,
+                                                 VkImage dstImage, VkFormat format, Uint32 srcMipLevel,
+                                                 Uint32 srcBaseArrayLayer, Uint32 dstMipLevel,
+                                                 Uint32 dstBaseArrayLayer, GLint srcX, GLint srcY, GLint dstX,
+                                                 GLint dstY, GLsizei width, GLsizei height,
+                                                 VkImageAspectFlagBits aspect);
         static SizeT GetReadbackTexelSize(VkFormat sourceFormat);
         // Map a GL bottom-left-origin rectangle into the display-oriented swapchain image.
         // Quarter-turn surface transforms swap the copy extent's axes.
@@ -381,7 +416,20 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             Int padding[3] = {0, 0, 0};
         };
 
+        // P7 wave 2-B2, CONTRACT-P7 §5.2 (B'): THE FRONTEND MEMBERS ARE PULL-BUILD ONLY. In a
+        // disaggregated build the monolith arm blits and generates depth mips with the baked
+        // modules (WireColorBlit.inc, WireDepthMipmap.inc), so no DirectVulkan object holds a
+        // ProgramObject, a ShaderObject or a SamplerObject any more - which is what takes
+        // ProgramObject::{AllocateLifetimeId, AttachShader, Link, ~ProgramObject},
+        // ShaderObject::{SetShaderSource, Compile, JoinPendingCompile, ReleaseCompileNode,
+        // DropCompileNode} and SamplerObject::{SetWrapS, SetWrapT, SetWrapR, SetLodRange} out
+        // of the link ratchet's `p7-magma` bucket (§4.2). The destructor of a SharedPtr member
+        // is a reference too, so the MEMBER has to go and not only its construction.
+        //
+        // The structs stay, empty, so ShutdownBlitResources and the two `= {}` assignments read
+        // the same on both builds.
         struct BlitResources {
+#if !MOBILEGL_BUILD_DISAGGREGATED
             SharedPtr<MG_State::GLState::ProgramObject> program;
             SharedPtr<MG_State::GLState::SamplerObject> nearestSampler;
             SharedPtr<MG_State::GLState::SamplerObject> linearSampler;
@@ -389,15 +437,18 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             Int dstRectLocation = -1;
             Int surfaceTransformLocation = -1;
             Uint32 samplerBinding = 0;
+#endif
         };
 
         struct DepthMipmapResources {
+#if !MOBILEGL_BUILD_DISAGGREGATED
             SharedPtr<MG_State::GLState::ProgramObject> program;
             Int srcRectLocation = -1;
             Int dstRectLocation = -1;
             Int surfaceTransformLocation = -1;
             Int srcTexelSizeLocation = -1;
             Uint32 samplerBinding = 0;
+#endif
         };
 
         // A single-sample staging image for multisample-resolve blits that also have to change
@@ -433,6 +484,189 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         };
 
         void QueueClearBufferPayload(GLenum buffer, GLint drawbuffer, const ClearAttachmentPayload& clearPayload);
+#if MOBILEGL_BUILD_DISAGGREGATED
+        struct WireImage {
+            VkImage image = VK_NULL_HANDLE;
+            VkFormat format = VK_FORMAT_UNDEFINED;
+            VkImageViewType viewType = VK_IMAGE_VIEW_TYPE_2D;
+            VkExtent2D extent{};
+            VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+            VkImageLayout* trackedLayout = nullptr;
+            VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+            VkImageAspectFlags aspect = 0;
+            // Zero for the default framebuffer, which no arm that reads this ever reaches.
+            VkImageUsageFlags usageFlags = 0;
+            Uint32 level = 0, layer = 0, layers = 1, levels = 1;
+            Bool isDefault = false;
+            // Set when isDefault: the swapchain image index this role resolved to.
+            Uint32 swapchainImageIndex = 0;
+            Bool is3D = false;
+            MG_Pipe::MGPipeHandle storage = MG_Pipe::kMGPipeNullHandle;
+        };
+        // `isWriteTarget` selects which side of the default framebuffer this resolves: a write
+        // re-points it at the image Present() acquired, a read keeps the current one (see
+        // m_defaultFramebufferImageIndex). Reads must pass false.
+        WireImage ResolveWireImage(const MG_Pipe::MGPFramebufferState& fbo,
+                                   const MG_Pipe::MGPSurface& surface, VkImageAspectFlags aspect,
+                                   Bool isWriteTarget = false);
+        void TransitionWireImage(WireImage& image, VkImageLayout layout);
+        void ClearWireFramebuffer(const MG_Pipe::MGPFramebufferState& fbo,
+                                  const ClearAttachmentPayload& payload, GLint drawbuffer = -1);
+        void BlitWireFramebuffers(GLint sx0, GLint sy0, GLint sx1, GLint sy1,
+                                 GLint dx0, GLint dy0, GLint dx1, GLint dy1, GLbitfield mask, GLenum filter);
+        void ResolveWireDepthStencil(WireImage source, WireImage destination,
+                                     GLint sx0, GLint sy0, GLint sx1, GLint sy1,
+                                     GLint dx0, GLint dy0, GLint dx1, GLint dy1);
+        // One aspect of a depth/stencil image through a buffer (source in TRANSFER_SRC_OPTIMAL,
+        // destination in TRANSFER_DST_OPTIMAL, one format). The returned buffer is named by the
+        // recorded commands and must be retired with them.
+        UniquePtr<VkBufferObject> CopyWireAspectThroughBuffer(VkImage srcImage, Uint32 srcLevel, Uint32 srcLayer,
+                                                              GLint sx, GLint sy, const WireImage& destination,
+                                                              GLint dx, GLint dy, Uint32 width, Uint32 height,
+                                                              VkImageAspectFlags aspect, VkFormat format,
+                                                              Bool mirrorY, const char* fatalDetail);
+        // A single-sample depth/stencil blit whose rectangles make it a plain copy, performed
+        // without vkCmdBlitImage (P7 gate 5). False when the shape is not a plain copy.
+        Bool CopyWireDepthStencilBlit(WireImage& source, WireImage& destination,
+                                      GLint sx0, GLint sy0, GLint sx1, GLint sy1,
+                                      GLint dx0, GLint dy0, GLint dx1, GLint dy1, VkImageAspectFlags aspect);
+        // True when the rectangles give a multisample depth/stencil resolve a shape it declines
+        // (a scale, an X mirror, a Y mirror across two formats); the decline has then been
+        // logged and its INVALID_OPERATION recorded. BlitWireFramebuffers asks it BEFORE any
+        // aspect runs, so a call the SHAPE declines leaves every attachment alone - the user
+        // and the default draw framebuffer alike. The CAPABILITY decline inside
+        // ResolveWireDepthStencil (a stencil-only resolve without VK_EXT_shader_stencil_export
+        // on a device without VK_KHR_depth_stencil_resolve) is still decided per aspect, after
+        // colour ran; rule I (a) accepts that (notes/p7/magma-b2.md §2.10).
+        Bool DeclineWireDepthStencilResolveShape(const WireImage& source, const WireImage& destination,
+                                                 GLint sx0, GLint sy0, GLint sx1, GLint sy1,
+                                                 GLint dx0, GLint dy0, GLint dx1, GLint dy1);
+        PFN_vkCreateRenderPass2 m_wireCreateRenderPass2 = nullptr;
+        VkResolveModeFlags m_wireDepthResolveModes = 0;
+        VkResolveModeFlags m_wireStencilResolveModes = 0;
+        // P7 wave 2-B2, CONTRACT-P7 §3.2 (`multisample-blit-aspect`): the SECOND arm of the
+        // multisample depth/stencil resolve, for the device that does not carry
+        // VK_KHR_depth_stencil_resolve. One baked pass per aspect, sample zero, no frontend
+        // object - see WireMultisampleResolve.inc. `resolved` must be a single-sample image of
+        // the source's format and extent; the rect is expressed by the scissor.
+        Bool ResolveWireDepthStencilWithShader(WireImage source, WireImage resolved,
+                                               VkImageAspectFlags aspect, GLint sx0, GLint sy0,
+                                               Uint32 width, Uint32 height);
+        struct WireMultisampleResolveResources;
+        WireMultisampleResolveResources* m_wireMultisampleResolveResources = nullptr;
+        void DestroyWireMultisampleResolveResources();
+        Bool m_wireShaderStencilExport = false;
+        // VK_EXT_robustness2 (or its KHR promotion) with ONLY nullDescriptor enabled, wire arms
+        // only: an invalid image unit binds a null storage descriptor (codex closeout finding 2).
+        Bool m_wireNullDescriptor = false;
+        // The resolve probe's verdict for this device (WireDepthResolveArm.h,
+        // WireDepthResolveProbe.h): true when the no-draw render pass was measured leaving its
+        // target unwritten while the shader control resolved - the shader arm then resolves
+        // first and the render-pass arm is the fallback (P7 gate 5, g5-msprobe).
+        Bool m_wirePreferShaderDepthResolve = false;
+        // Runs the probe (memoized per device identity) and sets the member above. Called at the end of
+        // device creation, after ArmPrimGenReroute: it records on m_graphicsQueue.
+        void ArmWireDepthResolveOrder();
+        Bool BlitWireColorToDefault(WireImage source, WireImage destination,
+                                   GLint sx0, GLint sy0, GLint sx1, GLint sy1,
+                                   GLint dx0, GLint dy0, GLint dx1, GLint dy1, GLenum filter);
+        Bool BlitWireColorImage(WireImage source, WireImage destination,
+                               GLint sx0, GLint sy0, GLint sx1, GLint sy1,
+                               GLint dx0, GLint dy0, GLint dx1, GLint dy1, GLenum filter, Bool mipmap);
+        // P7 wave 2-B, CONTRACT-P7 §3.2 (`default-color-blit-shape`): the rotated arm. Moves the
+        // source region into an owned single-sample 2D image of a sampled-float format in the
+        // same size-compatibility class, then shader-blits THAT to the rotated default
+        // framebuffer - the shapes BlitWireColorImage itself cannot sample (an integer format, a
+        // 3D or array source) become shapes it can.
+        Bool BlitWireColorToDefaultThroughScratch(WireImage source, WireImage destination,
+                                                  GLint sx0, GLint sy0, GLint sx1, GLint sy1,
+                                                  GLint dx0, GLint dy0, GLint dx1, GLint dy1,
+                                                  GLenum filter);
+        struct WireColorBlitResources;
+        WireColorBlitResources* m_wireColorBlitResources = nullptr;
+        void DestroyWireColorBlitResources();
+        // P7 wave 2-B, CONTRACT-P7 §5.1 (A): the baked depth-mip program (WireDepthMipmap.inc).
+        // One level of a depth chain, source and destination being two depth subresources of
+        // the same image; the caller loops. It owns no frontend object, which is what the
+        // monolith arm's GenerateDepthMipmapWithShader cannot say.
+        Bool GenerateWireDepthMipLevel(WireImage source, WireImage destination);
+        struct WireDepthMipmapResources;
+        WireDepthMipmapResources* m_wireDepthMipmapResources = nullptr;
+        void DestroyWireDepthMipmapResources();
+        // P7 wave 2-B (exit gate 3): the readback's own write-visibility barrier, recorded before
+        // the copy instead of inferred from the image's tracked layout. See WireFramebuffer.inc.
+        void RecordWireReadbackWriteBarrier();
+        void ReadWirePixels(GLint x, GLint y, GLsizei width, GLsizei height,
+                            GLenum format, GLenum type, void* pixels);
+        void GenerateWireMipmap();
+        Bool SetupWireDraw(FrameContext::FrameData& frame, GLenum mode, Flags<DrawSetupAspect> aspects,
+                           const DrawCmdParam& drawParams, const IndexBufferView* indices);
+        void DestroyWireDrawPass();
+        void RetireWireDrawPass();
+        struct WireDrawAttachmentKey {
+            MG_Pipe::MGPipeHandle storage = MG_Pipe::kMGPipeNullHandle;
+            Uint32 resourceKind = 0;
+            VkImage image = VK_NULL_HANDLE;
+            VkImageViewType viewType = VK_IMAGE_VIEW_TYPE_2D;
+            VkFormat format = VK_FORMAT_UNDEFINED;
+            VkImageAspectFlags aspect = 0, requestedAspect = 0;
+            Uint32 level = 0, layer = 0, layers = 1, imageLevels = 1;
+            Uint32 width = 0, height = 0;
+            VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+            Bool operator==(const WireDrawAttachmentKey&) const = default;
+        };
+        struct WireDrawPassKey {
+            Vector<WireDrawAttachmentKey> attachments;
+            Vector<Uint32> colorReferences;
+            Uint32 depthReference = VK_ATTACHMENT_UNUSED;
+            Uint32 width = 0, height = 0, layers = 1;
+            Uint64 textureImageEpoch = 0, resourceEraseEpoch = 0;
+            VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+            Uint32 swapchainImageIndex = 0;
+            Bool isDefault = false, framebufferSrgb = false;
+            Bool operator==(const WireDrawPassKey&) const = default;
+        };
+        struct WireDrawPassCacheEntry {
+            WireDrawPassKey key;
+            UniquePtr<RenderPassEntry> pass;
+            Vector<VkImageView> views;
+        };
+        // Objects only: every draw still ends/begins its pass and records the
+        // existing memory dependencies. Each slot is cleared after its fence.
+        Bool AcquireCachedWireDrawPass(const WireDrawPassKey& key);
+        void ClearWireDrawPassCache(Uint32 frameIndex);
+        void ClearAllWireDrawPassCaches();
+        Vector<Vector<WireDrawPassCacheEntry>> m_wireDrawPassCaches;
+        WireDrawPassKey m_wireDrawPassKey;
+        WireRenderPassCompatibilityTable m_wireRenderPassCompatibility;
+        struct WireRetiredObjects {
+            Uint64 submitIndex = 0;
+            UniquePtr<RenderPassEntry> drawPass;
+            Vector<VkFramebuffer> framebuffers;
+            Vector<VkRenderPass> renderPasses;
+            Vector<VkImageView> imageViews;
+            Vector<VkDescriptorPool> descriptorPools;
+            // Transfer/resolve scratch storage belongs to the submission that
+            // consumes it, just like the views and framebuffer above.
+            Vector<UniquePtr<VkTextureManager::TextureResource>> textures;
+            Vector<UniquePtr<VkBufferObject>> buffers;
+        };
+        void RetireWireObjects(WireRetiredObjects objects);
+        void CollectWireObjects(Uint64 completedSubmit, Bool all = false);
+        Vector<WireRetiredObjects> m_wireRetiredObjects;
+        Uint32 m_wirePreparationDepth = 0;
+        void DispatchWireCompute(GLuint x, GLuint y, GLuint z);
+        void RewindWireDescriptorSetsIfDue();
+        UniquePtr<RenderPassEntry> m_wireDrawPass;
+        Vector<VkImageView> m_wireDrawViews;
+        VkPipeline GetOrCreatePipelineWithInput(GLenum mode, const MagmaProgramSource& program,
+            const ProgramFactory::VkProgramObject& programObj, ProgramFactory::CompileOptionFlags transformFlags,
+            const VertexInputStateFactory::BackendVertexInputState& vis, const RenderPassEntry& renderPassEntry,
+            Bool primitiveRestartEnable, Uint64 wireRenderPassCompatibilityId = 0);
+
+        void CopyWireFramebufferToTexture(GLenum target, GLint level, GLint xoffset, GLint yoffset,
+                                           GLint x, GLint y, GLsizei width, GLsizei height);
+#endif
         void QueueClearBufferPayloadForFramebuffer(const MG_State::GLState::FramebufferObject& framebuffer,
                                                   GLenum buffer, GLint drawbuffer,
                                                   const ClearAttachmentPayload& clearPayload);
@@ -479,6 +713,11 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         // was waited or the device was idled); drops their records and
         // recycles pooled fences.
         void OnSubmitsCompletedUpTo(Uint64 submitIndex);
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // A later fence alone cannot retire earlier submissions. Wait for the
+        // whole still-live prefix before advancing the completed submit floor.
+        Bool WaitForSubmitsUpTo(Uint64 submitIndex, Uint64 timeoutNs);
+#endif
         VkFence AcquirePooledSubmitFence();
         void DestroySubmitFencePool();
         Bool HasPendingRecordedWork() const;
@@ -703,6 +942,14 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         // Wraps a recorded draw with BeginTransformFeedbackEXT/EndTransformFeedbackEXT
         // when GL transform feedback is active; binds capture buffers on demand.
         Bool BeginXfbCaptureForDraw(FrameContext::FrameData& frame);
+        Bool BeginXfbCaptureWithBuffers(FrameContext::FrameData& frame, Uint32 count,
+                                       const VkBuffer* buffers, const VkDeviceSize* offsets,
+                                       const VkDeviceSize* sizes);
+#if MOBILEGL_BUILD_DISAGGREGATED
+        Bool BeginWireXfbCaptureForDraw(FrameContext::FrameData& frame);
+#endif
+        Uint32 m_currentDrawXfbBufferCount = 0;
+        Uint32 m_currentDrawXfbBufferMask = 0;
         void EndXfbCaptureForDraw(FrameContext::FrameData& frame, Bool began);
         // Makes the captured bytes visible to whatever reads them next. Deferred rather than
         // recorded next to the capture, because the capturing draw runs inside a render pass
@@ -810,7 +1057,28 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         VkBufferManager m_bufferManager;
 
         Uint m_imageIndexAcquired = 0;
+        // The swapchain image GL addresses as the default framebuffer: the one a readback, a
+        // blit source or a copy out of it resolves, and the one the app last rendered into.
+        // Present() runs ahead - it presents the frame and acquires the next image without
+        // waiting for the apply that would render into it (kWaitPresent) - so this must NOT
+        // follow m_imageIndexAcquired. Before it existed a readback resolved the freshly
+        // acquired image, which nothing had written yet: the pure-black sundial-lite frame.
+        Uint m_defaultFramebufferImageIndex = 0;
         FrameContext m_frameContext;
+
+        // Resolves the swapchain image index a READ of the default framebuffer must use. A
+        // non-default framebuffer ignores the index; it keeps the acquired one, which still
+        // keys its render-pass cache.
+        Uint32 DefaultFramebufferReadIndex(Bool isDefaultFramebuffer) const {
+            return isDefaultFramebuffer ? m_defaultFramebufferImageIndex : m_imageIndexAcquired;
+        }
+
+        // Same for a WRITE: the default framebuffer starts addressing the image Present()
+        // acquired only once something renders into it again.
+        Uint32 DefaultFramebufferWriteIndex(Bool isDefaultFramebuffer) {
+            if (isDefaultFramebuffer) m_defaultFramebufferImageIndex = m_imageIndexAcquired;
+            return DefaultFramebufferReadIndex(isDefaultFramebuffer);
+        }
 
         UniquePtr<PipelineFactory> m_pipelineFactory;
         // Single-slot "last pipeline" memo: skip the per-draw GetOrCreatePipeline work (state
@@ -827,6 +1095,9 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             Uint64 programHash = 0;
             Uint64 vertexInputHash = 0;
             Uint64 renderPassHash = 0;
+#if MOBILEGL_BUILD_DISAGGREGATED
+            Uint64 wireRenderPassCompatibilityId = 0;
+#endif
             // The PRE-HANDLE arm's key component (P2 brief D12.1), and 0 in every entry the
             // handle arm mints. VALUE hash of the pipeline-relevant fixed-function state (see
             // ComputePipelineStateHash), not the monotonic pipeline-state version: the version
@@ -1508,7 +1779,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
 
         VkPipeline GetOrCreatePipeline(
             GLenum mode,
-            const MG_State::GLState::ProgramObject& program,
+            const MagmaProgramSource& program,
             const ProgramFactory::VkProgramObject& programObj,
             ProgramFactory::CompileOptionFlags transformFlags,
             const MG_State::GLState::VertexArrayObject& vao,
@@ -1520,14 +1791,14 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         // flush the pending recording (see the body), which retires the current command buffer.
         Bool PrepareStorageImageTextures(
             FrameContext::FrameData& frame,
-            const MG_State::GLState::ProgramObject& program,
+            const MagmaProgramSource& program,
             const ProgramFactory::VkProgramObject& programObj);
         // Vulkan forbids a sampled descriptor and writable storage descriptor from naming the
         // same image subresource in one shader operation. Snapshot only the sampler side; the
         // storage descriptor continues to name the application texture.
         Bool PrepareSamplerImageFeedbackSnapshots(
             FrameContext::FrameData& frame,
-            const MG_State::GLState::ProgramObject& program,
+            const MagmaProgramSource& program,
             const ProgramFactory::VkProgramObject& programObj,
             VkPipelineStageFlags consumerShaderStageMask);
 
@@ -1614,7 +1885,12 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         Bool MaterializePendingDepthStencilClearForDefaultFramebuffer(
             VkCommandBuffer commandBuffer, const MG_State::GLState::FramebufferAttachmentObject& attachment,
             const ClearAttachmentPayload& payload);
+#if !MOBILEGL_BUILD_DISAGGREGATED
+        // P7 wave 2-B2 (CONTRACT-P7 §5.2, (B')): the hidden blit program's pipeline. A
+        // disaggregated build has no hidden program on either arm, so this has neither a body
+        // nor a caller there.
         VkPipeline GetOrCreateBlitPipeline(const RenderPassEntry& renderPassEntry);
+#endif
         Bool GenerateDepthMipmapWithShader(FrameContext::FrameData& frame,
                                            MG_State::GLState::ITextureObject& texture,
                                            VkTextureManager::TextureResource& resource,

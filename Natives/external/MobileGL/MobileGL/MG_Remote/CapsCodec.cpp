@@ -35,6 +35,8 @@
 #include "CapsCodec.h"
 
 #include "Protocol/mg_protocol_base.h"
+#include <MG_Pipe/PipeWireLayout.h>
+#include <MG_State/GLState/ProgramState/ProgramArtifactsCodec.h>
 
 #include <MGGitHash.h>
 #include <MG_Util/Debug/Log.h>
@@ -59,6 +61,10 @@ namespace MobileGL::MG_Remote {
     // P4a's highest allocated subsystem bit must fit the sixteen-bit block. This is the
     // assertion that turns "room to P8" from a comment into a build break.
     static_assert(MG_Pipe::kMGPipeSubsystemsMigratedAtP4a <= 0xFFFFull,
+                  "the subsystem mask no longer fits CallMask's sixteen consumer bits");
+    // P5e (sb): and the phase constant that is actually published now, so the assertion tracks
+    // the highest allocated bit rather than the highest bit at the time it was written.
+    static_assert(MG_Pipe::kMGPipeSubsystemsMigratedAtP5e <= 0xFFFFull,
                   "the subsystem mask no longer fits CallMask's sixteen consumer bits");
 
     namespace {
@@ -457,37 +463,41 @@ namespace MobileGL::MG_Remote {
     // ---------------------------------------------------------------------------------
 
     Transport::AbiFingerprintInputs CapsAbiFingerprintInputs() {
-        // MGPCaps has only a COMPOSITIONAL size assertion (MGPipeTypes.h:145-146) because
-        // DynamicBackendParameters still carries SizeT and GLenum members - P0.5's fixed-width
-        // rewrite did not happen and P5 does not do it either (table 0's ABI row; the rewrite
-        // is P7's account). So the caps block's literal size IS ABI-dependent, and this
-        // fingerprint is what turns that from a latent hazard into a named refusal.
-        //
-        // The git stamp is in it because two builds of the same sizes can still disagree about
-        // a FIELD ORDER, which no sizeof can see; P6's spawn is same-machine and same-binary,
-        // so it inherits this unchanged rather than needing a looser rule.
         Transport::AbiFingerprintInputs inputs;
         inputs.DynamicParamsSize = sizeof(MG_Backend::DynamicBackendParameters);
         inputs.CapsSize = sizeof(MG_Pipe::MGPCaps);
-        inputs.FunctionTableSize = sizeof(MG_Backend::GLFunctionsTable);
-        inputs.FormatCapabilityTargets = static_cast<Uint64>(MG_Backend::kFormatCapabilityTargetCount);
-        inputs.FormatCapabilityFormats = static_cast<Uint64>(MG_Backend::kFormatCapabilityFormatCount);
+        inputs.MemberLayout = MG_Pipe::kMGPipeWireMemberLayoutDigest;
+        inputs.CatalogueLayout = MG_Pipe::kMGPipeWireCatalogueDigest;
+        inputs.RenderStateLayout = MG_Pipe::WireRenderStateDigest();
+        inputs.FormatCapabilityTargets = MG_Backend::kFormatCapabilityTargetCount;
+        inputs.FormatCapabilityFormats = MG_Backend::kFormatCapabilityFormatCount;
         inputs.FormatCapabilitiesCodecVersion = kFormatCapabilitiesCodecVersion;
         inputs.RendererInfoCodecVersion = kRendererInfoCodecVersion;
+        inputs.ProgramArtifactsCodecVersion = MG_State::GLState::kProgramArtifactsCodecVersion;
+        inputs.ProgramArtifactsSchema = MG_State::GLState::ProgramArtifactsSchemaFingerprint();
         inputs.OpCount = static_cast<Uint64>(MG_Pipe::MGPWireOp::kOpCount);
-        // The declared protocol ABI, carried over from s1's version of this function at
-        // integration (ID-33). The sizeofs above catch a struct that changed shape; this
-        // catches a peer that changed the PROTOCOL while every struct stayed the same size,
-        // which is the one break the rest of the mix is blind to.
-        inputs.AbiVersion =
-            static_cast<Uint32>(MOBILEGL_ABI_VERSION(MOBILEGL_PROTOCOL_ABI_MAJOR, MOBILEGL_PROTOCOL_ABI_MINOR));
-        inputs.BuildStamp = GIT_COMMIT_HASH_SHORT;
+#if MOBILEGL_BUILD_DISAGGREGATED
+        inputs.ControlSchemaRevision =
+            (static_cast<Uint64>(MOBILEGL_PROTOCOL_CONTROL_REVISION) << 32) |
+            MG_Pipe::kMGPipeResourceRespecifyExtentCarrierRevision;
+#else
+        // The pull build has no respecify extent carrier; preserve its pre-P7 wire fingerprint.
+        inputs.ControlSchemaRevision = MOBILEGL_PROTOCOL_CONTROL_REVISION;
+#endif
+        inputs.AbiVersion = MOBILEGL_ABI_VERSION(MOBILEGL_PROTOCOL_ABI_MAJOR, MOBILEGL_PROTOCOL_ABI_MINOR);
+        inputs.PointerBits = sizeof(void*) * 8;
+        const Uint32 endian = 1;
+        inputs.LittleEndian = *reinterpret_cast<const Uint8*>(&endian) == 1 ? 1u : 0u;
         return inputs;
     }
 
-    // ONE implementation, deliberately a one-liner: the wave-1 review (ID-46 finding 6) found a
-    // second hand-rolled FNV loop here while the mixer under Transport/ had no production caller,
-    // so the sensitivity test could not see this function change. Now it starts from here.
-    Uint64 CapsAbiFingerprint() { return Transport::MixAbiFingerprint(CapsAbiFingerprintInputs()); }
+    Uint64 WireFingerprint() {
+        static const Uint64 fingerprint = Transport::MixAbiFingerprint(CapsAbiFingerprintInputs());
+        return fingerprint;
+    }
+    // Compatibility spelling for existing wire tests and helper peers.
+    Uint64 CapsAbiFingerprint() { return WireFingerprint(); }
+    const char* BuildFingerprint() { return MOBILEGL_BUILD_STAMP_VALUE; }
+    Bool BuildFingerprintPresent() { return MOBILEGL_BUILD_STAMP_PRESENT != 0; }
 
 } // namespace MobileGL::MG_Remote

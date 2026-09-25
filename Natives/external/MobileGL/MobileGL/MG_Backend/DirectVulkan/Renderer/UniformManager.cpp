@@ -29,6 +29,13 @@
 #include "MG_Util/Metrics/TextureMetrics.h"
 #include "MG_Util/ShaderTranspiler/Types.h"
 #include <Config.h>
+#if MOBILEGL_BUILD_DISAGGREGATED
+#include <MG_Pipe/PipeApply.h>
+// P7 wave 0: the seam WireDescriptorFatal dies through. See MG_Pipe/PipeSessionFail.h.
+#include <MG_Pipe/PipeSessionFail.h>
+// P7 wave 2 package B3: rule I's tally for this file's silent wire-draw exits.
+#include "WireDeclineTally.h"
+#endif
 #include <vulkan/utility/vk_format_utils.h>
 #include <algorithm>
 #include <cstdio>
@@ -37,6 +44,268 @@
 #include <limits>
 
 namespace MobileGL::MG_Backend::DirectVulkan {
+#if MOBILEGL_BUILD_DISAGGREGATED
+    SizeT UniformManager::WireImageViewKeyHash::operator()(const WireImageViewKey& key) const {
+        SizeT hash = std::hash<VkImage>{}(key.image);
+        const auto mix = [&hash](Uint64 value) {
+            hash ^= std::hash<Uint64>{}(value) + static_cast<SizeT>(0x9e3779b97f4a7c15ULL) +
+                    (hash << 6) + (hash >> 2);
+        };
+        mix(key.root.Slot);
+        mix(key.root.Gen);
+        mix(key.imageEpoch);
+        mix(key.flags);
+        mix(key.type);
+        mix(key.format);
+        mix(key.components.r);
+        mix(key.components.g);
+        mix(key.components.b);
+        mix(key.components.a);
+        mix(key.range.aspectMask);
+        mix(key.range.baseMipLevel);
+        mix(key.range.levelCount);
+        mix(key.range.baseArrayLayer);
+        mix(key.range.layerCount);
+        return hash;
+    }
+
+    // P7 wave 0, the descriptor half of WireFramebuffer.inc's MagmaWireFatal - same message,
+    // same seam, same reason. Four of the fifteen P7-marked refusals die here.
+    [[noreturn]] static void WireDescriptorFatal(const char* detail) {
+        MG_Pipe::MGPipeSessionFail(MG_Pipe::MGPipeFatalFamily::UnmigratedVerb,
+                                   "MGPipe: Fatal{UnmigratedVerb, \"Magma:%s\"}", detail);
+    }
+
+    static Bool ResolveWireRange(Uint64 offset, Uint64 declaredSize, VkDeviceSize bufferSize,
+                                 VkDeviceSize& start, VkDeviceSize& size) {
+        if (offset >= bufferSize) return false;
+        start = static_cast<VkDeviceSize>(offset);
+        const VkDeviceSize remaining = bufferSize - start;
+        size = declaredSize == MG_Pipe::kMGPipeWholeBuffer
+            ? remaining : std::min<VkDeviceSize>(declaredSize, remaining);
+        return size != 0;
+    }
+
+    static VkImageViewType WireViewType(MG_Pipe::MGPipeResourceTarget target) {
+        using T = MG_Pipe::MGPipeResourceTarget;
+        switch (target) {
+        case T::Tex1D: return VK_IMAGE_VIEW_TYPE_1D;
+        case T::Tex1DArray: return VK_IMAGE_VIEW_TYPE_1D_ARRAY;
+        case T::Tex3D: return VK_IMAGE_VIEW_TYPE_3D;
+        case T::TexCube: return VK_IMAGE_VIEW_TYPE_CUBE;
+        case T::TexCubeArray: return VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+        case T::Tex2DArray: case T::Tex2DMSArray: return VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        default: return VK_IMAGE_VIEW_TYPE_2D;
+        }
+    }
+
+    // GL ignores Layer/Layered for a target with no layers. In particular image1D stays a 1D
+    // view, and an ignored nonzero Layer must not address another slice.
+    static Bool WireTargetHasLayers(MG_Pipe::MGPipeResourceTarget target) {
+        using T = MG_Pipe::MGPipeResourceTarget;
+        return target == T::Tex1DArray || target == T::Tex2DArray || target == T::Tex2DMSArray ||
+               target == T::Tex3D || target == T::TexCube || target == T::TexCubeArray;
+    }
+
+    // GL 4.6 core 8.26: an access through an image unit whose texture does not HAVE the
+    // (level, layer) the unit names is INVALID. A load returns zero, a store does nothing, an
+    // atomic updates nothing - and none of it is an error, neither at bind time (the bind only
+    // checks the level's and the layer's signs) nor at the draw. It is the observable an empty
+    // unit has, so the answer is the empty unit's (ResolveWirePlaceholderImage): a NULL storage
+    // descriptor where the device enables VK_EXT_robustness2 nullDescriptor, else a storage
+    // placeholder private to the unit (per shape), cleared before each use, of the dimensionality
+    // the SHADER declared.
+    //
+    // KHR-GL46.shader_image_load_store.incomplete_textures is the shape that found it: level 2
+    // of a texture that defines only level 0 (MAX_LEVEL 7, a mipmapping filter). The same
+    // question comes up empty for a level past an immutable texture's storage, a layer past an
+    // array's last slice, a texture that has no storage at all, and a level past a texture
+    // view's own window even where its owner has one. The record carries exactly what
+    // glBindImageTexture was given, so it is decided here, by the walk every wire consumer uses
+    // to find a texel's storage, and from that walk's "not there" answer ONLY: a null for any
+    // other reason (a dead record, a stale view CSO) stays the descriptor resolve's refusal.
+    //
+    // NOT DECIDED HERE, deliberately: a level that IS in storage but lies outside
+    // [BASE_LEVEL, MAX_LEVEL], or of a texture that is not mipmap-complete. The monolith arm
+    // binds those as it finds them too, and the P7 gate 5 comparison is against that arm.
+    static Bool WireShaderImageNamesNoTexel(VkTextureManager& textures, const MG_Pipe::MGPImageView& image) {
+        const auto& state = MG_Pipe::MGPipeApplier();
+        if (MG_Pipe::MGPipeHandleIsNull(image.Res) || image.Res.Slot >= state.TextureResources.size()) return false;
+        const auto& record = state.TextureResources[image.Res.Slot];
+        if (!record.Live || record.Gen != image.Res.Gen) return false;
+        const Bool selectsLayer =
+            WireTargetHasLayers(static_cast<MG_Pipe::MGPipeResourceTarget>(record.Desc.Target)) && !image.Layered;
+        Uint32 level = image.Level;
+        Uint32 layer = selectsLayer ? image.Layer : 0;
+        Bool outsideWindow = false;
+        (void)textures.ResolveWireTextureStorage(image.Res, level, layer, nullptr, nullptr, &outsideWindow);
+        return outsideWindow;
+    }
+
+    static VkComponentSwizzle WireSwizzle(Uint8 value) {
+        switch (static_cast<TextureSwizzleParam>(value)) {
+        case TextureSwizzleParam::Red: return VK_COMPONENT_SWIZZLE_R;
+        case TextureSwizzleParam::Green: return VK_COMPONENT_SWIZZLE_G;
+        case TextureSwizzleParam::Blue: return VK_COMPONENT_SWIZZLE_B;
+        case TextureSwizzleParam::Alpha: return VK_COMPONENT_SWIZZLE_A;
+        case TextureSwizzleParam::Zero: return VK_COMPONENT_SWIZZLE_ZERO;
+        case TextureSwizzleParam::One: return VK_COMPONENT_SWIZZLE_ONE;
+        default: WireDescriptorFatal("sampler-swizzle");
+        }
+    }
+
+    Bool UniformManager::ResolveWireImageDescriptor(
+        VkCommandBuffer commandBuffer, const MagmaProgramSource& program,
+        const ProgramFactory::VkProgramObject& programObj, Uint32 binding, Uint32 element,
+        Bool storage, VkDescriptorImageInfo& out) const {
+        out = {};
+        auto& state = MG_Pipe::MGPipeApplier();
+        const Int baseLocation = programObj.samplerUniformLocationByBinding[binding];
+        const Int location = baseLocation + static_cast<Int>(element);
+        if (baseLocation < 0 || !program.UniformLocationsAliasSameUniform(baseLocation, location)) return false;
+        const Int unit = program.GetUniformSamplerOrImageUnitIndex(static_cast<Uint>(location));
+        if (unit < 0 || static_cast<Uint32>(unit) >=
+            (storage ? MG_Pipe::kMGPipeMaxImageUnits : MG_Pipe::kMGPipeMaxTextureUnits)) return false;
+        const auto handle = storage ? state.BoundShaderImages[unit].Res : state.BoundSamplerViews[unit].Texture;
+        // An EMPTY image unit is the same 8.26 invalid access as the named-but-missing texel
+        // below, so it takes the same answer: a null storage descriptor where the device has
+        // one, else the unit-private placeholder (codex closeout finding 2).
+        if (MG_Pipe::MGPipeHandleIsNull(handle))
+            return ResolveWirePlaceholderImage(commandBuffer, program, programObj, binding, storage, out,
+                                               VK_FORMAT_UNDEFINED, static_cast<Uint32>(unit));
+        if (handle.Slot >= state.TextureResources.size()) WireDescriptorFatal("image-record");
+        const auto& record = state.TextureResources[handle.Slot];
+        if (!record.Live || record.Gen != handle.Gen) WireDescriptorFatal("image-record-generation");
+        // Before the sync: a texture with no storage at all is one of the shapes, and syncing
+        // it would refuse rather than answer.
+        if (storage && WireShaderImageNamesNoTexel(*m_textureManager, state.BoundShaderImages[unit])) {
+            const VkFormat bound = MG_Util::ConvertTextureInternalFormatToVkEnum(
+                MG_Util::ConvertGLEnumToTextureInternalFormat(state.BoundShaderImages[unit].InternalFormat));
+            return ResolveWirePlaceholderImage(commandBuffer, program, programObj, binding, storage, out, bound,
+                                               static_cast<Uint32>(unit));
+        }
+        auto* resource = m_textureManager->SyncTextureResourceByHandle(handle, false, storage);
+        if (!resource) WireDescriptorFatal("image-resource");
+        m_textureManager->FlushPendingUploads();
+
+        const auto target = static_cast<MG_Pipe::MGPipeResourceTarget>(record.Desc.Target);
+        const Bool layerable = WireTargetHasLayers(target);
+        Uint32 level = storage ? state.BoundShaderImages[unit].Level : record.Params.BaseLevel;
+        // GL ignores Layer/Layered for non-layerable targets (WireTargetHasLayers).
+        Uint32 layer = storage && layerable && !state.BoundShaderImages[unit].Layered
+            ? state.BoundShaderImages[unit].Layer : 0;
+        const Uint32 localLevel = level;
+        const Uint32 localLayer = layer;
+        Uint32 layers = 0;
+        VkFormat aliasFormat = VK_FORMAT_UNDEFINED;
+        const auto root = m_textureManager->ResolveWireTextureStorage(handle, level, layer, &aliasFormat, &layers);
+        if (MG_Pipe::MGPipeHandleIsNull(root)) WireDescriptorFatal("image-view-window");
+        VkImageViewType type = WireViewType(target);
+        if (storage && layerable && !state.BoundShaderImages[unit].Layered) {
+            layers = 1;
+            type = target == MG_Pipe::MGPipeResourceTarget::Tex1DArray ? VK_IMAGE_VIEW_TYPE_1D : VK_IMAGE_VIEW_TYPE_2D;
+        }
+        if (type == VK_IMAGE_VIEW_TYPE_3D) layers = 1;
+        Uint32 levels = 1;
+        if (!storage) {
+            if (record.Params.MaxLevel < localLevel || record.Desc.Levels <= localLevel) return false;
+            levels = std::min<Uint32>(record.Desc.Levels - localLevel,
+                                     record.Params.MaxLevel - localLevel + 1);
+            const auto viewHandle = state.BoundSamplerViews[unit].View;
+            if (!MG_Pipe::MGPipeHandleIsNull(viewHandle) && viewHandle.Slot < state.SamplerViewCsos.size()) {
+                const auto& view = state.SamplerViewCsos[viewHandle.Slot];
+                if (!view.Live || view.Gen != viewHandle.Gen || view.View.Texture != handle)
+                    WireDescriptorFatal("sampler-view-record");
+                // Ordinary texture views can encode an unrestricted window with zero
+                // counts; only an actual restriction narrows the resource/parameter range.
+                if (view.View.NumLevels != 0) {
+                    if (view.View.NumLevels <= localLevel) WireDescriptorFatal("sampler-view-level");
+                    levels = std::min<Uint32>(levels, view.View.NumLevels - localLevel);
+                }
+            } else if (!MG_Pipe::MGPipeHandleIsNull(viewHandle)) {
+                WireDescriptorFatal("sampler-view-record");
+            }
+            levels = std::min(levels, resource->mipLevels - level);
+        }
+        VkFormat format = aliasFormat == VK_FORMAT_UNDEFINED ? resource->format : aliasFormat;
+        const auto domain = programObj.samplerNumericDomainByBinding[binding];
+        if (storage) {
+            format = ResolveStorageImageViewFormat(programObj.storageImageFormatByBinding[binding],
+                state.BoundShaderImages[unit].InternalFormat, format,
+                programObj.storageImageUsesBindingFormatByBinding[binding]);
+        } else if (resource->aspect == VK_IMAGE_ASPECT_COLOR_BIT) {
+            format = VkTextureManager::ResolveSampledImageViewFormat(format, domain);
+        }
+        if (format == VK_FORMAT_UNDEFINED) return false;
+        VkImageAspectFlags aspect = resource->aspect;
+        if (!storage && (aspect & VK_IMAGE_ASPECT_DEPTH_BIT))
+            aspect = record.Params.DepthStencilMode == MG_Pipe::kMGPipeDepthStencilModeStencil
+                ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
+
+        // All wire image descriptors use GENERAL. A texture sampled and image-bound in
+        // the same shader then has one truthful layout, including views of the same owner.
+        if (!VkTextureManager::TransitionImageLayout(commandBuffer, resource->image, resource->layout,
+            VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            resource->layout == VK_IMAGE_LAYOUT_UNDEFINED ? 0 : VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, resource->aspect, 0, resource->mipLevels))
+            WireDescriptorFatal("image-descriptor-transition");
+        // A second descriptor/draw can keep GENERAL after a shader write. A layout
+        // equality fast return is not a memory dependency for that prior write.
+        VkMemoryBarrier memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        memory.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        memory.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             0, 1, &memory, 0, nullptr, 0, nullptr);
+        VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        info.image = resource->image;
+        info.viewType = type;
+        info.format = format;
+        info.subresourceRange = {aspect, level, levels, layer, layers};
+        if (!storage) {
+            const Bool alphaIsOne = ResolveTextureFormatInfo(
+                static_cast<TextureInternalFormat>(record.Desc.InternalFormat)).expandRgbToRgba;
+            const auto swizzle = [&](Uint32 channel) {
+                const auto value = record.Params.Swizzle[channel];
+                return alphaIsOne && static_cast<TextureSwizzleParam>(value) == TextureSwizzleParam::Alpha
+                    ? VK_COMPONENT_SWIZZLE_ONE : WireSwizzle(value);
+            };
+            info.components = {swizzle(0), swizzle(1), swizzle(2), swizzle(3)};
+        }
+        VkImageView view = VK_NULL_HANDLE;
+        const WireImageViewKey key{root, info.image, m_textureManager->GetTextureImageEpoch(),
+            info.flags, info.viewType, info.format, info.components, info.subresourceRange};
+        const auto& frame = m_frames[m_wireFrameIndex];
+        const auto cached = frame.wireImageViewCache.find(key);
+        if (cached != frame.wireImageViewCache.end()) {
+            view = cached->second;
+        } else {
+            if (vkCreateImageView(m_device, &info, nullptr, &view) != VK_SUCCESS) return false;
+            frame.wireImageViews.push_back(view);
+            frame.wireImageViewCache.emplace(key, view);
+        }
+        // Only view creation is memoized. Layout/memory dependencies above and
+        // write tracking below still run for every descriptor, including hits.
+        out.imageView = view;
+        out.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        if (storage) {
+            if (state.BoundShaderImages[unit].Access != kMGPipeImageAccessReadOnly)
+                m_textureManager->MarkWireTextureGpuWritten(handle, localLevel, localLayer, layers);
+        } else {
+            auto samplerHandle = state.BoundSamplerStates[unit];
+            if (MG_Pipe::MGPipeHandleIsNull(samplerHandle)) samplerHandle = record.Params.BuiltinSampler;
+            if (MG_Pipe::MGPipeHandleIsNull(samplerHandle) || samplerHandle.Slot >= state.SamplerCsos.size())
+                WireDescriptorFatal("sampler-record");
+            const auto& sampler = state.SamplerCsos[samplerHandle.Slot];
+            if (!sampler.Live || sampler.Gen != samplerHandle.Gen) WireDescriptorFatal("sampler-record-generation");
+            out.sampler = m_samplerManager->GetOrCreateSamplerFromParameters(sampler.Params,
+                static_cast<TextureInternalFormat>(record.Desc.InternalFormat),
+                domain == SamplerNumericDomain::SignedInteger || domain == SamplerNumericDomain::UnsignedInteger,
+                levels);
+            if (!out.sampler) return false;
+        }
+        return true;
+    }
+#endif
     namespace {
         constexpr Uint kFallbackTexture2DExternalIndex = 0xFFFFFF00u;
         // One id for every storage-image placeholder. They are never reachable through GL - no
@@ -189,6 +458,8 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         }
     }
 
+#include "WirePlaceholderImages.inc"
+
     static Bool FindFramebufferAttachmentForTexture(const MG_State::GLState::FramebufferObject& framebuffer,
                                                     const MG_State::GLState::ITextureObject& texture,
                                                     FramebufferAttachmentType& outAttachment, Int& outLevel) {
@@ -234,7 +505,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     // per array element, so the element's location is the base plus its index - bounded by the
     // array's real extent so a descriptorCount that outran the reflection cannot walk onto the
     // next uniform. Element 0 is the ordinary non-array case and costs nothing extra.
-    static Int ResolveDescriptorElementLocation(const MG_State::GLState::ProgramObject& program, Int baseLocation,
+    static Int ResolveDescriptorElementLocation(const MagmaProgramSource& program, Int baseLocation,
                                                 Uint32 element) {
         if (baseLocation < 0 || element == 0) {
             return baseLocation;
@@ -252,7 +523,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                    : 1u;
     }
 
-    static Int ResolveSamplerUnitIndex(const MG_State::GLState::ProgramObject& program, Int location, Uint32 binding) {
+    static Int ResolveSamplerUnitIndex(const MagmaProgramSource& program, Int location, Uint32 binding) {
         MOBILEGL_ASSERT(location >= -1, "ResolveSamplerUnitIndex: invalid sampler location for binding %u", binding);
         if (location < 0) {
             return 0;
@@ -301,6 +572,17 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         m_bufferManager = bufferManager;
         m_programFactory = programFactory;
         m_minDynamicOffsetAlignment = std::max<VkDeviceSize>(1, minUniformBufferOffsetAlignment);
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+            VkPhysicalDeviceProperties properties{};
+            vkGetPhysicalDeviceProperties(m_physicalDevice, &properties);
+            m_wireStorageOffsetAlignment = std::max<VkDeviceSize>(1, properties.limits.minStorageBufferOffsetAlignment);
+            m_wireTexelOffsetAlignment = std::max<VkDeviceSize>(1, properties.limits.minTexelBufferOffsetAlignment);
+            m_wireMaxUniformRange = properties.limits.maxUniformBufferRange;
+            m_wireMaxStorageRange = properties.limits.maxStorageBufferRange;
+            m_wireMaxTexelElements = properties.limits.maxTexelBufferElements;
+        }
+#endif
         m_frameCount = frameCount;
         m_maxBindings = maxBindings;
         m_samplerResolveMemo.assign(m_maxBindings, SamplerResolveMemo{});
@@ -349,6 +631,11 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         m_unboundStorageImageTextures.clear();
         for (auto& frame : m_frames) {
             if (m_device != VK_NULL_HANDLE) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+                frame.wireImageViewCache.clear();
+                for (const auto view : frame.wireImageViews) vkDestroyImageView(m_device, view, nullptr);
+                frame.wireImageViews.clear();
+#endif
                 for (auto& view : frame.texelBufferViews) {
                     if (view != VK_NULL_HANDLE) {
                         vkDestroyBufferView(m_device, view, nullptr);
@@ -369,6 +656,12 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             frame.peakAllocatedSetsThisFrame = 0;
         }
         m_frames.clear();
+#if MOBILEGL_BUILD_DISAGGREGATED
+        for (auto& entry : m_wirePlaceholderImages) DestroyWirePlaceholderImage(entry.second);
+        m_wirePlaceholderImages.clear();
+        m_wirePrivateStoragePlaceholders = 0;
+        m_wireInvalidStorageImagesBindNull = false;
+#endif
 
         m_bufferManager = nullptr;
         m_programFactory = nullptr;
@@ -390,6 +683,12 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     void UniformManager::BeginFrame(Uint32 frameIndex) {
         MOBILEGL_ASSERT(frameIndex < m_frames.size(), "UniformDescriptorBinder::BeginFrame invalid frame index");
         auto& frame = m_frames[frameIndex];
+#if MOBILEGL_BUILD_DISAGGREGATED
+        m_wireFrameIndex = frameIndex;
+        frame.wireImageViewCache.clear();
+        for (const auto view : frame.wireImageViews) vkDestroyImageView(m_device, view, nullptr);
+        frame.wireImageViews.clear();
+#endif
         for (auto& view : frame.texelBufferViews) {
             if (view != VK_NULL_HANDLE) {
                 vkDestroyBufferView(m_device, view, nullptr);
@@ -427,6 +726,40 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             m_samplerResolveMemo[binding].infoValid = false;
         }
     }
+
+#if MOBILEGL_BUILD_DISAGGREGATED
+    Bool UniformManager::WireDescriptorSetBudgetReached(Uint32 frameIndex) const {
+        MOBILEGL_ASSERT(frameIndex < m_frames.size(), "WireDescriptorSetBudgetReached invalid frame index");
+        return m_frames[frameIndex].allocatedSetsThisFrame >= kWireDescriptorSetBudget;
+    }
+
+    SizeT UniformManager::RewindWireDescriptorSets(Uint32 frameIndex) {
+        MOBILEGL_ASSERT(frameIndex < m_frames.size(), "RewindWireDescriptorSets invalid frame index");
+        auto& frame = m_frames[frameIndex];
+        // The caller proved that the last graphics submit using these sets has
+        // retired and that no unsubmitted command buffer still references them.
+        // Keep the pools and sets: only the per-layout write cursors rewind.
+        // Image and buffer views stay alive until the regular frame boundary.
+        m_peakDescriptorSetsObserved = std::max(m_peakDescriptorSetsObserved, frame.peakAllocatedSetsThisFrame);
+        SizeT cachedSets = 0;
+        for (auto& entry : frame.descriptorSetCacheByLayout) {
+            cachedSets += entry.second.sets.size();
+            entry.second.cursor = 0;
+        }
+        frame.allocatedSetsThisFrame = 0;
+        frame.peakAllocatedSetsThisFrame = 0;
+        for (auto& entry : m_descriptorReuseMemo) entry.valid = false;
+        m_fastRebindMemo.valid = false;
+        m_lastBindValid = false;
+        const Uint32 touchedBindings =
+            std::min<Uint32>(m_samplerResolveMemoHighWater, static_cast<Uint32>(m_samplerResolveMemo.size()));
+        for (Uint32 binding = 0; binding < touchedBindings; ++binding) {
+            m_samplerResolveMemo[binding].valid = false;
+            m_samplerResolveMemo[binding].infoValid = false;
+        }
+        return cachedSets;
+    }
+#endif
 
     void UniformManager::OnDescriptorSetLayoutDestroyed(VkDescriptorSetLayout descriptorSetLayout) {
         SizeT purgedSets = 0;
@@ -467,11 +800,14 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     }
 
     Bool UniformManager::ResolveSamplerDescriptor(VkCommandBuffer commandBuffer,
-                                                            const MG_State::GLState::ProgramObject& program,
+                                                            const MagmaProgramSource& program,
                                                             const ProgramFactory::VkProgramObject& programObj,
                                                             Uint32 binding, Uint32 element,
                                                             VkDescriptorImageInfo& outImageInfo,
                                                             Bool trustUnchangedHint) const {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (program.IsWire()) return ResolveWireImageDescriptor(commandBuffer, program, programObj, binding, element, false, outImageInfo);
+#endif
         MOBILEGL_ASSERT(m_textureManager != nullptr, "ResolveSamplerDescriptor: texture manager is null");
         MOBILEGL_ASSERT(m_samplerManager != nullptr, "ResolveSamplerDescriptor: sampler manager is null");
         // The whole-descriptor memo below is keyed by binding alone, so it describes a binding
@@ -753,7 +1089,10 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     }
 
     Bool UniformManager::ProgramSamplesOnlySingleLevelTextures(
-        const MG_State::GLState::ProgramObject& program, const ProgramFactory::VkProgramObject& programObj) {
+        const MagmaProgramSource& program, const ProgramFactory::VkProgramObject& programObj) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (program.IsWire()) return false; // Conservative optimization gate; no frontend probe.
+#endif
         // A declined program never draws (see VkProgramObject::declinedDescriptors), and its
         // declined binding has no resolvable uniform location - so there is nothing to prove
         // about the textures it would have sampled.
@@ -810,7 +1149,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         return sawSampler;
     }
 
-    Bool UniformManager::ResolveSamplerTexture(const MG_State::GLState::ProgramObject& program,
+    Bool UniformManager::ResolveSamplerTexture(const MagmaProgramSource& program,
                                                          const ProgramFactory::VkProgramObject& programObj, Uint32 binding,
                                                          SharedPtr<MG_State::GLState::ITextureObject>& outTexture) {
         outTexture.reset();
@@ -837,7 +1176,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     }
 
     MG_State::GLState::ITextureObject* UniformManager::ResolveSamplerTextureRaw(
-        const MG_State::GLState::ProgramObject& program, const ProgramFactory::VkProgramObject& programObj,
+        const MagmaProgramSource& program, const ProgramFactory::VkProgramObject& programObj,
         Uint32 binding, Uint32 element) {
         MOBILEGL_ASSERT(MGB_CTX_LIVE, "ResolveSamplerTextureRaw: GL context is null");
         MOBILEGL_ASSERT(binding < programObj.samplerUniformLocationByBinding.size(),
@@ -864,10 +1203,118 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         return texture;
     }
 
-    Bool UniformManager::ResolveTexelBufferDescriptor(const MG_State::GLState::ProgramObject& program,
+#if MOBILEGL_BUILD_DISAGGREGATED
+    Bool UniformManager::ResolveWireTexelBufferDescriptor(const MagmaProgramSource& program,
+            const ProgramFactory::VkProgramObject& programObj, Uint32 binding, Uint32 frameIndex,
+            Bool storage, VkBufferView& out) {
+        out = VK_NULL_HANDLE;
+        if (binding >= programObj.samplerUniformLocationByBinding.size() ||
+            binding >= programObj.samplerNumericDomainByBinding.size() || frameIndex >= m_frames.size()) return false;
+        const Int location = programObj.samplerUniformLocationByBinding[binding];
+        if (location < 0) return false;
+        const Int unit = program.GetUniformSamplerOrImageUnitIndex(static_cast<Uint>(location));
+        const auto& state = MG_Pipe::MGPipeApplier();
+        if (unit < 0 || static_cast<Uint32>(unit) >=
+            (storage ? MG_Pipe::kMGPipeMaxImageUnits : MG_Pipe::kMGPipeMaxTextureUnits)) return false;
+        if (storage && binding >= programObj.storageImageFormatByBinding.size()) return false;
+        const VkFormat declaredFormat = storage ? programObj.storageImageFormatByBinding[binding] : VK_FORMAT_UNDEFINED;
+        const auto placeholder = [&] {
+            out = AcquireUnboundTexelBufferView(declaredFormat,
+                programObj.samplerNumericDomainByBinding[binding], storage);
+            return out != VK_NULL_HANDLE;
+        };
+        const auto texture = storage ? state.BoundShaderImages[unit].Res : state.BoundSamplerViews[unit].Texture;
+        if (MG_Pipe::MGPipeHandleIsNull(texture)) return placeholder();
+        if (texture.Slot >= state.TextureResources.size()) WireDescriptorFatal("texel-buffer-record");
+        const auto& record = state.TextureResources[texture.Slot];
+        if (!record.Live || record.Gen != texture.Gen) WireDescriptorFatal("texel-buffer-generation");
+        if (record.Desc.Target != static_cast<Uint8>(MG_Pipe::MGPipeResourceTarget::TexBuffer))
+            WireDescriptorFatal("texel-buffer-target");
+        const auto buffer = record.Desc.BufferForTexBuffer;
+        if (MG_Pipe::MGPipeHandleIsNull(buffer)) return placeholder();
+
+        BufferSlice slice{};
+        if (!m_bufferManager->AcquireWireSlice(BufferKind::TextureBuffer, buffer, slice) || !slice.IsValid()) return false;
+        const auto internalFormat = static_cast<TextureInternalFormat>(record.Desc.InternalFormat);
+        VkFormat format = declaredFormat;
+        if (storage && format == VK_FORMAT_UNDEFINED && state.BoundShaderImages[unit].InternalFormat != 0)
+            format = MG_Util::ConvertTextureInternalFormatToVkEnum(MG_Util::ConvertGLEnumToTextureInternalFormat(
+                state.BoundShaderImages[unit].InternalFormat));
+        if (format == VK_FORMAT_UNDEFINED) format = MG_Util::ConvertTextureInternalFormatToVkEnum(internalFormat);
+        const auto feature = storage ? VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT : VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT;
+        if (format == VK_FORMAT_UNDEFINED || !BufferFormatSupportsFeature(m_physicalDevice, format, feature)) {
+            // P7 A.5, a decline (rule I (a)). GL's buffer-texture format list is wider than what
+            // Vulkan mandates for texel buffers - GL_RGB32{F,I,UI} and the 16-bit UNORM members
+            // are the realistic misses on a real driver - so this is a device capability gap, not
+            // anything the application did wrong, and nothing it could have sent differently.
+            //
+            // The placeholder is the RIGHT answer here, where it was not for the unaligned range
+            // above, and the difference is whether a correct answer exists at all. There, the
+            // bytes are addressable and only the descriptor cannot name them, so a placeholder
+            // would have hidden a fixable gap behind silently dropped writes. Here the device
+            // cannot represent this format as a texel buffer in any form - so the honest
+            // observable is monolith's for a missing view: the fetch reads zeros and the draw
+            // survives. AcquireUnboundTexelBufferView falls back to the R32 member of the
+            // shader's numeric class, whose texel-buffer support is mandatory, so the fallback
+            // itself cannot fail for want of device features.
+            MGLOG_E_ONCE("ResolveWireTexelBufferDescriptor: binding %u wants VkFormat %d as a %s texel buffer and "
+                         "this device does not support it; the binding falls back to the zero placeholder and the "
+                         "fetch reads zeros (texel-buffer-native-format)",
+                         binding, static_cast<Int>(format), storage ? "storage" : "uniform");
+            return placeholder();
+        }
+        const VkDeviceSize texelSize = MG_Util::GetSizedInternalFormatSizeInBytes(internalFormat);
+        VkDeviceSize start = 0, size = 0;
+        if (texelSize == 0 || !ResolveWireRange(record.Desc.BufOffset, record.Desc.BufSize, slice.size, start, size)) return false;
+        size = std::min(size / texelSize, static_cast<VkDeviceSize>(m_wireMaxTexelElements)) * texelSize;
+        if (size == 0) return false;
+        if (start > std::numeric_limits<VkDeviceSize>::max() - slice.offset)
+            WireDescriptorFatal("texel-buffer-offset-overflow");
+        if ((slice.offset + start) % m_wireTexelOffsetAlignment != 0) {
+            // P7 A.4, a named decline (rule I (a)). Not reachable through the public API:
+            // glTexBufferRange already refuses an offset that is not a multiple of
+            // GL_TEXTURE_BUFFER_OFFSET_ALIGNMENT (GL_Texture.cpp), and that cap is published
+            // from this same minTexelBufferOffsetAlignment. It stays a decline rather than a
+            // copy for the reason below.
+            const Bool writable = storage && state.BoundShaderImages[unit].Access != kMGPipeImageAccessReadOnly;
+            MGLOG_E_ONCE("ResolveWireTexelBufferDescriptor: binding %u is bound at offset %llu, which is not a "
+                         "multiple of this device's minTexelBufferOffsetAlignment (%llu); the %s view is DECLINED "
+                         "(unaligned-texel-buffer-range)", binding,
+                         static_cast<unsigned long long>(slice.offset + start),
+                         static_cast<unsigned long long>(m_wireTexelOffsetAlignment),
+                         writable ? "writable" : "read-only");
+            // A read-only fetch can still be served the way an unbound buffer texture is -
+            // zeros, which is what a missing view gives in monolith - and that keeps the draw.
+            // A writable imageBuffer must not: the placeholder is shared by every unbound
+            // binding, so absorbing real stores into it would alias other bindings AND lose
+            // the application's writes without a word. Copying into an aligned transient slice
+            // is not the answer either: the transient arena carries no
+            // {UNIFORM,STORAGE}_TEXEL_BUFFER usage (VkBufferManager::InitializeTransientArenas),
+            // so no VkBufferView can be made over it, and widening a shared per-frame
+            // allocation to buy an unreachable path is the wrong trade. See notes/p7/magma-a.md.
+            return writable ? false : placeholder();
+        }
+        VkBufferViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO};
+        viewInfo.buffer = slice.buffer;
+        viewInfo.format = format;
+        viewInfo.offset = slice.offset + start;
+        viewInfo.range = size;
+        if (vkCreateBufferView(m_device, &viewInfo, nullptr, &out) != VK_SUCCESS || out == VK_NULL_HANDLE) return false;
+        m_frames[frameIndex].texelBufferViews.push_back(out);
+        if (storage && state.BoundShaderImages[unit].Access != kMGPipeImageAccessReadOnly)
+            m_bufferManager->MarkWireBufferGpuWritten(buffer, start, size);
+        return true;
+    }
+#endif
+
+    Bool UniformManager::ResolveTexelBufferDescriptor(const MagmaProgramSource& program,
                                                       const ProgramFactory::VkProgramObject& programObj,
                                                       Uint32 binding, Uint32 frameIndex,
                                                       VkBufferView& outBufferView) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (program.IsWire())
+            return ResolveWireTexelBufferDescriptor(program, programObj, binding, frameIndex, false, outBufferView);
+#endif
         outBufferView = VK_NULL_HANDLE;
         MOBILEGL_ASSERT(m_bufferManager != nullptr, "ResolveTexelBufferDescriptor: buffer manager is null");
         MOBILEGL_ASSERT(frameIndex < m_frames.size(), "ResolveTexelBufferDescriptor: frame index out of range");
@@ -988,10 +1435,14 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     // binding at all for a uniform the shader still read, and lavapipe segfaulted inside pipeline
     // creation on the JIT worker thread. KHR-GL44.multi_bind.dispatch_bind_image_textures is the
     // case that carries it.
-    Bool UniformManager::ResolveStorageTexelBufferDescriptor(const MG_State::GLState::ProgramObject& program,
+    Bool UniformManager::ResolveStorageTexelBufferDescriptor(const MagmaProgramSource& program,
                                                              const ProgramFactory::VkProgramObject& programObj,
                                                              Uint32 binding, Uint32 frameIndex,
                                                              VkBufferView& outBufferView) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (program.IsWire())
+            return ResolveWireTexelBufferDescriptor(program, programObj, binding, frameIndex, true, outBufferView);
+#endif
         outBufferView = VK_NULL_HANDLE;
         MOBILEGL_ASSERT(m_bufferManager != nullptr, "ResolveStorageTexelBufferDescriptor: buffer manager is null");
         MOBILEGL_ASSERT(MGB_CTX_LIVE, "ResolveStorageTexelBufferDescriptor: GL context is null");
@@ -1154,7 +1605,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         return true;
     }
 
-    Bool UniformManager::ResolveStorageBufferDescriptor(const MG_State::GLState::ProgramObject& program,
+    Bool UniformManager::ResolveStorageBufferDescriptor(const MagmaProgramSource& program,
                                                         const ProgramFactory::VkProgramObject& programObj,
                                                         Uint32 binding, Uint32 element,
                                                         VkDescriptorBufferInfo& outBufferInfo) const {
@@ -1163,10 +1614,18 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         MOBILEGL_ASSERT(MGB_CTX_LIVE, "ResolveStorageBufferDescriptor: GL context is null");
         MOBILEGL_ASSERT(binding < programObj.storageBlockIndexByBinding.size(),
                         "ResolveStorageBufferDescriptor: binding %u out of range", binding);
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (program.IsWire() && (binding >= programObj.storageBlockIndexByBinding.size() ||
+                                binding >= programObj.storageBlockNameByBinding.size()))
+            WireDescriptorFatal("storage-buffer-reflection-binding");
+#endif
 
         const Int blockIndex = programObj.storageBlockIndexByBinding[binding];
         MOBILEGL_ASSERT(blockIndex >= 0, "ResolveStorageBufferDescriptor: no SSBO block mapped to binding %u",
                         binding);
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (program.IsWire() && blockIndex < 0) WireDescriptorFatal("storage-buffer-reflection-block");
+#endif
         // An atomic counter is not an SSBO the application ever declared: glslang lowers every
         // atomic_uint onto a synthesized gl_AtomicCounterBlock_<N> storage block, where N is the
         // GL ATOMIC-COUNTER binding. That block arrives here auto-mapped to an arbitrary
@@ -1195,7 +1654,90 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         const GLuint frontendBinding =
             isAtomicCounterBlock
                 ? static_cast<GLuint>(atomicCounterBinding)
-                : GetShaderStorageBlockBinding(program, static_cast<GLuint>(blockIndex)) + element;
+                :
+#if MOBILEGL_BUILD_DISAGGREGATED
+                  (program.IsWire() ? program.GetShaderStorageBlockBinding(static_cast<GLuint>(blockIndex)) :
+                   GetShaderStorageBlockBinding(*program.Frontend(), static_cast<GLuint>(blockIndex))) + element;
+#else
+                  GetShaderStorageBlockBinding(program, static_cast<GLuint>(blockIndex)) + element;
+#endif
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (program.IsWire()) {
+            const auto& state = MG_Pipe::MGPipeApplier();
+            const Uint32 cls = isAtomicCounterBlock ? MG_Pipe::kMGPipeShaderBufferClassAtomicCounter
+                                                   : MG_Pipe::kMGPipeShaderBufferClassShaderStorage;
+            if (frontendBinding >= MG_Pipe::kMGPipeMaxBufferBindingPoints)
+                WireDescriptorFatal("storage-buffer-binding-point");
+            // The applier retains entries outside the last partial update window. Count
+            // describes that update, not the upper bound of the complete binding table.
+            const auto& range = state.BoundShaderBuffers[cls][frontendBinding];
+            if (MG_Pipe::MGPipeHandleIsNull(range.Res)) {
+                const BufferSlice placeholder = m_bufferManager->AcquireUnboundStorageDescriptor();
+                if (!placeholder.IsValid()) return false;
+                outBufferInfo = {placeholder.buffer, placeholder.offset, placeholder.size};
+                return true;
+            }
+            BufferSlice slice{};
+            if (!m_bufferManager->AcquireWireSlice(BufferKind::ShaderStorage, range.Res, slice) || !slice.IsValid()) return false;
+            VkDeviceSize start = 0, size = 0;
+            if (!ResolveWireRange(range.Offset, range.Size, slice.size, start, size)) return false;
+            if (start > std::numeric_limits<VkDeviceSize>::max() - slice.offset)
+                WireDescriptorFatal("storage-buffer-offset-overflow");
+            if ((slice.offset + start) % m_wireStorageOffsetAlignment != 0) {
+                // P7 A.4, a named decline (rule I (a)), and the one shape in this cluster an
+                // application can actually reach. GL has no queryable atomic-counter buffer
+                // offset alignment, so glBindBufferRange only enforces offset % 4 for
+                // GL_ATOMIC_COUNTER_BUFFER (GL 4.6 core 6.1.1, GL_Buffer.cpp
+                // ValidateBufferRangeOffsetAndSize); glslang lowers the counter block onto a
+                // storage buffer, whose descriptor offset must be a multiple of
+                // minStorageBufferOffsetAlignment - 16 on lavapipe, 64 on Adreno. Offset 4 is
+                // therefore a legal bind this backend cannot express. The plain SSBO half is
+                // unreachable by comparison: GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT is
+                // published from that same Vulkan limit, so the frontend already refused it
+                // with GL_INVALID_VALUE.
+                //
+                // DECLINED RATHER THAN COPIED, deliberately. Copying the window into an aligned
+                // transient slice reads correctly and then silently DROPS every shader write,
+                // and this site cannot tell a writable block from a read-only one: there is no
+                // readonly bit in the storage-block reflection (ProgramFactory.h carries only
+                // name and index), an atomic counter is written by definition, and
+                // MarkWireBufferGpuWritten below already assumes any binding here may be
+                // written. A correct copy needs a post-dispatch copy-back from the transient
+                // slice to the unaligned source, ordered with a barrier - and the place to
+                // record that is the draw/dispatch tail in VulkanRenderer.cpp / WireDraw.inc,
+                // which belong to wave-2 packages B and C, not to this file. Losing the
+                // dispatch with a named line in the role log beats returning stale counters
+                // with no error at all. notes/p7/magma-a.md carries the recipe.
+                MGLOG_E_ONCE("ResolveStorageBufferDescriptor: block '%s' is bound at offset %llu, which is not a "
+                             "multiple of this device's minStorageBufferOffsetAlignment (%llu); %s ranges cannot be "
+                             "expressed as a descriptor and the shader's writes would be dropped by a read-only "
+                             "copy, so the binding is DECLINED (unaligned-%s-buffer-range)",
+                             blockName.c_str(), static_cast<unsigned long long>(slice.offset + start),
+                             static_cast<unsigned long long>(m_wireStorageOffsetAlignment),
+                             isAtomicCounterBlock ? "atomic-counter" : "shader-storage",
+                             isAtomicCounterBlock ? "atomic" : "storage");
+                return false;
+            }
+            if (size > m_wireMaxStorageRange) {
+                // P7 A.3: clamp, do not refuse. The monolith arm binds whatever the GL range
+                // asked for and never consults maxStorageBufferRange at all (see the resident
+                // path below), so refusing here was the wire arm inventing a death the other
+                // backend does not have. A clamped binding keeps every byte the device can
+                // name reachable; past it the shader is out of the descriptor and
+                // robustBufferAccess answers zero, which beats losing the draw outright.
+                MGLOG_E_ONCE("ResolveStorageBufferDescriptor: block '%s' bound %llu bytes, past this device's "
+                             "maxStorageBufferRange of %llu; the binding is clamped to the limit",
+                             blockName.c_str(), static_cast<unsigned long long>(size),
+                             static_cast<unsigned long long>(m_wireMaxStorageRange));
+                size = m_wireMaxStorageRange;
+            }
+            outBufferInfo = {slice.buffer, slice.offset + start, size};
+            // Shader writes stay in the canonical server VkBuffer. The event marks the
+            // client's shadow stale; neither this path nor later acquires seed it back.
+            m_bufferManager->MarkWireBufferGpuWritten(range.Res, start, size);
+            return true;
+        }
+#endif
         const Uint32 bindingPointCount =
             static_cast<Uint32>(MGB_CTX->GetBufferBindingPointCount(bufferTarget));
         MOBILEGL_ASSERT(frontendBinding < bindingPointCount,
@@ -1274,10 +1816,13 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     }
 
     Bool UniformManager::ResolveStorageImageDescriptor(VkCommandBuffer commandBuffer,
-                                                       const MG_State::GLState::ProgramObject& program,
+                                                       const MagmaProgramSource& program,
                                                        const ProgramFactory::VkProgramObject& programObj,
                                                        Uint32 binding, Uint32 element,
                                                        VkDescriptorImageInfo& outImageInfo) const {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (program.IsWire()) return ResolveWireImageDescriptor(commandBuffer, program, programObj, binding, element, true, outImageInfo);
+#endif
         outImageInfo = {};
         MOBILEGL_ASSERT(m_textureManager != nullptr, "ResolveStorageImageDescriptor: texture manager is null");
         MOBILEGL_ASSERT(MGB_CTX_LIVE, "ResolveStorageImageDescriptor: GL context is null");
@@ -1657,7 +2202,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         return texture;
     }
 
-    Bool UniformManager::ResolveSampledBinding(const MG_State::GLState::ProgramObject& program,
+    Bool UniformManager::ResolveSampledBinding(const MagmaProgramSource& program,
                                                const ProgramFactory::VkProgramObject& programObj,
                                                Uint32 binding, Uint32 element,
                                                MG_State::GLState::ITextureObject*& outTexture,
@@ -1726,10 +2271,13 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         return true;
     }
 
-    Bool UniformManager::CollectSampledTextures(const MG_State::GLState::ProgramObject& program,
+    Bool UniformManager::CollectSampledTextures(const MagmaProgramSource& program,
                                                           const ProgramFactory::VkProgramObject& programObj,
                                                           Vector<MG_State::GLState::ITextureObject*>& outTextures,
                                                           Vector<SampledBindingRecord>* outBindingRecords) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (program.IsWire()) { outTextures.clear(); if (outBindingRecords) outBindingRecords->clear(); return true; }
+#endif
         outTextures.clear();
         if (outBindingRecords != nullptr) {
             outBindingRecords->clear();
@@ -1773,9 +2321,12 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         return true;
     }
 
-    Bool UniformManager::SampledBindingsUnchanged(const MG_State::GLState::ProgramObject& program,
+    Bool UniformManager::SampledBindingsUnchanged(const MagmaProgramSource& program,
                                                   const ProgramFactory::VkProgramObject& programObj,
                                                   const Vector<SampledBindingRecord>& previousRecords) const {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (program.IsWire()) return false;
+#endif
         // A declined program takes the full path every time and is refused there.
         if (programObj.declinedDescriptors) {
             return false;
@@ -1816,9 +2367,12 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     }
 
     Bool UniformManager::CollectStorageImageTextures(
-        const MG_State::GLState::ProgramObject& program,
+        const MagmaProgramSource& program,
         const ProgramFactory::VkProgramObject& programObj,
         Vector<MG_State::GLState::ITextureObject*>& outTextures) const {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (program.IsWire()) { outTextures.clear(); return true; }
+#endif
         outTextures.clear();
         MOBILEGL_ASSERT(MGB_CTX_LIVE,
                         "CollectStorageImageTextures: GL context is null");
@@ -1898,9 +2452,12 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     }
 
     Bool UniformManager::CollectSamplerImageFeedback(
-        const MG_State::GLState::ProgramObject& program,
+        const MagmaProgramSource& program,
         const ProgramFactory::VkProgramObject& programObj,
         Vector<SamplerImageFeedbackBinding>& outBindings) const {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (program.IsWire()) { outBindings.clear(); return true; }
+#endif
         outBindings.clear();
         MOBILEGL_ASSERT(MGB_CTX_LIVE,
                         "CollectSamplerImageFeedback: GL context is null");
@@ -1976,7 +2533,104 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         return true;
     }
 
-    Bool UniformManager::ResolveUniformBufferPayload(const MG_State::GLState::ProgramObject& program,
+#if MOBILEGL_BUILD_DISAGGREGATED
+    Bool UniformManager::ResolveWireUniformBufferPayload(const MagmaProgramSource& program,
+            Uint32 blockIndex, Uint32 bindingPoint, UboBindResult& out) const {
+        if (bindingPoint >= MG_Pipe::kMGPipeMaxBufferBindingPoints)
+            WireDescriptorFatal("uniform-buffer-binding-point");
+        VkDeviceSize blockSize = program.GetUBOSizeAt(blockIndex);
+        if (blockSize == 0) return false;
+        if (blockSize > m_wireMaxUniformRange) {
+            // P7 A.3: clamp, do not refuse. A conformant program cannot get here -
+            // GL_MAX_UNIFORM_BLOCK_SIZE is published straight from this same
+            // maxUniformBufferRange (BackendLoaders/Vulkan/Loader.cpp), so a block this big
+            // fails to link long before a draw - which makes refusing it a Fatal for a shape
+            // nothing can produce. If the two ever disagree, the honest answer is the bytes
+            // the device CAN name: everything past the clamp is outside the descriptor and
+            // reads back as zero under robustBufferAccess, which is inside GL's "undefined"
+            // for a block the implementation never promised to hold. Clamping keeps the range
+            // constant across draws, so the descriptor-set reuse hash is unaffected.
+            MGLOG_E_ONCE("ResolveWireUniformBufferPayload: reflected uniform block %u is %llu bytes, past this "
+                         "device's maxUniformBufferRange of %llu; the binding is clamped to the limit and the "
+                         "remainder reads zero",
+                         blockIndex, static_cast<unsigned long long>(blockSize),
+                         static_cast<unsigned long long>(m_wireMaxUniformRange));
+            blockSize = m_wireMaxUniformRange;
+        }
+        const auto& range = MG_Pipe::MGPipeApplier().BoundShaderBuffers[
+            MG_Pipe::kMGPipeShaderBufferClassUniform][bindingPoint];
+        BufferSlice source{};
+        VkDeviceSize start = 0, available = 0;
+        const Bool bound = !MG_Pipe::MGPipeHandleIsNull(range.Res);
+        if (bound) {
+            if (!m_bufferManager->AcquireWireSlice(BufferKind::Uniform, range.Res, source) || !source.IsValid()) return false;
+            if (!ResolveWireRange(range.Offset, range.Size, source.size, start, available)) return false;
+            if (start > std::numeric_limits<VkDeviceSize>::max() - source.offset)
+                WireDescriptorFatal("uniform-buffer-offset-overflow");
+            const VkDeviceSize absoluteOffset = source.offset + start;
+            if (available >= blockSize && absoluteOffset % m_minDynamicOffsetAlignment == 0 &&
+                absoluteOffset <= std::numeric_limits<Uint32>::max()) {
+                out.directBindable = true;
+                out.buffer = source.buffer;
+                out.range = blockSize;
+                out.dynamicOffset = absoluteOffset;
+                return true;
+            }
+        }
+
+        // Preserve the existing short-range compatibility policy without sampling the
+        // client's shadow: zero the complete reflected block, then GPU-copy only bytes
+        // inside the GL binding range. A readback here could retire the command buffer
+        // whose value BindProgramUniformBuffers is currently holding.
+        const VkDeviceSize copied = std::min(available, blockSize);
+        static thread_local Vector<Uint8> zero;
+        zero.assign(static_cast<SizeT>(blockSize), 0);
+        BufferSlice padded{};
+        if (!m_bufferManager->UploadTransient(BufferKind::Uniform, m_wireFrameIndex, zero.data(), blockSize,
+                std::max<VkDeviceSize>(4, m_minDynamicOffsetAlignment), padded) || !padded.IsValid()) return false;
+        if (bound && copied != 0) {
+            // P7 A.1 retires `uniform-buffer-byte-tail`. The window is word-aligned at both
+            // ends on nearly every bind - glBindBufferRange already forces the offset onto
+            // GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, and that is a multiple of four on every
+            // device - but GL 4.6 core 6.1.1 puts no such rule on the SIZE, so `copied` is free
+            // to end mid-word and the Redmi Minecraft run lands there
+            // (notes/p5f/magma-inproc-fix.md #5). An unaligned start is not reachable through
+            // the public API and only a protocol-level offset can produce one; the sub-word arm
+            // handles it anyway rather than leaving a second shape to trip over later. Both arms
+            // copy the same bytes to the same place: the sub-word one pays one extra transient
+            // slice and one extra region copy, and nothing outside [start, start + copied)
+            // reaches the block, which is what makes the padded zeros the visible tail.
+            const Bool wordWindow = ((start | copied) & 3u) == 0;
+            if (!(wordWindow
+                      ? m_bufferManager->CopyWireBufferRangeToSlice(range.Res, start, copied, padded)
+                      : m_bufferManager->CopyWireBufferSubWordRangeToSlice(range.Res, start, copied,
+                                                                           m_wireFrameIndex, padded, 0)))
+                return false;
+        }
+        if (padded.offset > std::numeric_limits<Uint32>::max()) {
+            // P7 A.2, a decline (rule I (a)), not a session death. A Vulkan dynamic offset is a
+            // uint32_t, so a transient uniform ring that grew past 4 GiB inside one frame has
+            // nowhere to put this block - which is our ring's problem, not a protocol fault, and
+            // nothing the peer could have sent differently. One binding is skipped and the draw
+            // is lost; the session keeps running and the next frame's rewound ring resolves it.
+            // The monolith arm has the same ceiling and truncates silently on the way out
+            // (ResolveDynamicUboDescriptor's static_cast<Uint32>), i.e. it binds a WRONG window
+            // rather than none, so declining is the strictly better observable of the two.
+            MGLOG_E_ONCE("ResolveWireUniformBufferPayload: the transient uniform ring reached offset "
+                         "%llu, past the 4 GiB a Vulkan dynamic offset can name; uniform binding "
+                         "point %u is declined for this draw",
+                         static_cast<unsigned long long>(padded.offset), bindingPoint);
+            return false;
+        }
+        out.directBindable = true;
+        out.buffer = padded.buffer;
+        out.range = blockSize;
+        out.dynamicOffset = padded.offset;
+        return true;
+    }
+#endif
+
+    Bool UniformManager::ResolveUniformBufferPayload(const MagmaProgramSource& program,
                                                      const ProgramFactory::VkProgramObject& programObj, Uint32 binding,
                                                      Uint32 arrayElement, UboBindResult& out) const {
         const void* outData = nullptr;
@@ -2004,6 +2658,10 @@ namespace MobileGL::MG_Backend::DirectVulkan {
 
         MOBILEGL_ASSERT(binding < programObj.uniformBlockIndexByBinding.size(),
                         "ResolveUniformBufferPayload: UBO mapping binding %u out of range", binding);
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (program.IsWire() && binding >= programObj.uniformBlockIndexByBinding.size())
+            WireDescriptorFatal("uniform-buffer-reflection-binding");
+#endif
         Int blockIndex = programObj.uniformBlockIndexByBinding[binding];
         if (arrayElement > 0) {
             const auto arrayIt = programObj.arrayedUniformBlockIndicesByBinding.find(binding);
@@ -2024,8 +2682,16 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         MOBILEGL_ASSERT(static_cast<Uint32>(blockIndex) < activeUniformBlockCount,
                         "ResolveUniformBufferPayload: uniform block index %d out of range (count=%u)", blockIndex,
                         activeUniformBlockCount);
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (program.IsWire() && (blockIndex < 0 || static_cast<Uint32>(blockIndex) >= activeUniformBlockCount))
+            WireDescriptorFatal("uniform-buffer-reflection-block");
+#endif
 
         const Uint32 frontendBinding = program.GetUniformBlockBinding(static_cast<Uint32>(blockIndex));
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (program.IsWire())
+            return ResolveWireUniformBufferPayload(program, static_cast<Uint32>(blockIndex), frontendBinding, out);
+#endif
         const Uint32 uniformBindingPointCount =
             static_cast<Uint32>(MGB_CTX->GetBufferBindingPointCount(BufferTarget::Uniform));
         MOBILEGL_ASSERT(frontendBinding < uniformBindingPointCount,
@@ -2265,13 +2931,16 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         return VK_SUCCESS;
     }
 
-    Bool UniformManager::ResolveDynamicUboDescriptor(const MG_State::GLState::ProgramObject& program,
+    Bool UniformManager::ResolveDynamicUboDescriptor(const MagmaProgramSource& program,
                                                      const ProgramFactory::VkProgramObject& programObj,
                                                      Uint32 binding, Uint32 arrayElement, Uint32 frameIndex,
                                                      VkBuffer& outBuffer, VkDeviceSize& outRange,
                                                      Uint32& outDynamicOffset) {
         UboBindResult ubo{};
         const Bool hasPayload = ResolveUniformBufferPayload(program, programObj, binding, arrayElement, ubo);
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (program.IsWire() && !hasPayload) return false;
+#endif
         MOBILEGL_ASSERT(hasPayload && (ubo.directBindable || (ubo.payload != nullptr && ubo.payloadSize > 0)),
                         "UniformDescriptorBinder::ResolveDynamicUboDescriptor failed: missing UBO payload on binding %u element %u",
                         binding, arrayElement);
@@ -2360,8 +3029,60 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         }
     }
 
+#if MOBILEGL_BUILD_DISAGGREGATED
+    Bool UniformManager::PrepareWireTextureResources(const MagmaProgramSource& program,
+                                                      const ProgramFactory::VkProgramObject& programObj) {
+        if (!program.IsWire()) return true;
+        if (programObj.declinedDescriptors || m_textureManager == nullptr) {
+            MGL_WIRE_DECLINE_AT(DescriptorDeclined, "the program carries a descriptor MobileGL could not resolve");
+            return false;
+        }
+        const auto& state = MG_Pipe::MGPipeApplier();
+        // Resolve writable images first: aliases sampled by the same draw must
+        // see the final STORAGE-capable allocation before any view is built.
+        for (const Bool storage : {true, false}) {
+            const auto wanted = storage ? ProgramFactory::DescriptorBindingKind::StorageImage
+                                        : ProgramFactory::DescriptorBindingKind::CombinedImageSampler;
+            for (const Uint32 binding : programObj.activeBindings) {
+                if (binding >= m_maxBindings) break;
+                if (programObj.bindingKinds[binding] != wanted) continue;
+                const Int baseLocation = programObj.samplerUniformLocationByBinding[binding];
+                const Uint32 count = BindingDescriptorCount(programObj, binding);
+                for (Uint32 element = 0; element < count; ++element) {
+                    const Int location = baseLocation + static_cast<Int>(element);
+                    if (baseLocation < 0 || !program.UniformLocationsAliasSameUniform(baseLocation, location)) {
+                        MGL_WIRE_DECLINE_AT(SamplerLocationAlias,
+                                            "binding %u element %u does not alias one sampler uniform", binding,
+                                            element);
+                        return false;
+                    }
+                    const Int unit = program.GetUniformSamplerOrImageUnitIndex(static_cast<Uint>(location));
+                    if (unit < 0 || static_cast<Uint32>(unit) >=
+                        (storage ? MG_Pipe::kMGPipeMaxImageUnits : MG_Pipe::kMGPipeMaxTextureUnits)) {
+                        MGL_WIRE_DECLINE_AT(SamplerUnitRange, "sampler/image unit %d is out of range", unit);
+                        return false;
+                    }
+                    const auto handle = storage ? state.BoundShaderImages[unit].Res
+                                                : state.BoundSamplerViews[unit].Texture;
+                    // Null is the wire's unbound/incomplete binding. Its native
+                    // placeholder needs no resource upload or frontend allocation.
+                    if (MG_Pipe::MGPipeHandleIsNull(handle)) continue;
+                    // Nor does an image unit naming a (level, layer) its texture lacks: the
+                    // descriptor resolve binds that same placeholder (GL 4.6 core 8.26), and
+                    // preparing the texture would decline a storage-less one and lose the pass.
+                    if (storage && WireShaderImageNamesNoTexel(*m_textureManager, state.BoundShaderImages[unit]))
+                        continue;
+                    if (!m_textureManager->SyncTextureResourceByHandle(handle, false, storage)) return false;
+                }
+            }
+        }
+        m_textureManager->FlushPendingUploads();
+        return true;
+    }
+#endif
+
     Bool UniformManager::BindProgramUniformBuffers(VkCommandBuffer commandBuffer,
-                                                             const MG_State::GLState::ProgramObject& program,
+                                                             const MagmaProgramSource& program,
                                                              const ProgramFactory::VkProgramObject& programObj,
                                                              Uint32 frameIndex,
                                                              VkPipelineBindPoint bindPoint,
@@ -2398,6 +3119,12 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                                (samplerBindingOverrides == nullptr || samplerBindingOverrides->empty());
         if (cacheable && samplerDescriptorsUnchangedHint && m_fastRebindMemo.valid &&
             m_fastRebindMemo.frameIndex == frameIndex &&
+#if MOBILEGL_BUILD_DISAGGREGATED
+            // A wire store destroyed since the memo was taken may have handed its handle
+            // value to a later mint (see FastRebindMemo): "same VkBuffer" then names a
+            // different store, so the memo is refused and the full walk re-records it.
+            m_fastRebindMemo.wireStoreDestroyEpoch == m_bufferManager->GetWireStoreDestroyEpoch() &&
+#endif
             m_fastRebindMemo.programLifetimeId == program.GetLifetimeId() &&
             m_fastRebindMemo.programHash == programObj.hash) {
             VkBuffer uboBuffer = VK_NULL_HANDLE;
@@ -2694,6 +3421,16 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                 }
             };
             mixWords(&programObj.descriptorSetLayout, sizeof(programObj.descriptorSetLayout));
+#if MOBILEGL_BUILD_DISAGGREGATED
+            // P7 M2 round 2 (ID-P7-43): the buffer infos below name WIRE stores by VkBuffer
+            // handle, and a wire store can be destroyed mid-frame (VkBufferManager::
+            // DeferredWireRelease) with its handle value re-minted before this frame's memo
+            // is cleared. Folding the destroy epoch in makes every entry taken before such a
+            // destroy miss, so a byte-identical info can never revive a set baked to a dead
+            // store. NOT the slice epoch: that moves on every glBufferSubData and would make
+            // the memo miss on every draw.
+            mix64(m_bufferManager->GetWireStoreDestroyEpoch());
+#endif
             for (const auto& write : writes) {
                 mix64((static_cast<Uint64>(write.dstBinding) << 40) ^
                       (static_cast<Uint64>(write.descriptorType) << 8) ^
@@ -2748,7 +3485,11 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             m_fastRebindMemo = FastRebindMemo{
                 /*valid=*/true,          frameIndex,      program.GetLifetimeId(), programObj.hash,
                 fastRebindUboBinding,    bufferInfos[0].buffer,
-                bufferInfos[0].range,    descriptorSet};
+                bufferInfos[0].range,    descriptorSet,
+#if MOBILEGL_BUILD_DISAGGREGATED
+                m_bufferManager->GetWireStoreDestroyEpoch(),
+#endif
+            };
         } else {
             m_fastRebindMemo.valid = false;
         }

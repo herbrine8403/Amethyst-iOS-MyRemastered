@@ -28,12 +28,14 @@
 // regression re-committed at the transport layer.
 
 #include "EmitTables.h"
+#include <MG_Remote/FatalFunnel.h>
 
 #include "ClientSession.h"
 #include "GpuWritePending.h"
 #include "PersistentMapTracker.h"
 
 #include <MG_Util/Converters/GLToMG/TextureEnumConverter.h>
+#include <MG_Util/Converters/MGToGL/TextureEnumConverter.h>
 #include <MG_Util/Debug/Log.h>
 #include <MG_Util/Metrics/PipeStats.h>
 #include <MG_Util/Metrics/TextureMetrics.h>
@@ -53,15 +55,19 @@
 // set_index_buffer / the buffer's own constructor did that), for MGPDrawInfo::IndexResource and
 // the two indirect-buffer handles.
 #include <MG_Impl/Pipe/ResourceTracker.h>
+#include <MG_Impl/GLImpl/Texture/MipmapGenerationPlan.h>
+#include <MG_Impl/Pipe/OwnedDrawInputs.h>
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 #include "WireTables.h"
 #include <MG_Impl/Pipe/FramebufferEmit.h>
 #include <MG_Impl/Pipe/PipeFill.h>
 #include <MG_Impl/Pipe/TextureEmit.h>
+#include <MG_Impl/Pipe/ProgramEmit.h>
 #include <MG_Pipe/PipeMutation.h>
 
 namespace MobileGL::MG_Remote::Client {
@@ -82,8 +88,7 @@ namespace MobileGL::MG_Remote::Client {
         // The same shape as MGPipeInputPoisonFatal (generated/PipeFilled.inc:407-413): names the
         // slot, live at every log level, aborts. Deliberately NOT MOBILEGL_ASSERT, which is
         // inert in an INFO build - and INFO is what every device lane runs.
-        MGLOG_F("MGPipe: Fatal{UnmigratedVerb, \"%s\"}", slot);
-        std::abort();
+        SessionFail(MGFatalFamily::UnmigratedVerb, "MGPipe: Fatal{UnmigratedVerb, \"%s\"}", slot);
     }
 
     namespace {
@@ -192,6 +197,16 @@ namespace MobileGL::MG_Remote::Client {
             return (rowBytes % alignment) == 0;
         }
 
+        // A band's box origin (g5-readback): the read's origin plus the band's offset, summed
+        // wide. It can only leave Int32 for a read whose far edge was already past INT32_MAX,
+        // and every pixel out there is outside any framebuffer - GL leaves their values
+        // undefined - so it saturates instead of wrapping onto real pixels.
+        Int32 ReadbackBandOrigin(GLint origin, Uint64 offset) {
+            const Int64 at = static_cast<Int64>(origin) + static_cast<Int64>(offset);
+            constexpr Int64 kMax = std::numeric_limits<Int32>::max();
+            return static_cast<Int32>(at > kMax ? kMax : at);
+        }
+
         // ---- the session, demanded rather than assumed --------------------------------
         //
         // Every class-B slot needs one. A null session here is NOT the monolith answer - the
@@ -204,25 +219,14 @@ namespace MobileGL::MG_Remote::Client {
             RequireClientTablesInstalled(slot);
             ClientSession* session = ClientSession::Active();
             if (session == nullptr) {
-                MGLOG_F("MGPipe: Fatal{NoClientSession, \"%s\"} - the remote emit table is "
+                // @Ph-declined (ID-P7-1): returns ClientSession& and runs in the CLIENT - no
+                // session to hand back, no peer bytes, and the latch is a server-session idea.
+                SessionFail(MGFatalFamily::NoClientSession, "MGPipe: Fatal{NoClientSession, \"%s\"} - the remote emit table is "
                         "installed but no ClientSession is active. A slot may not fall through "
                         "to a driver this role does not have",
                         slot);
-                std::abort();
             }
             return *session;
-        }
-
-        // The two hooks b1 wrote and deliberately left with no caller, because the call site is
-        // this file's. ORDER: the push first (it produces resource_subdata records that must
-        // precede the verb on SEG_CMD), then the mark walk, then the verb record. The deferred
-        // destroy drain rides the same boundary: it replays, on this GL thread, the death
-        // announcements whose last SharedPtr dropped on the apply thread (PipeMutation.h's
-        // deferred destroy queue), and its records must also precede this verb.
-        void BeforeDrawVerb() {
-            PersistentMapTracker::Instance().PushDrawConsumers();
-            MG_Pipe::MGPipeDrainDeferredDestroys();
-            MarkGpuWritesForDraw();
         }
 
         // A verb that reads buffers but starts no shader: clear, blit, readback, present. The
@@ -377,29 +381,48 @@ namespace MobileGL::MG_Remote::Client {
             record.Target = static_cast<Uint16>(target);
             record.BaseLevel = texture->GetLevelRange().x();
             const auto* mipmap = dynamic_cast<const MG_State::GLState::TextureObjectMipmap*>(texture.get());
-            record.LevelCount = mipmap ? mipmap->GetMipmapLevelCount() : 0;
+            if (mipmap && !texture->GetUploadTargets().empty()) {
+                const auto plan = MG_Impl::GLImpl::ComputeMipmapGenerationRange(*mipmap, texture->GetUploadTargets()[0]);
+                // LevelCount is the logical end-exclusive, not the number of
+                // levels following BaseLevel. Preserve that existing carrier.
+                record.LevelCount = static_cast<Uint16>(std::min<Uint>(plan.End, mipmap->GetMipmapLevelCount()));
+            }
             session.EmitAndWait(MG_Pipe::MGPWireOp::GenerateMipmap, &record, sizeof(record),
                                 nullptr, 0, nullptr, 0, nullptr);
         }
 
-        void EmitDrawArrays(GLenum mode, GLint first, GLsizei count) {
-            ClientSession& session = RequireSession("DrawArrays");
-            BeforeDrawVerb();
+        // All draw entry points share the owned-input preparation and emission below.
+        [[noreturn]] void RefuseDrawByName(const char* slot, const char* qualifier);
+        void EmitDrawRecord(const char* slot, MG_Pipe::MGPDrawInfo& info,
+                            const MG_Pipe::MGPDrawRange* ranges, Uint32 numDraws,
+                            const void* clientIndices, Uint64 clientIndexBytes,
+                            const MG_Pipe::MGPDrawIndirect* indirect);
 
-            if (g_dropDrawEmission) {
-                // E2's LOAD-BEARING negative control. Same shape as the clear drop and the same
-                // rule: everything above still ran - the persistent-map push and the GPU-write
-                // mark walk both happened - so the ONLY difference from the live arm is that
-                // this frame's geometry never crossed the ring. A lane that still matches its
-                // golden with this armed did not get its picture from the wire.
-                ++g_droppedDrawEmissions;
-                return;
+        // Does the bound VAO fetch any ENABLED attribute out of the application's own memory.
+        // The test is EmitVertexBuffers' own (`attrib.Enabled && !attrib.Buffer` is exactly what
+        // it publishes as Res == kMGPipeNullHandle), so the flag on the wire and the record the
+        // server applies agree by construction.
+        Bool BoundVaoHasClientVertexArrays(MG_State::GLState::GLContext* ctx) {
+            if (ctx == nullptr) return false;
+            const auto& vao = ctx->GetBoundVertexArray();
+            if (!vao) return false;
+            const auto& attributes = vao->GetAllAttributes();
+            for (SizeT i = 0; i < attributes.size(); ++i) {
+                if (attributes[i].Enabled && !attributes[i].Buffer) return true;
             }
+            return false;
+        }
+
+        void EmitDrawArrays(GLenum mode, GLint first, GLsizei count) {
+            const Bool clientArrays = BoundVaoHasClientVertexArrays(MG_State::pGLContext.get());
 
             MG_Pipe::MGPDrawInfo info{};
             info.Mode = static_cast<Uint32>(mode);
             info.IndexSize = 0; // arrays
-            info.Flags = 0;     // NO kDrawHasUserIndices: the reduced path draws from a VBO
+            // NO kDrawHasUserIndices: the reduced path draws from a VBO. kDrawClientArrays IS
+            // set when one is present, because the wait rule is computed from the record on
+            // both sides and this path publishes its own record rather than PlanDrawInfo's.
+            info.Flags = clientArrays ? static_cast<Uint8>(MG_Pipe::kDrawClientArrays) : 0;
             info.InstanceCount = 1;
             info.StartInstance = 0;
             info.RestartIndex = 0;
@@ -415,8 +438,7 @@ namespace MobileGL::MG_Remote::Client {
             // payload and Fatals on a disagreement, on THIS side - so a NumDraws that drifted
             // from the tail is a producer-side abort rather than a corrupt stream a peer has to
             // diagnose.
-            session.EmitAndWait(MG_Pipe::MGPWireOp::DrawVbo, &info, sizeof(info), &range,
-                                sizeof(range), nullptr, 0, nullptr);
+            EmitDrawRecord("DrawArrays", info, &range, 1, nullptr, 0, nullptr);
         }
 
         // =============================================================================
@@ -432,11 +454,8 @@ namespace MobileGL::MG_Remote::Client {
         // ID-18), honours the E2 draw-drop control for every draw record and not only the P5
         // one, stages a client index array into SEG_STAGE when there is one, and emits.
         //
-        // WHAT IS REFUSED BY NAME, ID-57's shape (Fatal{UnmigratedVerb, "<slot>+<QUALIFIER>"}),
-        // never rendered wrong and never fallen through to the driver (R-4):
-        //   +CLIENT_INDICES    a glMultiDrawElements* with no element buffer bound: `indices[i]`
-        //                      are drawcount separate client pointers and one span names one run;
-        //                      P8's HostResolve.cpp flattens it. No measured workload has one.
+        // Client arrays and client indices become owned ordinary buffer resources.
+        // Remaining invalid/unrepresentable draw shapes are named before encoding:
         //   +CLIENT_COMMANDS   an indirect draw with no GL_DRAW_INDIRECT_BUFFER bound: `indirect`
         //                      would be a host pointer, which rule B forbids on the wire.
         //   +UNBOUND_PARAMETER an *IndirectCount with no GL_PARAMETER_BUFFER (the frontend has
@@ -465,6 +484,19 @@ namespace MobileGL::MG_Remote::Client {
                     b.ElementBufferBound = true;
                     b.ElementBuffer = MG_Pipe::MGPipeResourceTrackerInstance().Find(*bound);
                 }
+                // P5e (vi): the client-array probe, in the SAME single read of the bindings the
+                // rest of the plan is made from rather than in a second walk at the refusal -
+                // this runs on the GL thread once per draw and the refusal must not add its own
+                // frontend pass. The test is the emitter's own: EmitVertexBuffers publishes
+                // Res == kMGPipeNullHandle for exactly `attrib.Enabled && !attrib.Buffer`, so
+                // the flag and the record agree by construction instead of by inspection.
+                const auto& attributes = vao->GetAllAttributes();
+                for (SizeT i = 0; i < attributes.size(); ++i) {
+                    if (attributes[i].Enabled && !attributes[i].Buffer) {
+                        b.ClientVertexArrays = true;
+                        break;
+                    }
+                }
             }
             if (const auto& di = ctx->GetBufferBindingSlot(::MobileGL::BufferTarget::DrawIndirect).GetBoundObject()) {
                 b.DrawIndirectBuffer = MG_Pipe::MGPipeResourceTrackerInstance().Find(*di);
@@ -486,7 +518,22 @@ namespace MobileGL::MG_Remote::Client {
                             const void* clientIndices, Uint64 clientIndexBytes,
                             const MG_Pipe::MGPDrawIndirect* indirect) {
             ClientSession& session = RequireSession(slot);
-            BeforeDrawVerb();
+            PersistentMapTracker::Instance().PushDrawConsumers();
+            MG_Pipe::MGPipeDrainDeferredDestroys();
+            // Snapshot before marking THIS draw's potential GPU writes: resolving
+            // a GPU-produced EBO here must not clear its pending mark for this draw.
+            UniquePtr<MG_Pipe::MGPipeOwnedDrawInputs> ownedInputs;
+            if ((info.Flags & MG_Pipe::kDrawClientArrays) != 0 || clientIndexBytes != 0) {
+                if (MG_State::pGLContext == nullptr) RefuseDrawByName(slot, "NO_CONTEXT");
+                ownedInputs = MakeUnique<MG_Pipe::MGPipeOwnedDrawInputs>(*MG_State::pGLContext);
+                if (!ownedInputs->Prepare(info, ranges, numDraws, clientIndices, clientIndexBytes, indirect)) {
+                    MG_State::pGLContext->RecordError(ErrorCode::InvalidOperation,
+                        MakeUnique<GenericErrorInfo>("MG_Remote/Client", slot,
+                            "the client vertex/index fetch range cannot be represented by its storage"));
+                    return;
+                }
+            }
+            MarkGpuWritesForDraw();
 
             if (g_dropDrawEmission) {
                 // E2's negative control covers EVERY draw record, not only DrawArrays: the
@@ -500,22 +547,7 @@ namespace MobileGL::MG_Remote::Client {
             Wire::WireTail tails[2] = {{ranges, static_cast<Uint64>(numDraws) * sizeof(MG_Pipe::MGPDrawRange)},
                                        {nullptr, 0}};
             Uint32 tailCount = 1;
-            MG_Pipe::MGHostSpan span{};
-            if (clientIndices != nullptr && clientIndexBytes != 0) {
-                // The P8 resolve-on-client rule, applied: the bytes exist on the client only,
-                // so the client stages them whole and the record names the run - Ptr = nullptr,
-                // Seg = SEG_STAGE (rule B). The encoder runs all four honesty arms on the span
-                // before it is published, and the sink resolves it through MGPipeHostBytes.
-                const MG_Pipe::MGPBlobRef staged =
-                    session.Encoder().StageBytes(clientIndices, clientIndexBytes);
-                span.Ptr = nullptr;
-                span.Seg = staged.Seg;
-                span.Offset = staged.Offset;
-                span.Size = staged.Size;
-                info.Flags |= MG_Pipe::kDrawHasUserIndices;
-                tails[1] = {&span, sizeof(span)};
-                tailCount = 2;
-            } else if (indirect != nullptr) {
+            if (indirect != nullptr) {
                 info.Flags |= MG_Pipe::kDrawIsIndirect;
                 tails[1] = {indirect, sizeof(*indirect)};
                 tailCount = 2;
@@ -648,17 +680,31 @@ namespace MobileGL::MG_Remote::Client {
             const RemoteDrawBindings bindings = ReadDrawBindings();
             const Uint8 indexSize = RemoteIndexSizeFor(type);
             if (indexSize == 0) RefuseDrawByName(slot, "INDEX_TYPE");
-            if (!bindings.ElementBufferBound) RefuseDrawByName(slot, "CLIENT_INDICES");
             const auto n = static_cast<Uint32>(drawcount);
             MG_Pipe::MGPDrawInfo info = PlanDrawInfo(mode, indexSize, 1, 0, n, bindings);
             Vector<MG_Pipe::MGPDrawRange>& ranges = MultiDrawScratch(n);
+            Vector<Uint8> ownedIndices;
             for (Uint32 i = 0; i < n; ++i) {
                 if (!PlanDrawRange(bindings, indexSize, indices[i], count[i],
                                    basevertex != nullptr ? basevertex[i] : 0, ranges[i])) {
                     RefuseDrawByName(slot, "INDEX_OFFSET");
                 }
+                if (!bindings.ElementBufferBound) {
+                    const Uint64 byteCount = static_cast<Uint64>(ranges[i].Count) * indexSize;
+                    if (byteCount > std::numeric_limits<Uint32>::max() - ownedIndices.size() ||
+                        (byteCount != 0 && indices[i] == nullptr)) {
+                        MG_State::pGLContext->RecordError(ErrorCode::InvalidOperation,
+                            MakeUnique<GenericErrorInfo>("MG_Remote/Client", slot, "invalid client index span"));
+                        return;
+                    }
+                    ranges[i].Start = static_cast<Uint32>(ownedIndices.size() / indexSize);
+                    const SizeT at = ownedIndices.size();
+                    ownedIndices.resize(at + static_cast<SizeT>(byteCount));
+                    if (byteCount != 0) std::memcpy(ownedIndices.data() + at, indices[i], byteCount);
+                }
             }
-            EmitDrawRecord(slot, info, ranges.data(), n, nullptr, 0, nullptr);
+            EmitDrawRecord(slot, info, ranges.data(), n, ownedIndices.empty() ? nullptr : ownedIndices.data(),
+                           ownedIndices.size(), nullptr);
         }
         void EmitMultiDrawElements(GLenum mode, const GLsizei* count, GLenum type,
                                    const GLvoid* const* indices, GLsizei drawcount) {
@@ -801,11 +847,10 @@ namespace MobileGL::MG_Remote::Client {
                 // NOT a guess and not a zero-length reply. A format this build cannot size is a
                 // readback whose answer would be silently truncated, which is the one failure a
                 // picture comparison cannot see.
-                MGLOG_F("MGPipe: Fatal{UnsizedReadback, \"read_pixels\"} format=0x%04x type=0x%04x "
+                SessionFail(MGFatalFamily::UnsizedReadback, "MGPipe: Fatal{UnsizedReadback, \"read_pixels\"} format=0x%04x type=0x%04x "
                         "- the client must declare MGPReadbackInfo::DstSize and cannot size this "
                         "pair; P5's reduced path reads RGBA/UNSIGNED_BYTE",
                         static_cast<unsigned>(format), static_cast<unsigned>(type));
-                std::abort();
             }
             return static_cast<Uint64>(bytesPerPixel);
         }
@@ -847,131 +892,166 @@ namespace MobileGL::MG_Remote::Client {
         // an oversize reply, so the only failures left are a wrong status or a SHORT one.
         void RequireReadbackReplyComplete(Int32 status, Uint64 replySize, Uint64 expected) {
             if (status == Wire::ReplySink::kStatusError) {
-                MGLOG_F("MGPipe: Fatal{ReplyError, \"ReadPixels\"} - the readback answered ERROR; "
+                SessionFail(MGFatalFamily::ReplyError, "MGPipe: Fatal{ReplyError, \"ReadPixels\"} - the readback answered ERROR; "
                         "the destination is left untouched rather than filled with stale bytes");
-                std::abort();
             }
             if (status == Wire::ReplySink::kStatusDeclined) {
-                MGLOG_F("MGPipe: Fatal{ReadbackDeclined, \"ReadPixels\"} - the server has no "
+                SessionFail(MGFatalFamily::ReadbackDeclined, "MGPipe: Fatal{ReadbackDeclined, \"ReadPixels\"} - the server has no "
                         "GL.ReadPixels and DECLINED; a decline is a real answer for an acceptance "
                         "row (R-5) but a blocking readback has no pixels to return, so it is a "
                         "Fatal here rather than a buffer of stale bytes");
-                std::abort();
             }
             if (status != Wire::ReplySink::kStatusOk) {
-                MGLOG_F("MGPipe: Fatal{ReplyStatusInvalid, \"ReadPixels\"} - unknown reply status %d", status);
-                std::abort();
+                SessionFail(MGFatalFamily::ReplyStatusInvalid, "MGPipe: Fatal{ReplyStatusInvalid, \"ReadPixels\"} - unknown reply status %d", status);
             }
             if (replySize != expected) {
-                MGLOG_F("MGPipe: Fatal{ReadbackReplyShort, \"ReadPixels %llu < %llu\"} - the OK "
+                SessionFail(MGFatalFamily::ReadbackReplyShort, "MGPipe: Fatal{ReadbackReplyShort, \"ReadPixels %llu < %llu\"} - the OK "
                         "reply carried fewer bytes than the read's own DstSize (CONTRACT-P5 row "
                         "23's exact extent); the missing rows would otherwise be scattered as "
                         "whatever the destination held",
                         static_cast<unsigned long long>(replySize),
                         static_cast<unsigned long long>(expected));
-                std::abort();
             }
         }
+
+#include "TextureReadbackEmit.inc"
 
         void EmitReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format,
                             GLenum type, void* pixels) {
             ClientSession& session = RequireSession("ReadPixels");
 
-            // ID-57 / M8: A PACK-PBO DESTINATION IS REFUSED BY NAME, BEFORE ANY EMISSION AND
-            // BEFORE `pixels` IS TOUCHED. With GL_PIXEL_PACK_BUFFER bound, the frontend permits
-            // `pixels` to be a byte OFFSET into that buffer, not an address (GL_Framebuffer.cpp:
-            // 3055 aligns it to the type size, one byte for UNSIGNED_BYTE) - and this emitter has
-            // no PBO branch: it sets DstOffset = 0, hands the offset to EmitAndWait as a host
-            // buffer, and the reply is memcpy'd to CPU address <offset>. Under monolith the
-            // backend maps the PBO and writes the reply into the buffer (unchanged). The real
-            // split form - the server writes the reply into the buffer resource and the client
-            // marks it GPU-written (b1's MarkReadPixelsPackBuffer becoming the producer contract
-            // §3 names) - is a P6 ROADMAP item. In P5 it is class C's shape (R-4), refused here.
-            if (MG_State::pGLContext != nullptr &&
-                MG_State::pGLContext->GetBufferBindingSlot(::MobileGL::BufferTarget::PixelPack)
-                    .GetBoundObject()) {
-                UnmigratedVerbFatal("ReadPixels+PACK_BUFFER");
-            }
+            // A bound PACK buffer makes pixels an offset. The owned reply is
+            // packed on this thread and only the requested rows are uploaded.
+            const auto pbo = MG_State::pGLContext != nullptr
+                ? MG_State::pGLContext->GetBufferBindingSlot(::MobileGL::BufferTarget::PixelPack).GetBoundObject()
+                : SharedPtr<MG_State::GLState::BufferObject>{};
 
             BeforeReadOnlyVerb();
 
-            // THE PBO HALF IS b1's DESIGN AND b1 ALREADY WIRED ITS MARK, at
-            // GL_Framebuffer.cpp:3109 - immediately after this table call returns, inside
-            // ReadPixels_Backend itself. So this emitter deliberately does NOT call
-            // MarkReadPixelsPackBuffer(): a second call there would be the "wire it twice"
-            // shape, and the per-row counter b1's unit cases assert on would then count one
-            // read as two. (In P5 the refusal above means no PBO read reaches here at all; the
-            // note stays for the P6 form.)
             if (width <= 0 || height <= 0) return;
             const Uint64 bytesPerPixel = ReadbackBytesPerPixel(format, type);
-            // ONE tight-size function for production AND the control (M3 / codex 10a). The first
-            // cut computed this inline here while the test drove TightReadbackByteCount, so a
-            // `+16` on the production line stayed green - the test observed a different number.
-            // Now the number the server allocates and the number the test asserts come from the
-            // same body.
-            const Uint64 tight = TightReadbackBytes(width, height, format, type);
-
-            MG_Pipe::MGPReadbackInfo info{};
-            info.Res = MG_Pipe::kMGPipeNullHandle; // "the bound read surface answers"
-            info.Box = MG_Pipe::MGPBox{x, y, 0, static_cast<Uint32>(width),
-                                       static_cast<Uint32>(height), 1};
-            info.Format = static_cast<Uint32>(format);
-            info.Type = static_cast<Uint32>(type);
-            info.Target = 0;
-            info.Level = 0;
-            info.DstOffset = 0;
-            info.DstSize = tight;
-
-            // CHECKED BEFORE THE EMISSION, not after the answer (ID-47), and through S1's
-            // HELPER rather than a copy of it here. A reply bigger than a slot is Fatal on the
-            // SERVER too, and s1 keeps that as the last line of defence - but it fires on the
-            // apply thread with the record already on the wire, where all the client sees is a
-            // hang. This one names the read, at the call site that knows what the read was.
-            //
-            // THE NUMBER IS ID-49's TIGHT EXTENT and not the packed one: the pack state never
-            // crosses, so the answer that has to fit a slot is w*h*bytesPerPixel. The cap is
-            // the pool's own, read live, so s1's growth of SEG_REPLY to 16 MiB / eight 2 MiB
-            // slots needed no edit in this file - only the merge.
-            session.RequireReadPixelsReplyFits(static_cast<Uint32>(width),
-                                               static_cast<Uint32>(height),
-                                               static_cast<Uint32>(format),
-                                               static_cast<Uint32>(type), tight);
 
             PixelStoreParameters pack{};
             if (MG_State::pGLContext != nullptr) {
                 pack = MG_State::pGLContext->GetPixelStoreParameters(/*isUnpack=*/false);
             }
-
-            Int32 status = 0;
-            Uint64 replySize = 0;
-            if (ReadbackPackStateIsTight(width, bytesPerPixel, pack)) {
-                // THE COMMON CASE, AND IT KEEPS THE ZERO-COPY. A neutral pack state means the
-                // destination layout IS the tight layout, so the reply lands straight in the
-                // application's buffer and there is no bounce at all. It is a fast path for the
-                // SAME bytes, not a second rule: ScatterTightReadback below is a memcpy of the
-                // whole run in exactly this case, and the control drives that function.
-                session.EmitAndWait(MG_Pipe::MGPWireOp::ReadPixels, &info, sizeof(info), nullptr, 0,
-                                    pixels, tight, &status, &replySize);
-                // M2 / codex 11: an OK reply that arrived short, or a DECLINE/ERROR, must not be
-                // handed back as pixels. The Fatal aborts before the application reads the buffer,
-                // so the bytes EmitAndWait already copied into `pixels` are never observed.
-                RequireReadbackReplyComplete(status, replySize, tight);
-                ApplyReadbackByteSwap(pixels, tight, type, pack);
+            ReadbackLayout layout;
+            const SizeT pboOffset = reinterpret_cast<SizeT>(pixels);
+            if (!CheckedReadbackLayout(width, height, 1, bytesPerPixel, pack, false, layout) ||
+                (pbo && (pboOffset > pbo->GetSize() || layout.End > pbo->GetSize() - pboOffset))) {
+                RecordReadbackRangeError("ReadPixels");
                 return;
             }
 
-            // The bounce is the price of the application having asked for a layout. It is the
-            // tight size and never more, and it is freed before this returns - R-11's rule one
-            // level out: nothing here outlives the call.
-            Vector<Uint8> bounce(static_cast<SizeT>(tight));
-            session.EmitAndWait(MG_Pipe::MGPWireOp::ReadPixels, &info, sizeof(info), nullptr, 0,
-                                bounce.data(), tight, &status, &replySize);
-            // BEFORE THE SCATTER, so a short or non-OK reply never reaches the application's
-            // pointer at all (the bounce is the only thing that held the partial bytes).
-            RequireReadbackReplyComplete(status, replySize, tight);
-            ApplyReadbackByteSwap(bounce.data(), tight, type, pack);
-            ScatterTightReadbackIntoPackState(bounce.data(), pixels, width, height, bytesPerPixel,
-                                              pack);
+            // P7 GATE 5 (g5-readback): A READ LARGER THAN ONE REPLY SLOT IS BANDED, NOT REFUSED.
+            // KHR-GL46.direct_state_access.renderbuffers_storage reads 256x512 RGBA/FLOAT =
+            // 2,097,152 bytes, sixteen over MaxReplyBytes, and that used to be
+            // Fatal{ReplyTooLarge} on every split arm while the monolith passed. Each band below
+            // is an ordinary read_pixels record - its own box, and a DstSize that IS its tight
+            // w*h*bpp extent (ID-49) - so every answer still fits one slot (ID-47) and the
+            // server's PH-3 bound (its tight answer against its own LinkTerms.maxReplyBytes,
+            // PipeApplier.cpp OnReadPixels) holds unchanged: no reply is chunked, the READ is. The cap is the link's own, read live, exactly as
+            // before, so a different SEG_REPLY geometry or a stream link needs no edit here.
+            ReadbackBandPlan plan;
+            if (!PlanReadbackBands(static_cast<Uint64>(width), static_cast<Uint64>(height),
+                                   bytesPerPixel, session.MaxReplyBytes(), plan)) {
+                // NOT EVEN ONE PIXEL FITS (or there is no reply pool at all). That is the only
+                // read no banding can answer, and ID-47's named refusal is kept for it - for the
+                // one-pixel piece that cannot be sent, so the message names what was impossible.
+                session.RequireReadPixelsReplyFits(1, 1, static_cast<Uint32>(format),
+                                                   static_cast<Uint32>(type), bytesPerPixel);
+                return;
+            }
+
+            // THE COMMON CASE KEEPS THE ZERO-COPY. A neutral pack state means the destination
+            // layout IS the tight layout, so each band's reply lands straight in the
+            // application's buffer at the band's tight offset (whole-width bands and single-row
+            // pieces are both contiguous there). It is a fast path for the SAME bytes, not a
+            // second rule: ScatterReadbackBandIntoPackState is a memcpy of the band in exactly
+            // this case, and the control drives that function.
+            const Bool direct = !pbo && ReadbackPackStateIsTight(width, bytesPerPixel, pack);
+            // The bounce is the price of the application having asked for a layout. It is ONE
+            // band - at most a reply slot - rather than the whole read, and it is freed before
+            // this returns: R-11's rule one level out, nothing here outlives the call.
+            Vector<Uint8> bounce;
+            Bool pboSynced = false;
+            ForEachReadbackBand(static_cast<Uint64>(width), static_cast<Uint64>(height), plan,
+                                [&](const ReadbackBand& band) {
+                // ONE tight-size function for production AND the control (M3 / codex 10a): the
+                // number the server allocates and the number the test asserts come from the
+                // same body, per band now.
+                const Uint64 bandBytes = TightReadbackBytes(static_cast<GLsizei>(band.Columns),
+                                                            static_cast<GLsizei>(band.Rows),
+                                                            format, type);
+                MG_Pipe::MGPReadbackInfo info{};
+                info.Res = MG_Pipe::kMGPipeNullHandle; // "the bound read surface answers"
+                info.Box = MG_Pipe::MGPBox{ReadbackBandOrigin(x, band.FirstColumn),
+                                           ReadbackBandOrigin(y, band.FirstRow), 0,
+                                           static_cast<Uint32>(band.Columns),
+                                           static_cast<Uint32>(band.Rows), 1};
+                info.Format = static_cast<Uint32>(format);
+                info.Type = static_cast<Uint32>(type);
+                info.Target = 0;
+                info.Level = 0;
+                info.DstOffset = 0;
+                info.DstSize = bandBytes;
+
+                // CHECKED BEFORE THE EMISSION, not after the answer (ID-47), through S1's
+                // helper, for every record. The plan makes it true by construction; it stays
+                // because it is the one check that names the read at the call site if the plan
+                // and the pool ever disagree, where the server's PH-3 refusal would only answer
+                // ERROR on the apply thread.
+                session.RequireReadPixelsReplyFits(static_cast<Uint32>(band.Columns),
+                                                   static_cast<Uint32>(band.Rows),
+                                                   static_cast<Uint32>(format),
+                                                   static_cast<Uint32>(type), bandBytes);
+
+                Int32 status = 0;
+                Uint64 replySize = 0;
+                if (direct) {
+                    Uint8* at = pixels == nullptr
+                        ? nullptr
+                        : static_cast<Uint8*>(pixels) +
+                              (band.FirstRow * static_cast<Uint64>(width) + band.FirstColumn) *
+                                  bytesPerPixel;
+                    session.EmitAndWait(MG_Pipe::MGPWireOp::ReadPixels, &info, sizeof(info),
+                                        nullptr, 0, at, bandBytes, &status, &replySize);
+                    // M2 / codex 11: an OK reply that arrived short, or a DECLINE/ERROR, must not
+                    // be handed back as pixels. The Fatal aborts before the application reads the
+                    // buffer, so the bytes EmitAndWait already copied are never observed.
+                    RequireReadbackReplyComplete(status, replySize, bandBytes);
+                    ApplyReadbackByteSwap(at, bandBytes, type, pack);
+                    return;
+                }
+
+                if (bounce.size() < bandBytes) bounce.resize(static_cast<SizeT>(bandBytes));
+                session.EmitAndWait(MG_Pipe::MGPWireOp::ReadPixels, &info, sizeof(info), nullptr,
+                                    0, bounce.data(), bandBytes, &status, &replySize);
+                // BEFORE THE SCATTER, so a short or non-OK reply never reaches the application's
+                // pointer at all (the bounce is the only thing that held the partial bytes).
+                RequireReadbackReplyComplete(status, replySize, bandBytes);
+                ApplyReadbackByteSwap(bounce.data(), bandBytes, type, pack);
+                if (pbo) {
+                    // pixels is an offset, never a host pointer. Upload only the requested
+                    // rows so PACK padding and untouched bytes survive; the offsets are the
+                    // overflow-checked layout's, the same numbers the range check accepted.
+                    if (!pboSynced) {
+                        pbo->SyncGpuWrites();
+                        pboSynced = true;
+                    }
+                    const Uint64 bandRowBytes = band.Columns * bytesPerPixel;
+                    for (Uint64 row = 0; row < band.Rows; ++row) {
+                        pbo->UploadSubData({bounce.data() + row * bandRowBytes,
+                                            static_cast<SizeT>(bandRowBytes)},
+                                           pboOffset + layout.Start +
+                                               (band.FirstRow + row) * layout.RowStride +
+                                               band.FirstColumn * bytesPerPixel);
+                    }
+                    return;
+                }
+                ScatterReadbackBandIntoPackState(bounce.data(), pixels, width, band, bytesPerPixel,
+                                                 pack);
+            });
         }
 
         void EmitPresent() {
@@ -1017,7 +1097,7 @@ namespace MobileGL::MG_Remote::Client {
                 // AND THE ROW, WHENEVER THE MAXIMUM MOVES. The summary line can carry the
                 // number but not the name - MG_Util is below MG_Remote and has no WireOpName -
                 // and the name is the actionable half: R-10 makes the integrator choose between
-                // early chunking and a bigger ring, and that is a decision about a record
+                // a cut for that row and a bigger ring, and that is a decision about a record
                 // FAMILY. ClientSession::Stop prints the same pair at teardown, but a trace
                 // replay never reaches it (measured: the OpenRA lane's library log ends mid-run
                 // with no teardown line at all), so a stats-enabled run would otherwise publish
@@ -1026,7 +1106,7 @@ namespace MobileGL::MG_Remote::Client {
                 if (encoder.MaxRecordBytesSeen() > g_publishedMaxRecordBytes) {
                     g_publishedMaxRecordBytes = encoder.MaxRecordBytesSeen();
                     MGLOG_I("MGPipe: wire ledger: new maximum record - maxrec=%llu "
-                            "maxrecop=%s cap=%llu (R-10's proof obligation; P5 does not chunk)",
+                            "maxrecop=%s cap=%llu (R-10's proof obligation; blobs are cut, a record is not)",
                             static_cast<unsigned long long>(g_publishedMaxRecordBytes),
                             encoder.MaxRecordOpName(),
                             static_cast<unsigned long long>(encoder.MaxRecordBytesCap()));
@@ -1034,10 +1114,20 @@ namespace MobileGL::MG_Remote::Client {
             }
 
             MG_Pipe::MGPPresent record{};
-            // FrameSerial 0 = "the server stamps its own". P5 has no client-side present credit
-            // (MOBILEGL_IPC_PRESENT_CREDIT is P6's), so a client-minted serial would be a second
-            // id space with no consumer.
-            record.FrameSerial = 0;
+            // P5e (ra, CONTRACT-P5E §1, §2.4). FrameSerial USED TO BE 0 - "the server stamps
+            // its own" - and that was honest while nothing paced on it. It is now minted here,
+            // 1-based, by AcquirePresentCredit, which also PAYS the credit: if this client
+            // already has MOBILEGL_IPC_PRESENT_CREDIT presents in flight it parks until the
+            // server's OnPresent returns one, and only then does it mint.
+            //
+            // THE CREDIT WAIT IS BEFORE THE ENCODE, WHICH IS NOT A DETAIL: EmitAndWait
+            // reserves SEG_CMD bytes as its first act, so a client that encoded and then
+            // parked would hold a ring reservation across a whole frame of server time. It
+            // also drains SEG_EVENT on its way out, like every other wait (§2.6).
+            //
+            // With run-ahead disarmed this is a counter and nothing else, and the record below
+            // travels exactly as it did - the present row's own barrier is the pacing there.
+            record.FrameSerial = session.AcquirePresentCredit();
             session.EmitAndWait(MG_Pipe::MGPWireOp::Present, &record, sizeof(record), nullptr, 0,
                                 nullptr, 0, nullptr);
 
@@ -1208,25 +1298,21 @@ namespace MobileGL::MG_Remote::Client {
                                   GLsizei srcWidth, GLsizei srcHeight, GLsizei srcDepth) {
             ClientSession& session = RequireSession("CopyImageSubData");
 
-            // ID-57's SHAPE: REFUSED BY NAME, BEFORE ANY EMISSION. GL 4.6 core 18.3.2 accepts
-            // GL_RENDERBUFFER as either endpoint, and an endpoint is a sum type for exactly that
-            // reason - but no sticky forward hands out a renderbuffer object, so the sink has no
-            // way to rebuild one from a name, and none was measured. P7 is where the backend
-            // takes handles and this arm becomes ordinary. The sink refuses the same shape by
-            // the same name if a record ever reaches it (defence on both sides of one wire).
-            if (src.IsRenderbuffer() || dst.IsRenderbuffer()) {
-                UnmigratedVerbFatal("CopyImageSubData+RENDERBUFFER");
-            }
-
+            // The GL target selects the texture or renderbuffer handle namespace.
             MG_Pipe::MGPCopyRegion record{};
-            record.Src = PublishedTextureHandle(src.Texture);
-            record.Dst = PublishedTextureHandle(dst.Texture);
-            // The GL names beside the handles: the key MGB_CTX->GetTextureObject(name) takes on
-            // the far side (a BARRIER-PULLED sticky forward, counted in `rsp`, retired by P7).
+            const auto handle = [](const MG_Backend::CopyImageEndpoint& endpoint) {
+                return endpoint.IsRenderbuffer()
+                    ? MG_Pipe::MGPipeSlots().FindByLifetimeId(MG_Pipe::MGPipeKind::Renderbuffer,
+                                                              endpoint.Renderbuffer->GetLifetimeId())
+                    : PublishedTextureHandle(endpoint.Texture);
+            };
+            record.Src = handle(src);
+            record.Dst = handle(dst);
+            // GL names remain diagnostic only; backend identity comes from handles.
             record.SrcGlName =
-                src.Texture ? static_cast<Uint32>(src.Texture->GetExternalIndex()) : 0u;
+                src.IsRenderbuffer() ? src.Renderbuffer->GetExternalIndex() : src.Texture->GetExternalIndex();
             record.DstGlName =
-                dst.Texture ? static_cast<Uint32>(dst.Texture->GetExternalIndex()) : 0u;
+                dst.IsRenderbuffer() ? dst.Renderbuffer->GetExternalIndex() : dst.Texture->GetExternalIndex();
             // The GL targets verbatim, in a Uint16 - every GL texture target fits one. NOT
             // MGPipeResourceTarget: the sink only ever forwards these to a slot that takes GL
             // enums, and the tree has no resource-target -> GL-enum inverse to spend on them.
@@ -1256,6 +1342,7 @@ namespace MobileGL::MG_Remote::Client {
             // The backend slot's own first line (DirectGLES.cpp:9201), kept here so a null name
             // never becomes a zero-size blob - which rule A forbids spelling at all.
             if (storageBlockName == nullptr) return;
+            BeforeReadOnlyVerb();
 
             MG_Pipe::MGPStorageBlockBinding record{};
             record.GlName = static_cast<Uint32>(program);
@@ -1264,8 +1351,14 @@ namespace MobileGL::MG_Remote::Client {
             if (MG_State::pGLContext != nullptr) {
                 const auto& programObject = MG_State::pGLContext->GetProgramObject(program);
                 if (programObject) {
-                    record.ShaderCso = MG_Pipe::MGPipeSlots().FindByLifetimeId(
-                        MG_Pipe::MGPipeKind::ShaderCso, programObject->GetLifetimeId());
+                    // The application may rebind a stage program before it is
+                    // current or attached to a pipeline. A minted slot alone does
+                    // not publish its archive; this verb must follow that birth.
+                    programObject->JoinLinkAndSpirv();
+                    Uint64 bytes = 0;
+                    auto& emitter = MG_Pipe::MGPipeProgramEmitterInstance();
+                    record.ShaderCso = emitter.AcquireShaderCso(*programObject, bytes);
+                    emitter.EmitProgramBindings(*programObject, record.ShaderCso);
                 }
             }
             // Size = strlen + 1: THE NUL TRAVELS (contract table 0's block-name row). The
@@ -1292,21 +1385,12 @@ namespace MobileGL::MG_Remote::Client {
         // MarkEndTransformFeedbackCaptureTargets). Taking it here as well would mark the same
         // buffers twice and taking it INSTEAD of there would mark nothing.
         //
-        // RULE D (CONTRACT-P5B.md §0): each record carries the GL arguments the frontend handed
-        // the backend slot and nothing that is a READING of them. The capture program, the
-        // capture-buffer bindings, the patch state and the bound XFB object all stay
-        // BARRIER-PULLED - the server's backend reads the client's gPipeInputs fill of the
-        // moment, which MGP_FILL at each call site has just written and the verb barrier holds
-        // still (R-1). That is why these are six two-line emitters and not an XFB protocol.
-        //
-        // WHAT MUST HAVE CROSSED BEFORE begin_stream_output, since it is the ordering question
-        // this package was asked: the capture buffers' own resource records (emitted at their
-        // own call sites through the resource family, long before this point), the program
-        // (the CSO/program family, likewise), and the buffer BINDINGS - which do not cross as a
-        // record at all, because set_stream_output_targets (39) has no producer and no consumer
-        // and CONTRACT-P5B.md §2 rules it NOT required for t2: under the barrier the server's
-        // StartPendingTransformFeedback reads them through the kXfbSpan/kDraw pulls
-        // (GetTransformFeedbackProgram, GetBufferBindingPoint). Producing that row is P9's.
+        // P5f fe extends Begin with the immutable capture snapshot: program CSO handle,
+        // XFB object lifetime id, and four buffer handle/range pairs. Buffer resource records
+        // precede this verb through BeforeReadOnlyVerb; AcquireShaderCso below publishes the
+        // program archive before Begin. Deferred driver Begin and End therefore need no
+        // frontend program or binding-point lookup. set_stream_output_targets stays unused:
+        // this state changes at the capture-span boundary, so it rides Begin itself.
 
         void EmitBeginTransformFeedback(GLenum primitiveMode) {
             ClientSession& session = RequireSession("BeginTransformFeedback");
@@ -1316,6 +1400,24 @@ namespace MobileGL::MG_Remote::Client {
             // The GL token verbatim (contract table 0's "GL enums on the wire"): the sink hands
             // it to the backend slot that takes it, and nothing between here and there reads it.
             record.PrimitiveMode = static_cast<Uint32>(primitiveMode);
+            auto& context = *MG_State::pGLContext;
+            record.LifetimeId = context.GetBoundTransformFeedbackLifetimeId();
+            const auto& program = context.GetTransformFeedbackProgram();
+            if (program) {
+                Uint64 bytes = 0;
+                record.CaptureProgram = MG_Pipe::MGPipeProgramEmitterInstance().AcquireShaderCso(*program, bytes);
+            }
+            static_assert(MG_State::GLState::GLContext::MAX_TRANSFORM_FEEDBACK_BUFFERS == 4);
+            for (Uint i = 0; i < 4; ++i) {
+                const auto& point = context.GetBufferBindingPoint(BufferTarget::TransformFeedback, i);
+                const auto& buffer = point.GetBoundObject();
+                if (!buffer) continue;
+                const auto range = point.GetRange();
+                const SizeT start = std::min(range.start, buffer->GetSize());
+                const SizeT end = std::min(range.end, buffer->GetSize());
+                record.Targets[i] = {MG_Pipe::MGPipeResourceTrackerInstance().Find(*buffer), start,
+                                     end > start ? end - start : 0};
+            }
             session.EmitAndWait(MG_Pipe::MGPWireOp::BeginStreamOutput, &record, sizeof(record),
                                 nullptr, 0, nullptr, 0, nullptr);
         }
@@ -1518,7 +1620,9 @@ namespace MobileGL::MG_Remote::Client {
             g_fenceProxies.erase(proxy);
         }
 
-        // CLASS C - 16 slots remain after d1/i1/t2/f1; each names its first blocker.
+#include "QueryEmit.inc"
+
+        // CLASS C - each remaining slot names its first blocker.
         // =============================================================================
         //
         // PARTITIONED BY THE P5b PACKAGE THAT OWNS THE FLIP (MG_Remote/CONTRACT-P5B.md,
@@ -1567,35 +1671,19 @@ namespace MobileGL::MG_Remote::Client {
         // not by omission (unmeasured; the driver object leaks on the server until P9's XFB
         // namespace work, and a bind of name 0 is what the backend does on delete of the bound
         // one, DirectGLES.cpp:1422). It therefore still aborts by its own name.
-#define MGR_UNMIGRATED_T2_SLOTS(X)                                                                 \
-    X(DeleteTransformFeedback, void, (GLuint))
+#define MGR_UNMIGRATED_T2_SLOTS(X)
 
 #define MGR_UNMIGRATED_F1_SLOTS(X)
 
         // The wave-3 tail. SetSwapInterval is hand-written below (it is not a GL.* slot).
-#define MGR_UNMIGRATED_TAIL_SLOTS(X)                                                               \
-    X(GetTexImage, void, (GLenum, GLint, GLenum, GLenum, GLvoid*))                                 \
-    X(GetTextureImage, void,                                                                       \
-      (const SharedPtr<MG_State::GLState::ITextureObject>&, TextureUploadTarget, GLint, GLenum,    \
-       GLenum, GLsizei, GLvoid*))                                                                  \
-    X(EndTimeElapsedQuery, void, (MG_Backend::BackendQueryHandle))                                  \
-    X(DeleteBackendQuery, void, (MG_Backend::BackendQueryHandle))                                   \
-    X(EndOcclusionQuery, void, (MG_Backend::BackendQueryHandle))                                    \
-    X(EndXfbPrimitivesQuery, void, (MG_Backend::BackendQueryHandle))
+#define MGR_UNMIGRATED_TAIL_SLOTS(X)
 
         // The non-void ones, kept apart only because the macro body differs: a [[noreturn]]
         // call is a complete body for a void slot and for a value-returning one alike, but a
         // compiler that does not see UnmigratedVerbFatal's attribute through the macro would
         // warn on the second. It does see it; they are split for readability. All ten are the
         // wave-3 tail.
-#define MGR_UNMIGRATED_TAIL_VALUE_SLOTS(X)                                                         \
-    X(BeginTimeElapsedQuery, MG_Backend::BackendQueryHandle, ())                                   \
-    X(QueryCounterTimestamp, MG_Backend::BackendQueryHandle, ())                                   \
-    X(IsQueryResultAvailable, Bool, (MG_Backend::BackendQueryHandle))                               \
-    X(GetQueryResult64, Bool, (MG_Backend::BackendQueryHandle, Bool, Uint64*))                      \
-    X(BeginOcclusionQuery, MG_Backend::BackendQueryHandle, ())                                      \
-    X(BeginXfbPrimitivesQuery, MG_Backend::BackendQueryHandle, (Bool))                              \
-    X(GetGpuTimestampNs, Int64, ())
+#define MGR_UNMIGRATED_TAIL_VALUE_SLOTS(X)
 
         // The union, for the places that want every class-C row at once (the definitions and
         // the assignments). A package never edits THIS; it edits its own list above.
@@ -1639,13 +1727,14 @@ namespace MobileGL::MG_Remote::Client {
         constexpr Uint32 kEmittedSlotsP5 = 5; // Clear, DrawArrays, ReadPixels, Blit, Present
         constexpr Uint32 kEmittedSlotsD1 = 19;
         constexpr Uint32 kEmittedSlotsI1 = 7;
-        constexpr Uint32 kEmittedSlotsT2 = 6;
+        constexpr Uint32 kEmittedSlotsT2 = 7;
         constexpr Uint32 kEmittedSlotsF1 = 11;
-        constexpr Uint32 kEmittedSlotsTail = 1; // BlitNamedFramebuffer
+        constexpr Uint32 kEmittedSlotsTail = 3; // BlitNamedFramebuffer, both texture readbacks
         constexpr Uint32 kEmittedSlotsSync = 5;
+        constexpr Uint32 kEmittedSlotsQueries = 11;
         constexpr Uint32 kEmittedSlots =
             kEmittedSlotsP5 + kEmittedSlotsD1 + kEmittedSlotsI1 + kEmittedSlotsT2 + kEmittedSlotsF1 +
-            kEmittedSlotsTail + kEmittedSlotsSync;
+            kEmittedSlotsTail + kEmittedSlotsSync + kEmittedSlotsQueries;
         constexpr Uint32 kLocallyAnsweredSlots = 2; // GetIntegeri_v, IsTimerQuerySupported
 
         // EACH PACKAGE'S OWNERSHIP, PINNED. A package that flips a slot removes one row and
@@ -1656,7 +1745,7 @@ namespace MobileGL::MG_Remote::Client {
         static_assert(kUnmigratedI1 + kEmittedSlotsI1 == 7, "i1 owns the 7 image/compute/barrier/copy/SSBO slots");
         static_assert(kUnmigratedT2 + kEmittedSlotsT2 == 7, "t2 owns the 7 XFB/tessellation slots");
         static_assert(kUnmigratedF1 + kEmittedSlotsF1 == 11, "f1 owns the 11 clear/copy/mip slots");
-        static_assert(kUnmigratedTail + kEmittedSlotsTail + kEmittedSlotsSync == 20,
+        static_assert(kUnmigratedTail + kEmittedSlotsTail + kEmittedSlotsSync + kEmittedSlotsQueries == 20,
                       "the original wave-3 tail owns 20 slots");
         static_assert(kUnmigratedSlots + kEmittedSlots == 69, "class B and C own 69 slots");
         static_assert(kLocallyAnsweredSlots + kEmittedSlots + kUnmigratedSlots == kRemoteEmitSlotCount,
@@ -1682,6 +1771,18 @@ namespace MobileGL::MG_Remote::Client {
             table.GL.GetSyncStatus = &EmitGetSyncStatus;
             table.GL.WaitSync = &EmitWaitSync;
             table.GL.DeleteSync = &EmitDeleteSync;
+            table.GL.BeginTimeElapsedQuery = &EmitBeginTimeElapsedQuery;
+            table.GL.EndTimeElapsedQuery = &EmitEndQuery;
+            table.GL.QueryCounterTimestamp = &EmitQueryCounterTimestamp;
+            table.GL.BeginOcclusionQuery = &EmitBeginOcclusionQuery;
+            table.GL.EndOcclusionQuery = &EmitEndQuery;
+            table.GL.BeginXfbPrimitivesQuery = &EmitBeginXfbPrimitivesQuery;
+            table.GL.EndXfbPrimitivesQuery = &EmitEndQuery;
+            table.GL.IsQueryResultAvailable = &EmitIsQueryResultAvailable;
+            table.GL.GetQueryResult64 = &EmitGetQueryResult64;
+            table.GL.DeleteBackendQuery = &EmitDeleteBackendQuery;
+            table.GL.GetGpuTimestampNs = &EmitGetGpuTimestampNs;
+            table.GL.DeleteTransformFeedback = &EmitDeleteTransformFeedback;
 
             // ---- class A
             table.GL.GetIntegeri_v = &AnswerGetIntegeri_v;
@@ -1744,6 +1845,8 @@ namespace MobileGL::MG_Remote::Client {
             table.GL.CopyTexImage2D = &EmitCopyTexImage2D;
             table.GL.CopyTexSubImage2D = &EmitCopyTexSubImage2D;
             table.GL.GenerateMipmap = &EmitGenerateMipmap;
+            table.GL.GetTexImage = &EmitGetTexImage;
+            table.GL.GetTextureImage = &EmitGetTextureImage;
 
             // ---- class B, P5b package i1 (kEmittedSlotsI1 = 7)
             table.GL.BindImageTexture = &EmitBindImageTexture;
@@ -1793,12 +1896,41 @@ namespace MobileGL::MG_Remote::Client {
         return status == Wire::ReplySink::kStatusOk && replySize == expected;
     }
 
-    // ID-49's scatter. Exported for the same reason as the refusal above: the control drives
-    // THIS, which is what the emitter calls, rather than a second copy of 8.4.4's arithmetic.
-    void ScatterTightReadbackIntoPackState(const void* tight, void* destination, GLsizei width,
-                                           GLsizei height, Uint64 bytesPerPixel,
-                                           const PixelStoreParameters& pack) {
-        if (tight == nullptr || destination == nullptr || width <= 0 || height <= 0) return;
+    // g5-readback's plan (EmitTables.h, ReadbackBand). Pixels-per-reply first and the row test
+    // against it, so no product here can overflow whatever the inputs: a unit control drives
+    // this with Uint64 extremes, and the emitter with a GLsizei width.
+    Bool PlanReadbackBands(Uint64 width, Uint64 height, Uint64 bytesPerPixel, Uint64 maxReplyBytes,
+                           ReadbackBandPlan& plan) {
+        if (width == 0 || height == 0 || bytesPerPixel == 0 || maxReplyBytes < bytesPerPixel) {
+            return false;
+        }
+        const Uint64 pixelsPerReply = maxReplyBytes / bytesPerPixel; // >= 1
+        if (width <= pixelsPerReply) {
+            // floor(floor(cap / bpp) / width) == floor(cap / (bpp * width)): the most whole rows
+            // one reply holds, and at least one because a row fits.
+            plan.RowsPerBand = pixelsPerReply / width;
+            plan.ColumnsPerBand = width;
+        } else {
+            // A SINGLE ROW IS LARGER THAN A REPLY (a >131071-pixel RGBA/FLOAT row at the 2 MiB
+            // slot - wider than any attachment, but a legal glReadPixels whose in-bounds pixels
+            // GL still defines). Each row is cut into pieces; one row per band keeps every piece
+            // contiguous in the tight layout.
+            plan.RowsPerBand = 1;
+            plan.ColumnsPerBand = pixelsPerReply;
+        }
+        return true;
+    }
+
+    // ID-49's scatter, for one band of a banded read (g5-readback). The whole-read scatter below
+    // is this function over the single band {0, height, 0, width}, so there is one copy of
+    // 8.4.4's arithmetic and the control drives it.
+    void ScatterReadbackBandIntoPackState(const void* band, void* destination, GLsizei width,
+                                          const ReadbackBand& where, Uint64 bytesPerPixel,
+                                          const PixelStoreParameters& pack) {
+        if (band == nullptr || destination == nullptr || width <= 0 || where.Rows == 0 ||
+            where.Columns == 0) {
+            return;
+        }
         const Uint64 rowPixels =
             pack.RowLength > 0 ? static_cast<Uint64>(pack.RowLength) : static_cast<Uint64>(width);
         const Uint64 alignment = pack.Alignment > 0 ? static_cast<Uint64>(pack.Alignment) : 1ull;
@@ -1811,21 +1943,35 @@ namespace MobileGL::MG_Remote::Client {
         // would do with the same state rather than clamping, so the two arms stay byte-identical.
         // The fast path (ReadbackPackStateIsTight) already rejects any ROW_LENGTH != width, so
         // this only runs on the scatter path the application asked for.
-        const Uint64 writtenPerRow = static_cast<Uint64>(width) * bytesPerPixel;
+        const Uint64 writtenPerRow = where.Columns * bytesPerPixel;
         // SKIP_IMAGES and IMAGE_HEIGHT ARE IGNORED (codex 6). glReadPixels is a 2-D read; GL
         // does not apply the image-level pack parameters to it, and the monolith conversion path
         // says so explicitly with honorPackImageParams=false (DirectGLES.cpp:10905). Applying
         // SKIP_IMAGES here shifted a read with SKIP_IMAGES=1 by a whole image and overran an
         // application buffer sized for exactly `height` rows. Only SKIP_ROWS and SKIP_PIXELS -
-        // the 2-D skips - offset the first written byte.
+        // the 2-D skips - offset the first written byte; the band's own row and column then
+        // offset it within the read, on the SAME stride, so a banded read writes exactly the
+        // bytes the whole-read scatter would have, in the same row order.
         auto* out = static_cast<Uint8*>(destination) +
-                    static_cast<Uint64>(pack.SkipRows) * strideBytes +
-                    static_cast<Uint64>(pack.SkipPixels) * bytesPerPixel;
-        const auto* in = static_cast<const Uint8*>(tight);
-        for (Uint64 row = 0; row < static_cast<Uint64>(height); ++row) {
+                    (static_cast<Uint64>(pack.SkipRows) + where.FirstRow) * strideBytes +
+                    (static_cast<Uint64>(pack.SkipPixels) + where.FirstColumn) * bytesPerPixel;
+        const auto* in = static_cast<const Uint8*>(band);
+        for (Uint64 row = 0; row < where.Rows; ++row) {
             std::memcpy(out + row * strideBytes, in + row * writtenPerRow,
                         static_cast<SizeT>(writtenPerRow));
         }
+    }
+
+    // ID-49's scatter. Exported for the same reason as the refusal above: the control drives
+    // THIS, which is what the emitter calls, rather than a second copy of 8.4.4's arithmetic.
+    void ScatterTightReadbackIntoPackState(const void* tight, void* destination, GLsizei width,
+                                           GLsizei height, Uint64 bytesPerPixel,
+                                           const PixelStoreParameters& pack) {
+        if (tight == nullptr || destination == nullptr || width <= 0 || height <= 0) return;
+        ScatterReadbackBandIntoPackState(
+            tight, destination, width,
+            ReadbackBand{0, static_cast<Uint64>(height), 0, static_cast<Uint64>(width)},
+            bytesPerPixel, pack);
     }
 
     // =============================================================================
@@ -1853,6 +1999,13 @@ namespace MobileGL::MG_Remote::Client {
         // on its side). kDrawHasUserIndices / kDrawIsIndirect are added by the emission itself,
         // kDrawHasIndexRange by the two DrawRangeElements* callers.
         info.Flags = bindings.PrimitiveRestart ? static_cast<Uint8>(MG_Pipe::kDrawPrimitiveRestart) : 0;
+        // P5e (vi), CONTRACT-P5E §2.1 (ii) / §5.1. On the wire BECAUSE the server needs it: the
+        // barriered predicate is computed identically by both roles from the record alone, and
+        // "does this draw fetch from client memory" is not derivable from anything else in it -
+        // a null Res inside the vertex-buffer window is also what a DISABLED attribute below
+        // the high-water mark publishes. Set for every draw shape, not just the array ones: a
+        // glDrawElements can fetch its VERTICES from client memory too.
+        if (bindings.ClientVertexArrays) info.Flags |= static_cast<Uint8>(MG_Pipe::kDrawClientArrays);
         // A negative count has already been refused by the frontend (INVALID_VALUE); 0 crosses
         // as 0 and draws nothing, which is what the driver does with it.
         info.InstanceCount = instanceCount > 0 ? static_cast<Uint32>(instanceCount) : 0u;

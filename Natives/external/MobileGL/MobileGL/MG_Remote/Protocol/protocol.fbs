@@ -56,6 +56,47 @@ table SegmentRef {
 // Handshake
 // ---------------------------------------------------------------------------
 
+// P6.5: independent control and data-plane choices. Values are append-only.
+enum DataPlane : ubyte { SharedSegments = 0, Stream = 1 }
+enum WireForm : ubyte { StructImage = 0 }
+enum DialMode : ubyte { No = 0, Fork = 1, Connect = 2 }
+
+// Window sizes are stated by the server; the client's values are proposals only.
+table LinkTerms {
+  dataPlane: DataPlane;
+  wireForm: WireForm;
+  maxReplyBytes: ulong;
+  cmdWindowBytes: ulong;
+  stageWindowBytes: ulong;
+  eventWindowBytes: ulong;
+}
+
+enum RefuseCode : uint {
+  None = 0,
+  ProtocolVersion = 1,
+  WireFingerprint = 2,
+  BuildFingerprint = 3,
+  Authentication = 4,
+  LinkTerms = 5,
+  Backend = 6,
+  Busy = 7,
+  MalformedHello = 8,
+}
+
+// A handshake rejection is a normal session outcome, never a process abort.
+table Refuse {
+  code: RefuseCode;
+  detail: string;
+  expected: ulong;
+  actual: ulong;
+  peerValue: string;
+}
+
+table LogFlush {
+  seq: ulong;
+  ack: bool;
+}
+
 table Hello {
   abiMajor: uint;
   abiMinor: uint;
@@ -63,15 +104,12 @@ table Hello {
   backendType: uint;
   pid: uint;
   configBlob: [ubyte];
-  // CONTRACT-P5 table 0, "ABI agreement": MGPCaps has only a COMPOSITIONAL size
-  // assertion, because DynamicBackendParameters still carries SizeT and GLenum.
-  // So the two peers assert they were built from the same struct shapes instead
-  // of rewriting them fixed-width (that is P7's account). This is
-  // MG_Remote::CapsAbiFingerprint(): sizeof(DynamicBackendParameters),
-  // sizeof(MGPCaps), sizeof(GLFunctionsTable), the protocol ABI version and the
-  // build's git stamp, mixed. A mismatch is Fatal{AbiMismatch} and NEVER a
-  // downgrade - every alternative silently reads one struct as another.
+  // Retained legacy slot. P6.5 peers compare wireFingerprint instead.
   abiFingerprint: ulong;
+  wireFingerprint: ulong;
+  linkTerms: LinkTerms;
+  token: string;
+  dialMode: DialMode;
 }
 
 table Welcome {
@@ -82,12 +120,26 @@ table Welcome {
   stageRing: SegmentRef;
   replyPool: SegmentRef;
   eventRing: SegmentRef;
-  // The server's half of the assertion above. The string is carried beside the
-  // mixed value only so a mismatch can name both builds in the Fatal line; the
-  // COMPARISON is on abiFingerprint, which also covers the three sizeofs the
-  // string cannot.
   buildFingerprint: string;
+  // Retained legacy slot; do not reuse or renumber it.
   abiFingerprint: ulong;
+  wireFingerprint: ulong;
+  linkTerms: LinkTerms;
+  backendType: uint;
+  // PH-7 (4), ID-P7-3. 128 bits from the server's CSPRNG, minted after the Hello authenticated
+  // and only on a Stream data plane. The client opens its data connection AFTER this Welcome
+  // and presents the value as that connection's first frame (DataBind); the server binds the
+  // connection to this session by the value, not by which connection arrived second. Absent on
+  // SharedSegments, whose descriptors travel over the control connection's own aux socket.
+  dataNonce: [ubyte];
+}
+
+// PH-7 (4). The FIRST and only control-framed message on a TCP data connection: the Welcome's
+// dataNonce, handed back. Everything after it on that connection is StreamLink's own framing.
+// A connection whose first frame is not this, or whose nonce is not the live session's, is
+// refused by name (`Refuse{Authentication}`) and never becomes a data plane.
+table DataBind {
+  nonce: [ubyte];
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +224,16 @@ enum SurfaceOpKind : ubyte {
   ReleaseSurface = 5,
   MakeCurrent = 6,
   ReleaseCurrent = 7,
+  // P5f (package fc) appended these three. Append-only, always: the enum's values ARE the wire.
+  SetSwapInterval = 8,
+  ReleaseResources = 9,
+  SetWindowHandle = 10,
+  // P6 (package cp) appended this one. The draft held that InitCapabilities needs
+  // no wire form because "the CapsSnapshot answers it" - but a CapsSnapshot is the
+  // ANSWER and this is the REQUEST, and a spawn client has a live caller for it
+  // (Client/BackendObject_Remote.cpp). Without the tag the codec refused it by
+  // name and every spawned eglMakeCurrent failed with InprocOnlyOpOnTheWire.
+  InitCapabilities = 11,
 }
 
 enum WindowKind : ubyte {
@@ -181,6 +243,26 @@ enum WindowKind : ubyte {
   Win32Hwnd = 3,
   Surfaceless = 4,
   Pbuffer = 5,
+  // P5f (package fc): WindowBackend (MG_Backend/BackendObject.h) has a fourth window backend and
+  // the two enums may only meet through the explicit mapping table in Protocol/SurfaceOpCodec.cpp
+  // - Surfaceless/Pbuffer are surface SHAPES, not window backends, and answer "no backend" there.
+  MetalLayer = 6,
+  // P12 (on-screen server window), appended. THE WINDOW IS THE SERVER'S OWN: the client asks the
+  // server to create the surface on the window the server process owns (the display Activity's
+  // SurfaceView) and has none of its own to name, so `nativeToken` is always 0 and no pointer
+  // crosses (Rule G/H). Legal on CreateWindowSurface only; SetWindowHandle may not name it.
+  ServerOwned = 7,
+}
+
+// P12, appended: WHY A SURFACE OP WAS DECLINED, so the client can name the refusal in its own log
+// instead of reading a bare `ok = false`. None of these latches the session: each is a
+// configuration or ordering answer, not a peer's corrupt bytes.
+enum SurfaceRefusal : ubyte {
+  None = 0,
+  NoServerDisplay = 1,              // ServerOwned asked of a server that owns no display
+  NoServerWindow = 2,               // the server owns a display, but no window came within its wait
+  SurfaceModeMismatch = 3,          // the session's surface mode (on-screen / offscreen) is the other one
+  ServerOwnedOnSetWindowHandle = 4, // SetWindowHandle named the server's own window
 }
 
 table SurfaceOp {
@@ -189,10 +271,16 @@ table SurfaceOp {
   display: ulong;
   surface: ulong;
   windowKind: WindowKind;
-  nativeToken: ulong;   // X11 XID / HWND; Android transfers the window out of band
+  nativeToken: ulong;   // X11 XID / HWND; 0 for ServerOwned (the server substitutes its own window)
   width: int;
   height: int;
   swapInterval: int;
+  // P5f (package fc), appended (a FlatBuffers table field's id IS its vtable slot - append only):
+  // MakeCurrent's semantic unit is the (display, draw, read, context) four-tuple, and `surface`
+  // alone cannot carry it. `surface` stays the DRAW surface; `readSurface` and `context` are 0
+  // ("no surface" / "no context") for every other op and for a ReleaseCurrent.
+  readSurface: ulong;
+  context: ulong;
 }
 
 table SurfaceReply {
@@ -201,6 +289,16 @@ table SurfaceReply {
   eglMajor: int;
   eglMinor: int;
   defaultFb: DefaultFramebufferInfo;
+  // P6.5: all preceding data-plane events must arrive before this reply is observed.
+  eventHead: ulong;
+  // P12, appended. The surface's REAL extent as the server has it - for a ServerOwned
+  // CreateWindowSurface, the server window's size - so a headless client knows its surface
+  // geometry when eglCreateWindowSurface returns, before any backend has published a
+  // surface-changed event (Magma creates its swapchain only at the first MakeCurrent). 0/0 for
+  // every other op.
+  width: int;
+  height: int;
+  refusal: SurfaceRefusal;
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +342,11 @@ enum FatalCode : uint {
 table Fatal {
   code: FatalCode;
   message: string;
+  // P6 dl (CONTRACT-P6 5.2, D2). The internal MGFatalFamily word, so a peer that receives this
+  // frame before the sender aborts can name WHICH family ended the session instead of reading a
+  // bare EOF. `code` stays the coarse seven-value projection; this carries the full vocabulary.
+  // Append-only: an older peer that does not read it still gets `code` and `message`.
+  family: string;
 }
 
 // Severity-graded per plan B section 8.2: <= Warn is lossy, >= Error is
@@ -259,6 +362,19 @@ enum LogLevel : ubyte {
 table LogLine {
   level: LogLevel;
   text: string;
+}
+
+// P7 (p7/spawnhang). THE SERVER IS STILL RUNNING THE CLIENT'S SURFACE OP. Sent only by the
+// server's control pump, only while its apply thread is running a SurfaceOp it has TAKEN, and
+// only before that op's SurfaceReply - once per progress interval after the op has run that long
+// (ServerLoop.cpp, kControlProgressIntervalMs). It is how a client tells a server that is BUSY
+// with its op (a cold native bring-up inside the first surface creation or MakeCurrent: eglInitialize
+// loading a software rasteriser off a cold disk) from one that is SILENT: the client's reply budget
+// restarts on each report, up to a ceiling. A server that never took the op, or is frozen, sends
+// none and still times out by name (CONTRACT-P6 5.4 D5b).
+table SurfaceProgress {
+  seq: ulong;       // the SurfaceOp.seq being run
+  elapsedMs: uint;  // since the op was posted to the apply thread
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +397,10 @@ union CtrlMsg {
   AuxRequest,
   Fatal,
   LogLine,
+  Refuse,
+  LogFlush,
+  DataBind,
+  SurfaceProgress,
 }
 
 table CtrlEnvelope {

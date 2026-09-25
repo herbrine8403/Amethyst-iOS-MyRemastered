@@ -60,7 +60,7 @@ struct FenceBudgetPeer : Codec::WireVerbSink {
     }
     Bool OnFenceWaitServer(const MGPFenceWait&) override { AwaitPark(); return true; }
     void Install() {
-        if (Srv::ServerLoopInstance().RunOnApplyThread([](void* self) {
+        if (Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting([](void* self) {
             auto& decoder = Srv::ServerSessionInstance().Applier().*PeerMember(DecoderTag{});
             decoder.SetVerbSink(static_cast<FenceBudgetPeer*>(self));
             return MOBILEGL_OK;
@@ -74,9 +74,12 @@ struct BackendTag {
 };
 template struct PeerAccess<BackendTag, &Srv::ServerLoop::m_backend>;
 
-void StartControlSession() {
+MG_Backend::BackendObject* ControlCapsPeer();
+
+void StartControlSession(MG_Backend::BackendObject* capsSource = nullptr) {
     ::alarm(15);
     MG_Config::Transport = MG_Config::TransportMode::InProcess;
+    Srv::ServerSessionInstance().SetBackend(capsSource ? capsSource : ControlCapsPeer());
     Srv::ServerSessionInstance().SetCapabilityBits(0);
     Srv::ServerSessionInstance().SetConsumedSubsystems(kMGPipeSubsystemsMigratedAtP4a);
     if (ClientSessionInstance().Start(MG_Config::TransportMode::InProcess, {}) != MOBILEGL_OK)
@@ -95,7 +98,7 @@ struct ReadPeer : Codec::WireVerbSink {
         return true;
     }
     void Install() {
-        auto rc = Srv::ServerLoopInstance().RunOnApplyThread([](void* self) {
+        auto rc = Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting([](void* self) {
             auto& decoder = Srv::ServerSessionInstance().Applier().*PeerMember(DecoderTag{});
             decoder.SetVerbSink(static_cast<ReadPeer*>(self));
             return MOBILEGL_OK;
@@ -111,7 +114,7 @@ struct ErrorPeer : Codec::ReplySink {
         Srv::ServerSessionInstance().Replies().PostReply(seq, status, nullptr, 0);
     }
     void Install() {
-        auto rc = Srv::ServerLoopInstance().RunOnApplyThread([](void* self) {
+        auto rc = Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting([](void* self) {
             auto& decoder = Srv::ServerSessionInstance().Applier().*PeerMember(DecoderTag{});
             decoder.*PeerMember(RepliesTag{}) = static_cast<ErrorPeer*>(self);
             return MOBILEGL_OK;
@@ -134,6 +137,13 @@ struct CapsPeer : MG_Backend::BackendObject {
     const MG_Backend::DynamicBackendParameters& GetDynamicParameters() const override { return dynamic; }
     BackendType GetBackendType() const override { return BackendType::DirectGLES; }
 };
+
+MG_Backend::BackendObject* ControlCapsPeer() {
+    // A real encoded initial snapshot is required even when the apply fixture
+    // substitutes every verb and has no GPU backend of its own.
+    static CapsPeer backend;
+    return &backend;
+}
 
 void ExpectNamedAbort(const ChildResult& child, const char* diagnostic) {
     EXPECT_TRUE(DiedOfAbort(child)) << DescribeStatus(child) << '\n' << child.Log;
@@ -218,13 +228,16 @@ TEST(RemoteClientControls, UnknownReadPixelsReplyStatusRefusesTightAndBounce) {
 }
 
 TEST(RemoteClientControls, FenceWaitBudgetHonorsGlTimeoutAndFiniteTransportChunks) {
+    // 120000 below is ClientSession.cpp's kBarrierTimeoutMs, the transport grace every CPU bound
+    // wait adds on top of the GL timeout. It was 30 s; lavapipe's texture-handle registration
+    // (vkCreateImageView -> llvmpipe_register_texture) exceeds that in a single apply stall.
     struct WaitCase { Uint64 timeoutNs; MGPWireOp op; Uint32 expectedParkMs; };
     const WaitCase cases[] = {
-        {0, MGPWireOp::FenceWait, 30000},
-        {1, MGPWireOp::FenceWait, 30001},
-        {60000000000ull, MGPWireOp::FenceWait, 90000},
+        {0, MGPWireOp::FenceWait, 120000},
+        {1, MGPWireOp::FenceWait, 120001},
+        {60000000000ull, MGPWireOp::FenceWait, 180000},
         {~Uint64(0), MGPWireOp::FenceWait, Transport::kWaitForever - 1},
-        {~Uint64(0), MGPWireOp::FenceWaitServer, 30000},
+        {~Uint64(0), MGPWireOp::FenceWaitServer, 120000},
     };
     for (const auto test : cases) {
         const auto child = RunInChild([test] {
@@ -245,7 +258,7 @@ TEST(RemoteClientControls, FenceWaitBudgetHonorsGlTimeoutAndFiniteTransportChunk
             producer.*PeerMember(ProducerBellTag{}) = bell.original;
             const auto observed = bell.firstMs.load();
             // Doorbell converts the remaining deadline to whole milliseconds. Allow
-            // scheduler delay, but neither a 30s clamp nor an unbounded sentinel.
+            // scheduler delay, but neither the barrier clamp nor an unbounded sentinel.
             if (!bell.entered.load() || observed > test.expectedParkMs ||
                 observed < test.expectedParkMs - 100 || observed == Transport::kWaitForever) ::_exit(93);
             if (test.op == MGPWireOp::FenceWait &&
@@ -307,7 +320,7 @@ TEST(RemoteClientControls, MapPersistentErrorIsNotADecline) {
 TEST(RemoteClientControls, AnIdenticalRepeatedMakeCurrentRepublishesNothing) {
     const auto child = RunInChild([] {
         StartControlSession();
-        if (Srv::ServerLoopInstance().RunOnApplyThread([](void*) {
+        if (Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting([](void*) {
             auto backend = MakeUnique<CapsPeer>();
             backend->dynamic.MaxComputeWorkGroupCount[0] = 113;
             Srv::ServerSessionInstance().SetBackend(backend.get());
@@ -335,7 +348,7 @@ TEST(RemoteClientControls, AnIdenticalRepeatedMakeCurrentRepublishesNothing) {
 TEST(RemoteClientControls, ADifferentTupleMakeCurrentIsAdoptedWithoutAPumpOrPresent) {
     const auto child = RunInChild([] {
         StartControlSession();
-        if (Srv::ServerLoopInstance().RunOnApplyThread([](void*) {
+        if (Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting([](void*) {
             auto backend = MakeUnique<CapsPeer>();
             backend->dynamic.MaxComputeWorkGroupCount[0] = 113;
             Srv::ServerSessionInstance().SetBackend(backend.get());
@@ -354,7 +367,7 @@ TEST(RemoteClientControls, ADifferentTupleMakeCurrentIsAdoptedWithoutAPumpOrPres
         GLint before = 0;
         remote.GetBackendFunctions().GL.GetIntegeri_v(0x91BE, 0, &before);
         if (before != 113) ::_exit(92);
-        if (Srv::ServerLoopInstance().RunOnApplyThread([](void*) {
+        if (Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting([](void*) {
             static_cast<CapsPeer*>(Srv::ServerLoopInstance().Backend())->dynamic.MaxComputeWorkGroupCount[0] = 227;
             return MOBILEGL_OK;
         }, nullptr) != MOBILEGL_OK) ::_exit(93);
@@ -384,8 +397,7 @@ TEST(RemoteClientControls, BounceReadPixelsShortReplyRefusesBeforeScatter) {
 TEST(RemoteClientControls, DeleteTexturesAdvancesTheWireOrdinal) {
     const auto child = RunInChild([] {
         CapsPeer backend;
-        Srv::ServerSessionInstance().SetBackend(&backend);
-        StartControlSession();
+        StartControlSession(&backend);
         ErrorPeer replies;
         replies.status = 0; // The peer accepts the resource; the client must publish and delete it.
         replies.Install();
@@ -406,16 +418,28 @@ TEST(RemoteClientControls, DeleteTexturesAdvancesTheWireOrdinal) {
 }
 
 TEST(RemoteClientControls, BoundPackBufferOffsetReadRefusesByName) {
+    // Historical name retained: the live path now copies the reply into the PBO.
     const auto child = RunInChild([] {
         StartControlSession();
+        ReadPeer peer;
+        peer.size = 4;
+        peer.Install();
         MG_State::pGLContext = MakeUnique<MG_State::GLState::GLContext>();
         GLuint buffer = 0;
         MG_Impl::GLImpl::GenBuffers(1, &buffer);
         MG_Impl::GLImpl::BindBuffer(0x88EB, buffer);
-        MG_Impl::GLImpl::BufferData(0x88EB, 64, nullptr, 0x88E1);
+        Uint8 seed[64];
+        std::memset(seed, 0x5a, sizeof(seed));
+        MG_Impl::GLImpl::BufferData(0x88EB, sizeof(seed), seed, 0x88E1);
         RemoteEmitTable().GL.ReadPixels(0, 0, 1, 1, 0x1908, 0x1401, reinterpret_cast<void*>(16));
+        Uint8 actual[64]{};
+        MG_Impl::GLImpl::GetBufferSubData(0x88EB, 0, sizeof(actual), actual);
+        for (SizeT i = 0; i < sizeof(actual); ++i)
+            if (actual[i] != (i >= 16 && i < 20 ? 0x37 : 0x5a)) ::_exit(104);
+        if (peer.observed != 4) ::_exit(105);
+        ClientSessionInstance().Stop();
     });
-    ExpectNamedAbort(child, "Fatal{UnmigratedVerb, \"ReadPixels+PACK_BUFFER\"}");
+    ExpectChildSuccess(child);
 }
 
 TEST(RemoteClientControls, ServerRoleRespecifyDoesNotEmitClientInitialBytes) {
@@ -427,10 +451,9 @@ TEST(RemoteClientControls, ServerRoleRespecifyDoesNotEmitClientInitialBytes) {
     // SEG_EVENT producers are what replaces the mechanism this case used to drive.
     const auto child = RunInChild([] {
         CapsPeer backend;
-        Srv::ServerSessionInstance().SetBackend(&backend);
-        StartControlSession();
+        StartControlSession(&backend);
         MG_Config::Features.PipePush |= kMGPipeSubsystemResources;
-        Srv::ServerLoopInstance().RunOnApplyThread([](void*) {
+        Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting([](void*) {
             MG_State::GLState::BufferObject buffer(701);
             Uint8 data[64]{};
             buffer.Respecify(sizeof(data), data);
@@ -460,10 +483,9 @@ TEST(RemoteClientControls, ServerRoleFlushDoesNotRunTheClientSubDataFollowup) {
     // (Fatal{RoleViolation, "MGPipeSlots"}; ev's events replace the mechanism).
     const auto child = RunInChild([] {
         CapsPeer backend;
-        Srv::ServerSessionInstance().SetBackend(&backend);
-        StartControlSession();
+        StartControlSession(&backend);
         MG_Config::Features.PipePush |= kMGPipeSubsystemResources;
-        Srv::ServerLoopInstance().RunOnApplyThread([](void*) {
+        Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting([](void*) {
             MGPipeResourceOps ops{};
             ops.Create = [](MGPipeHandle, const MGPResourceDesc&) {};
             ops.Respecify = [](MGPipeHandle, const MGPResourceDesc&, const void*) {};
@@ -513,16 +535,14 @@ int RunPackGpuControl(bool split) {
         G::BindBuffer(GL_PIXEL_PACK_BUFFER, pbo);
         G::BufferData(GL_PIXEL_PACK_BUFFER, 64, nullptr, GL_STREAM_READ);
         G::ReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, reinterpret_cast<void*>(16));
-        if (split) ::_exit(104); // Must have refused by name, never returned or dereferenced 16.
         Uint8 pixels[4]{};
         G::GetBufferSubData(GL_PIXEL_PACK_BUFFER, 16, 4, pixels);
         if (pixels[0] != 0 || pixels[1] != 255 || pixels[2] != 0 || pixels[3] != 255) ::_exit(105);
-        std::printf("C1F_PACK_MONOLITH bytes at offset 16: %u %u %u %u\n", pixels[0], pixels[1], pixels[2], pixels[3]);
+        std::printf("C1F_PACK_%s bytes at offset 16: %u %u %u %u\n", split ? "INPROC" : "MONOLITH",
+                    pixels[0], pixels[1], pixels[2], pixels[3]);
         std::fflush(stdout);
     });
-    const bool ok = split
-        ? DiedOfAbort(child) && child.Log.find("Fatal{UnmigratedVerb, \"ReadPixels+PACK_BUFFER\"}") != std::string::npos
-        : WIFEXITED(child.Status) && WEXITSTATUS(child.Status) == 0;
+    const bool ok = WIFEXITED(child.Status) && WEXITSTATUS(child.Status) == 0;
     std::printf("C1F_PACK_%s: %s (%s)\n%s", split ? "INPROC" : "MONOLITH",
                 ok ? "PASS" : "FAIL", DescribeStatus(child).c_str(), child.Log.c_str());
     return ok ? 0 : 1;
@@ -555,7 +575,7 @@ struct DrawPeer : Codec::WireVerbSink {
     Bool OnDrawVbo(const MGPDrawInfo&, const MGPDrawRange*, const MGHostSpan*,
                    const MGPDrawIndirect*) override { return true; }
     void Install() {
-        Srv::ServerLoopInstance().RunOnApplyThread([](void* self) {
+        Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting([](void* self) {
             auto& decoder = Srv::ServerSessionInstance().Applier().*PeerMember(DecoderTag{});
             decoder.SetVerbSink(static_cast<DrawPeer*>(self));
             return MOBILEGL_OK;
@@ -606,7 +626,7 @@ TEST(RemoteClientControls, ReadPixelsSwapsComponentsInTightAndScatteredReplies) 
 TEST(RemoteClientControls, PersistentMapProducerRefusesTheApplyThread) {
     const auto child = RunInChild([] {
         StartControlSession();
-        Srv::ServerLoopInstance().RunOnApplyThread([](void*) {
+        Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting([](void*) {
             PersistentMapTracker::Instance().PushAllMembers();
             return MOBILEGL_OK;
         }, nullptr);
@@ -631,7 +651,7 @@ TEST(RemoteClientControls, CommandWrapWaitsForRetirementAfterThePriorRecordAppli
         peer.Install(); // A mailbox round trip also lets the previous drain retire.
         Srv::ServerLoopInstance().SetBeforeRetireHookForTesting(&HoldRetirementUntilProducerWaits);
         const auto prior = emit(32768);
-        if (ClientSessionInstance().Control()->retiredSeq.load() >= prior) ::_exit(111);
+        if (ClientSessionInstance().Control()->Progress.retiredSeq.load() >= prior) ::_exit(111);
         retirementRetryStarted.store(true);
         const auto next = emit(32768);
         if (next != prior + 1 || !retirementWaitObserved.load()) ::_exit(112);
@@ -651,11 +671,68 @@ TEST(RemoteClientControls, StagingWaitsForRetirementAfterThePriorRecordApplied) 
         MGPBindRenderState bind{};
         const auto prior = session.EmitAndWait(MGPWireOp::BindRenderState, &bind, sizeof(bind),
                                                nullptr, 0, nullptr, 0, nullptr);
-        if (session.Control()->retiredSeq.load() >= prior) ::_exit(113);
+        if (session.Control()->Progress.retiredSeq.load() >= prior) ::_exit(113);
         retirementRetryStarted.store(true);
         session.Encoder().StageBytes(bytes.data(), bytes.size());
         if (!retirementWaitObserved.load() || session.Encoder().StageReclaimWaits() != 1) ::_exit(114);
         session.Stop();
+    });
+    ExpectChildSuccess(child);
+}
+
+// P5e (gl) RED-ONCE, ID-111. THE SERVER-SIDE MIRROR OF THE CLIENT LATCH - the line that makes
+// ID-90 ("Magma keeps the lockstep for the whole of P5e") true in code rather than in prose.
+//
+// The control session calls SetCapabilityBits(0), so its CallMask IS set and does NOT carry
+// bit 10. That is a Magma server's answer for ever (MGPipeRunAheadCapBitsFor returns kCapNone
+// off DirectGLES) and an Espryt server's answer for the whole bring-up window. A DrawVbo then
+// crosses for real, so what is under test is the stamp PipeApplier::ApplyOne writes and not a
+// test-only branch beside it.
+//
+// FOUR ASSERTIONS, because each one alone can be true for the wrong reason:
+//   1. the session really lacks the bit, said in its own words rather than inferred from the
+//      stamp being tested (ID-102: the action under test is the probe itself);
+//   2. the wire really answers UNBARRIERED for this record - draw_vbo is kWaitNone - so the
+//      `wireSaysBarriered` arm is the one a flipped constant would take;
+//   3. the record that actually crossed was stamped barriered;
+//   4. and the stamp is STILL barriered at the POST-FLIP value of the wait-rule constant.
+//
+// (4) IS THE ONE THAT MATTERS AND IT IS STATED AT `true` RATHER THAN READ FROM THE CONSTANT.
+// kMGPipeP5eClientWaitRuleLanded is false today, so (3) alone would pass for a server that had
+// no capability conjunct at all - and would keep passing until the integration commit, at which
+// point Magma SIGSEGVs on its first draw with the lane still green. Asking the pure function
+// for the post-flip answer is how the claim gets tested before the day it starts deciding.
+//
+// THE RED: delete `serverPublishesRunAhead &&` from MGPipeApplierStampsBarriered
+// (MG_Remote/Server/PipeApplier.h) and (4) flips to false - the child exits 124.
+TEST(RemoteClientControls, ADrawOnASessionWithoutTheRunAheadBitStaysStampedBarriered) {
+    const auto child = RunInChild([] {
+        StartControlSession();
+        DrawPeer peer;
+        peer.Install();
+        MGPDrawInfo info{};
+        info.NumDraws = 1;
+        MGPDrawRange range{};
+        if (ClientSessionInstance().EmitAndWait(MGPWireOp::DrawVbo, &info, sizeof(info), &range,
+                                                sizeof(range), nullptr, 0, nullptr) == 0)
+            ::_exit(120);
+        // Read the stamp on the thread that owns it: it is a thread_local describing "which
+        // record is the apply thread inside right now", and ApplyOne leaves it standing.
+        if (Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting([](void*) {
+                if (Srv::MGPipeServerPublishesRunAhead()) ::_exit(121);
+                MGPDrawInfo probe{};
+                probe.NumDraws = 1;
+                if (MGPipeBarriered(MGPWireOp::DrawVbo, &probe, MGPipeApplier())) ::_exit(122);
+                if (!MGPipeApplierCurrentRecordIsBarriered()) ::_exit(123);
+                if (!Srv::MGPipeApplierStampsBarriered(/*clientWaitRuleLanded=*/true,
+                                                       Srv::MGPipeServerPublishesRunAhead(),
+                                                       /*wireSaysBarriered=*/false))
+                    ::_exit(124);
+                return MOBILEGL_OK;
+            },
+            nullptr) != MOBILEGL_OK)
+            ::_exit(125);
+        ClientSessionInstance().Stop();
     });
     ExpectChildSuccess(child);
 }

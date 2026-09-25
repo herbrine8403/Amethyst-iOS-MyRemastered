@@ -23,6 +23,7 @@
 // EVERY CASE BELOW CARRIES ITS RED-ONCE LINE, and each of those perturbations was run.
 
 #include <gtest/gtest.h>
+#include <MG_Util/Debug/Log.h>
 
 #include <cstdint>
 #include <cstdlib>
@@ -38,11 +39,17 @@
 #include "Includes.h"
 
 #include <MG_Remote/CapsCodec.h>
+#include <MG_Remote/Handshake.h>
+#include <MG_Pipe/PipeWireLayout.h>
+#include <MG_State/GLState/ProgramState/ProgramArtifactsCodec.h>
 #include <MG_Remote/Client/ClientSession.h>
 #include <MG_Remote/Protocol/generated/protocol_generated.h>
 #include <MG_Remote/Server/ServerSession.h>
 #include <MG_Remote/Transport/InProcessTransport.h>
 #include <MG_Remote/Transport/SessionRings.h>
+#if !defined(_WIN32)
+#include <MG_Remote/Transport/SocketTransport.h>
+#endif
 
 #if __has_include(<MGGitHash.h>)
 #include <MGGitHash.h>
@@ -66,10 +73,10 @@ namespace {
     std::string g_logPath;
 
     std::string ReadLog() {
-        std::ifstream in(g_logPath, std::ios::binary);
-        std::ostringstream ss;
-        ss << in.rdbuf();
-        return ss.str();
+        // BOTH ROLES' LOGS (P6). A death test asserts that the CHILD said something; which
+        // role's thread said it is not what these cases are about, and refusals raised on the
+        // apply thread are written under the SERVER role by construction.
+        return MobileGL::MG_Util::Debug::ReadRoleLogs(g_logPath.c_str());
     }
 
     long ProcessId() {
@@ -113,75 +120,272 @@ namespace {
 // below. Also red, separately, by deleting any one `mix(...)` line from MixAbiFingerprint: the
 // matching EXPECT_NE names the input that stopped being mixed. Both perturbations were run.
 TEST(SessionHandshakeTest, TheAbiFingerprintChangesWhenAnyOfItsInputsDoes) {
-    const Uint64 production = CapsAbiFingerprint();
-    EXPECT_NE(production, 0u) << "0 is reserved for \"not stated\"";
-    EXPECT_EQ(production, CapsAbiFingerprint()) << "not stable within one build";
-
-    const Transport::AbiFingerprintInputs inputs = CapsAbiFingerprintInputs();
-    EXPECT_EQ(production, Transport::MixAbiFingerprint(inputs))
-        << "CapsAbiFingerprint() is not MixAbiFingerprint over CapsAbiFingerprintInputs(): the "
-           "handshake compares a value this case cannot reach, which is finding 6 again";
-
-    // The inputs are the real ones, so a CapsAbiFingerprintInputs() that hard-coded a size
-    // would be caught here rather than agreed with by a peer built from a different tree.
+    const Uint64 production = WireFingerprint();
+    const auto inputs = CapsAbiFingerprintInputs();
+    EXPECT_NE(production, 0u);
+    EXPECT_EQ(production, CapsAbiFingerprint());
+    EXPECT_EQ(production, Transport::MixAbiFingerprint(inputs));
     EXPECT_EQ(inputs.DynamicParamsSize, sizeof(MG_Backend::DynamicBackendParameters));
     EXPECT_EQ(inputs.CapsSize, sizeof(MG_Pipe::MGPCaps));
-    EXPECT_EQ(inputs.FunctionTableSize, sizeof(MG_Backend::GLFunctionsTable));
-    EXPECT_EQ(inputs.FormatCapabilityTargets,
-              static_cast<Uint64>(MG_Backend::kFormatCapabilityTargetCount));
-    EXPECT_EQ(inputs.FormatCapabilityFormats,
-              static_cast<Uint64>(MG_Backend::kFormatCapabilityFormatCount));
-    EXPECT_NE(inputs.FormatCapabilitiesCodecVersion, 0u);
-    EXPECT_NE(inputs.RendererInfoCodecVersion, 0u);
+    EXPECT_EQ(inputs.MemberLayout, MG_Pipe::kMGPipeWireMemberLayoutDigest);
+    EXPECT_EQ(inputs.CatalogueLayout, MG_Pipe::kMGPipeWireCatalogueDigest);
+    EXPECT_EQ(inputs.RenderStateLayout, MG_Pipe::WireRenderStateDigest());
+    EXPECT_EQ(inputs.ProgramArtifactsCodecVersion, MG_State::GLState::kProgramArtifactsCodecVersion);
+    EXPECT_EQ(inputs.ProgramArtifactsSchema, MG_State::GLState::ProgramArtifactsSchemaFingerprint());
     EXPECT_EQ(inputs.OpCount, static_cast<Uint64>(MG_Pipe::MGPWireOp::kOpCount));
-    EXPECT_EQ(inputs.AbiVersion, static_cast<Uint32>(MOBILEGL_ABI_VERSION(
-                                     MOBILEGL_PROTOCOL_ABI_MAJOR, MOBILEGL_PROTOCOL_ABI_MINOR)));
-    ASSERT_NE(inputs.BuildStamp, nullptr);
-    EXPECT_NE(inputs.BuildStamp[0], '\0');
-#if MGL_HANDSHAKE_TEST_HAS_GIT_HASH
-    EXPECT_STREQ(inputs.BuildStamp, GIT_COMMIT_HASH_SHORT);
+#if MOBILEGL_BUILD_DISAGGREGATED
+    EXPECT_EQ(inputs.ControlSchemaRevision,
+              (static_cast<Uint64>(MOBILEGL_PROTOCOL_CONTROL_REVISION) << 32) |
+                  MG_Pipe::kMGPipeResourceRespecifyExtentCarrierRevision);
+#else
+    EXPECT_EQ(inputs.ControlSchemaRevision, static_cast<Uint64>(MOBILEGL_PROTOCOL_CONTROL_REVISION));
 #endif
-
-    // Every input moves the answer. Each lambda changes exactly one field of a copy of the
-    // REAL inputs, so what is proven is that the production value depends on that field.
-    const auto perturbed = [&](auto&& mutate) {
-        Transport::AbiFingerprintInputs copy = inputs;
+    EXPECT_EQ(inputs.PointerBits, sizeof(void*) * 8);
+    const auto perturbed = [&](auto mutate) {
+        auto copy = inputs;
         mutate(copy);
         return Transport::MixAbiFingerprint(copy);
     };
-    EXPECT_NE(production, perturbed([](Transport::AbiFingerprintInputs& i) { ++i.DynamicParamsSize; }))
-        << "sizeof(DynamicBackendParameters) is not mixed";
-    EXPECT_NE(production, perturbed([](Transport::AbiFingerprintInputs& i) { ++i.CapsSize; }))
-        << "sizeof(MGPCaps) is not mixed";
-    EXPECT_NE(production, perturbed([](Transport::AbiFingerprintInputs& i) { ++i.FunctionTableSize; }))
-        << "sizeof(GLFunctionsTable) is not mixed";
-    EXPECT_NE(production,
-              perturbed([](Transport::AbiFingerprintInputs& i) { ++i.FormatCapabilityTargets; }))
-        << "kFormatCapabilityTargetCount is not mixed";
-    EXPECT_NE(production,
-              perturbed([](Transport::AbiFingerprintInputs& i) { ++i.FormatCapabilityFormats; }))
-        << "kFormatCapabilityFormatCount is not mixed";
-    EXPECT_NE(production, perturbed([](Transport::AbiFingerprintInputs& i) {
-                  ++i.FormatCapabilitiesCodecVersion;
-              }))
-        << "kFormatCapabilitiesCodecVersion is not mixed";
-    EXPECT_NE(production,
-              perturbed([](Transport::AbiFingerprintInputs& i) { ++i.RendererInfoCodecVersion; }))
-        << "kRendererInfoCodecVersion is not mixed";
-    EXPECT_NE(production, perturbed([](Transport::AbiFingerprintInputs& i) { ++i.OpCount; }))
-        << "MGPWireOp::kOpCount is not mixed (ID-33)";
-    EXPECT_NE(production, perturbed([](Transport::AbiFingerprintInputs& i) { ++i.AbiVersion; }))
-        << "the protocol ABI version is not mixed (ID-33)";
-    EXPECT_NE(production,
-              perturbed([](Transport::AbiFingerprintInputs& i) { i.BuildStamp = "not-this-build"; }))
-        << "the git stamp is not mixed";
-    // A missing stamp is not the same as an empty one, and neither is the same as a real build.
-    EXPECT_NE(production, perturbed([](Transport::AbiFingerprintInputs& i) { i.BuildStamp = nullptr; }));
-    EXPECT_NE(production, perturbed([](Transport::AbiFingerprintInputs& i) { i.BuildStamp = ""; }));
-    EXPECT_NE(perturbed([](Transport::AbiFingerprintInputs& i) { i.BuildStamp = nullptr; }),
-              perturbed([](Transport::AbiFingerprintInputs& i) { i.BuildStamp = ""; }))
-        << "\"no stamp\" and \"an empty stamp\" collapsed into one input";
+    EXPECT_NE(production, perturbed([](auto& i) { ++i.DynamicParamsSize; })) << "DynamicParamsSize";
+    EXPECT_NE(production, perturbed([](auto& i) { ++i.CapsSize; })) << "CapsSize";
+    EXPECT_NE(production, perturbed([](auto& i) { ++i.MemberLayout; })) << "MemberLayout";
+    EXPECT_NE(production, perturbed([](auto& i) { ++i.CatalogueLayout; })) << "CatalogueLayout";
+    EXPECT_NE(production, perturbed([](auto& i) { ++i.RenderStateLayout; })) << "RenderStateLayout";
+    EXPECT_NE(production, perturbed([](auto& i) { ++i.FormatCapabilityTargets; })) << "FormatCapabilityTargets";
+    EXPECT_NE(production, perturbed([](auto& i) { ++i.FormatCapabilityFormats; })) << "FormatCapabilityFormats";
+    EXPECT_NE(production, perturbed([](auto& i) { ++i.FormatCapabilitiesCodecVersion; })) << "FormatCapabilitiesCodecVersion";
+    EXPECT_NE(production, perturbed([](auto& i) { ++i.RendererInfoCodecVersion; })) << "RendererInfoCodecVersion";
+    EXPECT_NE(production, perturbed([](auto& i) { ++i.ProgramArtifactsCodecVersion; })) << "ProgramArtifactsCodecVersion";
+    EXPECT_NE(production, perturbed([](auto& i) { ++i.ProgramArtifactsSchema; })) << "ProgramArtifactsSchema";
+    EXPECT_NE(production, perturbed([](auto& i) { ++i.OpCount; })) << "OpCount";
+    EXPECT_NE(production, perturbed([](auto& i) { ++i.ControlSchemaRevision; })) << "ControlSchemaRevision";
+    EXPECT_NE(production, perturbed([](auto& i) { ++i.AbiVersion; })) << "AbiVersion";
+    EXPECT_NE(production, perturbed([](auto& i) { ++i.PointerBits; })) << "PointerBits";
+    EXPECT_NE(production, perturbed([](auto& i) { ++i.LittleEndian; })) << "LittleEndian";
 }
+
+TEST(SessionHandshakeTest, SameWidthFieldReorderingChangesTheWireDigestWithoutABuildStamp) {
+    using namespace MG_Pipe;
+    std::vector<WireLayoutMember> fields(std::begin(kMGPipeWireLayoutMembers),
+                                       std::end(kMGPipeWireLayoutMembers));
+    // MGPRange.Offset and Size have the same width: sizeof-only checks cannot see this.
+    SizeT offsetIndex = 0, sizeIndex = 0;
+    for (SizeT i = 0; i < fields.size(); ++i) {
+        if (std::strcmp(fields[i].Name, "MGPRange.Offset") == 0) offsetIndex = i;
+        if (std::strcmp(fields[i].Name, "MGPRange.Size") == 0) sizeIndex = i;
+    }
+    ASSERT_NE(offsetIndex, sizeIndex);
+    ASSERT_EQ(fields[offsetIndex].Size, fields[sizeIndex].Size);
+    std::swap(fields[offsetIndex].Offset, fields[sizeIndex].Offset);
+    EXPECT_NE(WireMemberLayoutDigest(fields.data(), fields.size()), kMGPipeWireMemberLayoutDigest);
+    const auto before = WireFingerprint();
+    EXPECT_STREQ(BuildFingerprint(), MOBILEGL_BUILD_STAMP_VALUE);
+    EXPECT_EQ(BuildFingerprintPresent(), MOBILEGL_BUILD_STAMP_PRESENT != 0);
+    EXPECT_EQ(before, WireFingerprint());
+}
+
+namespace {
+    class ScopedHandshakeEnvironment {
+    public:
+        ScopedHandshakeEnvironment(const char* name, const char* value) : m_name(name) {
+            const char* previous = std::getenv(name);
+            m_present = previous != nullptr;
+            if (m_present) m_previous = previous;
+            Set(value);
+        }
+        ~ScopedHandshakeEnvironment() { Set(m_present ? m_previous.c_str() : nullptr); }
+    private:
+        void Set(const char* value) {
+#if defined(_WIN32)
+            ::_putenv_s(m_name, value == nullptr ? "" : value);
+#else
+            if (value == nullptr) ::unsetenv(m_name); else ::setenv(m_name, value, 1);
+#endif
+        }
+        const char* m_name;
+        bool m_present = false;
+        std::string m_previous;
+    };
+
+    std::vector<Uint8> ReadHandshakeFrame(Transport::ITransport& transport) {
+        Uint64 bytes = 0;
+        if (transport.ReceiveFrame({nullptr, 0}, &bytes, 1000) != MOBILEGL_ERR_BUFFER_TOO_SMALL) return {};
+        std::vector<Uint8> frame(bytes);
+        if (transport.ReceiveFrame({frame.data(), frame.size()}, &bytes, 1000) != MOBILEGL_OK) return {};
+        return frame;
+    }
+
+    void CheckHandshake(Uint32 major, Uint64 wire, const char* build,
+                        ::MobileGL::Wire::DialMode dial, ::MobileGL::Wire::RefuseCode expected) {
+        using namespace ::MobileGL::Wire;
+        std::unique_ptr<Transport::InProcessTransport> client, server;
+        Transport::InProcessTransport::CreatePair(client, server);
+        ::flatbuffers::FlatBufferBuilder builder(512);
+        auto terms = CreateLinkTerms(builder);
+        auto hello = CreateHelloDirect(builder, major, MOBILEGL_PROTOCOL_ABI_MINOR, build,
+                                       0, 1, nullptr, wire, wire, terms, nullptr, dial);
+        auto root = CreateCtrlEnvelope(builder, CtrlMsg::Hello, hello.Union());
+        FinishCtrlEnvelopeBuffer(builder, root);
+        std::vector<Uint8> first(builder.GetBufferPointer(), builder.GetBufferPointer() + builder.GetSize());
+        Server::ServerSession session;
+        Transport::SessionSegmentSizes sizes;
+        sizes.CmdRingBytes = 4096; sizes.StageBytes = 4096;
+        sizes.ReplyBytes = 4096; sizes.EventRingBytes = 4096;
+        session.SetSegmentSizes(sizes);
+        const auto result = session.Accept(*server, &first);
+        EXPECT_EQ(result, expected == RefuseCode::None ? MOBILEGL_OK : MOBILEGL_ERR_PROTOCOL_MISMATCH);
+        const auto reply = ReadHandshakeFrame(*client);
+        ASSERT_FALSE(reply.empty());
+        ::flatbuffers::Verifier verifier(reply.data(), reply.size());
+        ASSERT_TRUE(VerifyCtrlEnvelopeBuffer(verifier));
+        const auto* envelope = GetCtrlEnvelope(reply.data());
+        if (expected == RefuseCode::None) {
+            ASSERT_NE(envelope->msg_as_Welcome(), nullptr);
+            EXPECT_EQ(envelope->msg_as_Welcome()->wireFingerprint(), WireFingerprint());
+            ASSERT_NE(envelope->msg_as_Welcome()->linkTerms(), nullptr);
+            EXPECT_EQ(envelope->msg_as_Welcome()->linkTerms()->cmdWindowBytes(), 4096u);
+        } else {
+            ASSERT_NE(envelope->msg_as_Refuse(), nullptr);
+            EXPECT_EQ(envelope->msg_as_Refuse()->code(), expected);
+            EXPECT_FALSE(session.Accepted());
+        }
+        session.Close();
+    }
+}
+
+TEST(SessionHandshakeTest, WireMajorMismatchReturnsNamedRefuseWithoutAborting) {
+    CheckHandshake(99, WireFingerprint(), BuildFingerprint(), ::MobileGL::Wire::DialMode::No,
+                   ::MobileGL::Wire::RefuseCode::ProtocolVersion);
+}
+TEST(SessionHandshakeTest, WireLayoutMismatchReturnsNamedRefuseWithoutAborting) {
+    CheckHandshake(MOBILEGL_PROTOCOL_ABI_MAJOR, WireFingerprint() ^ 1, BuildFingerprint(),
+                   ::MobileGL::Wire::DialMode::No, ::MobileGL::Wire::RefuseCode::WireFingerprint);
+}
+TEST(SessionHandshakeTest, ConnectAcceptsDifferentBuildWithIdenticalWire) {
+    ScopedHandshakeEnvironment required("MOBILEGL_IPC_REQUIRE_SAME_BUILD", "0");
+    CheckHandshake(MOBILEGL_PROTOCOL_ABI_MAJOR, WireFingerprint(), "different-commit",
+                   ::MobileGL::Wire::DialMode::Connect, ::MobileGL::Wire::RefuseCode::None);
+}
+TEST(SessionHandshakeTest, ForkRefusesDifferentBuildWithIdenticalWire) {
+    CheckHandshake(MOBILEGL_PROTOCOL_ABI_MAJOR, WireFingerprint(), "different-commit",
+                   ::MobileGL::Wire::DialMode::Fork, ::MobileGL::Wire::RefuseCode::BuildFingerprint);
+}
+// PH-8. THE SERVER SIZES THE SESSION; THE CLIENT'S HELLO ONLY ASKS.
+//
+// Hello.linkTerms carries four byte counts a client may fill in, and nothing on the server reads
+// them for sizing: Accept builds the segments from its own SetSegmentSizes and Welcome states
+// those. That was stated (CONTRACT-P65 LinkTerms) and never pinned, so a refactor that "honoured
+// the client's request" would have handed any peer a 64 GiB allocation per connection. Here a
+// Hello asks for 64 GiB in every window and the Welcome must come back with the server's own
+// 4 KiB terms and 4 KiB segments - the allocation that happened is the one Welcome describes.
+// RED ONCE by making Accept size from the Hello's terms (m_sizes <- hello->linkTerms()): the
+// Accept below then fails to create a 64 GiB private segment, or the EXPECT_EQs name the window
+// that was echoed. The two-process half, with the child's own VmPeak, is
+// TcpLane.SupervisorProtocolControls' `hello_asks_64_gib`.
+//
+// "Clamped" in the name is the plan's word; what Accept does is IGNORE the ask - it never reads
+// the four counts for sizing - and the session is server-sized. Since the F fix round that is
+// said out loud: an ask above the granted terms logs one MGLOG_W naming both sides (rule I: a
+// silent difference between what a client configured and what it got is the kind this phase
+// removes), and this case requires the line. RED before that fix: the line is absent.
+TEST(SessionHandshakeTest, AHelloAskingFor64GiBIsClampedToTheServersTermsAndAllocatesNothingOfIt) {
+    using namespace ::MobileGL::Wire;
+    constexpr Uint64 kAsk = 64ull << 30;
+    std::unique_ptr<Transport::InProcessTransport> client, server;
+    Transport::InProcessTransport::CreatePair(client, server);
+    ::flatbuffers::FlatBufferBuilder builder(512);
+    auto terms = CreateLinkTerms(builder, DataPlane::SharedSegments, WireForm::StructImage, kAsk, kAsk, kAsk, kAsk);
+    auto hello = CreateHelloDirect(builder, MOBILEGL_PROTOCOL_ABI_MAJOR, MOBILEGL_PROTOCOL_ABI_MINOR,
+                                   BuildFingerprint(), 0, 1, nullptr, WireFingerprint(), WireFingerprint(),
+                                   terms, nullptr, DialMode::No);
+    auto root = CreateCtrlEnvelope(builder, CtrlMsg::Hello, hello.Union());
+    FinishCtrlEnvelopeBuffer(builder, root);
+    std::vector<Uint8> first(builder.GetBufferPointer(), builder.GetBufferPointer() + builder.GetSize());
+    Server::ServerSession session;
+    Transport::SessionSegmentSizes sizes;
+    sizes.CmdRingBytes = 4096; sizes.StageBytes = 4096;
+    sizes.ReplyBytes = 4096; sizes.EventRingBytes = 4096;
+    session.SetSegmentSizes(sizes);
+    const std::string before = ReadLog();
+    ASSERT_EQ(session.Accept(*server, &first), MOBILEGL_OK);
+    const std::string delta = ReadLog().substr(before.size());
+    EXPECT_TRUE(Contains(delta, "MG_Remote server: Hello asked for windows the server does not grant"))
+        << "the 64 GiB ask was ignored silently; an operator comparing the client's configured "
+           "windows with the server's would see no line. Log delta:\n" << delta;
+    const auto reply = ReadHandshakeFrame(*client);
+    ASSERT_FALSE(reply.empty());
+    ::flatbuffers::Verifier verifier(reply.data(), reply.size());
+    ASSERT_TRUE(VerifyCtrlEnvelopeBuffer(verifier));
+    const auto* welcome = GetCtrlEnvelope(reply.data())->msg_as_Welcome();
+    ASSERT_NE(welcome, nullptr);
+    ASSERT_NE(welcome->linkTerms(), nullptr);
+    EXPECT_EQ(welcome->linkTerms()->cmdWindowBytes(), 4096u) << "the command window echoed the Hello";
+    EXPECT_EQ(welcome->linkTerms()->stageWindowBytes(), 4096u) << "the stage window echoed the Hello";
+    EXPECT_EQ(welcome->linkTerms()->eventWindowBytes(), 4096u) << "the event window echoed the Hello";
+    EXPECT_EQ(welcome->linkTerms()->maxReplyBytes(),
+              4096u / sizes.ReplySlotCount - sizeof(Transport::ReplySlotHeader)) << "the reply bound echoed the Hello";
+    // The segments that EXIST are the server's: each announced size is a few pages at most, never
+    // the ask. A 64 GiB request that had been honoured would show here even if Welcome's terms
+    // had been rewritten afterwards.
+    for (const auto* segment : {welcome->cmdRing(), welcome->stageRing(), welcome->replyPool(), welcome->eventRing()}) {
+        ASSERT_NE(segment, nullptr);
+        EXPECT_LE(segment->sizeBytes(), 64u * 1024u);
+    }
+    session.Close();
+}
+
+TEST(SessionHandshakeTest, ConnectCanRequireTheSameBuild) {
+    ScopedHandshakeEnvironment required("MOBILEGL_IPC_REQUIRE_SAME_BUILD", "1");
+    CheckHandshake(MOBILEGL_PROTOCOL_ABI_MAJOR, WireFingerprint(), "different-commit",
+                   ::MobileGL::Wire::DialMode::Connect, ::MobileGL::Wire::RefuseCode::BuildFingerprint);
+}
+
+#if !defined(_WIN32)
+// PH-7 (5) (ph-f.md §6.4 (b)). AN UNAUTHENTICATED PEER LEARNS ONLY THAT IT IS UNAUTHENTICATED.
+//
+// ServerSession::Accept checked the dial mode, the version, the wire fingerprint and the build
+// stamp BEFORE the token, so a peer without the token that sent a wrong fingerprint was answered
+// Refuse{WireFingerprint} with this build's fingerprint in `expected` - and with a wrong major,
+// Refuse{ProtocolVersion} with this build's version; with REQUIRE_SAME_BUILD, the build stamp.
+// Here a Hello wrong in EVERY one of those, and in its token, reaches a real Accept over a real
+// socket pair (the only transport role the token policy applies to - InProcess has no peer) with a
+// token configured: the one answer is Refuse{Authentication} with expected = actual = 0 and no
+// peer value. RED ONCE by moving AuthenticatePeerToken back below ValidatePeerHandshake in
+// ServerSession::Accept: the code comes back ProtocolVersion with our version in `expected`.
+TEST(SessionHandshakeTest, AnUnauthenticatedHelloLearnsNeitherTheFingerprintNorTheBuild) {
+    using namespace ::MobileGL::Wire;
+    ScopedHandshakeEnvironment token("MOBILEGL_IPC_TOKEN", "ph7-5-the-servers-own-token");
+    ScopedHandshakeEnvironment required("MOBILEGL_IPC_REQUIRE_SAME_BUILD", "1");
+    std::unique_ptr<Transport::SocketTransport> client, server;
+    ASSERT_EQ(Transport::SocketTransport::CreatePair(client, server), MOBILEGL_OK);
+    ::flatbuffers::FlatBufferBuilder builder(512);
+    auto terms = CreateLinkTerms(builder);
+    auto hello = CreateHelloDirect(builder, 99, MOBILEGL_PROTOCOL_ABI_MINOR, "some-other-build", 0, 1, nullptr,
+                                   WireFingerprint() ^ 1, WireFingerprint() ^ 1, terms, "not-the-servers-token",
+                                   DialMode::Fork);
+    auto root = CreateCtrlEnvelope(builder, CtrlMsg::Hello, hello.Union());
+    FinishCtrlEnvelopeBuffer(builder, root);
+    std::vector<Uint8> first(builder.GetBufferPointer(), builder.GetBufferPointer() + builder.GetSize());
+    Server::ServerSession session;
+    Transport::SessionSegmentSizes sizes;
+    sizes.CmdRingBytes = 4096; sizes.StageBytes = 4096;
+    sizes.ReplyBytes = 4096; sizes.EventRingBytes = 4096;
+    session.SetSegmentSizes(sizes);
+    EXPECT_EQ(session.Accept(*server, &first), MOBILEGL_ERR_PROTOCOL_MISMATCH);
+    EXPECT_FALSE(session.Accepted());
+    const auto reply = ReadHandshakeFrame(*client);
+    ASSERT_FALSE(reply.empty());
+    ::flatbuffers::Verifier verifier(reply.data(), reply.size());
+    ASSERT_TRUE(VerifyCtrlEnvelopeBuffer(verifier));
+    const auto* refusal = GetCtrlEnvelope(reply.data())->msg_as_Refuse();
+    ASSERT_NE(refusal, nullptr);
+    EXPECT_EQ(refusal->code(), RefuseCode::Authentication) << EnumNameRefuseCode(refusal->code());
+    EXPECT_EQ(refusal->expected(), 0u) << "an unauthenticated peer was told a value of ours";
+    EXPECT_EQ(refusal->actual(), 0u);
+    EXPECT_TRUE(refusal->peerValue() == nullptr || refusal->peerValue()->size() == 0);
+    session.Close();
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // The two null-union guards, driven THROUGH the handshakes (ID-46 finding 7)

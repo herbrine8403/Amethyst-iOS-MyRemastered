@@ -9,15 +9,20 @@
 // P5 package v1: the apply thread, its affinity, its parking, and the EGL ownership move.
 
 #include "ServerLoop.h"
+#include <MG_Remote/FatalFunnel.h>
+#include <MG_Backend/MGPipe/PipeInputs.h>
 
 #include <Config.h>
 #include <MG_Backend/BackendObjects.h>
 #include <MG_Util/Debug/Log.h>
 #include <MG_Util/Metrics/PipeStats.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstdio>
+#include <thread>
 
 #if defined(__linux__) || defined(__ANDROID__)
 #include <pthread.h>
@@ -206,6 +211,10 @@ namespace MobileGL::MG_Remote::Server {
         }
         m_session = &session;
         m_stopRequested.store(false, std::memory_order_release);
+        m_abandonQueue.store(false, std::memory_order_release);
+        // PH-6 fix round: the session's copy of the request, for ReserveEventOrBlock's wait. Lowered
+        // with the loop's own, so a loop restarted on the same session does not forfeit at once.
+        session.ClearApplyStopRequest();
         // m-3: reset THIS session's own diagnostics. DrainedRecords()/ParkCount() are absolute and
         // a case asserts == N, so a process that opens a SECOND session (context loss, or
         // Initialize after Destroy) must start them at zero rather than carry the first session's
@@ -216,7 +225,16 @@ namespace MobileGL::MG_Remote::Server {
         m_nativeBinds.store(0, std::memory_order_release);
         m_clientReleases.store(0, std::memory_order_release);
         m_makeCurrentRepublishes.store(0, std::memory_order_release);
+        m_controlSeq.store(0, std::memory_order_release);
+        m_controlFramesDispatched.store(0, std::memory_order_release);
         m_haveCurrentTuple = false;
+        // P12 (D4, D6): a new session decides its own surface mode, holds no window lease yet and
+        // has no window-lost request pending. The apply thread that reads these is not started yet.
+        m_surfaceMode = SessionSurfaceMode::None;
+        m_holdsWindowLease = false;
+        m_serverOwnedSurfaces.clear();
+        m_windowLostRequested.store(false, std::memory_order_release);
+        m_serverWindowsLost.store(0, std::memory_order_release);
         {
             const std::lock_guard<std::mutex> lock(m_exitMutex);
             m_exited = false;
@@ -269,7 +287,8 @@ namespace MobileGL::MG_Remote::Server {
     ServerLoop::MakeCurrentOutcome ServerLoop::ApplyMakeCurrent(MG_Backend::BackendObject* backend,
                                                                EGLDisplay dpy, EGLSurface draw,
                                                                EGLSurface read, EGLContext ctx) {
-        // Apply thread only (RunOnApplyThread put us here), so m_haveCurrentTuple/m_cur* need no
+        // Apply thread only (RunSurfaceControlFrame's dispatch put us here), so
+        // m_haveCurrentTuple/m_cur* need no
         // lock. The counters are atomic for the reader on the test thread.
         MakeCurrentOutcome outcome;
         const EglBindAction action = ClassifyEglMakeCurrent(m_haveCurrentTuple, m_curDpy, m_curDraw,
@@ -283,10 +302,12 @@ namespace MobileGL::MG_Remote::Server {
             // removes. m_haveCurrentTuple is left intact so a later identical bind is still a
             // RepeatNoOp (the driver never lost the context).
             m_clientReleases.fetch_add(1, std::memory_order_acq_rel);
+            MG_Pipe::MGPipeServerSetContextLive(false);
             outcome.ok = true;
             outcome.boundNatively = false;
             return outcome;
         case EglBindAction::RepeatNoOp:
+            MG_Pipe::MGPipeServerSetContextLive(true);
             // ID-54's "a no-op apart from the R-12 republish decision": the decision for an
             // identical repeat is NO republish, because nothing ran that could have moved the
             // caps - InitCapabilities runs inside the backend's MakeEGLCurrent, which this arm
@@ -305,6 +326,7 @@ namespace MobileGL::MG_Remote::Server {
         // control counts THAT at the EGL function table. This counter counts forwards.
         outcome.ok = backend->MakeEGLCurrent(dpy, draw, read, ctx);
         if (!outcome.ok) return outcome;
+        MG_Pipe::MGPipeServerSetContextLive(true);
         m_haveCurrentTuple = true;
         m_curDpy = dpy;
         m_curDraw = draw;
@@ -336,6 +358,13 @@ namespace MobileGL::MG_Remote::Server {
         // declaration: it is an identity, not a handshake, and this thread is the only writer.
         Detail::g_applyThreadKey.store(Detail::CurrentThreadKey(), std::memory_order_relaxed);
         NameThisThread("mgl-srv-apply");
+        // P6: THIS THREAD IS THE SERVER, and saying so is what sends its lines to the server's
+        // own log. Under spawn the process role already answers this; under INPROC it is the
+        // only thing that can, because the client role is another thread of this same process.
+        MG_Util::Debug::SetThreadLogRole(MG_Util::Debug::LogRole::Server);
+        // P12 review fix: and it is one of the session's own threads, whose lines a session-scoped
+        // forwarder (the in-process display server's) sends to the client. Inert otherwise.
+        MG_Util::Debug::SetThreadForwardsLogToPeer(true);
 
         Bool recognised = true;
         const char* raw = AffinityStringFromConfig();
@@ -360,10 +389,10 @@ namespace MobileGL::MG_Remote::Server {
         // The decoder is built HERE, on this thread, because PipeWireDecoder is "not thread
         // safe: one decoder on the apply thread, by construction" and its constructor installs
         // the process-wide apply hook.
-        session.Applier().Attach(&session.Control(), m_backend.get());
+        session.Applier().Attach(session.DataLink(), m_backend.get());
 
-        Transport::RingControl& control = session.Control();
-        Transport::Doorbell& bell = session.ConsumerDoorbell();
+        const auto signals = session.DataLink()->Signals();
+        Transport::Doorbell& bell = session.DataLink()->ConsumerBell();
         Transport::RingConsumer& ring = session.CommandRing();
         const Uint32 spinUs = SpinUsFromConfig();
 
@@ -377,16 +406,52 @@ namespace MobileGL::MG_Remote::Server {
         // CondVarDoorbell::Kill() breaks that, and Kill is the CLIENT's teardown call, not
         // something an EGL make-current request may perform. So the predicate carries all
         // three arming conditions and the doorbell wakes the thread for any of them.
-        const auto ready = [this, &control, &ring] {
-            return control.cmdHead.load(std::memory_order_acquire) != ring.LocalTail() ||
-                   m_stopRequested.load(std::memory_order_acquire) || ControlIsPending();
+        // P5e (ra, CONTRACT-P5E §2.6) ADDS A FOURTH, AND IT IS THE ONE THAT SAYS "NOT NOW"
+        // RATHER THAN "WAKE UP". A full SEG_EVENT means the apply thread has nowhere to put
+        // the events the next record's apply would produce, so a waiting record is NOT work
+        // yet: applying it would only park the producer half way through. Stop and Control
+        // still win - a teardown may not be held up by a client that stopped draining - which
+        // is why they are tested first and the ring test sits between them and the queue.
+        //
+        // The wake comes from EventRingConsumer::Drained(), which clears the latch AND rings
+        // this bell (that pairing is the whole of the flow-control protocol; a cleared flag
+        // with no bell is the lost wakeup the forward direction's publish-then-ring order
+        // exists to prevent).
+        //
+        // PH-6 (ID-P7-2) ADDS THE FORFEIT LATCH BESIDE STOP, AND FOR STOP'S REASON. A session whose
+        // reverse channel was forfeited (ServerSession::ForfeitReverseChannel) has a client that
+        // is not reading SEG_EVENT, so its ring stays full - and the ring test below would park
+        // this thread on `eventRingFull` for ever, waiting for a drain that the forfeit has
+        // already decided will not come. The latch wins over the ring exactly as Stop does, and
+        // the loop takes the same way out.
+        const auto stopOrForfeit = [this, &session] {
+            return m_stopRequested.load(std::memory_order_acquire) || session.ReverseChannelForfeited();
+        };
+        // P12 (D6) ADDS ONE MORE WAKE, BESIDE CONTROL: a window-lost request from ServerDisplay::
+        // Detach (the UI thread's surfaceDestroyed, which is blocked until this thread answers).
+        const auto ready = [this, signals, &ring, &stopOrForfeit] {
+            if (stopOrForfeit() || ControlIsPending() || m_windowLostRequested.load(std::memory_order_acquire))
+                return true;
+            if (signals.EventRingFull->load(std::memory_order_acquire) != 0) return false;
+            return signals.CmdHead->load(std::memory_order_acquire) != ring.LocalTail();
         };
 
         for (;;) {
             PumpControlRequest();
-            if (m_stopRequested.load(std::memory_order_acquire)) break;
-            DrainRing();
-            if (m_stopRequested.load(std::memory_order_acquire)) break;
+            if (stopOrForfeit()) break;
+            if (signals.EventRingFull->load(std::memory_order_acquire) == 0) DrainRing();
+            if (stopOrForfeit()) break;
+            // PH-1 (3): a latched session applies nothing more, so this thread leaves the loop
+            // (and does not spin on a ring whose head is still ahead of a tail DrainRing will no
+            // longer move). The exit path below tears the backend down as for a Stop; the
+            // control connection's owner (ServerMain::RunSession) sees the latch and closes.
+            // Pinned by ServerLoopTest's latched-batch case: without this break the thread is
+            // still running, with no Stop(), three seconds after the latch.
+            if (SessionLatched()) {
+                MGLOG_E("MG_Remote server: mgl-srv-apply leaves its loop - the session latched a "
+                        "named fault and declines the rest of the ring (PH-1)");
+                break;
+            }
             if (ready()) continue;
 
             const Uint64 waits = m_parks.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -412,7 +477,9 @@ namespace MobileGL::MG_Remote::Server {
                 MG_Util::PipeStats::PublishGauge(Gauge::ServerWaits, waits);
                 MG_Util::PipeStats::PublishGauge(Gauge::ServerParks, ParkBlockCount());
             }
-            const bool woke = bell.Wait(control.consumerParked, ready, spinUs,
+            // Flush-on-idle publishes the last reply record even below the batch threshold.
+            session.FlushDataProgress();
+            const bool woke = bell.Wait(*signals.ConsumerParked, ready, spinUs,
                                         Transport::kWaitForever, &m_parkBlocks);
             if (!woke) {
                 // Wait returns false only on a dead bell or an expired deadline, and this park
@@ -438,8 +505,32 @@ namespace MobileGL::MG_Remote::Server {
         // drain (ClientSession::Stop step 1) normally empties the ring first and is BOUNDED, so
         // a timeout there leaves records here; applying them costs nothing and dropping them
         // would leave the emitter's var-tails referenced by records nobody ever read.
+        //
+        // EXCEPT AFTER A FORFEIT (PH-6). That stop was not asked for by a client finishing its
+        // work; it was decided about a peer that stopped reading this session's answers, and
+        // every event the rest of its queue produced would only be one more counted drop - while
+        // a peer that keeps publishing could keep this final drain going as long as it liked,
+        // which is exactly the unbounded hold the forfeit exists to end. The queue is left
+        // unapplied; the rings die with the session.
+        //
+        // AND AFTER AbandonQueuedRecords (P12 review fix), for the forfeit's reason: the server is
+        // stopping under a client that may still be streaming, and draining what it keeps queuing
+        // is the unbounded hold Stop()'s bounded join turns into an abort.
+        const Bool forfeited = session.ReverseChannelForfeited();
+        const Bool abandoned = m_abandonQueue.load(std::memory_order_acquire);
         PumpControlRequest();
-        DrainRing();
+        if (forfeited) {
+            MGLOG_E("MG_Remote server: mgl-srv-apply stops on ReverseChannelForfeit - %llu reverse-channel "
+                    "event(s) dropped, applied seq %llu; the records still queued are not applied",
+                    static_cast<unsigned long long>(session.ForfeitDrops()),
+                    static_cast<unsigned long long>(session.Consumer().AppliedSeq()));
+        } else if (abandoned) {
+            MGLOG_W("MG_Remote server: mgl-srv-apply stops because the server is stopping - applied seq %llu; "
+                    "the records still queued are not applied",
+                    static_cast<unsigned long long>(session.Consumer().AppliedSeq()));
+        } else {
+            DrainRing();
+        }
 
         // THE BACKEND IS DESTROYED ON THIS THREAD, WHILE IT IS STILL THE CONTEXT OWNER.
         // ~BackendObject_DirectGLES calls DestroyEGLContext (BackendObject_DirectGLES.cpp:
@@ -453,6 +544,12 @@ namespace MobileGL::MG_Remote::Server {
                     "which is the context owner");
             m_backend.reset();
         }
+        // P12 (D6): the backend - and with it every surface on the server's window - is gone, so the
+        // session's lease on that window ends here, AFTER the reset. A Detach waiting on it returns
+        // now; one that arrives later finds no lease and releases the window at once.
+        m_windowLostRequested.store(false, std::memory_order_release);
+        EndServerWindowLease();
+        MG_Pipe::MGPipeServerSetContextLive(false);
         // N-3: the context died with the backend; a tuple that outlives it would make the next
         // session's first make-current onto the same (recycled) handle values a RepeatNoOp.
         ForgetCurrentTuple();
@@ -465,7 +562,7 @@ namespace MobileGL::MG_Remote::Server {
         // m_controlDone with no answer possible (the bounded join has already succeeded, so there
         // is not even a Fatal{ApplyThreadJoinTimeout}). With the clear under the lock, a caller
         // either takes the lock FIRST (its request is here and answered NOT_INITIALIZED) or takes
-        // it AFTER (it sees !m_running under the lock in RunOnApplyThread and returns
+        // it AFTER (it sees !m_running under the lock in RunSurfaceControlFrame and returns
         // NOT_INITIALIZED without publishing). There is no third order.
         {
             const std::lock_guard<std::mutex> lock(m_controlMutex);
@@ -499,11 +596,12 @@ namespace MobileGL::MG_Remote::Server {
             // be: ServerLoopTest has no GL context, so CreateBackend is never called and the
             // ~BackendObject_DirectGLES -> ReleaseEGLResources self-post named above is never
             // built. Move the store above m_backend.reset() and that post misses
-            // RunOnApplyThread's re-entrancy arm (ServerLoop.cpp: `if (OnApplyThread()) return
-            // work(user);`) while m_running is still true, so it publishes into the one-slot
-            // mailbox and waits on m_controlDone for an answer only THIS thread could ever
-            // give. The integration lane - a real EGL teardown - is the only thing that would
-            // catch that, and it would catch it as a hang, not as a failed assertion.
+            // RunSurfaceControlFrame's re-entrancy arm (`if (OnApplyThread()) return
+            // ApplySurfaceControlFrame(frame);`) while m_running is still true, so it publishes
+            // into the one-slot channel and waits on m_controlDone for an answer only THIS
+            // thread could ever give. The integration lane - a real EGL teardown - is the only
+            // thing that would catch that, and it would catch it as a hang, not as a failed
+            // assertion.
             Detail::g_applyThreadKey.store(0, std::memory_order_relaxed);
         }
         m_controlDone.notify_all();
@@ -519,14 +617,18 @@ namespace MobileGL::MG_Remote::Server {
     }
 
     Bool ServerLoop::PumpControlRequest() {
+        // P12 (D6): A LOST SERVER WINDOW IS ANSWERED FIRST, before any frame this pump would run -
+        // a frame taken now might render into the window the UI thread is waiting to destroy. One
+        // relaxed-cost load on the idle poll, beside the shadow's.
+        if (m_windowLostRequested.load(std::memory_order_acquire)) ReleaseLostServerWindow();
         // THE IDLE POLL'S FAST NEGATIVE. The loop calls this once per iteration whether or not
         // anything was posted, and the common answer is "nothing". Taking m_controlMutex to
         // learn that was the other half of package T's finding; the shadow answers it with a
         // load, and everything below this line still runs under the lock exactly as before.
         if (!m_controlPosted.load(std::memory_order_acquire)) return false;
 
-        ControlWork work = nullptr;
-        void* user = nullptr;
+        SurfaceControlFrame frame;
+        Bool declinedOnLatch = false;
         {
             const std::lock_guard<std::mutex> lock(m_controlMutex);
             if (!m_controlPending) {
@@ -537,17 +639,51 @@ namespace MobileGL::MG_Remote::Server {
                 m_controlPosted.store(false, std::memory_order_release);
                 return false;
             }
-            work = m_controlWork;
-            user = m_controlUser;
+            frame = m_controlFrame;
             // CLEARED WHEN THE REQUEST IS TAKEN, not when it finishes. m_controlPending stays
-            // true for the duration of `work` (the C2 exit block reads it), but the thread that
-            // would act on the shadow is THIS one and it is busy running the request; leaving
+            // true for the duration of the dispatch (the C2 exit block reads it), but the thread
+            // that would act on the shadow is THIS one and it is busy running the frame; leaving
             // the shadow set would only make the post-work iteration spin instead of park.
             m_controlPosted.store(false, std::memory_order_release);
+            // PH-1 (3), ID-P7-1: A LATCHED SESSION RUNS NO FURTHER CONTROL OP. A frame can be
+            // posted before the latch and taken after it - RunSession passed SurfaceOpCodec's
+            // latch check a moment before a record latched on this thread, and this thread's
+            // exit path pumps once more - and a MakeCurrent, a surface create or a swap has no
+            // business running on a backend whose session has already been declared over. It
+            // is answered here, without a dispatch, with the code SurfaceOpCodec's own latched
+            // arm gives. ServerLoopTest's post-after-latch case goes red without it.
+            if (SessionLatched()) {
+                m_controlResult = MOBILEGL_ERR_PROTOCOL_MISMATCH;
+                m_controlPending = false;
+                m_controlFinished = true;
+                declinedOnLatch = true;
+            }
         }
-        const MobileGLResult result = work == nullptr ? MOBILEGL_ERR_INVALID_ARGUMENT : work(user);
+        if (declinedOnLatch) {
+            m_controlDone.notify_all();
+            return true;
+        }
+        // The dispatch runs OUTSIDE the lock, exactly as the old work(user) did, and fills the
+        // frame's reply half; the reply is then published back into the slot under the lock so
+        // the poster's copy-out after m_controlDone sees it.
+        const auto dispatchStart = std::chrono::steady_clock::now();
+        const MobileGLResult result = ApplySurfaceControlFrame(
+            frame, m_controlProbeHook.load(std::memory_order_acquire),
+            m_controlProbeUser.load(std::memory_order_acquire));
+        // p7/spawnhang: A SLOW DISPATCH NAMES ITSELF. The first surface creation / MakeCurrent is
+        // where a lazy native bring-up runs, and on a cold CI runner it outran the client's whole
+        // reply budget with nothing in this log to say so - the investigation had to infer it.
+        const auto dispatchMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - dispatchStart).count();
+        if (dispatchMs >= static_cast<long long>(kSlowControlDispatchMs)) {
+            MGLOG_W("MG_Remote server: %s seq %llu ran %lld ms on mgl-srv-apply (a lazy native "
+                    "bring-up runs inside the first surface creation or MakeCurrent)",
+                    SurfaceControlOpName(frame.kind), static_cast<unsigned long long>(frame.seq),
+                    static_cast<long long>(dispatchMs));
+        }
         {
             const std::lock_guard<std::mutex> lock(m_controlMutex);
+            m_controlFrame = frame;
             m_controlResult = result;
             m_controlPending = false;
             m_controlFinished = true;
@@ -565,11 +701,51 @@ namespace MobileGL::MG_Remote::Server {
         // the consumer's own m_localTail (Ring.cpp:222-232) - no mutex, no steady_clock, no
         // allocation; `applied == 0` then skips the retire block below entirely. Keep it that
         // way: anything added here runs ~900 times a frame doing nothing.
+        //
+        // PH-1 (3), ID-P7-1: THE LATCH CHECK, ONCE, IMMEDIATELY BEFORE EVERY POP. Once a named
+        // fault has latched (an armed spawn / TCP session child only - unarmed this is one acquire
+        // load of a flag nobody sets), no further record is applied: the rest of the ring is
+        // declined unread, the apply thread leaves its loop, and RunSession closes the session by
+        // name. The one check does three jobs, and each has a case that goes red without it:
+        //   * a drain ENTERED latched pops nothing - the apply thread's exit-path drain after it
+        //     left on the latch, and any drain after RunSession's thread latched a control op
+        //     (ServerLoopTest's latched-batch case: the exit-path drain applies the record behind
+        //     the latched one);
+        //   * a record that latched is the last one this drain pops, even when the peer published
+        //     more behind it in the same batch (PeerLatchTest's two-record case, ServerLoopTest's
+        //     latched-batch case);
+        //   * a latch ANOTHER thread stores between two records - RunSession's control thread
+        //     latching a malformed SurfaceOp while this drain is mid-batch - stops the next pop
+        //     when it is stored before this load (codex closeout finding 6; ServerLoopLatchTest's
+        //     between-records case). The first version checked at the top of the function and after
+        //     each record, and made one more load (the PH-6 forfeit check) before the next pop;
+        //     checking HERE only NARROWS that control/apply window to this load-to-pop span, it
+        //     does not close it.
+        // A latch stored inside that span still lets the one record already admitted be popped and
+        // applied; the session then ends at the next check, one record later. Closing the span would
+        // take a lock the control thread shares with every pop.
+        //
+        // The idle poll's cost is unchanged: this load replaces the function-top check the first
+        // version made, and the empty-ring answer is still it plus Pop's cmdHead load.
+        //
+        // P12 (D6) REVIEW FIX: A LOST SERVER WINDOW IS ANSWERED BEFORE EVERY POP TOO, not only by
+        // PumpControlRequest between batches. A batch ends when the ring is empty, and a client
+        // streaming frames keeps it from emptying for seconds: surfaceDestroyed (ServerDisplay::
+        // Detach) waited that long on the UI thread - past its 3 s bound, so it gave up and the
+        // session went on presenting into the destroyed window. Checked AFTER the latch check (the
+        // MECHANICS row in ph_latch_sites.py pins that one as the loop's first statement); the
+        // release latches ServerWindowLost, so `continue` takes the latch check's way out. One more
+        // acquire load per pop; the empty-ring answer pays it once.
         ServerSession& session = *m_session;
         Transport::SessionConsumer& consumer = session.Consumer();
         PipeApplier& applier = session.Applier();
         Uint64 applied = 0;
         for (;;) {
+            if (SessionLatched()) break;
+            if (m_windowLostRequested.load(std::memory_order_acquire)) {
+                ReleaseLostServerWindow();
+                continue;
+            }
             bool corrupt = false;
             const bool popped = consumer.ApplyOne(
                 [this, &applier](const Transport::RingRecordView& record) {
@@ -592,14 +768,32 @@ namespace MobileGL::MG_Remote::Server {
             if (corrupt) {
                 // Ring.h's own rule: a header the producer could not have written is
                 // Fatal{ProtocolCorruption}, never a retry. Retrying re-reads the same bytes
-                // for ever; skipping desynchronises seq, and seq IS the reply-slot id.
-                MGLOG_F("MGPipe: Fatal{ProtocolCorruption, \"SEG_CMD record header\"} - the "
+                // for ever; skipping desynchronises seq, and seq IS the reply-slot id. PH-1 (3):
+                // the header is the peer's bytes, so an armed session child latches here and
+                // stops reading the ring - neither a retry nor a skip.
+                (void)SessionLatch(MGFatalFamily::ProtocolCorruption, "MGPipe: Fatal{ProtocolCorruption, \"SEG_CMD record header\"} - the "
                         "consumer refused a record header at applied seq %llu",
                         static_cast<unsigned long long>(consumer.AppliedSeq()));
-                std::abort();
+                break;
             }
             if (!popped) break;
             ++applied;
+            // PH-6: the record whose event forfeited the reverse channel is the last one this
+            // session applies. Checked only AFTER a popped record, so the empty-ring answer above
+            // still costs its two loads and nothing else. (A record that LATCHED is stopped by the
+            // loop-head check on the next iteration - ph_latch_sites.py's MECHANICS row pins that
+            // check as the first statement of this loop.)
+            if (session.ReverseChannelForfeited()) break;
+            // P12 review fix: and the record in hand is the last one when the server is stopping
+            // (AbandonQueuedRecords); same placement, same free empty-ring answer.
+            if (m_abandonQueue.load(std::memory_order_acquire)) break;
+            // TEST-ONLY scheduling point BETWEEN two records: after this record's own checks and
+            // before the next pop's latch check. A control-thread latch stored here is seen by that
+            // check (the first version let it through); one stored after the check and before the
+            // pop still is not - the window is narrowed to check-to-pop, not closed, and the session
+            // ends at the check after that record. Only after a popped record, so the idle poll never
+            // pays for it; null outside ServerLoopLatchTest.
+            if (const auto hook = m_betweenRecordsHook.load(std::memory_order_acquire)) hook();
         }
         if (applied != 0) {
             // THE TWO TALLIES MUST AGREE, AND THAT IS WHAT MAKES R-9's BATCHING BAN CHECKABLE.
@@ -607,13 +801,15 @@ namespace MobileGL::MG_Remote::Server {
             // and PipeWireDecoder keeps its own count; a batched publish would move one and not
             // the other, which a single counter could not have told apart (w1-v1 5).
             if (applier.DecoderAppliedSeq() != consumer.AppliedSeq()) {
-                MGLOG_F("MGPipe: Fatal{ProtocolCorruption, \"appliedSeq batched\"} - the "
+                // PH-1 (3): latched, and nothing is retired against a watermark this side no
+                // longer believes.
+                (void)SessionLatch(MGFatalFamily::ProtocolCorruption, "MGPipe: Fatal{ProtocolCorruption, \"appliedSeq batched\"} - the "
                         "session's watermark is %llu and the decoder applied %llu records. P5 "
                         "forbids batching appliedSeq (R-9): the verb barrier's waiter reads it, "
                         "and a watermark ahead of the decoder promises work that has not run",
                         static_cast<unsigned long long>(consumer.AppliedSeq()),
                         static_cast<unsigned long long>(applier.DecoderAppliedSeq()));
-                std::abort();
+                return applied;
             }
             // RETIRE. MANDATORY, not optional: RingProducer::FreeBytes() reclaims against
             // retiredTail only, and w1's SEG_STAGE linear allocator reclaims on retiredSeq - so
@@ -630,15 +826,36 @@ namespace MobileGL::MG_Remote::Server {
         return applied;
     }
 
-    MobileGLResult ServerLoop::RunOnApplyThread(ControlWork work, void* user) {
-        if (work == nullptr) return MOBILEGL_ERR_INVALID_ARGUMENT;
+    void ServerLoop::SetRemoteControlSink(RemoteControlSink sink, void* user) {
+        m_remoteSink = sink;
+        m_remoteSinkUser = user;
+    }
+
+    MobileGLResult ServerLoop::RunSurfaceControlFrame(SurfaceControlFrame& frame) {
+        if (frame.kind == SurfaceControlOp::None) return MOBILEGL_ERR_INVALID_ARGUMENT;
+
+        // `cp`: the server is another process, so the frame CROSSES instead of
+        // being posted. Checked before the seq mint below, because a wire request
+        // must carry the CLIENT's number all the way through dispatch and the
+        // reply - the local mint at :662 is for unnumbered LOCAL requests and
+        // renumbering a wire one would make its reply uncorrelatable.
+        if (m_remoteSink != nullptr) {
+            return m_remoteSink(m_remoteSinkUser, frame);
+        }
+        // Zero marks an unnumbered local request. A wire request is already numbered by its
+        // client and MUST retain that number all the way through dispatch and the reply.
+        if (frame.seq == 0) frame.seq = m_controlSeq.fetch_add(1, std::memory_order_acq_rel) + 1;
         // RE-ENTRANCY IS NOT A DEADLOCK. The teardown path posts from the apply thread itself -
         // ~BackendObject_DirectGLES reaches ReleaseEGLResources - and so does anything the
         // applier calls that wants "run this where the context is". Running inline is the
         // correct answer there and the only non-hanging one.
-        if (OnApplyThread()) return work(user);
+        if (OnApplyThread()) return ApplySurfaceControlFrame(frame);
 
         const std::lock_guard<std::mutex> callerLock(m_callerMutex);
+        return PostSurfaceControlFrameWithCallerLock(frame);
+    }
+
+    MobileGLResult ServerLoop::PostSurfaceControlFrameWithCallerLock(SurfaceControlFrame& frame) {
         std::unique_lock<std::mutex> lock(m_controlMutex);
         // C2 + M-7: the m_running check and the publish are ONE critical section, and m_running is
         // cleared under this same lock on the way out (ApplyThreadMain's exit block), so this read
@@ -650,35 +867,33 @@ namespace MobileGL::MG_Remote::Server {
             if (backendAlive) {
                 // M-7: the backend exists but no thread owns it - ClientSession::Start refused
                 // (ServerLoop.cpp Start's !Accepted arm) or std::thread's constructor threw.
-                // Running `work` inline here would issue eglMakeCurrent on the APP thread and
-                // stamp g_backendContextOwnerThread with it, so a lane called split would render
-                // correctly with the context on the wrong thread - the one outcome R-1 exists to
-                // make impossible. Fatal by name, never a fallback; compare CreateBackend's
-                // default: arm, which also refuses rather than substitutes.
-                MGLOG_F("MGPipe: Fatal{ApplyThreadNotRunning, \"EGL on the app thread\"} - a "
-                        "control request reached RunOnApplyThread with the server's backend built "
-                        "but no mgl-srv-apply thread running (ClientSession::Start failed after "
-                        "ServerLoop::CreateBackend). Running it inline would make the context "
-                        "current on the APP thread - the split lane's whole premise. Refusing by "
-                        "name rather than falling back to monolith");
-                std::abort();
+                // Dispatching the frame inline here would issue eglMakeCurrent on the APP thread
+                // and stamp g_backendContextOwnerThread with it, so a lane called split would
+                // render correctly with the context on the wrong thread - the one outcome R-1
+                // exists to make impossible. Fatal by name, never a fallback; compare
+                // CreateBackend's default: arm, which also refuses rather than substitutes.
+                SessionFail(MGFatalFamily::ApplyThreadNotRunning, "MGPipe: Fatal{ApplyThreadNotRunning, \"EGL on the app thread\"} - a "
+                        "control frame reached RunSurfaceControlFrame with the server's backend "
+                        "built but no mgl-srv-apply thread running (ClientSession::Start failed "
+                        "after ServerLoop::CreateBackend). Dispatching it inline would make the "
+                        "context current on the APP thread - the split lane's whole premise. "
+                        "Refusing by name rather than falling back to monolith");
             }
-            // Backend already gone (post-Stop teardown, or the pre-Init window): the forwarders'
-            // ServerBackendOrNull() would answer null anyway, so NOT_INITIALIZED is the honest
-            // result and running inline is pointless. This is the deterministic half of C2 - a
-            // forwarder call after the loop stopped returns NOT_INITIALIZED, it does not hang and
-            // it does not run on the caller.
+            // Backend already gone (post-Stop teardown, or the pre-Init window): the dispatch's
+            // null-backend arm would answer NOT_INITIALIZED anyway, so that is the honest result
+            // and running inline is pointless. This is the deterministic half of C2 - a forwarder
+            // call after the loop stopped returns NOT_INITIALIZED, it does not hang and it does
+            // not run on the caller.
             return MOBILEGL_ERR_NOT_INITIALIZED;
         }
-        m_controlWork = work;
-        m_controlUser = user;
+        m_controlFrame = frame;
         m_controlPending = true;
         m_controlFinished = false;
-        // THE SHADOW IS PUBLISHED LAST OF THE FOUR AND WITH A RELEASE, inside this same
+        // THE SHADOW IS PUBLISHED LAST OF THE THREE AND WITH A RELEASE, inside this same
         // critical section: the apply thread's park predicate reads ONLY this word, so an
-        // acquire load that returns true must also see the three fields above it. Storing it
+        // acquire load that returns true must also see the slot and flags above it. Storing it
         // first would let a pump that is already past its own fast-negative read a slot that
-        // does not name the work yet.
+        // does not hold the frame yet.
         m_controlPosted.store(true, std::memory_order_release);
         // Publish THEN ring, in that order and never the other (Doorbell.h, NotifyIfParked's
         // PRECONDITION block: the fence only orders what precedes it). The bell
@@ -688,10 +903,59 @@ namespace MobileGL::MG_Remote::Server {
         // it atomically, so the apply thread cannot observe the request until this side is
         // waiting, and the doorbell remembers the notify regardless.
         if (m_session != nullptr) {
-            m_session->ConsumerDoorbell().Notify();
+            m_session->DataLink()->ConsumerBell().Notify();
         }
-        m_controlDone.wait(lock, [this] { return m_controlFinished; });
+        // p7/spawnhang: THE WAIT IS SLICED, AND A SLICE THE APPLY THREAD SPENT RUNNING THIS FRAME IS
+        // REPORTED (SetControlProgressSink). It used to be one untimed wait, so the poster - under
+        // spawn, the control pump in ServerMain, the only thread that talks to the client - was mute
+        // for as long as the dispatch ran, and a client could not tell a cold bring-up from a wedge.
+        // "Running" is read under this lock from the mailbox's own fields: the pump clears the
+        // shadow when it TAKES the frame (PumpControlRequest), and m_controlPending stays true until
+        // the reply is published under this same lock. Posted-but-not-taken says nothing. The sink
+        // runs without the lock, so a dispatch finishing meanwhile is not held up by the send; the
+        // predicate is re-asked on the way back in. Only the timing of the wakeups changed: the
+        // handshake, the C2 exit block's answer and the copy-out below are exactly as before.
+        const auto postedAt = std::chrono::steady_clock::now();
+        while (!m_controlDone.wait_for(lock, std::chrono::milliseconds(kControlProgressIntervalMs),
+                                       [this] { return m_controlFinished; })) {
+            const Bool running = m_controlPending && !m_controlPosted.load(std::memory_order_acquire);
+            const ControlProgressSink sink = m_progressSink;
+            void* const user = m_progressUser;
+            if (!running || sink == nullptr) continue;
+            const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::steady_clock::now() - postedAt).count();
+            lock.unlock();
+            sink(user, frame.kind, frame.seq,
+                 static_cast<Uint32>(std::min<long long>(elapsedMs, 0xFFFFFFFFll)));
+            lock.lock();
+        }
+        frame = m_controlFrame; // the reply half, written by the dispatch
         return m_controlResult;
+    }
+
+    void ServerLoop::SetControlProgressSink(ControlProgressSink sink, void* user) {
+        // Under the mailbox's lock, which the poster holds when it reads the pair, so a sink is
+        // never called with another sink's user.
+        const std::lock_guard<std::mutex> lock(m_controlMutex);
+        m_progressSink = sink;
+        m_progressUser = user;
+    }
+
+    MobileGLResult ServerLoop::RunProbeOnApplyThreadForTesting(ControlProbeHook hook, void* user) {
+        SurfaceControlFrame frame;
+        frame.kind = SurfaceControlOp::ProbeForTesting;
+        frame.seq = m_controlSeq.fetch_add(1, std::memory_order_acq_rel) + 1;
+        // Nested probes never touch the shared pair: another poster may already be waiting,
+        // and its arguments must survive a probe run inline on the apply thread.
+        if (OnApplyThread()) return ApplySurfaceControlFrame(frame, hook, user);
+        const std::lock_guard<std::mutex> callerLock(m_callerMutex);
+        m_controlProbeHook.store(hook, std::memory_order_release);
+        m_controlProbeUser.store(user, std::memory_order_release);
+        return PostSurfaceControlFrameWithCallerLock(frame);
+    }
+
+    Uint64 ServerLoop::ControlFramesDispatched() const {
+        return m_controlFramesDispatched.load(std::memory_order_acquire);
     }
 
     void ServerLoop::SignalExited() {
@@ -702,6 +966,8 @@ namespace MobileGL::MG_Remote::Server {
         m_exitCv.notify_all();
     }
 
+    void ServerLoop::AbandonQueuedRecords() { m_abandonQueue.store(true, std::memory_order_release); }
+
     void ServerLoop::Stop() {
         if (!m_thread.joinable()) {
             // Never started, or already stopped. The backend may still exist - the hook builds
@@ -709,6 +975,9 @@ namespace MobileGL::MG_Remote::Server {
             // thread called Stop. No context was ever made current from another thread in that
             // case, which is exactly the condition that makes this safe.
             if (m_backend != nullptr) m_backend.reset();
+            // P12 (D6): as on the apply thread's own exit - no thread runs, so nothing else ends it.
+            EndServerWindowLease();
+            MG_Pipe::MGPipeServerSetContextLive(false);
             // N-3, same reason as ApplyThreadMain's exit: no thread runs, so the apply-thread-only
             // rule on the tuple has no other writer to race.
             ForgetCurrentTuple();
@@ -717,10 +986,15 @@ namespace MobileGL::MG_Remote::Server {
         }
         m_stopRequested.store(true, std::memory_order_release);
         if (m_session != nullptr) {
+            // PH-6 fix round: the apply thread may be parked in ReserveEventOrBlock rather than in
+            // the loop's own park, and that wait's predicate is the session's, not this loop's.
+            // Raised BEFORE the ring below for the same publish-then-ring reason as the flag above;
+            // without it a knob longer than kJoinTimeoutMs outlives this join.
+            m_session->RequestApplyStop();
             // The bell may already be dead - ClientSession::Stop calls transport->Shutdown()
             // first, which is what table 3's step 2 requires - and Notify on a dead bell is
             // harmless. Ringing anyway covers the paths that Stop without a Kill.
-            m_session->ConsumerDoorbell().Notify();
+            m_session->DataLink()->ConsumerBell().Notify();
         }
 
         // THE JOIN IS BOUNDED. std::thread::join has no deadline, so a lost wakeup would wedge
@@ -737,7 +1011,7 @@ namespace MobileGL::MG_Remote::Server {
             // run on into the client's teardown, reading rings the client is about to unmap -
             // a use-after-free whose only symptom is an intermittent crash somewhere else.
             // Aborting here is red, immediate, and names the cause.
-            MGLOG_F("MGPipe: Fatal{ApplyThreadJoinTimeout} - mgl-srv-apply did not exit within "
+            SessionFail(MGFatalFamily::ApplyThreadJoinTimeout, "MGPipe: Fatal{ApplyThreadJoinTimeout} - mgl-srv-apply did not exit within "
                     "%u ms of Stop(). Stop() published m_stopRequested (in the park predicate) "
                     "BEFORE it rang, so a plain Notify should already have un-parked the thread; "
                     "Doorbell::Kill() (Doorbell.h, CondVarDoorbell::Kill; table 3 step 2) is "
@@ -746,7 +1020,6 @@ namespace MobileGL::MG_Remote::Server {
                     "lost, not slow. Aborting rather than detaching: a detached apply thread still "
                     "owns the context and would read rings the client is about to unmap",
                     kJoinTimeoutMs);
-            std::abort();
         }
         m_thread.join();
         // The identity is NOT cleared here any more: the thread clears it itself, under
@@ -764,192 +1037,650 @@ namespace MobileGL::MG_Remote::Server {
     }
 
     // ---------------------------------------------------------------------------------
-    // The twelve EGL forwarders
+    // The control-frame dispatch and the twelve EGL forwarders (P5f, package fc)
     // ---------------------------------------------------------------------------------
+    //
+    // THE MAILBOX'S PAYLOAD CHANGED SHAPE, NOT ITS PROTOCOL. The channel is still one blocking
+    // slot pumped between drain batches, with the shadow, the publish-then-ring doorbell and the
+    // C2 exit block exactly as before; what is gone is the payload - a raw function pointer (the
+    // op's identity) plus a void* to a stack-local Args (its arguments and out-pointers), neither
+    // of which means anything in another address space (P5c audit row G4). The slot now carries
+    // one SurfaceControlFrame BY VALUE: `kind` is the op, the scalar fields are the arguments,
+    // and the reply half (ok / eglMajor / eglMinor) comes back in the same value. Nine of the
+    // twelve forwarders map onto protocol.fbs's ten SurfaceOp kinds; the three without a wire
+    // kind (f0-egl's census: present is a record, capabilities are a CapsSnapshot, and
+    // InitWindowSurface has no caller) ride the same channel as inproc-only kinds rather than
+    // keeping a second, pointer-shaped path alive for dead or answered code.
 
     namespace {
 
-        // One captureless trampoline for every call: ControlWork is a raw function pointer
-        // plus a void*, not a std::function, because these run on the TEARDOWN path and the
-        // teardown path may not allocate (ID-8 exists because frontend destructors reach here
-        // from exit handlers).
-        template <class Args>
-        MobileGLResult RunOnApply(Args& args) {
-            return ServerLoopInstance().RunOnApplyThread(
-                +[](void* user) -> MobileGLResult { return static_cast<Args*>(user)->Run(); },
-                &args);
+        // EGL handles are pointers on every platform in scope; the frame carries them as Uint64
+        // tokens. Inproc the token IS the handle value bit-cast (same process, same driver), so
+        // the round-trip is exact and the N-3 tuple bookkeeping - which compares handle VALUES -
+        // is unchanged. Under spawn the client mints dense tokens instead (P6-CONTRACT-DRAFT
+        // table 0); the field width is already the token's.
+        template <class Handle>
+        Uint64 TokenFromHandle(Handle handle) {
+            static_assert(std::is_pointer_v<Handle>, "an EGL handle is a pointer");
+            return static_cast<Uint64>(reinterpret_cast<std::uintptr_t>(handle));
+        }
+        template <class Handle>
+        Handle HandleFromToken(Uint64 token) {
+            static_assert(std::is_pointer_v<Handle>, "an EGL handle is a pointer");
+            return reinterpret_cast<Handle>(static_cast<std::uintptr_t>(token));
         }
 
-        // Null means the hook never ran or the session is already down. Every forwarder
-        // answers false / no-op rather than dereferencing: a client that calls eglMakeCurrent
-        // on a process whose split bring-up failed must see a refusal, not a crash.
-        MG_Backend::BackendObject* ServerBackendOrNull() { return ServerLoopInstance().Backend(); }
+        // WindowHandle -> frame values (the forwarder side). The frame carries the BACKEND tag,
+        // not the wire's WindowKind: the WindowKind mapping belongs to the wire codec
+        // (Protocol/SurfaceOpCodec.cpp) and must not leak into the inproc path.
+        void PackWindowHandle(SurfaceControlFrame& frame, const MG_Backend::WindowHandle& handle) {
+            frame.windowBackend = static_cast<Int>(handle.Backend);
+            frame.nativeToken = TokenFromHandle(handle.Handle);
+            frame.width = static_cast<Int>(handle.Width);
+            frame.height = static_cast<Int>(handle.Height);
+        }
+
+        // The dispatch-side range check. Inproc the value came from the poster's own
+        // WindowHandle, so an out-of-range tag is a memory-corruption shape, not bad input -
+        // same discipline as the ring's Fatal{ProtocolCorruption} on a header the producer could
+        // not have written.
+        //
+        // PH-1 (3): false = the refusal latched (an armed spawn / TCP session child, where the
+        // frame's values came off the wire through SurfaceOpCodec). Under spawn the codec has
+        // already mapped the wire WindowKind onto a legal tag, so this arm is defence in depth
+        // there; unarmed it still dies.
+        Bool WindowBackendFromFrameValue(Int value, MG_Backend::WindowBackend* out) {
+            if (value < static_cast<Int>(MG_Backend::WindowBackend::Unknown) ||
+                value >= static_cast<Int>(MG_Backend::WindowBackend::WindowBackendCount)) {
+                return SessionLatch(MGFatalFamily::ProtocolCorruption, "MGPipe: Fatal{ProtocolCorruption, \"SurfaceOp.windowBackend\"} - a "
+                        "control frame carried window backend tag %d, which names no "
+                        "WindowBackend", value);
+            }
+            *out = static_cast<MG_Backend::WindowBackend>(value);
+            return true;
+        }
+
+        Bool UnpackWindowHandle(const SurfaceControlFrame& frame, MG_Backend::WindowHandle* out) {
+            MG_Backend::WindowHandle handle;
+            if (!WindowBackendFromFrameValue(frame.windowBackend, &handle.Backend)) return false;
+            handle.Handle = HandleFromToken<void*>(frame.nativeToken);
+            handle.Width = static_cast<Uint32>(frame.width);
+            handle.Height = static_cast<Uint32>(frame.height);
+            *out = handle;
+            return true;
+        }
+
+        // P7 CI. THE TEST LEVER FOR THE CLIENT'S COLD-START BUDGET (ClientSession.cpp,
+        // ControlReplyBudgetMs), in the style of MOBILEGL_TEST_DELAY_FIRST_CAPS_MS.
+        //
+        // MOBILEGL_TEST_DELAY_FIRST_BRINGUP_MS holds back this process's FIRST surface creation
+        // and its FIRST MakeCurrent by that many milliseconds each - the two dispatches a lazy
+        // native backend bring-up runs inside (Espryt's eglInitialize, Magma's instance and
+        // device). It stands in for a cold software rasteriser on a loaded runner, where that
+        // bring-up outlasted the client's steady reply bound and the retrace-split spawn legs died
+        // with the server still alive. Only the reply is late; the op itself is unchanged.
+        //
+        // Meant for a server in its OWN process (spawn / tcp), which is where the client's reply
+        // bound is. It is a TEST knob: it does nothing unless set, and is read once.
+        void DelayFirstBringUpForTest(SurfaceControlOp kind) {
+            static std::atomic<bool> surfaceSpent{false};
+            static std::atomic<bool> makeCurrentSpent{false};
+            std::atomic<bool>* spent = nullptr;
+            if (kind == SurfaceControlOp::CreatePbufferSurface || kind == SurfaceControlOp::CreateWindowSurface) {
+                spent = &surfaceSpent;
+            } else if (kind == SurfaceControlOp::MakeCurrent) {
+                spent = &makeCurrentSpent;
+            } else {
+                return;
+            }
+            static const long ms = [] {
+                const char* text = std::getenv("MOBILEGL_TEST_DELAY_FIRST_BRINGUP_MS");
+                return (text == nullptr || *text == '\0') ? 0L : std::strtol(text, nullptr, 10);
+            }();
+            if (ms <= 0 || spent->exchange(true, std::memory_order_acq_rel)) return;
+            MGLOG_W("MG_Remote server: MOBILEGL_TEST_DELAY_FIRST_BRINGUP_MS=%ld - the reply to the "
+                    "first %s is held back by that many milliseconds. This is the cold-start "
+                    "budget's test-only lever and must never be set in a measured run",
+                    ms, SurfaceControlOpName(kind));
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        }
 
     } // namespace
 
-    Bool ServerInitializeEGLDisplay(EGLDisplay dpy, EGLint* major, EGLint* minor) {
-        struct Args {
-            EGLDisplay dpy;
-            EGLint* major;
-            EGLint* minor;
-            Bool ok = false;
-            MobileGLResult Run() {
-                MG_Backend::BackendObject* backend = ServerBackendOrNull();
-                if (backend == nullptr) return MOBILEGL_ERR_NOT_INITIALIZED;
-                ok = backend->InitializeEGLDisplay(dpy, major, minor);
-                return MOBILEGL_OK;
+    MobileGLResult ServerLoop::ApplySurfaceControlFrame(SurfaceControlFrame& frame,
+                                                        ControlProbeHook probeHook, void* probeUser) {
+        // The frame channel's own tally, bumped for EVERY dispatch including probes: a forwarder
+        // that stopped posting frames (the fc red-once revert shape) leaves this unmoved, which
+        // is what ServerLoopTest's AVoidForwarderCrossesAsOneDispatchedFrame reads.
+        m_controlFramesDispatched.fetch_add(1, std::memory_order_acq_rel);
+        if (frame.kind == SurfaceControlOp::ProbeForTesting) {
+            if (probeHook == nullptr) return MOBILEGL_ERR_INVALID_ARGUMENT;
+            return probeHook(probeUser);
+        }
+        // Null means the hook never ran or the session is already down. Every op answers
+        // NOT_INITIALIZED rather than dereferencing: a client that calls eglMakeCurrent on a
+        // process whose split bring-up failed must see a refusal, not a crash.
+        MG_Backend::BackendObject* backend = m_backend.get();
+        if (backend == nullptr) return MOBILEGL_ERR_NOT_INITIALIZED;
+        DelayFirstBringUpForTest(frame.kind);
+        switch (frame.kind) {
+        case SurfaceControlOp::InitializeDisplay: {
+            // The old Args carried the poster's `major`/`minor` OUT-POINTERS; here they are
+            // reply fields. A pointer to the caller's stack is exactly what does not survive a
+            // process boundary, so the version numbers travel back in the frame's value.
+            EGLint major = 0;
+            EGLint minor = 0;
+            frame.ok = backend->InitializeEGLDisplay(HandleFromToken<EGLDisplay>(frame.display),
+                                                     &major, &minor);
+            frame.eglMajor = major;
+            frame.eglMinor = minor;
+            return MOBILEGL_OK;
+        }
+        case SurfaceControlOp::CreateWindowSurface: {
+            // P12 (D3): the SERVER's window, asked for by a headless client. Before the unpack,
+            // which would refuse the frame-local tag as a WindowBackend out of range.
+            if (frame.windowBackend == kServerOwnedWindowBackend) return ApplyServerOwnedWindowSurface(backend, frame);
+            MG_Backend::WindowHandle window;
+            if (!UnpackWindowHandle(frame, &window)) {
+                frame.ok = false;
+                return MOBILEGL_ERR_PROTOCOL_MISMATCH; // PH-1 (3): latched
             }
-        } args{dpy, major, minor};
-        return RunOnApply(args) == MOBILEGL_OK && args.ok;
+            frame.ok = backend->CreateEGLWindowSurface(HandleFromToken<EGLSurface>(frame.surface),
+                                                       window);
+            // N-3: BackendObject_DirectGLES destroys and recreates the native context to create
+            // a DIFFERENT surface, so whatever tuple was bound names a dead context.
+            if (frame.ok) ForgetCurrentTuple();
+            return MOBILEGL_OK;
+        }
+        case SurfaceControlOp::ResizeWindowSurface:
+            // P12 review fix: a server-owned surface is resized by resizing the SERVER's window.
+            if (IsServerOwnedSurface(HandleFromToken<EGLSurface>(frame.surface)))
+                return ApplyServerOwnedWindowResize(backend, frame);
+            frame.ok = backend->ResizeEGLWindowSurface(HandleFromToken<EGLSurface>(frame.surface),
+                                                       static_cast<Uint32>(frame.width),
+                                                       static_cast<Uint32>(frame.height));
+            return MOBILEGL_OK;
+        case SurfaceControlOp::CreatePbufferSurface:
+            // P12 (D4): a pbuffer in a session that went on-screen is the other mode, refused by
+            // name and not latched - the session and its window surface carry on.
+            if (!SessionSurfaceModeAdmits(m_surfaceMode, /*serverOwnedWindow=*/false)) {
+                frame.ok = false;
+                frame.refusal = static_cast<Uint8>(SurfaceRefusalCode::SurfaceModeMismatch);
+                MGLOG_E("MG_Remote server: SurfaceModeMismatch - CreatePbufferSurface (seq %llu, %dx%d) in a "
+                        "session whose surface mode is %s: its first surface was a server-owned window, and "
+                        "only one rendering path is active per session. Refused, the session is not latched",
+                        static_cast<unsigned long long>(frame.seq), frame.width, frame.height,
+                        SessionSurfaceModeName(m_surfaceMode));
+                return MOBILEGL_ERR_INVALID_ARGUMENT;
+            }
+            frame.ok = backend->CreateEGLPbufferSurface(HandleFromToken<EGLSurface>(frame.surface),
+                                                        frame.width, frame.height);
+            // N-3: as for the window surface - a (re)creation may have destroyed the context the
+            // held tuple named. The surface's own creation binds natively, so the client's
+            // make-current that follows is forwarded and deduped one layer down (ID-54).
+            if (frame.ok) {
+                ForgetCurrentTuple();
+                if (m_surfaceMode == SessionSurfaceMode::None) m_surfaceMode = SessionSurfaceMode::Offscreen;
+                // P12: THE ARM PROOF (ID-124), once per surface: which of the two paths ran.
+                MGLOG_I("MG_Remote server: surface=pbuffer %dx%d", frame.width, frame.height);
+            }
+            return MOBILEGL_OK;
+        case SurfaceControlOp::MakeCurrent: {
+            // C7 / ID-54: the apply thread binds the native context ONCE per context lifetime
+            // and holds it for life. ApplyMakeCurrent forwards a bind only for a tuple it does
+            // not hold and treats an identical repeat as a no-op; the native call for a surface
+            // already current on this thread is skipped one layer down
+            // (BackendObject_DirectGLES's ID-54 arm), which is what makes "the owner slot is
+            // written once" TRUE and measured (ServerLoopTest's C7 control) rather than claimed.
+            const MakeCurrentOutcome outcome =
+                ApplyMakeCurrent(backend, HandleFromToken<EGLDisplay>(frame.display),
+                                 HandleFromToken<EGLSurface>(frame.surface),
+                                 HandleFromToken<EGLSurface>(frame.readSurface),
+                                 HandleFromToken<EGLContext>(frame.context));
+            frame.ok = outcome.ok;
+            if (!outcome.ok || !outcome.boundNatively) return MOBILEGL_OK;
+            // R-12, arm (a): the caps snapshot is REPUBLISHED because InitCapabilities has now
+            // run for real - on every forwarded bind of a tuple this loop did not hold (the
+            // first, and every DIFFERENT tuple after it), and NEVER on an identical repeat
+            // (ID-67: a repeat is a native no-op AND publishes nothing, so the client's mirror
+            // generation does not move and nothing accumulates). DirectGLES has no
+            // OnCapsInvalidated producer at all, and c0's answer is that a SECOND arrival IS the
+            // invalidation - so the client's mirror is refreshed with no dev-shaped backend edit
+            // and with no eleventh MGPipeCallbacks slot (MGPipeCallbacks.h:56-58's static_assert
+            // exists to make that cost visible). Red once by republishing only on the first
+            // bind: the ID-67 control's different tuple reads 1 republish where 2 are required.
+            ServerSession* session = ServerSession::Active();
+            if (session != nullptr && session->Accepted()) {
+                const MobileGLResult published = session->PublishCapsSnapshot();
+                if (published == MOBILEGL_OK) NoteMakeCurrentRepublished();
+                if (published != MOBILEGL_OK) {
+                    MGLOG_E("MG_Remote server: the post-make-current CapsSnapshot could not be "
+                            "published (rc=%d); the client's mirror still holds the empty "
+                            "snapshot Accept() sent before any context existed",
+                            static_cast<int>(published));
+                }
+            }
+            return MOBILEGL_OK;
+        }
+        case SurfaceControlOp::ReleaseCurrent: {
+            // The release request's own op on the wire. It reaches the same ClientRelease arm of
+            // ApplyMakeCurrent as before (recorded, NOT forwarded - ID-54: the context stays
+            // current on this thread until ~BackendObject_DirectGLES or context loss, so
+            // forwarding would unbind and reinstate the off-thread degradation the phase
+            // removes). A client release never republishes: nothing ran that could move caps.
+            const MakeCurrentOutcome outcome =
+                ApplyMakeCurrent(backend, HandleFromToken<EGLDisplay>(frame.display),
+                                 EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+            frame.ok = outcome.ok;
+            return MOBILEGL_OK;
+        }
+        case SurfaceControlOp::SetSwapInterval:
+            backend->SetEGLSwapInterval(frame.swapInterval);
+            frame.ok = true;
+            return MOBILEGL_OK;
+        case SurfaceControlOp::ReleaseSurface: {
+            const EGLSurface surface = HandleFromToken<EGLSurface>(frame.surface);
+            backend->ReleaseEGLSurface(surface);
+            ForgetServerOwnedSurface(surface);
+            // N-3: a released surface the held tuple names may have taken the context with it
+            // (BackendObject::ReleaseEGLSurface -> OnEGLSurfaceReleased -> DestroyEGLContext once
+            // nothing holds it current). Forgetting when the base class only DEFERRED the destroy
+            // costs one forwarded bind; remembering when it did not would cost a silent
+            // no-context-current.
+            ForgetCurrentTupleIfItNames(surface);
+            frame.ok = true;
+            return MOBILEGL_OK;
+        }
+        case SurfaceControlOp::ReleaseResources:
+            // BLOCKING BY CONTRACT (the forwarder's own comment, below): EGLImpl.cpp's teardown
+            // walks into MobileGL::Destroy() the moment this answers. For DirectGLES this runs
+            // DestroyEGLContext - eglMakeCurrent(NO_SURFACE), eglDestroyContext, eglTerminate -
+            // on the thread that made the context current.
+            backend->ReleaseEGLResources();
+            MG_Pipe::MGPipeServerSetContextLive(false);
+            // N-3: DestroyEGLContext just ran; the tuple names nothing. Without this a
+            // destroy-recreate with the same handle values (every EGL handle on this host is
+            // 0x1) classified as a RepeatNoOp, bound nothing, and republished no caps. Red once
+            // by deleting it: ServerLoopTest's recreate control reads NativeBindCount() == 1
+            // where 2 is required.
+            ForgetCurrentTuple();
+            frame.ok = true;
+            return MOBILEGL_OK;
+        case SurfaceControlOp::SetWindowHandle: {
+            MG_Backend::WindowHandle window;
+            if (!UnpackWindowHandle(frame, &window)) {
+                frame.ok = false;
+                return MOBILEGL_ERR_PROTOCOL_MISMATCH; // PH-1 (3): latched
+            }
+            backend->SetWindowHandle(window);
+            frame.ok = true;
+            return MOBILEGL_OK;
+        }
+        case SurfaceControlOp::InitCapabilities:
+            // Inproc-only (f0-egl §4.2): on the wire the ANSWER to this op is the CapsSnapshot
+            // frame itself, so there is no SurfaceOp kind for it. The frame channel still has to
+            // carry it inproc because InitCapabilities runs GL queries and therefore belongs to
+            // the apply thread.
+            frame.ok = backend->InitCapabilities();
+            if (frame.ok) {
+                ServerSession* session = ServerSession::Active();
+                if (session != nullptr && session->Accepted()) {
+                    (void)session->PublishCapsSnapshot();
+                }
+            }
+            return MOBILEGL_OK;
+        case SurfaceControlOp::SwapBuffersInprocOnly:
+            // Inproc-only (f0-egl F8): present travels as a class-B record with its own credit;
+            // this forwarder has no production caller and survives for ServerLoopTest's N-3
+            // recreate control, which needs a swap that is NOT a record.
+            frame.ok = backend->SwapEGLBuffers(HandleFromToken<EGLDisplay>(frame.display),
+                                               HandleFromToken<EGLSurface>(frame.surface));
+            return MOBILEGL_OK;
+        case SurfaceControlOp::InitWindowSurfaceInprocOnly:
+            // Inproc-only (f0-egl F8): no caller at all (the client's InitWindowSurface is a
+            // no-op); kept because deleting the free function would delete the seam the
+            // inproc-only rule is stated against.
+            frame.ok = backend->InitWindowSurface();
+            return MOBILEGL_OK;
+        case SurfaceControlOp::None:
+        case SurfaceControlOp::ProbeForTesting:
+            // Unreachable in a correct process (None is refused at post, the probe is answered
+            // above the switch); a slot that still arrives here with one shares the Fatal below.
+            break;
+        }
+        // A kind the switch does not know never legitimately posts (RunSurfaceControlFrame
+        // refuses None), so reaching this line means the slot's bytes were not written by the
+        // poster at all - the ring's Fatal{ProtocolCorruption} discipline, one channel over.
+        // PH-1 (3): latched in an armed session child (under spawn SurfaceOpCodec has already
+        // refused an unknown wire kind, so this is defence in depth); unarmed it dies.
+        frame.ok = false;
+        (void)SessionLatch(MGFatalFamily::ProtocolCorruption, "MGPipe: Fatal{ProtocolCorruption, \"SurfaceOp.kind\"} - the control slot held "
+                "kind %d, which names no dispatchable op", static_cast<int>(frame.kind));
+        return MOBILEGL_ERR_PROTOCOL_MISMATCH;
+    }
+
+    // ---------------------------------------------------------------------------------
+    // P12 (on-screen server window): the ServerOwned arm, the surface mode, the lost window
+    // ---------------------------------------------------------------------------------
+
+    const char* SessionSurfaceModeName(SessionSurfaceMode mode) {
+        switch (mode) {
+        case SessionSurfaceMode::None: return "undecided";
+        case SessionSurfaceMode::OnScreen: return "on-screen";
+        case SessionSurfaceMode::Offscreen: return "offscreen";
+        }
+        return "<unknown SessionSurfaceMode>";
+    }
+
+    Bool SessionSurfaceModeAdmits(SessionSurfaceMode current, Bool serverOwnedWindow) {
+        switch (current) {
+        case SessionSurfaceMode::None: return true;
+        case SessionSurfaceMode::OnScreen: return serverOwnedWindow;
+        case SessionSurfaceMode::Offscreen: return !serverOwnedWindow;
+        }
+        return false;
+    }
+
+    void ServerLoop::ServerWindowLostThunk(void* self) {
+        auto* loop = static_cast<ServerLoop*>(self);
+        // Publish, then ring (the park predicate reads the flag; Doorbell.h's order). Called under
+        // the display's lock while this loop holds its lease - and the lease ends before the apply
+        // thread exits and before Stop() lets go of m_session - so the session is still here.
+        loop->m_windowLostRequested.store(true, std::memory_order_release);
+        if (loop->m_session != nullptr && loop->m_session->DataLink() != nullptr) {
+            loop->m_session->DataLink()->ConsumerBell().Notify();
+        }
+    }
+
+    Bool ServerLoop::ServerWindowWaitCancelled(void* self) {
+        const auto* loop = static_cast<const ServerLoop*>(self);
+        // A window-lost request also ends the wait: this thread holds a lease on a window that is
+        // being destroyed, and the UI thread is blocked until it answers (PumpControlRequest).
+        return loop->m_stopRequested.load(std::memory_order_acquire) || SessionLatched() ||
+               loop->m_windowLostRequested.load(std::memory_order_acquire);
+    }
+
+    MobileGLResult ServerLoop::AcquireServerWindow(Uint32 width, Uint32 height, Uint32 timeoutMs,
+                                                   ServerWindowLease* out, SurfaceRefusalCode* refusal) {
+        ServerDisplay& display = ServerDisplayInstance();
+        const ServerWindowAcquire acquired = display.AcquireFor(width, height, timeoutMs, this, &ServerWindowLostThunk,
+                                                                &ServerWindowWaitCancelled, this, out);
+        switch (acquired) {
+        case ServerWindowAcquire::Acquired:
+            m_holdsWindowLease = true;
+            return MOBILEGL_OK;
+        case ServerWindowAcquire::NoDisplay:
+            // A CONFIGURATION ANSWER, NOT A LATCH: the client asked an offscreen server (the exec'd
+            // supervisor's session child, or any host server) for a window it does not have.
+            if (refusal != nullptr) *refusal = SurfaceRefusalCode::NoServerDisplay;
+            MGLOG_E("MG_Remote server: Refuse ServerOwned: this server owns no display - a client "
+                    "(MOBILEGL_IPC_SURFACE=server) asked for a %ux%u window surface on the server's own window, "
+                    "and this process is an offscreen server. Start the on-screen display server, or run the "
+                    "client offscreen. Refused (NoServerDisplay); the session is not latched",
+                    width, height);
+            return MOBILEGL_ERR_UNSUPPORTED;
+        case ServerWindowAcquire::NoWindow:
+        case ServerWindowAcquire::Cancelled:
+        case ServerWindowAcquire::Interrupted:
+        case ServerWindowAcquire::LeasedElsewhere:
+            break;
+        }
+        if (refusal != nullptr) *refusal = SurfaceRefusalCode::NoServerWindow;
+        MGLOG_E("MG_Remote server: Refuse ServerOwned: this server owns a display but no window for a %ux%u surface "
+                "(%s after at most %u ms) - the display's surface is not up. Refused (NoServerWindow); the "
+                "session is not latched",
+                width, height, ServerWindowAcquireName(acquired), timeoutMs);
+        return MOBILEGL_ERR_TIMEOUT;
+    }
+
+    MobileGLResult ServerLoop::ApplyServerOwnedWindowSurface(MG_Backend::BackendObject* backend,
+                                                            SurfaceControlFrame& frame) {
+        frame.ok = false;
+        frame.refusal = static_cast<Uint8>(SurfaceRefusalCode::None);
+        const Uint32 wantWidth = frame.width > 0 ? static_cast<Uint32>(frame.width) : 0u;
+        const Uint32 wantHeight = frame.height > 0 ? static_cast<Uint32>(frame.height) : 0u;
+        // D4 FIRST: an offscreen session may not go on-screen, display or no display.
+        if (!SessionSurfaceModeAdmits(m_surfaceMode, /*serverOwnedWindow=*/true)) {
+            frame.refusal = static_cast<Uint8>(SurfaceRefusalCode::SurfaceModeMismatch);
+            MGLOG_E("MG_Remote server: SurfaceModeMismatch - a ServerOwned CreateWindowSurface (seq %llu, %ux%u) in a "
+                    "session whose surface mode is %s: its first surface was a pbuffer, and only one rendering "
+                    "path is active per session. Refused, the session is not latched",
+                    static_cast<unsigned long long>(frame.seq), wantWidth, wantHeight,
+                    SessionSurfaceModeName(m_surfaceMode));
+            return MOBILEGL_ERR_INVALID_ARGUMENT;
+        }
+        ServerWindowLease lease;
+        SurfaceRefusalCode refusal = SurfaceRefusalCode::None;
+        const MobileGLResult acquired = AcquireServerWindow(wantWidth, wantHeight, kServerWindowWaitMs, &lease, &refusal);
+        if (acquired != MOBILEGL_OK) {
+            frame.refusal = static_cast<Uint8>(refusal);
+            return acquired;
+        }
+        // THE SUBSTITUTION. The client named no window; the server's own goes into the SAME backend
+        // call monolith Android makes (Register -> Activate -> SetWindowHandle -> InitWindowSurface),
+        // so nothing below this line knows the window was not the client's. Android is the only
+        // platform that installs a display (the host never does), hence the backend tag.
+        MG_Backend::WindowHandle window;
+        window.Backend = MG_Backend::WindowBackend::Android;
+        window.Handle = lease.window;
+        window.Width = lease.width;
+        window.Height = lease.height;
+        // Review fix: the backend is told which window is the server's own, so its surface init
+        // reports the extent for this window and for no window a client named (MGPipeServerOwnedWindow).
+        MG_Pipe::MGPipeServerSetOwnedWindow(lease.window);
+        frame.ok = backend->CreateEGLWindowSurface(HandleFromToken<EGLSurface>(frame.surface), window);
+        if (!frame.ok) {
+            MGLOG_E("MG_Remote server: the backend could not create a window surface on the server window %p "
+                    "(%ux%u) for ServerOwned seq %llu",
+                    lease.window, lease.width, lease.height, static_cast<unsigned long long>(frame.seq));
+            // A session that never got a surface on the window has nothing to release: the lease goes.
+            if (m_surfaceMode != SessionSurfaceMode::OnScreen) EndServerWindowLease();
+            return MOBILEGL_OK;
+        }
+        // N-3: as for any window surface - a (re)creation may have destroyed the held context.
+        ForgetCurrentTuple();
+        m_surfaceMode = SessionSurfaceMode::OnScreen;
+        if (!IsServerOwnedSurface(HandleFromToken<EGLSurface>(frame.surface)))
+            m_serverOwnedSurfaces.push_back(HandleFromToken<EGLSurface>(frame.surface));
+        // The reply's geometry (SurfaceReply.width/height): the window's real extent, which is what
+        // the headless client's eglQuerySurface answers from here on.
+        frame.width = static_cast<Int>(lease.width);
+        frame.height = static_cast<Int>(lease.height);
+        // THE ARM PROOF (ID-124), once per surface: which of the two paths ran, and at what size.
+        MGLOG_I("MG_Remote server: surface=window %ux%u owner=server (ServerOwned seq %llu, window %p generation %llu%s)",
+                lease.width, lease.height, static_cast<unsigned long long>(frame.seq), lease.window,
+                static_cast<unsigned long long>(lease.generation),
+                lease.sizeAsRequested ? "" : ", NOT the size the client asked for");
+        return MOBILEGL_OK;
+    }
+
+    Bool ServerLoop::IsServerOwnedSurface(EGLSurface surface) const {
+        return std::find(m_serverOwnedSurfaces.begin(), m_serverOwnedSurfaces.end(), surface) !=
+               m_serverOwnedSurfaces.end();
+    }
+
+    void ServerLoop::ForgetServerOwnedSurface(EGLSurface surface) {
+        m_serverOwnedSurfaces.erase(std::remove(m_serverOwnedSurfaces.begin(), m_serverOwnedSurfaces.end(), surface),
+                                    m_serverOwnedSurfaces.end());
+    }
+
+    // P12 review fix (client resize). eglResize on a headless client's server-owned surface used to
+    // resize only the backend's record of the window - the phone's SurfaceView kept its size - and
+    // the client's EGL state answered the size it ASKED for. The window is the server's, so the
+    // resize is a geometry request like the creation's: the display is asked for the size and waited
+    // for (the same lease, re-taken by its holder), the backend surface follows the window's REAL
+    // extent, and that extent is the reply's width/height - which the client adopts.
+    MobileGLResult ServerLoop::ApplyServerOwnedWindowResize(MG_Backend::BackendObject* backend,
+                                                           SurfaceControlFrame& frame) {
+        frame.ok = false;
+        frame.refusal = static_cast<Uint8>(SurfaceRefusalCode::None);
+        const Uint32 wantWidth = frame.width > 0 ? static_cast<Uint32>(frame.width) : 0u;
+        const Uint32 wantHeight = frame.height > 0 ? static_cast<Uint32>(frame.height) : 0u;
+        ServerWindowLease lease;
+        SurfaceRefusalCode refusal = SurfaceRefusalCode::None;
+        const MobileGLResult acquired = AcquireServerWindow(wantWidth, wantHeight, kServerWindowWaitMs, &lease, &refusal);
+        if (acquired != MOBILEGL_OK) {
+            frame.refusal = static_cast<Uint8>(refusal);
+            return acquired;
+        }
+        frame.ok = backend->ResizeEGLWindowSurface(HandleFromToken<EGLSurface>(frame.surface), lease.width, lease.height);
+        frame.width = static_cast<Int>(lease.width);
+        frame.height = static_cast<Int>(lease.height);
+        MGLOG_I("MG_Remote server: surface=window %ux%u owner=server resized (ServerOwned seq %llu, %ux%u requested%s)",
+                lease.width, lease.height, static_cast<unsigned long long>(frame.seq), wantWidth, wantHeight,
+                lease.sizeAsRequested ? "" : ", NOT reached");
+        return MOBILEGL_OK;
+    }
+
+    void ServerLoop::EndServerWindowLease() {
+        if (!m_holdsWindowLease) return;
+        m_holdsWindowLease = false;
+        MG_Pipe::MGPipeServerSetOwnedWindow(nullptr);
+        ServerDisplayInstance().EndLease(this);
+    }
+
+    void ServerLoop::ReleaseLostServerWindow() {
+        if (!m_windowLostRequested.exchange(false, std::memory_order_acq_rel)) return;
+        if (!m_holdsWindowLease) return; // raced with the session's own end; nothing is held
+        // THE ORDER IS THE CONTRACT (D6): the backend lets go of the window first - Espryt destroys
+        // its EGL surface and context, Magma its swapchain and VkSurface - then the session latches
+        // by name, and only then does the lease end, which is what lets surfaceDestroyed return.
+        if (m_backend != nullptr) m_backend->ReleaseEGLResources();
+        MG_Pipe::MGPipeServerSetContextLive(false);
+        ForgetCurrentTuple();
+        m_serverWindowsLost.fetch_add(1, std::memory_order_acq_rel);
+        (void)SessionLatch(MGFatalFamily::ServerWindowLost,
+                           "MGPipe: Fatal{ServerWindowLost, \"surfaceDestroyed\"} - the server's own display "
+                           "window was destroyed under this on-screen session; its surface was released on "
+                           "mgl-srv-apply before the window went, and the session ends so the client reads a "
+                           "clean device loss. The display server keeps listening");
+        EndServerWindowLease();
+    }
+
+    // ---------------------------------------------------------------------------------
+    // The twelve forwarders: pack the frame, post it, unpack the reply
+    // ---------------------------------------------------------------------------------
+
+    Bool ServerInitializeEGLDisplay(EGLDisplay dpy, EGLint* major, EGLint* minor) {
+        SurfaceControlFrame frame;
+        frame.kind = SurfaceControlOp::InitializeDisplay;
+        frame.display = TokenFromHandle(dpy);
+        const MobileGLResult rc = ServerLoopInstance().RunSurfaceControlFrame(frame);
+        if (rc == MOBILEGL_OK) {
+            // Written back whenever the dispatch ran, success or not - the old out-pointers
+            // reached the backend directly, and a failed eglInitialize's partial writes are the
+            // caller's to ignore exactly as before.
+            if (major != nullptr) *major = frame.eglMajor;
+            if (minor != nullptr) *minor = frame.eglMinor;
+        }
+        return rc == MOBILEGL_OK && frame.ok;
     }
 
     Bool ServerCreateEGLWindowSurface(EGLSurface surface, const MG_Backend::WindowHandle& handle) {
-        struct Args {
-            EGLSurface surface;
-            const MG_Backend::WindowHandle* handle;
-            Bool ok = false;
-            MobileGLResult Run() {
-                MG_Backend::BackendObject* backend = ServerBackendOrNull();
-                if (backend == nullptr) return MOBILEGL_ERR_NOT_INITIALIZED;
-                ok = backend->CreateEGLWindowSurface(surface, *handle);
-                // N-3: BackendObject_DirectGLES destroys and recreates the native context to
-                // create a DIFFERENT surface, so whatever tuple was bound names a dead context.
-                if (ok) ServerLoopInstance().ForgetCurrentTuple();
-                return MOBILEGL_OK;
-            }
-        } args{surface, &handle};
-        return RunOnApply(args) == MOBILEGL_OK && args.ok;
+        SurfaceControlFrame frame;
+        frame.kind = SurfaceControlOp::CreateWindowSurface;
+        frame.surface = TokenFromHandle(surface);
+        PackWindowHandle(frame, handle);
+        const MobileGLResult rc = ServerLoopInstance().RunSurfaceControlFrame(frame);
+        return rc == MOBILEGL_OK && frame.ok;
     }
 
     Bool ServerResizeEGLWindowSurface(EGLSurface surface, Uint32 width, Uint32 height) {
-        struct Args {
-            EGLSurface surface;
-            Uint32 width;
-            Uint32 height;
-            Bool ok = false;
-            MobileGLResult Run() {
-                MG_Backend::BackendObject* backend = ServerBackendOrNull();
-                if (backend == nullptr) return MOBILEGL_ERR_NOT_INITIALIZED;
-                ok = backend->ResizeEGLWindowSurface(surface, width, height);
-                return MOBILEGL_OK;
-            }
-        } args{surface, width, height};
-        return RunOnApply(args) == MOBILEGL_OK && args.ok;
+        SurfaceControlFrame frame;
+        frame.kind = SurfaceControlOp::ResizeWindowSurface;
+        frame.surface = TokenFromHandle(surface);
+        frame.width = static_cast<Int>(width);
+        frame.height = static_cast<Int>(height);
+        const MobileGLResult rc = ServerLoopInstance().RunSurfaceControlFrame(frame);
+        return rc == MOBILEGL_OK && frame.ok;
     }
 
-    Bool ServerCreateEGLPbufferSurface(EGLSurface surface, EGLint width, EGLint height) {
-        struct Args {
-            EGLSurface surface;
-            EGLint width;
-            EGLint height;
-            Bool ok = false;
-            MobileGLResult Run() {
-                MG_Backend::BackendObject* backend = ServerBackendOrNull();
-                if (backend == nullptr) return MOBILEGL_ERR_NOT_INITIALIZED;
-                ok = backend->CreateEGLPbufferSurface(surface, width, height);
-                // N-3: as for the window surface - a (re)creation may have destroyed the context
-                // the held tuple named. The surface's own creation binds natively, so the client's
-                // make-current that follows is forwarded and deduped one layer down (ID-54).
-                if (ok) ServerLoopInstance().ForgetCurrentTuple();
-                return MOBILEGL_OK;
-            }
-        } args{surface, width, height};
-        return RunOnApply(args) == MOBILEGL_OK && args.ok;
+    Bool ServerCreateEGLPbufferSurface(EGLSurface surface, EGLint width, EGLint height, SurfaceRefusalCode* refusal) {
+        SurfaceControlFrame frame;
+        frame.kind = SurfaceControlOp::CreatePbufferSurface;
+        frame.surface = TokenFromHandle(surface);
+        frame.width = width;
+        frame.height = height;
+        const MobileGLResult rc = ServerLoopInstance().RunSurfaceControlFrame(frame);
+        if (refusal != nullptr) *refusal = static_cast<SurfaceRefusalCode>(frame.refusal);
+        return rc == MOBILEGL_OK && frame.ok;
+    }
+
+    ServerOwnedWindowReply ServerCreateServerOwnedWindowSurface(EGLSurface surface, Uint32 width, Uint32 height) {
+        // P12 (D1/D2): ONE frame, and no SetWindowHandle in front of it - the window is the
+        // server's, so there is nothing of the client's to name. The frame-local tag is what the
+        // codec turns into WindowKind::ServerOwned with token 0.
+        SurfaceControlFrame frame;
+        frame.kind = SurfaceControlOp::CreateWindowSurface;
+        frame.surface = TokenFromHandle(surface);
+        frame.windowBackend = kServerOwnedWindowBackend;
+        frame.nativeToken = 0;
+        frame.width = static_cast<Int>(width);
+        frame.height = static_cast<Int>(height);
+        const MobileGLResult rc = ServerLoopInstance().RunSurfaceControlFrame(frame);
+        ServerOwnedWindowReply reply;
+        reply.transport = rc;
+        reply.ok = rc == MOBILEGL_OK && frame.ok;
+        reply.refusal = static_cast<SurfaceRefusalCode>(frame.refusal);
+        reply.width = frame.width > 0 ? static_cast<Uint32>(frame.width) : 0u;
+        reply.height = frame.height > 0 ? static_cast<Uint32>(frame.height) : 0u;
+        return reply;
+    }
+
+    ServerOwnedWindowReply ServerResizeServerOwnedWindowSurface(EGLSurface surface, Uint32 width, Uint32 height) {
+        // The ordinary resize frame: the server knows the surface is on its own window.
+        SurfaceControlFrame frame;
+        frame.kind = SurfaceControlOp::ResizeWindowSurface;
+        frame.surface = TokenFromHandle(surface);
+        frame.width = static_cast<Int>(width);
+        frame.height = static_cast<Int>(height);
+        const MobileGLResult rc = ServerLoopInstance().RunSurfaceControlFrame(frame);
+        ServerOwnedWindowReply reply;
+        reply.transport = rc;
+        reply.ok = rc == MOBILEGL_OK && frame.ok;
+        reply.refusal = static_cast<SurfaceRefusalCode>(frame.refusal);
+        reply.width = frame.width > 0 ? static_cast<Uint32>(frame.width) : 0u;
+        reply.height = frame.height > 0 ? static_cast<Uint32>(frame.height) : 0u;
+        return reply;
     }
 
     Bool ServerMakeEGLCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx) {
-        struct Args {
-            EGLDisplay dpy;
-            EGLSurface draw;
-            EGLSurface read;
-            EGLContext ctx;
-            Bool ok = false;
-            MobileGLResult Run() {
-                MG_Backend::BackendObject* backend = ServerBackendOrNull();
-                if (backend == nullptr) return MOBILEGL_ERR_NOT_INITIALIZED;
-                // C7 / ID-54: the apply thread binds the native context ONCE per context
-                // lifetime and holds it for life. ApplyMakeCurrent forwards a bind only for a
-                // tuple it does not hold, treats an identical repeat as a no-op, and records a
-                // client release-current WITHOUT unbinding; the native call for a surface already
-                // current on this thread is skipped one layer down (BackendObject_DirectGLES's
-                // ID-54 arm), which is what makes "the owner slot is written once" TRUE and
-                // measured (ServerLoopTest's C7 control) rather than claimed.
-                const ServerLoop::MakeCurrentOutcome outcome =
-                    ServerLoopInstance().ApplyMakeCurrent(backend, dpy, draw, read, ctx);
-                ok = outcome.ok;
-                if (!ok || !outcome.boundNatively) return MOBILEGL_OK;
-                // R-12, arm (a): the caps snapshot is REPUBLISHED because InitCapabilities has
-                // now run for real - on every forwarded bind of a tuple this loop did not hold
-                // (the first, and every DIFFERENT tuple after it), and NEVER on an identical
-                // repeat (ID-67: a repeat is a native no-op AND publishes nothing, so the client's
-                // mirror generation does not move and nothing accumulates). DirectGLES has no
-                // OnCapsInvalidated producer at all, and c0's answer is that a SECOND arrival IS the
-                // invalidation - so the client's mirror is refreshed with no dev-shaped backend edit
-                // and with no eleventh MGPipeCallbacks slot (MGPipeCallbacks.h:56-58's static_assert
-                // exists to make that cost visible). Red once by republishing only on the first
-                // bind: the ID-67 control's different tuple reads 1 republish where 2 are required.
-                ServerSession* session = ServerSession::Active();
-                if (session != nullptr && session->Accepted()) {
-                    const MobileGLResult published = session->PublishCapsSnapshot();
-                    if (published == MOBILEGL_OK) ServerLoopInstance().NoteMakeCurrentRepublished();
-                    if (published != MOBILEGL_OK) {
-                        MGLOG_E("MG_Remote server: the post-make-current CapsSnapshot could not "
-                                "be published (rc=%d); the client's mirror still holds the empty "
-                                "snapshot Accept() sent before any context existed",
-                                static_cast<int>(published));
-                    }
-                }
-                return MOBILEGL_OK;
-            }
-        } args{dpy, draw, read, ctx};
-        return RunOnApply(args) == MOBILEGL_OK && args.ok;
+        SurfaceControlFrame frame;
+        // The release request (the three NO_* markers, ClassifyEglMakeCurrent's ClientRelease
+        // shape) crosses as its own op: on the wire that is what ReleaseCurrent IS
+        // (protocol.fbs), and the dispatch reaches the same ApplyMakeCurrent arm either way.
+        frame.kind = (draw == EGL_NO_SURFACE && read == EGL_NO_SURFACE && ctx == EGL_NO_CONTEXT)
+                         ? SurfaceControlOp::ReleaseCurrent
+                         : SurfaceControlOp::MakeCurrent;
+        frame.display = TokenFromHandle(dpy);
+        frame.surface = TokenFromHandle(draw);
+        frame.readSurface = TokenFromHandle(read);
+        frame.context = TokenFromHandle(ctx);
+        const MobileGLResult rc = ServerLoopInstance().RunSurfaceControlFrame(frame);
+        return rc == MOBILEGL_OK && frame.ok;
     }
 
     Bool ServerSwapEGLBuffers(EGLDisplay dpy, EGLSurface draw) {
-        struct Args {
-            EGLDisplay dpy;
-            EGLSurface draw;
-            Bool ok = false;
-            MobileGLResult Run() {
-                MG_Backend::BackendObject* backend = ServerBackendOrNull();
-                if (backend == nullptr) return MOBILEGL_ERR_NOT_INITIALIZED;
-                ok = backend->SwapEGLBuffers(dpy, draw);
-                return MOBILEGL_OK;
-            }
-        } args{dpy, draw};
-        return RunOnApply(args) == MOBILEGL_OK && args.ok;
+        SurfaceControlFrame frame;
+        frame.kind = SurfaceControlOp::SwapBuffersInprocOnly;
+        frame.display = TokenFromHandle(dpy);
+        frame.surface = TokenFromHandle(draw);
+        const MobileGLResult rc = ServerLoopInstance().RunSurfaceControlFrame(frame);
+        return rc == MOBILEGL_OK && frame.ok;
     }
 
     void ServerSetEGLSwapInterval(Int interval) {
-        struct Args {
-            Int interval;
-            MobileGLResult Run() {
-                MG_Backend::BackendObject* backend = ServerBackendOrNull();
-                if (backend == nullptr) return MOBILEGL_ERR_NOT_INITIALIZED;
-                backend->SetEGLSwapInterval(interval);
-                return MOBILEGL_OK;
-            }
-        } args{interval};
-        (void)RunOnApply(args);
+        SurfaceControlFrame frame;
+        frame.kind = SurfaceControlOp::SetSwapInterval;
+        frame.swapInterval = interval;
+        (void)ServerLoopInstance().RunSurfaceControlFrame(frame);
     }
 
     void ServerReleaseEGLSurface(EGLSurface surface) {
-        struct Args {
-            EGLSurface surface;
-            MobileGLResult Run() {
-                MG_Backend::BackendObject* backend = ServerBackendOrNull();
-                if (backend == nullptr) return MOBILEGL_ERR_NOT_INITIALIZED;
-                backend->ReleaseEGLSurface(surface);
-                // N-3: a released surface the held tuple names may have taken the context with
-                // it (BackendObject::ReleaseEGLSurface -> OnEGLSurfaceReleased -> DestroyEGLContext
-                // once nothing holds it current). Forgetting when the base class only DEFERRED
-                // the destroy costs one forwarded bind; remembering when it did not would cost a
-                // silent no-context-current.
-                ServerLoopInstance().ForgetCurrentTupleIfItNames(surface);
-                return MOBILEGL_OK;
-            }
-        } args{surface};
-        (void)RunOnApply(args);
+        SurfaceControlFrame frame;
+        frame.kind = SurfaceControlOp::ReleaseSurface;
+        frame.surface = TokenFromHandle(surface);
+        (void)ServerLoopInstance().RunSurfaceControlFrame(frame);
     }
 
     void ServerReleaseEGLResources() {
@@ -958,66 +1689,32 @@ namespace MobileGL::MG_Remote::Server {
         // runs DestroyEGLContext - eglMakeCurrent(NO_SURFACE), eglDestroyContext, eglTerminate -
         // and those must happen on the thread that made the context current. A fire-and-forget
         // here lets Destroy() walk on while the server still holds the context, which is
-        // scout-install 5.3's named hazard.
-        struct Args {
-            MobileGLResult Run() {
-                MG_Backend::BackendObject* backend = ServerBackendOrNull();
-                if (backend == nullptr) return MOBILEGL_ERR_NOT_INITIALIZED;
-                backend->ReleaseEGLResources();
-                // N-3: DestroyEGLContext just ran; the tuple names nothing. Without this a
-                // destroy-recreate with the same handle values (every EGL handle on this host
-                // is 0x1) classified as a RepeatNoOp, bound nothing, and republished no caps.
-                // Red once by deleting it: ServerLoopTest's recreate control reads
-                // NativeBindCount() == 1 where 2 is required.
-                ServerLoopInstance().ForgetCurrentTuple();
-                return MOBILEGL_OK;
-            }
-        } args{};
-        (void)RunOnApply(args);
+        // scout-install 5.3's named hazard. The frame channel is blocking, so nothing about
+        // that changed with fc.
+        SurfaceControlFrame frame;
+        frame.kind = SurfaceControlOp::ReleaseResources;
+        (void)ServerLoopInstance().RunSurfaceControlFrame(frame);
     }
 
     Bool ServerInitCapabilities() {
-        struct Args {
-            Bool ok = false;
-            MobileGLResult Run() {
-                MG_Backend::BackendObject* backend = ServerBackendOrNull();
-                if (backend == nullptr) return MOBILEGL_ERR_NOT_INITIALIZED;
-                ok = backend->InitCapabilities();
-                if (!ok) return MOBILEGL_OK;
-                ServerSession* session = ServerSession::Active();
-                if (session != nullptr && session->Accepted()) {
-                    (void)session->PublishCapsSnapshot();
-                }
-                return MOBILEGL_OK;
-            }
-        } args{};
-        return RunOnApply(args) == MOBILEGL_OK && args.ok;
+        SurfaceControlFrame frame;
+        frame.kind = SurfaceControlOp::InitCapabilities;
+        const MobileGLResult rc = ServerLoopInstance().RunSurfaceControlFrame(frame);
+        return rc == MOBILEGL_OK && frame.ok;
     }
 
     Bool ServerInitWindowSurface() {
-        struct Args {
-            Bool ok = false;
-            MobileGLResult Run() {
-                MG_Backend::BackendObject* backend = ServerBackendOrNull();
-                if (backend == nullptr) return MOBILEGL_ERR_NOT_INITIALIZED;
-                ok = backend->InitWindowSurface();
-                return MOBILEGL_OK;
-            }
-        } args{};
-        return RunOnApply(args) == MOBILEGL_OK && args.ok;
+        SurfaceControlFrame frame;
+        frame.kind = SurfaceControlOp::InitWindowSurfaceInprocOnly;
+        const MobileGLResult rc = ServerLoopInstance().RunSurfaceControlFrame(frame);
+        return rc == MOBILEGL_OK && frame.ok;
     }
 
     void ServerSetWindowHandle(const MG_Backend::WindowHandle& handle) {
-        struct Args {
-            const MG_Backend::WindowHandle* handle;
-            MobileGLResult Run() {
-                MG_Backend::BackendObject* backend = ServerBackendOrNull();
-                if (backend == nullptr) return MOBILEGL_ERR_NOT_INITIALIZED;
-                backend->SetWindowHandle(*handle);
-                return MOBILEGL_OK;
-            }
-        } args{&handle};
-        (void)RunOnApply(args);
+        SurfaceControlFrame frame;
+        frame.kind = SurfaceControlOp::SetWindowHandle;
+        PackWindowHandle(frame, handle);
+        (void)ServerLoopInstance().RunSurfaceControlFrame(frame);
     }
 
 } // namespace MobileGL::MG_Remote::Server

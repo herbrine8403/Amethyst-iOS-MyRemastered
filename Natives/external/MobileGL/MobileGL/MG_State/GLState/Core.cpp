@@ -1455,6 +1455,13 @@ namespace MobileGL::MG_State {
             return it != m_transformFeedbackObjects.end() && it->second.everBound;
         }
 
+#if MOBILEGL_BUILD_DISAGGREGATED
+        Uint64 GLContext::GetTransformFeedbackLifetimeId(Uint index) const {
+            const auto found = m_transformFeedbackObjects.find(index);
+            return found == m_transformFeedbackObjects.end() ? 0 : found->second.lifetimeId;
+        }
+#endif
+
         void GLContext::MarkTransformFeedbackObjectForDeletion(Uint index) {
             if (index == 0 || !m_transformFeedbackNames.IsValid(index)) return;
             // Deleting the bound object reverts to the default one (GL 4.6 core 13.2.1);
@@ -1522,6 +1529,17 @@ namespace MobileGL::MG_State {
                                                          Bool hasExplicitRange) {
             if (bufferIndex >= MAX_TRANSFORM_FEEDBACK_BUFFERS) return;
             if (index == m_boundTransformFeedback) {
+#if MOBILEGL_PIPE_PUSH
+                // P5e (sb): the THIRD writer of a transform-feedback binding point, and the one
+                // a reader of GL_Buffer.cpp alone would miss - glTransformFeedbackBufferBase /
+                // ...Range on the CURRENTLY BOUND object land here rather than in
+                // BindBufferBase_State. Dirty bit 17 shutters on this generation, so a bump
+                // left out here would make the DSA spelling of a capture-point bind invisible
+                // while the non-DSA one was not. The saved-bindings arm below writes no binding
+                // POINT at all (it writes the named object's own table) and deliberately bumps
+                // nothing.
+                NoteBufferBindPointChanged(BufferTarget::TransformFeedback);
+#endif
                 auto& point = m_bufferState.GetBindingPoint(BufferTarget::TransformFeedback, bufferIndex);
                 point.Bind(buffer);
                 if (buffer && hasExplicitRange) {

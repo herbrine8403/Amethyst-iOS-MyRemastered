@@ -70,7 +70,9 @@
 #pragma once
 #include <Includes.h>
 
+#include "ServerDisplay.h"
 #include "ServerSession.h"
+#include "SurfaceControlFrame.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -79,6 +81,7 @@
 #include <mutex>
 #include <thread>
 #include <type_traits>
+#include <vector>
 
 namespace MobileGL::MG_Remote::Server {
 
@@ -169,7 +172,7 @@ namespace MobileGL::MG_Remote::Server {
             // a type that has padding bytes would let two calls ON THE SAME THREAD return
             // different keys, and OnApplyThread() would then answer FALSE ON THE APPLY THREAD -
             // a role guard that has stopped guarding, which is the one direction CONTRACT-P5C
-            // rule E says a guard may never fail in (RunOnApplyThread would also lose its
+            // rule E says a guard may never fail in (RunSurfaceControlFrame would also lose its
             // re-entrancy shortcut and the EGL teardown post would deadlock on m_controlDone).
             // Every library this fallback is built against today wraps a single scalar
             // (libstdc++ __gthread_t, libc++ __libcpp_thread_id, MSVC unsigned int) and
@@ -186,6 +189,22 @@ namespace MobileGL::MG_Remote::Server {
         }
     } // namespace Detail
 
+    // ---------------------------------------------------------------------------------
+    // P12 (on-screen server window), D4: ONE SURFACE MODE PER SESSION
+    // ---------------------------------------------------------------------------------
+    //
+    // "Only one of the two rendering paths is active at a time, decided at context creation": a
+    // session's mode latches at its FIRST successful surface creation - a ServerOwned window makes
+    // it on-screen, a pbuffer makes it offscreen - and a later surface of the OTHER kind in the same
+    // session is refused by name (SurfaceRefusal::SurfaceModeMismatch: reply ok=false, logged, the
+    // session NOT latched). Windows the client names itself (the X11/Win32/None tokens CONTRACT-P6
+    // D8 has yet to close) are neither kind and neither latch nor are refused: nothing about them
+    // changes here. Reset by ServerLoop::Start, i.e. per session.
+    enum class SessionSurfaceMode : Uint8 { None, OnScreen, Offscreen };
+    const char* SessionSurfaceModeName(SessionSurfaceMode mode);
+    // The decision, pure, so a unit case can drive all six pairs without a backend.
+    Bool SessionSurfaceModeAdmits(SessionSurfaceMode current, Bool serverOwnedWindow);
+
     class ServerLoop {
     public:
         // Creates the apply thread, names it mgl-srv-apply, applies
@@ -198,6 +217,15 @@ namespace MobileGL::MG_Remote::Server {
         // Kill the doorbell, join the thread (bounded), then destroy the private backend object
         // ON THAT THREAD before it exits. Blocking by contract - see the header note.
         void Stop();
+        // P12 review fix: THE NEXT Stop() LEAVES THE QUEUE UNAPPLIED. A Stop() normally lets the
+        // apply thread finish its batch and drain what is still queued - the client's own drain
+        // bounds that. A SERVER that is stopping (the in-process display server's
+        // mobilegl_server_stop_inprocess) has a client that may still be streaming, and a batch plus
+        // a final drain of a ring that client keeps refilling can outlast the bounded join
+        // (Fatal{ApplyThreadJoinTimeout} aborts the display Activity's process). Called before Stop():
+        // the drain stops after the record in hand and the exit path declines the rest, as a
+        // ReverseChannelForfeit does. Reset by Start().
+        void AbandonQueuedRecords();
 
         Bool Running() const;
 
@@ -214,11 +242,66 @@ namespace MobileGL::MG_Remote::Server {
         // nine EGL lifecycle virtuals cross; it is deliberately NOT a queue of async messages,
         // because every one of them has a return value the caller acts on immediately.
         //
-        // A raw function pointer plus a user pointer, not std::function: this runs on the
-        // teardown path too, and the teardown path may not allocate - ID-8's leak-at-exit rule
-        // exists because frontend destructors reach here from exit handlers.
-        using ControlWork = MobileGLResult (*)(void* user);
-        MobileGLResult RunOnApplyThread(ControlWork work, void* user);
+        // THE REQUEST IS A VALUE FRAME (P5f, package fc). It used to be a raw function pointer
+        // plus a void* to a stack-local Args struct - neither has a meaning across a process
+        // boundary, which is the whole of P5c audit row G4. Now the slot carries one
+        // SurfaceControlFrame BY VALUE: the op's identity is the frame's `kind`, its arguments
+        // are scalars, and its reply fields come back in the same value when the wait returns.
+        // What did NOT move: the blocking handshake, the one slot, and the apply-thread
+        // ownership. Under spawn the same frame is what SurfaceOpCodec encodes into a
+        // Wire::SurfaceOp - this signature is the seam both transports share.
+        // P6 `cp`: where a control frame goes when the server is ANOTHER PROCESS.
+        //
+        // All twelve Server* forwarders funnel through RunSurfaceControlFrame, so
+        // this is ONE seam rather than twelve (a6 row A4-13 counted them). The
+        // client installs a sink at handshake; with none installed the behaviour
+        // is exactly what it was - post into the one-slot mailbox, or run inline
+        // when we are already on the apply thread.
+        //
+        // A HOOK RATHER THAN A CALL INTO ClientSession, deliberately: the server
+        // half calling the client half is four of the six symbols a6 found
+        // MG_Remote owes itself (a6-link-experiment §5), and this is the one
+        // place that would have added a fifth.
+        using RemoteControlSink = MobileGLResult (*)(void* user, SurfaceControlFrame& frame);
+        void SetRemoteControlSink(RemoteControlSink sink, void* user);
+
+        MobileGLResult RunSurfaceControlFrame(SurfaceControlFrame& frame);
+
+        // The TEST seam through the same channel: posts a ProbeForTesting frame whose dispatch
+        // runs the given hook on the apply thread. A raw function pointer held in a MEMBER (not
+        // in the mailbox slot, which carries the frame and nothing else), because the suites that
+        // drive guards and Fatal arms need arbitrary work on the apply thread and the teardown
+        // path's no-allocation rule (ID-8) forbids a std::function here. Same discipline as
+        // SetBeforeRetireHookForTesting.
+        using ControlProbeHook = MobileGLResult (*)(void* user);
+        MobileGLResult RunProbeOnApplyThreadForTesting(ControlProbeHook hook, void* user);
+
+        // P7 (p7/spawnhang). WHAT A POSTER SAYS WHILE THE APPLY THREAD RUNS ITS FRAME.
+        //
+        // A posted frame is waited for in slices of kControlProgressIntervalMs, and after every
+        // slice in which the apply thread is RUNNING it - taken, not yet answered - the poster calls
+        // this sink with the frame's kind, its seq and how long ago it was posted, WITHOUT
+        // m_controlMutex held. ServerMain installs one that sends Wire::SurfaceProgress on the
+        // control connection: that is how a spawn / TCP client tells a server BUSY with its op (a
+        // cold native bring-up - eglInitialize loading a software rasteriser off a cold disk ran
+        // ~20 s on a CI runner) from a SILENT one, and restarts its reply budget. A frame posted but
+        // NOT TAKEN reports nothing, because that silence is exactly what the client's budget
+        // exists to name. Null (inproc, and every case that does not set one): the slices are
+        // waited out and nothing is said. Read on the posting thread, set from any (both under
+        // m_controlMutex).
+        using ControlProgressSink = void (*)(void* user, SurfaceControlOp kind, Uint64 seq, Uint32 elapsedMs);
+        void SetControlProgressSink(ControlProgressSink sink, void* user);
+        // Well inside the smallest default reply budget (MOBILEGL_IPC_CONTROL_TIMEOUT_MS, 5000),
+        // and a frame's worth of bytes per interval only while an op runs that long.
+        static constexpr Uint32 kControlProgressIntervalMs = 250;
+        // A dispatch that runs at least this long is logged, with its op, seq and duration, on the
+        // apply thread when it returns - the line the retrace-split investigation did not have.
+        static constexpr Uint32 kSlowControlDispatchMs = 1000;
+
+        // How many frames this loop has dispatched (every kind, probe included). Reset by
+        // Start(). The frame channel's own red-once handle: a forwarder that stopped posting
+        // frames leaves this unmoved.
+        Uint64 ControlFramesDispatched() const;
 
         // ---- v1's additions beyond c0's signature block ---------------------------------
 
@@ -235,8 +318,8 @@ namespace MobileGL::MG_Remote::Server {
         // context is never OWNED by it.
         MobileGLResult CreateBackend(BackendType type);
 
-        // True on the apply thread itself. RunOnApplyThread uses it to run inline rather than
-        // deadlock when the apply thread posts to itself - which the EGL teardown path does,
+        // True on the apply thread itself. RunSurfaceControlFrame uses it to run inline rather
+        // than deadlock when the apply thread posts to itself - which the EGL teardown path does,
         // because ~BackendObject_DirectGLES runs THERE and reaches ReleaseEGLResources.
         //
         // INLINE, AND THAT IS THE POINT (P5d round 3, package D): see the Detail block above.
@@ -275,6 +358,13 @@ namespace MobileGL::MG_Remote::Server {
         // Integration tests use it to observe real producer back-pressure from GL uploads.
         void SetBeforeRetireHookForTesting(void (*hook)()) {
             m_beforeRetireHook.store(hook, std::memory_order_release);
+        }
+        // Scheduling point only, same discipline: DrainRing runs the hook on the apply thread
+        // BETWEEN two records - after a popped record's own checks, before the next pop's latch
+        // check - and never on an empty-ring poll. ServerLoopLatchTest latches from a second
+        // thread there, which is the interleaving codex closeout finding 6 named.
+        void SetBetweenRecordsHookForTesting(void (*hook)()) {
+            m_betweenRecordsHook.store(hook, std::memory_order_release);
         }
 
         // C7 / ID-54 diagnostics, read by ServerLoopTest's C7 and N-3 controls. NativeBindCount is
@@ -337,17 +427,75 @@ namespace MobileGL::MG_Remote::Server {
         // narrower than the name's "a control request is in flight". The shadow is cleared
         // when the pump takes the work, not when the work returns, so for the whole duration
         // of `work(user)` this answers false although m_controlPending is still true and the
-        // poster is still blocked in RunOnApplyThread. That is deliberate - it is a PARK
+        // poster is still blocked in RunSurfaceControlFrame. That is deliberate - it is a PARK
         // PREDICATE, and the thread that would act on it is the one running the work - but it
         // means this is not a liveness query and must not be used as one. The only in-tree
         // reader outside the test is the apply thread's own `ready` lambda, which by
         // construction cannot be inside that window.
         Bool ControlIsPending() const;
 
+        // ---- P12 (on-screen server window), D3/D6 -------------------------------------------
+        //
+        // How long a ServerOwned creation waits for the display server's window (D3: ~10 s). The
+        // control pump's SurfaceProgress heartbeat keeps the client's reply budget alive meanwhile.
+        static constexpr Uint32 kServerWindowWaitMs = ServerDisplay::kDefaultAcquireTimeoutMs;
+
+        // APPLY THREAD ONLY. Leases the process display's window for this session (ServerDisplay::
+        // AcquireFor with this loop as the holder), refusing by name when there is no display
+        // (NoServerDisplay, NOT a latch - a configuration answer) or no window within `timeoutMs`
+        // (NoServerWindow). The ServerOwned arm of the dispatch is its production caller; a test
+        // reaches it through RunProbeOnApplyThreadForTesting. The lease is held until the backend
+        // has let go of the window: ServerDisplay::Detach's lost hook (D6) or the session's end.
+        MobileGLResult AcquireServerWindow(Uint32 width, Uint32 height, Uint32 timeoutMs,
+                                           ServerWindowLease* out, SurfaceRefusalCode* refusal);
+        // APPLY THREAD ONLY: this session's surface mode (D4).
+        SessionSurfaceMode SurfaceMode() const { return m_surfaceMode; }
+        // How many times this loop released a lost server window and latched ServerWindowLost (D6).
+        Uint64 ServerWindowsLost() const { return m_serverWindowsLost.load(std::memory_order_acquire); }
+
     private:
+        RemoteControlSink m_remoteSink = nullptr;
+        void* m_remoteSinkUser = nullptr;
+
+        // P12. The ServerOwned arm of the CreateWindowSurface dispatch (D3, D4).
+        MobileGLResult ApplyServerOwnedWindowSurface(MG_Backend::BackendObject* backend, SurfaceControlFrame& frame);
+        // P12 (D6), apply thread: the lost window's backend surface goes, the lease ends, and the
+        // session latches ServerWindowLost. Runs from PumpControlRequest when Detach asked.
+        void ReleaseLostServerWindow();
+        // Ends this loop's display lease if it holds one (after the backend let go of the window).
+        void EndServerWindowLease();
+        // Review fix: the ResizeWindowSurface arm for a server-owned surface - a geometry request to
+        // the display, the backend surface at the window's real extent, that extent in the reply.
+        MobileGLResult ApplyServerOwnedWindowResize(MG_Backend::BackendObject* backend, SurfaceControlFrame& frame);
+        Bool IsServerOwnedSurface(EGLSurface surface) const;
+        void ForgetServerOwnedSurface(EGLSurface surface);
+        // Apply thread only: this session's surfaces created on the server's window; reset by Start().
+        std::vector<EGLSurface> m_serverOwnedSurfaces;
+        // ServerDisplay's lost hook: called under the display's lock from Detach's thread. Sets the
+        // request and rings the apply thread's bell; never blocks.
+        static void ServerWindowLostThunk(void* self);
+        // AcquireFor's cancel predicate: the loop is stopping, or the session latched.
+        static Bool ServerWindowWaitCancelled(void* self);
+        // D4: latched at the session's first successful surface creation; reset by Start().
+        SessionSurfaceMode m_surfaceMode = SessionSurfaceMode::None;
+        // Apply thread only: this loop holds the display's lease.
+        Bool m_holdsWindowLease = false;
+        // Set by ServerWindowLostThunk (any thread), taken by the apply thread. Part of the park
+        // predicate, so a parked apply thread wakes for it.
+        std::atomic<Bool> m_windowLostRequested{false};
+        std::atomic<Uint64> m_serverWindowsLost{0};
+
         void ApplyThreadMain();
-        // Runs a posted control request, if there is one. Returns true if it ran one.
+        // Runs a posted control frame, if there is one. Returns true if it ran one.
         Bool PumpControlRequest();
+        // The dispatch, on the apply thread (or inline for a re-entrant post): executes the
+        // frame's op against the private backend and fills the frame's reply half. The eleven
+        // wire+inproc op bodies from the old forwarder Args structs live here now.
+        MobileGLResult ApplySurfaceControlFrame(SurfaceControlFrame& frame,
+                                                 ControlProbeHook probeHook = nullptr, void* probeUser = nullptr);
+        // The caller already holds m_callerMutex; shared by normal and test-probe posting so
+        // the probe's metadata is protected for the same lifetime as its frame.
+        MobileGLResult PostSurfaceControlFrameWithCallerLock(SurfaceControlFrame& frame);
         // Pops and applies every record currently in the ring; returns how many it applied.
         Uint64 DrainRing();
         void SignalExited();
@@ -355,6 +503,8 @@ namespace MobileGL::MG_Remote::Server {
         ServerSession* m_session = nullptr;
         std::atomic<Bool> m_running{false};
         std::atomic<Bool> m_stopRequested{false};
+        // P12 review fix: AbandonQueuedRecords() - read after every popped record and at the exit.
+        std::atomic<Bool> m_abandonQueue{false};
         std::thread m_thread;
         // The apply thread's identity used to live here as an atomic<std::thread::id>. It is
         // Detail::g_applyThreadKey now - see the block at the top of this header for why the
@@ -364,8 +514,11 @@ namespace MobileGL::MG_Remote::Server {
         // context - see Stop().
         UniquePtr<MG_Backend::BackendObject> m_backend;
 
-        // The blocking control mailbox. ONE slot, because the verb barrier already leaves one
+        // The blocking control channel. ONE slot, because the verb barrier already leaves one
         // client thread runnable at a time; m_callerMutex serialises anything that is not.
+        // The slot carries ONE SurfaceControlFrame BY VALUE (P5f, package fc) - no function
+        // pointer, no address of caller storage. The poster's frame is copied in at publish and
+        // the dispatch's reply half is copied back over it before m_controlDone is signalled.
         std::mutex m_callerMutex;
         std::mutex m_controlMutex;
         // THE MAILBOX'S ONE-BIT SHADOW, and the only field of it the idle poll may read.
@@ -382,11 +535,24 @@ namespace MobileGL::MG_Remote::Server {
         // notifier anywhere in the tree (m_controlDone is the one that carries the handshake).
         std::atomic<Bool> m_controlPosted{false};
         std::condition_variable m_controlDone;
-        ControlWork m_controlWork = nullptr;
-        void* m_controlUser = nullptr;
+        // The one slot. A frame by value; the reply half is written through it on the way back.
+        SurfaceControlFrame m_controlFrame;
         MobileGLResult m_controlResult = MOBILEGL_OK;
         Bool m_controlPending = false;
         Bool m_controlFinished = false;
+        // Minted per posted frame (0 = never posted) and the dispatch tally beside it. Both
+        // atomic: the re-entrant inline arm mints without taking m_callerMutex.
+        std::atomic<Uint64> m_controlSeq{0};
+        std::atomic<Uint64> m_controlFramesDispatched{0};
+        // The test probe (RunProbeOnApplyThreadForTesting). Members, NOT slot content - the slot
+        // carries only the frame. Written under m_callerMutex before the probe frame is
+        // published; held until its reply returns. Re-entrant probes use call-local arguments.
+        std::atomic<ControlProbeHook> m_controlProbeHook{nullptr};
+        std::atomic<void*> m_controlProbeUser{nullptr};
+        // SetControlProgressSink's pair (p7/spawnhang). Guarded by m_controlMutex: the poster reads
+        // both while it holds that lock between slices, so the pair is always read whole.
+        ControlProgressSink m_progressSink = nullptr;
+        void* m_progressUser = nullptr;
 
         // The BOUNDED join's other half. std::thread::join has no deadline, so a lost wakeup
         // would wedge CI rather than fail it; the thread signals here last and Stop() waits
@@ -402,6 +568,7 @@ namespace MobileGL::MG_Remote::Server {
         // that reached the blocking Park. Relaxed everywhere: it is a gauge.
         std::atomic<Uint64> m_parkBlocks{0};
         std::atomic<void (*)()> m_beforeRetireHook{nullptr};
+        std::atomic<void (*)()> m_betweenRecordsHook{nullptr};
 
         // C7 / ID-54: the (dpy, draw, read, ctx) currently bound on the apply thread. Written and
         // read ONLY on the apply thread inside ApplyMakeCurrent, so it needs no lock; the two
@@ -456,10 +623,36 @@ namespace MobileGL::MG_Remote::Server {
     // WHY THEY ARE FREE FUNCTIONS AND NOT MEMBERS: c1 needs exactly this surface and nothing
     // else of the server, so the seam between the two packages is a list of twelve signatures
     // rather than a class with a lifecycle.
+    //
+    // P5f (package fc): each of the twelve packs its arguments into a SurfaceControlFrame and
+    // posts it through RunSurfaceControlFrame - the wire-shaped value channel that replaced the
+    // function-pointer mailbox (P5c audit row G4). Nine of them map onto the ten wire ops of
+    // protocol.fbs's SurfaceOp; ServerSwapEGLBuffers, ServerInitCapabilities and
+    // ServerInitWindowSurface ride the same channel as inproc-only kinds (present travels as a
+    // record, capabilities are answered by the CapsSnapshot frame, and the third has no caller -
+    // f0-egl's census, findings F8/§4.2).
     Bool ServerInitializeEGLDisplay(EGLDisplay dpy, EGLint* major, EGLint* minor);
     Bool ServerCreateEGLWindowSurface(EGLSurface surface, const MG_Backend::WindowHandle& handle);
     Bool ServerResizeEGLWindowSurface(EGLSurface surface, Uint32 width, Uint32 height);
-    Bool ServerCreateEGLPbufferSurface(EGLSurface surface, EGLint width, EGLint height);
+    // P12: `refusal`, when given, receives the server's named refusal (SurfaceModeMismatch for a
+    // pbuffer in an on-screen session), None otherwise.
+    Bool ServerCreateEGLPbufferSurface(EGLSurface surface, EGLint width, EGLint height,
+                                       SurfaceRefusalCode* refusal = nullptr);
+    // P12 (on-screen server window), D1/D2. CreateWindowSurface on the SERVER's window: one frame,
+    // WindowKind::ServerOwned with nativeToken 0 on the wire, no SetWindowHandle. `width`/`height`
+    // is the size the client asked for (0/0 = the server window's own size); the reply carries the
+    // window's REAL extent, and the server's named refusal when it declined.
+    struct ServerOwnedWindowReply {
+        Bool ok = false;
+        MobileGLResult transport = MOBILEGL_OK; // the frame channel's own answer
+        SurfaceRefusalCode refusal = SurfaceRefusalCode::None;
+        Uint32 width = 0;
+        Uint32 height = 0;
+    };
+    ServerOwnedWindowReply ServerCreateServerOwnedWindowSurface(EGLSurface surface, Uint32 width, Uint32 height);
+    // P12 review fix: ResizeWindowSurface for a surface created on the server's window. The server
+    // resizes its WINDOW (a geometry request) and replies with the window's real extent.
+    ServerOwnedWindowReply ServerResizeServerOwnedWindowSurface(EGLSurface surface, Uint32 width, Uint32 height);
     // Also RE-PUBLISHES THE CAPS SNAPSHOT on success (R-12). BackendObject::MakeEGLCurrent runs
     // InitCapabilities() on the first make-current per surface (BackendObject.cpp:341-347), so
     // this is the moment the server's answers stop being the empty ones Accept() published -

@@ -1891,7 +1891,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         }
 
         Bool TransformSpirvForXfbCapture(const Vector<Uint>& input, Vector<Uint>& output,
-                                         const MG_State::GLState::ProgramObject& program) {
+                                         const MagmaProgramSource& program) {
             if (input.empty()) {
                 output.clear();
                 return true;
@@ -2466,7 +2466,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         }
     }
 
-    ProgramFactory::HashType ProgramFactory::ComputeHash(const MG_State::GLState::ProgramObject& program,
+    ProgramFactory::HashType ProgramFactory::ComputeHash(const MagmaProgramSource& program,
                                                          CompileOptionFlags flags) const {
         XXHASH_VERIFY(XXH64_reset(m_hashState, m_config.CacheVersion));
         // We expect shader stages in program object are sorted
@@ -2832,7 +2832,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     // key and every element of an array of arrays seeds texture unit 0. Resolving those elements
     // would then paint silently-wrong pixels with no diagnostic at all - strictly worse than
     // declining. The decline goes away together with the seeding fix, not before it.
-    static Uint32 DescriptorCountForOpaqueUniformArray(const MG_State::GLState::ProgramObject& program,
+    static Uint32 DescriptorCountForOpaqueUniformArray(const MagmaProgramSource& program,
                                                        const String& uniformName, Uint32 binding, Int baseLocation,
                                                        Uint32 reflectedCount, Uint32 maxBindings,
                                                        const char* kindLabel, Bool& outDeclined) {
@@ -2868,7 +2868,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         return count;
     }
 
-    void ProgramFactory::ReflectLayout(const MG_State::GLState::ProgramObject& program,
+    void ProgramFactory::ReflectLayout(const MagmaProgramSource& program,
                                        const Vector<Vector<Uint>>& spirv, VkProgramObject& entry) const {
         // Initialize layout vectors
         entry.bindingKinds.assign(m_maxBindings, DescriptorBindingKind::None);
@@ -3068,7 +3068,12 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                 entry.bindingKinds[binding] = descriptorKind;
 
                 if (descriptorKind == DescriptorBindingKind::StorageBuffer) {
-                    const GLuint blockIndex = GetShaderStorageBlockIndex(program, uniformName);
+                    const GLuint blockIndex =
+#if MOBILEGL_BUILD_DISAGGREGATED
+                        program.GetShaderStorageBlockIndex(uniformName);
+#else
+                        GetShaderStorageBlockIndex(program, uniformName);
+#endif
                     if (blockIndex == GL_INVALID_INDEX) {
                         MGLOG_D("ProgramFactory::ReflectLayout: skipping inactive SSBO '%s' at binding %u",
                                 uniformName.c_str(), binding);
@@ -3360,6 +3365,13 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                                                 updateAfterBindSampledImages + updateAfterBindStorageImages;
         const auto& uab = m_updateAfterBindLimits;
         entry.usesUpdateAfterBind =
+#if MOBILEGL_BUILD_DISAGGREGATED
+            // Vulkan forbids ANY update-after-bind binding in a set layout that
+            // contains a dynamic buffer descriptor (VUID 03001/03011). Wire draws
+            // retain UniformManager's per-frame, content-versioned descriptor sets;
+            // this selects the legal ordinary pool, not in-place mutation of a live set.
+            (!program.IsWire() || entry.dynamicBindings.empty()) &&
+#endif
             uab.enabled && updateAfterBindSamplers <= uab.maxPerStageSamplers &&
             updateAfterBindUniformBuffers <= uab.maxPerStageUniformBuffers &&
             updateAfterBindStorageBuffers <= uab.maxPerStageStorageBuffers &&
@@ -3426,7 +3438,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     }
 
     const ProgramFactory::VkProgramObject& ProgramFactory::GetOrCreateProgram(
-        const MG_State::GLState::ProgramObject& program, CompileOptionFlags flags) {
+        const MagmaProgramSource& program, CompileOptionFlags flags) {
         // Hashing the full SPIR-V of every stage is far too expensive to repeat per draw;
         // reuse the program's memoized hash while its backend state version is unchanged.
         // The memo keys on the flags word, which ComputeHash is no longer a pure function of:

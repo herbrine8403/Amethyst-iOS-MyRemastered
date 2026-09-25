@@ -7,6 +7,7 @@
 // End of Source File Header
 
 #include "VulkanRenderer.h"
+#include "SubmitFencePrefix.h"
 
 #include "MG_Backend/DirectVulkan/SubgroupSupportPolicy.h"
 #include "MG_Backend/DirectGLES/Utils.h"
@@ -25,6 +26,9 @@
 #include "MG_State/GLState/TextureState/TextureObject.h"
 #include "MG_Impl/GLImpl/Framebuffer/GL_Framebuffer.h"
 #include "MG_Impl/GLImpl/Texture/GL_Texture.h"
+// The generation window GenerateMipmap defines its chain in: one definition, shared with the
+// frontend arm and with the wire carrier that publishes it (MGPMipPlan::LevelCount).
+#include "MG_Impl/GLImpl/Texture/MipmapGenerationPlan.h"
 #include "MG_Util/Converters/GLToMG/TextureEnumConverter.h"
 // Only reached from an MGLOG_W, which the shipping INFO log level compiles out - so the
 // missing include never broke a default build and did break every WARN/DEBUG-level one.
@@ -38,11 +42,19 @@
 #include "MG_Util/Texture/PixelStoreProcessor.h"
 #include <Config.h>
 #if MOBILEGL_BUILD_DISAGGREGATED
+// P7 wave 0: the seam WireFramebuffer.inc's MagmaWireFatal and WireDraw.inc's
+// WireBufferLegacyFatal die through. Declared by MG_Pipe on purpose - see PipeSessionFail.h.
+#include <MG_Pipe/PipeSessionFail.h>
 // P5c (T5 / tx): the server's staged-texture shadow GenerateMipmap defines its chain on.
 #include <MG_Remote/Server/StagedTextureStore.h>
 #include <MG_Remote/Server/ServerLoop.h>
 // P5c (G6): the named-blit arm's endpoint resolution runs inside the frontend-keyed scope.
 #include <MG_Impl/Pipe/SlotAllocator.h>
+// P7 wave 2 package B3: rule I's tally for WireDraw.inc's silent draw drops.
+#include "WireDeclineTally.h"
+#include "WireColorBlitFilter.h"
+#include "WireDepthResolveArm.h"
+#include "WireDepthResolveProbe.h"
 #endif
 #include <algorithm>
 #include <bit>
@@ -1446,6 +1458,17 @@ namespace MobileGL::MG_Backend::DirectVulkan {
 
     namespace {
         static constexpr Uint32 kDescriptorSetsPerFrame = 64;
+#if !MOBILEGL_BUILD_DISAGGREGATED
+        // P7 wave 2-B2, CONTRACT-P7 §5.2 (B'): THE HIDDEN GL PROGRAMS ONLY EXIST IN THE PULL
+        // BUILD NOW. In a disaggregated build the monolith arm drives WireColorBlit.inc and
+        // WireDepthMipmap.inc - the baked modules the wire arm already uses - so nothing below
+        // this line is compiled: no GLSL text, no hidden object ids, no ShaderObject,
+        // ProgramObject or SamplerObject construction on a DirectVulkan path. That is what
+        // takes those three classes out of the link-closure ratchet's `p7-magma` bucket (§4.2),
+        // and the reason it is an `#if` and not a runtime branch is exactly that: a runtime
+        // early return leaves the symbols referenced.
+        //
+        // The pull build keeps every statement below byte for byte, which is what G1 pins.
         static constexpr Uint kHiddenBlitProgramId = 0xFFFFFFF0u;
         static constexpr Uint kHiddenBlitVertexShaderId = 0xFFFFFFF1u;
         static constexpr Uint kHiddenBlitFragmentShaderId = 0xFFFFFFF2u;
@@ -1524,6 +1547,7 @@ void main() {
     gl_FragDepth = 0.25 * (depth0 + depth1 + depth2 + depth3);
 }
 )";
+#endif // !MOBILEGL_BUILD_DISAGGREGATED
 
 
         static Uint32 ComputeFullMipLevelCount(const IntVec3& baseTexelSize) {
@@ -1573,22 +1597,20 @@ void main() {
             return size;
         }
 
-        static Uint32 ComputeFullMipLevelCountWithFixedComponents(const IntVec3& baseTexelSize,
-                                                                  Int shrinkingComponents) {
-            Int maxDimension = 1;
-            for (Int component = 0; component < shrinkingComponents && component < 3; ++component) {
-                maxDimension = std::max<Int>(maxDimension, baseTexelSize[component]);
-            }
-            Uint32 mipLevelCount = 1;
-            while (maxDimension > 1) {
-                maxDimension = std::max<Int>(maxDimension / 2, 1);
-                ++mipLevelCount;
-            }
-            return mipLevelCount;
-        }
-
+        // glGenerateMipmap defines levels BASE_LEVEL+1 up to the level the base image's extent and
+        // MAX_LEVEL admit, and leaves every other level exactly as it was (GL 4.6 core 8.17). That
+        // window is a property of the GL call rather than of the backend, so the caller hands in
+        // the frontend's own plan (MG_Impl/GLImpl/Texture/MipmapGenerationPlan.h) and this defines
+        // exactly those levels - neither a chain derived here nor a truncation of the tail.
+        //
+        // IMMUTABLE storage - glTexStorage*'s chain, and ANY view, which GL 4.6 core 8.18 makes
+        // immutable from birth - already owns every level generation can write, so none may be
+        // redefined here. Allocating through a view is destructive in a way the view's own extents
+        // cannot describe: its base extent is ONE slice of the storage's layers, so AllocateStorage
+        // through a two-layer view of a four-layer array resizes the storage owner's level to two
+        // layers and the storage behind its other two is gone.
         static Bool EnsureGenerateMipmapStorageAllocated(::MobileGL::MG_State::GLState::TextureObjectMipmap& texture,
-                                                         Uint32 baseMipLevel) {
+                                                         Uint32 baseMipLevel, Uint32 endMipLevel) {
             const Uint32 existingMipLevelCount = static_cast<Uint32>(texture.GetMipmapLevelCount());
             if (existingMipLevelCount <= baseMipLevel) {
                 return false;
@@ -1597,6 +1619,10 @@ void main() {
             const auto& uploadTargets = texture.GetUploadTargets();
             if (uploadTargets.empty()) {
                 return false;
+            }
+
+            if (texture.IsImmutable()) {
+                return true;
             }
 
             const Int shrinkingComponents = MipShrinkingComponentCount(texture.GetTarget());
@@ -1617,13 +1643,12 @@ void main() {
                 }
 
                 const SizeT bytesPerTexel = baseByteSize / baseTexelCount;
-                const Uint32 requiredMipLevelCount =
-                    baseMipLevel + ComputeFullMipLevelCountWithFixedComponents(baseTexelSize, shrinkingComponents);
-                if (existingMipLevelCount >= requiredMipLevelCount) {
-                    continue;
-                }
-
-                for (Uint32 level = existingMipLevelCount; level < requiredMipLevelCount; ++level) {
+                // AllocateStorage RESIZES the level it is handed, so only levels the chain does not
+                // have yet are allocated: the ones inside the window that already exist - the
+                // levels a mutable chain defined by hand, or a previous generate built - keep the
+                // shadow bytes their own upload path wrote.
+                const Uint32 firstMissingMipLevel = std::max(baseMipLevel + 1, existingMipLevelCount);
+                for (Uint32 level = firstMissingMipLevel; level < endMipLevel; ++level) {
                     const IntVec3 levelTexelSize = ComputeMipTexelSizeWithFixedComponents(
                         baseTexelSize, level - baseMipLevel, shrinkingComponents);
                     const SizeT levelByteSize = bytesPerTexel * static_cast<SizeT>(levelTexelSize.x()) *
@@ -1670,10 +1695,16 @@ void main() {
             const Uint64 key = MG_Remote::Server::StagedTextureStore::KeyForTwinAddress(&resource);
             for (const auto uploadTarget : uploadTargets) {
                 for (Uint32 level = baseMipLevel + 1; level < requiredMipLevelCount; ++level) {
-                    // A level the shadow already tracks (an adopted base chain) keeps its bytes;
-                    // the generation made the GPU newer than either, which the mark says.
+                    // Bytes the shadow held for a generated level go: the declaration below moves its
+                    // format and byte bound (NoteLevelDefined clears them); the GPU copy is newer.
+                    // PH-4: a twin-address key never receives a staged run (no Adopt names one),
+                    // so these generated levels are declared BYTELESS - an Unknown format gives a
+                    // zero byte bound and skips the Tex2D device-limit rule the defaults would
+                    // apply to a 2D-array or 3D level's depth.
                     store.NoteLevelDefined(key, static_cast<Uint16>(uploadTarget), static_cast<Uint16>(level),
-                                           ComputeMipTexelSize(storageBaseTexelSize, level));
+                                           ComputeMipTexelSize(storageBaseTexelSize, level),
+                                           static_cast<Uint8>(MG_Pipe::MGPipeResourceTarget::Tex2D),
+                                           static_cast<Uint32>(TextureInternalFormat::Unknown));
                     store.MarkLevelGpuDirty(key, static_cast<Uint16>(uploadTarget), static_cast<Uint16>(level),
                                             true);
                 }
@@ -3154,9 +3185,18 @@ void main() {
 
     inline ProgramFactory::CompileOptionFlags GetShaderTransformFlags(VkSurfaceTransformFlagBitsKHR preTransform) {
         ProgramFactory::CompileOptionFlags flags = ProgramFactory::CompileOptionBit::PositionZRemap;
-        const auto& currentDrawFBO =
+#if MOBILEGL_BUILD_DISAGGREGATED
+        const Bool wire = MG_Config::Transport != MG_Config::TransportMode::Monolith;
+        const auto* wireFbo = wire ? MG_Pipe::MGPipeApplier().DrawFramebuffer() : nullptr;
+        const auto currentDrawFBO = wire ? SharedPtr<MG_State::GLState::FramebufferObject>{} :
             MGB_CTX->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject();
-        if (currentDrawFBO != nullptr && currentDrawFBO->IsDefaultFramebuffer()) {
+        const Bool isDefault = wire ? (wireFbo && wireFbo->IsDefault) :
+            (currentDrawFBO && currentDrawFBO->IsDefaultFramebuffer());
+#else
+        const auto& currentDrawFBO = MGB_CTX->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject();
+        const Bool isDefault = currentDrawFBO != nullptr && currentDrawFBO->IsDefaultFramebuffer();
+#endif
+        if (isDefault) {
             flags |= ProgramFactory::CompileOptionBit::PositionYFlip;
             // gl_FragCoord follows the same rule the default-framebuffer RECTANGLES follow
             // (GetDefaultFramebufferRectMapping): flipped for identity/180, left alone under a
@@ -3370,6 +3410,9 @@ void main() {
             m_physicalDevice.properties.limits.minUniformBufferOffsetAlignment, m_config.MaxFramesInFlight,
             maxProgramBindings, kDescriptorSetsPerFrame, m_textureManager.get(), m_samplerManager.get());
         MOBILEGL_ASSERT(succeeded, "UniformDescriptorBinder initialization failed.");
+#if MOBILEGL_BUILD_DISAGGREGATED
+        m_uniformManager->SetWireInvalidStorageImageArm(m_wireNullDescriptor);
+#endif
 #if MOBILEGL_PIPE_PUSH
         m_vertexInputStateFactory =
             MakeUnique<VertexInputStateFactory>(m_config, m_physicalDevice.handle, m_pipeIdentity);
@@ -3402,6 +3445,10 @@ void main() {
                 acquireResult = VK_SUCCESS;
             }
             VK_VERIFY(acquireResult, "Initialize, WaitAndAcquireNextImage");
+            // The first acquired image is the one the opening frame renders into, so the
+            // default framebuffer addresses it from the start (see
+            // m_defaultFramebufferImageIndex).
+            m_defaultFramebufferImageIndex = m_imageIndexAcquired;
         } else {
             MGLOG_W("DirectVulkan: no swapchain at initialization (zero-area window); deferring first acquire");
         }
@@ -3420,6 +3467,17 @@ void main() {
         if (m_device != VK_NULL_HANDLE) {
             VK_VERIFY(vkDeviceWaitIdle(m_device));
         }
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // P7 wave 2 package B3: the session's decline tally. Silent when nothing declined, so a
+        // green lane stays quiet and a lane that dropped a draw cannot (rule I's observable).
+        WireDeclineTally::Dump("shutdown");
+        DestroyWireDrawPass();
+        CollectWireObjects(m_submitCounter, true);
+        ClearAllWireDrawPassCaches();
+        DestroyWireColorBlitResources();
+        DestroyWireDepthMipmapResources();
+        DestroyWireMultisampleResolveResources();
+#endif
         OnSubmitsCompletedUpTo(m_submitCounter);
         DestroySubmitFencePool();
 
@@ -4005,7 +4063,29 @@ void main() {
                 // real fetch range. For indexed draws that means scanning the index bytes:
                 // the guessed vertexCount (indexCount + baseVertex) can both truncate draws
                 // whose max index exceeds their index count and over-read below it.
-                const SizeT clientElementBound = resolveDrawElementBound();
+                // AN INSTANCE-RATE BINDING IS BOUNDED BY ITS INSTANCES, not by the vertex range:
+                // it fetches one element per instance, shifted by the draw's baseInstance, so
+                // its last element is baseInstance + (instanceCount - 1) / divisor. The two
+                // bounds are independent and either can exceed the other (an indexed draw
+                // naming element 2^16, or baseInstance 1000 over a three-element array), so
+                // the upload covers their union.
+                SizeT clientElementBound = resolveDrawElementBound();
+                if (vertexInputState.bindings[binding].inputRate == VK_VERTEX_INPUT_RATE_INSTANCE &&
+                    drawParams.instanceCount > 0) {
+                    Uint32 divisor = 1;
+                    for (const auto& divisorEntry : vertexInputState.bindingDivisors) {
+                        if (divisorEntry.binding == vertexInputState.bindings[binding].binding) {
+                            divisor = divisorEntry.divisor;
+                            break;
+                        }
+                    }
+                    if (divisor > 0) {
+                        const Uint64 first = drawParams.firstInstance;
+                        const Uint64 last = first + (drawParams.instanceCount - 1) / divisor;
+                        clientElementBound =
+                            std::max<SizeT>(clientElementBound, static_cast<SizeT>(last + 1));
+                    }
+                }
                 BufferSlice slice{};
                 Bool uploaded = false;
                 if (conversion == VertexInputStateFactory::VertexStreamConversion::None) {
@@ -4470,6 +4550,19 @@ void main() {
     }
 
     Bool VulkanRenderer::InitializeBlitResources() {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // P5f fv gave this an early return for every non-monolith transport, because the hidden
+        // programs are frontend objects and creating them on the server would retain a client
+        // compiler/allocator dependency. P7 wave 2-B2 (CONTRACT-P7 §5.2, (B')) takes the last
+        // step: in a disaggregated build there is NOTHING TO INITIALIZE on any transport,
+        // because the monolith arm now blits with WireColorBlit.inc's baked module too.
+        //
+        // AN `#if` AND NOT A RUNTIME BRANCH, which is the whole point (§4.2): the early return
+        // left every ShaderObject / ProgramObject / SamplerObject symbol REFERENCED by this
+        // object file, so the link-closure ratchet counted them whether or not the branch ever
+        // ran. Compiling the construction out is what makes them fall.
+        return true;
+#else
         ShutdownBlitResources();
 
         auto vertexShader = MakeShared<MG_State::GLState::ShaderObject>(ShaderStage::Vertex, kHiddenBlitVertexShaderId);
@@ -4539,29 +4632,43 @@ void main() {
         m_blitResources.nearestSampler = createSampler(kHiddenBlitNearestSamplerId, SamplerFilterMode::Nearest);
         m_blitResources.linearSampler = createSampler(kHiddenBlitLinearSamplerId, SamplerFilterMode::Linear);
         return true;
+#endif
     }
 
     void VulkanRenderer::ShutdownBlitResources() {
-#if MOBILEGL_BUILD_DISAGGREGATED
-        // P5c (G6, CONTRACT-P5C §3.1's named exemption): the hidden blit program and samplers
-        // are FRONTEND objects the server backend created on the apply thread, and under an
-        // active transport they die here on that same thread. Their destructors run the client
-        // death helper, whose lifetime-id probe is the frontend-keyed registry family - it
-        // resolves to nothing (no handle was ever minted for these objects) and routes no
-        // delete, so the scope admits the probe as named debt rather than letting the guard
-        // Fatal at server teardown. P7 gives these resources storage that is not a frontend
-        // object.
+        // P7 wave 2-B2: TWO OF P5e RULING 12'S FOUR APPLY-THREAD ALLOCATOR DEBTS ARE GONE, and
+        // the scope that named them with them. The debt was real when it was written: the hidden
+        // blit program and its samplers are FRONTEND objects, and under an active transport the
+        // server backend created them on the apply thread and destroyed them here on it, where
+        // their destructors run the client death helper and its lifetime-id probe.
         //
-        // P5e (id), ruling 12: one of Magma's FOUR apply-thread allocator debts, and the scope
-        // is now named after that debt rather than after the frontend-keyed registry - Espryt's
-        // half of which P5e is retiring, while this one waits for P7. The exemption is keyed on
-        // a DirectVulkan server, which is what this file always is.
-        const MG_Pipe::MagmaP7AllocatorDebtScope magmaP7AllocatorDebt;
-#endif
+        // What retires it is not a new exemption but the absence of the objects. P5f fv gave
+        // InitializeBlitResources an early return for every non-monolith transport, so off the
+        // monolith arm `m_blitResources` never holds anything and this assignment destroys
+        // nothing - MEASURED, not argued: a temporary probe here and in
+        // ShutdownDepthMipmapResources failed the session if either resource was non-null under
+        // a non-monolith transport, and integration-magma-{split,spawn,tcp} (93/72/74),
+        // integration-magma-full-{split,spawn} (524/524), integration-split (187) and
+        // integration-magma-buffers (21) all stayed green with it armed. Dropping its transport
+        // test killed EVERY monolith `DirectVulkan.` entry at teardown and left the split
+        // entries green, which is what makes the first run evidence rather than an absence.
+        //
+        // The TYPE stays: MG_Test/Wire/RemoteClientTest's RemoteGuards
+        // .BarrieredLegacyScopesCannotExemptAllocator and
+        // .BarrieredFrontendRegistryMembersRefuseBothLegacyScopes use it as a NEGATIVE CONTROL -
+        // they construct it on the apply thread and assert the allocator still refuses, which is
+        // the thing P5f (fr) changed and the only remaining reason for it to exist.
         m_blitResources = {};
     }
 
     Bool VulkanRenderer::InitializeDepthMipmapResources() {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // P7 wave 2-B2 (CONTRACT-P7 §5.2, (B')): the depth-mip half of the same step. In a
+        // disaggregated build the monolith arm generates its depth chain with
+        // WireDepthMipmap.inc's baked pass, so there is no hidden GL program to build on any
+        // transport. See InitializeBlitResources above for why this is an `#if`.
+        return true;
+#else
         ShutdownDepthMipmapResources();
 
         auto vertexShader = MakeShared<MG_State::GLState::ShaderObject>(ShaderStage::Vertex,
@@ -4629,16 +4736,13 @@ void main() {
         MOBILEGL_ASSERT(foundSamplerBinding,
                         "InitializeDepthMipmapResources: failed to resolve reflected binding for uSource");
         return true;
+#endif
     }
 
     void VulkanRenderer::ShutdownDepthMipmapResources() {
-#if MOBILEGL_BUILD_DISAGGREGATED
-        // Same shape as ShutdownBlitResources above: the hidden depth-mipmap program is a
-        // frontend object created and destroyed by the server backend on the apply thread, and
-        // its destructor's lifetime-id probe is admitted here as named debt - Magma's, P7's to
-        // retire, which is what the scope's P5e name says (ruling 12).
-        const MG_Pipe::MagmaP7AllocatorDebtScope magmaP7AllocatorDebt;
-#endif
+        // P7 wave 2-B2: the second of the pair, retired for ShutdownBlitResources's reason and
+        // proved by the same probe. InitializeDepthMipmapResources carries the same non-monolith
+        // early return, so off the monolith arm this assignment destroys nothing.
         m_depthMipmapResources = {};
     }
 
@@ -4685,6 +4789,11 @@ void main() {
         m_deferredDepthMipmapCleanup.clear();
     }
 
+#if !MOBILEGL_BUILD_DISAGGREGATED
+    // P7 wave 2-B2 (CONTRACT-P7 §5.2, (B')): the pull build's blit pipeline, built out of the
+    // hidden GL program through the program/pipeline factories. A disaggregated build has no
+    // such program on either arm - WireColorBlit.inc owns its pipeline - so this is compiled
+    // out with its only caller's body.
     VkPipeline VulkanRenderer::GetOrCreateBlitPipeline(const RenderPassEntry& renderPassEntry) {
         MOBILEGL_ASSERT(m_blitResources.program != nullptr, "GetOrCreateBlitPipeline: blit program is null");
         MOBILEGL_ASSERT(m_programFactory != nullptr, "GetOrCreateBlitPipeline: program factory is null");
@@ -4739,6 +4848,7 @@ void main() {
         }
         return m_pipelineFactory->GetOrCreatePipeline(payload);
     }
+#endif // !MOBILEGL_BUILD_DISAGGREGATED
 
     Bool VulkanRenderer::GenerateDepthMipmapWithShader(FrameContext::FrameData& frame,
                                                        MG_State::GLState::ITextureObject& texture,
@@ -4748,6 +4858,52 @@ void main() {
                                                        const IntVec3& storageBaseTexelSize,
                                                        VkImageLayout originalLayout,
                                                        VkImageLayout finalLayout) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // P7 wave 2-B2 (CONTRACT-P7 §5.2, (B')): THE MONOLITH ARM ON THE BAKED PASS. Every
+        // level below is WireDepthMipmap.inc's GenerateWireDepthMipLevel - the same 2x2
+        // texelFetch box, the same clamp, the same average, the same half-texel offset, since
+        // that shader is a PORT of the one this function used to compile at startup. What goes
+        // away with the GL program is the four frontend objects and the compiler call; what the
+        // texture ends up holding is the same chain.
+        //
+        // `texture`, `storageBaseTexelSize` and `originalLayout` are the pull build's; the pass
+        // reads its shape from `resource`, whose tracked layout IS `originalLayout` at entry.
+        (void)frame;
+        (void)texture;
+        (void)storageBaseTexelSize;
+        (void)originalLayout;
+        if (generateMipLevelCount <= 1) return true;
+        if (resource.aspect != VK_IMAGE_ASPECT_DEPTH_BIT) return false;
+        for (Uint32 level = baseMipLevel + 1; level < baseMipLevel + generateMipLevelCount; ++level) {
+            WireImage source{};
+            source.image = resource.image;
+            source.format = resource.format;
+            source.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+            source.layout = resource.layout;
+            source.trackedLayout = &resource.layout;
+            source.levels = resource.mipLevels;
+            source.level = level - 1;
+            source.extent = {std::max(resource.extent.width >> (level - 1), 1u),
+                             std::max(resource.extent.height >> (level - 1), 1u)};
+            WireImage destination = source;
+            destination.level = level;
+            destination.extent = {std::max(resource.extent.width >> level, 1u),
+                                  std::max(resource.extent.height >> level, 1u)};
+            if (!GenerateWireDepthMipLevel(source, destination)) return false;
+        }
+        // The caller's contract is that the image is left in `finalLayout`; the per-level pass
+        // leaves it in the GENERAL it uses for a same-image source and destination.
+        WireImage whole{};
+        whole.image = resource.image;
+        whole.format = resource.format;
+        whole.aspect = resource.aspect;
+        whole.layout = resource.layout;
+        whole.trackedLayout = &resource.layout;
+        whole.levels = resource.mipLevels;
+        whole.extent = resource.extent;
+        TransitionWireImage(whole, finalLayout);
+        return true;
+#else
         MOBILEGL_ASSERT(m_depthMipmapResources.program != nullptr,
                         "GenerateDepthMipmapWithShader: depth mipmap program is null");
         MOBILEGL_ASSERT(m_blitResources.nearestSampler != nullptr,
@@ -5049,6 +5205,7 @@ void main() {
             MOBILEGL_ASSERT(finishedReady, "%s: failed to transition mip level %u to sampled layout", __func__, level);
         }
         return true;
+#endif
     }
 
     // Boost-style hash combine. The inputs are tiny enum ordinals and bit masks, so
@@ -5210,7 +5367,7 @@ void main() {
 
     // A program that runs a geometry shader AND captures transform feedback. Both halves are
     // link-time properties, so this is safe to fold into a pipeline keyed on the program hash.
-    static Bool ProgramCapturesXfbFromGeometryStage(const MG_State::GLState::ProgramObject& program) {
+    static Bool ProgramCapturesXfbFromGeometryStage(const MagmaProgramSource& program) {
         if (program.GetTransformFeedbackVaryingCount() == 0) return false;
         // Both halves are link-time properties, so both are asked of the LAST LINK. Reading the
         // live attach list would let a glAttachShader that has not been linked in yet - which GL
@@ -5247,14 +5404,40 @@ void main() {
         return rsp.PrimitiveRestartIndex <= MG_Util::FixedRestartIndexForGLType(pIndexBufferView->indexType);
     }
 
+#if MOBILEGL_BUILD_DISAGGREGATED
+    // MOBILEGL_TEST_PIPELINE_CREATE_DELAY_MS - milliseconds to spend in a pipeline-creation MISS
+    // on the wire arm. See the call site below for why it exists: the device's divergence needs a
+    // COLD driver pipeline cache, and this host's is always warm, so the only way to reproduce
+    // what a cold cache costs is to buy the time. Read once; inert unless set; compiled only into
+    // the disaggregated build, so the monolith image G1 pins never carries it.
+    static Uint32 MagmaTestPipelineCreateDelayMs() {
+        static const Uint32 milliseconds = [] {
+            const char* value = std::getenv("MOBILEGL_TEST_PIPELINE_CREATE_DELAY_MS");
+            if (!value || !*value) return 0u;
+            return static_cast<Uint32>(std::strtoul(value, nullptr, 10));
+        }();
+        return milliseconds;
+    }
+#endif
+
     VkPipeline VulkanRenderer::GetOrCreatePipeline(
             GLenum mode,
-            const MG_State::GLState::ProgramObject& program,
+            const MagmaProgramSource& program,
             const ProgramFactory::VkProgramObject& programObj,
             ProgramFactory::CompileOptionFlags transformFlags,
             const MG_State::GLState::VertexArrayObject& vao,
             const RenderPassEntry& renderPassEntry,
             Bool primitiveRestartEnable) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        return GetOrCreatePipelineWithInput(mode, program, programObj, transformFlags,
+            m_vertexInputStateFactory->GetOrCreateVertexInputState(vao), renderPassEntry, primitiveRestartEnable);
+    }
+
+    VkPipeline VulkanRenderer::GetOrCreatePipelineWithInput(GLenum mode, const MagmaProgramSource& program,
+            const ProgramFactory::VkProgramObject& programObj, ProgramFactory::CompileOptionFlags transformFlags,
+            const VertexInputStateFactory::BackendVertexInputState& vis, const RenderPassEntry& renderPassEntry,
+            Bool primitiveRestartEnable, Uint64 wireRenderPassCompatibilityId) {
+#endif
         Bool invertClockwise = transformFlags & ProgramFactory::CompileOptionBit::PositionYFlip;
         if (programObj.stages.empty()) {
             MGLOG_D("GetOrCreatePipeline skipped: program has no shader stages");
@@ -5272,9 +5455,15 @@ void main() {
         // payload key on the resolved LAYOUT hash instead, so draws over identical
         // layouts share one pipeline.
         // The one-arg fetch rides the VAO's state-pointer memo (no hash, no map).
+#if !MOBILEGL_BUILD_DISAGGREGATED
         auto& vis = m_vertexInputStateFactory->GetOrCreateVertexInputState(vao);
+#endif
         const Uint64 vertexLayoutHash = vis.layoutHash;
-        const Uint64 renderPassHash = renderPassEntry.hash;
+        const Uint64 renderPassHash =
+#if MOBILEGL_BUILD_DISAGGREGATED
+            wireRenderPassCompatibilityId != 0 ? 0 :
+#endif
+            renderPassEntry.hash;
         // The pipeline-relevant subset only: glViewport / glScissor / glBlendColor / glStencilMask
         // and friends are dynamic state or not pipeline state at all, and keying the memo on the
         // all-state counter made any of them evict a perfectly good VkPipeline. The memo compares
@@ -5318,6 +5507,9 @@ void main() {
             if (entry.pipeline != VK_NULL_HANDLE && entry.mode == mode &&
                 entry.programHash == programObj.hash && entry.vertexInputHash == vertexLayoutHash &&
                 entry.renderPassHash == renderPassHash &&
+#if MOBILEGL_BUILD_DISAGGREGATED
+                entry.wireRenderPassCompatibilityId == wireRenderPassCompatibilityId &&
+#endif
                 entry.pipelineStateHash == pipelineStateHash &&
 #if MOBILEGL_PIPE_PUSH
                 entry.renderStateCso == renderStateCso &&
@@ -5506,6 +5698,16 @@ void main() {
         // (stencil) test always passes and nothing is written - even when the bound
         // image is a packed depth-stencil texture attached through only one half.
         {
+#if MOBILEGL_BUILD_DISAGGREGATED
+            if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+                const auto* fbo = MG_Pipe::MGPipeApplier().DrawFramebuffer();
+                if (fbo && !fbo->IsDefault) {
+                    if (fbo->Depth.Kind == MG_Pipe::kMGPipeSurfaceKindNone) depthTestEnabled = false;
+                    if (fbo->Stencil.Kind == MG_Pipe::kMGPipeSurfaceKindNone) stencilTestEnabled = false;
+                }
+            } else
+#endif
+            {
             const auto& gatingFbo =
                 MGB_CTX->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject();
             if (gatingFbo != nullptr && !gatingFbo->IsDefaultFramebuffer()) {
@@ -5518,6 +5720,7 @@ void main() {
                     stencilTestEnabled = false;
                 }
             }
+        }
         }
         const StencilFaceState& frontStencil = MGB_CTX->GetStencilState(StencilFace::Front);
         const StencilFaceState& backStencil = MGB_CTX->GetStencilState(StencilFace::Back);
@@ -5600,6 +5803,9 @@ void main() {
             .vertexInputHash = vertexLayoutHash,
             .pipelineLayout = programObj.pipelineLayout,
             .renderPass = renderPassEntry.renderPass,
+#if MOBILEGL_BUILD_DISAGGREGATED
+            .wireRenderPassCompatibilityId = wireRenderPassCompatibilityId,
+#endif
             .colorAttachmentCount = renderPassEntry.colorAttachmentCount,
             .rasterizationSamples = renderPassEntry.sampleCount,
             // ARB_sample_shading. Dropped on a device without sampleRateShading rather than
@@ -5726,12 +5932,35 @@ void main() {
         MOBILEGL_ASSERT(payload.colorAttachmentCount <= PipelineFactory::PipelineCreatePayload::kMaxColorAttachments,
                         "GetOrCreatePipeline: colorAttachmentCount=%u exceeds payload capacity",
                         payload.colorAttachmentCount);
+#if MOBILEGL_BUILD_DISAGGREGATED
+        const auto* wireFbo = MG_Config::Transport != MG_Config::TransportMode::Monolith ?
+            MG_Pipe::MGPipeApplier().DrawFramebuffer() : nullptr;
+        const auto drawFboBinding = wireFbo ? SharedPtr<MG_State::GLState::FramebufferObject>{} :
+            MGB_CTX->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject();
+#else
         const auto& drawFboBinding =
             MGB_CTX->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject();
+#endif
+#if MOBILEGL_BUILD_DISAGGREGATED
+        MOBILEGL_ASSERT(wireFbo != nullptr || drawFboBinding != nullptr, "GetOrCreatePipeline: draw framebuffer is null");
+#else
         MOBILEGL_ASSERT(drawFboBinding != nullptr, "GetOrCreatePipeline: draw framebuffer is null");
+#endif
+#if MOBILEGL_BUILD_DISAGGREGATED
+        const Bool isDefaultDrawFbo = wireFbo ? wireFbo->IsDefault : drawFboBinding->IsDefaultFramebuffer();
+        Array<FramebufferAttachmentType, MG_Pipe::kMGPipeMaxColorAttachments> wireDrawBuffers{};
+        if (wireFbo) for (SizeT i = 0; i < wireDrawBuffers.size(); ++i)
+            wireDrawBuffers[i] = wireFbo->DrawBuffers[i] < 0 ? FramebufferAttachmentType::None :
+                static_cast<FramebufferAttachmentType>(static_cast<Int>(FramebufferAttachmentType::Color0) + wireFbo->DrawBuffers[i]);
+        const auto& drawBuffers = wireFbo ? wireDrawBuffers : drawFboBinding->GetDrawBuffers();
+#else
         const Bool isDefaultDrawFbo = drawFboBinding->IsDefaultFramebuffer();
         const auto& drawBuffers = drawFboBinding->GetDrawBuffers();
+#endif
         auto resolveCompleteColorAttachmentTexture = [&](Uint32 drawBufferIndex) -> MG_State::GLState::ITextureObject* {
+#if MOBILEGL_BUILD_DISAGGREGATED
+            if (wireFbo) return nullptr;
+#endif
             if (isDefaultDrawFbo || drawBufferIndex >= drawBuffers.size()) {
                 return nullptr;
             }
@@ -5782,6 +6011,15 @@ void main() {
                 attachmentColorWriteMask = 0;
                 effectiveBlendEnabled = false;
             }
+#if MOBILEGL_BUILD_DISAGGREGATED
+            if (wireFbo && !isDefaultDrawFbo) {
+                const Int32 slot = wireFbo->DrawBuffers[i];
+                if (slot < 0 || wireFbo->Color[slot].Kind == MG_Pipe::kMGPipeSurfaceKindNone) {
+                    attachmentColorWriteMask = 0;
+                    effectiveBlendEnabled = false;
+                }
+            } else
+#endif
             if (!isDefaultDrawFbo && i < drawBuffers.size()) {
                 const auto drawBuffer = drawBuffers[i];
                 colorAttachmentTexture = resolveCompleteColorAttachmentTexture(i);
@@ -5877,6 +6115,12 @@ void main() {
 
                 VkFormat colorAttachmentFormat = VK_FORMAT_UNDEFINED;
                 Int textureExternalIndex = -1;
+#if MOBILEGL_BUILD_DISAGGREGATED
+                if (wireFbo && !isDefaultDrawFbo) {
+                    const Int32 slot = wireFbo->DrawBuffers[i];
+                    colorAttachmentFormat = ResolveWireImage(*wireFbo, wireFbo->Color[slot], VK_IMAGE_ASPECT_COLOR_BIT).format;
+                } else
+#endif
                 if (isDefaultDrawFbo) {
                     colorAttachmentFormat = m_swapchainObject.GetSurfaceFormat().format;
                 } else if (colorAttachmentRenderbuffer != nullptr) {
@@ -5982,6 +6226,22 @@ void main() {
                 MG_Util::ConvertBlendEquationToVkEnum(alphaEquation),
                 attachmentColorWriteMask);
         }
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // P7 wave 2-B: MOBILEGL_TEST_PIPELINE_CREATE_DELAY_MS.
+        //
+        // The Redmi's OpenRA divergence (exit gate 3) is timing-shaped and reproduces ONLY with a
+        // cold driver pipeline cache: three cleared-cache runs give a bit-identical 0.976494 /
+        // 14658 mismatched pixels, while a warm cache gives 1.000000 from the second run on. What
+        // a cold cache changes is how long vkCreateGraphicsPipelines takes on the apply thread,
+        // so this knob buys that time on a host whose cache is always warm. INERT unless set, and
+        // compiled only into the disaggregated build - the monolith image, which G1 pins, never
+        // sees these lines. The delay goes on the MISS path only: a memo or cache hit is not
+        // what is slow on the device either.
+        if (const Uint32 delayMs = MagmaTestPipelineCreateDelayMs();
+            delayMs != 0 && MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+        }
+#endif
         VkPipeline pipeline = m_pipelineFactory->GetOrCreatePipeline(payload);
         if (pipeline != VK_NULL_HANDLE) {
             PipelineMemoEntry& entry = m_pipelineMemo[m_pipelineMemoNext];
@@ -5989,6 +6249,9 @@ void main() {
             entry.programHash = programObj.hash;
             entry.vertexInputHash = vertexLayoutHash;
             entry.renderPassHash = renderPassHash;
+#if MOBILEGL_BUILD_DISAGGREGATED
+            entry.wireRenderPassCompatibilityId = wireRenderPassCompatibilityId;
+#endif
             entry.pipelineStateHash = pipelineStateHash;
 #if MOBILEGL_PIPE_PUSH
             entry.renderStateCso = renderStateCso;
@@ -6004,7 +6267,7 @@ void main() {
 
     Bool VulkanRenderer::PrepareStorageImageTextures(
         FrameContext::FrameData& frame,
-        const MG_State::GLState::ProgramObject& program,
+        const MagmaProgramSource& program,
         const ProgramFactory::VkProgramObject& programObj) {
         if (!programObj.hasStorageImages) {
             return true;
@@ -6100,7 +6363,7 @@ void main() {
     }
     Bool VulkanRenderer::PrepareSamplerImageFeedbackSnapshots(
         FrameContext::FrameData& frame,
-        const MG_State::GLState::ProgramObject& program,
+        const MagmaProgramSource& program,
         const ProgramFactory::VkProgramObject& programObj,
         VkPipelineStageFlags consumerShaderStageMask) {
         auto& feedbackBindings = m_samplerImageFeedbackScratch;
@@ -6356,6 +6619,12 @@ void main() {
         // the SAME draw-framebuffer binding the draw uses - see the assert below.
         MOBILEGL_ASSERT(
             [&] {
+#if MOBILEGL_BUILD_DISAGGREGATED
+                if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+                    const auto* fbo = MG_Pipe::MGPipeApplier().DrawFramebuffer();
+                    return isDefaultFbo == (fbo != nullptr && fbo->IsDefault);
+                }
+#endif
                 const auto& fbo =
                     MGB_CTX->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject();
                 return isDefaultFbo == (fbo != nullptr && fbo->IsDefaultFramebuffer());
@@ -6717,6 +6986,9 @@ void main() {
                 if (entry.pipeline != VK_NULL_HANDLE && entry.mode == mode &&
                     entry.programHash == programObj.hash && entry.vertexInputHash == vaoLayoutHash &&
                     entry.renderPassHash == snap.renderPassHash &&
+#if MOBILEGL_BUILD_DISAGGREGATED
+                    entry.wireRenderPassCompatibilityId == 0 &&
+#endif
                     entry.pipelineStateHash == pipelineStateHash &&
 #if MOBILEGL_PIPE_PUSH
                     entry.renderStateCso == renderStateCso &&
@@ -6801,6 +7073,16 @@ void main() {
     Bool VulkanRenderer::SetupDraw(FrameContext::FrameData& frame, GLenum mode, Flags<DrawSetupAspect> aspects,
                                    const DrawCmdParam& drawParams,
                                    const IndexBufferView* pIndexBufferView) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+            RewindWireDescriptorSetsIfDue();
+            // The wire route returns before the monolith branch's draw-gated
+            // sweep. Dead wire texture/renderbuffer records otherwise live
+            // until the next frame boundary, which a long trace may not reach.
+            m_textureManager->CollectGarbage();
+            return SetupWireDraw(frame, mode, aspects, drawParams, pIndexBufferView);
+        }
+#endif
         // Sync each sampled texture at most once across this whole draw: the layout
         // probe loop, the post-transition loop, and ResolveSamplerDescriptor would
         // otherwise each re-run the full SyncTexture path on the same textures.
@@ -7210,8 +7492,8 @@ void main() {
         const Bool drawUsesDepthStencil =
             MGB_CTX->IsCapabilityEnabled(CapabilityInput::DepthTest) ||
             MGB_CTX->IsCapabilityEnabled(CapabilityInput::StencilTest);
-        auto* renderPassEntry =
-            m_renderPassManager->GetOrCreateRenderPass(*drawFbo, m_imageIndexAcquired, drawUsesDepthStencil);
+        auto* renderPassEntry = m_renderPassManager->GetOrCreateRenderPass(
+            *drawFbo, DefaultFramebufferWriteIndex(drawFbo->IsDefaultFramebuffer()), drawUsesDepthStencil);
         // nullptr: the framebuffer has an attachment DirectVulkan cannot represent (a texture the
         // texture manager declined to back, or a view it could not build). The builder logged which
         // one; drop the draw here, exactly as an unresolvable sampler descriptor drops one in
@@ -7223,8 +7505,8 @@ void main() {
         if (activeRenderPass && !activeRenderPass->CompatibleWith(*renderPassEntry)) {
             VkRenderPassManager::EndRenderPass(frame.commandBuffer);
             activeRenderPass = nullptr;
-            renderPassEntry =
-                m_renderPassManager->GetOrCreateRenderPass(*drawFbo, m_imageIndexAcquired, drawUsesDepthStencil);
+            renderPassEntry = m_renderPassManager->GetOrCreateRenderPass(
+                *drawFbo, DefaultFramebufferWriteIndex(drawFbo->IsDefaultFramebuffer()), drawUsesDepthStencil);
             if (renderPassEntry == nullptr) {
                 return false;
             }
@@ -7417,6 +7699,14 @@ void main() {
     }
 
     void VulkanRenderer::DispatchCompute(GLuint numGroupsX, GLuint numGroupsY, GLuint numGroupsZ) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+            RewindWireDescriptorSetsIfDue();
+            m_textureManager->CollectGarbage();
+            DispatchWireCompute(numGroupsX, numGroupsY, numGroupsZ);
+            return;
+        }
+#endif
         m_textureManager->CollectGarbage();
         auto& frame = m_frameContext.GetCurrent();
         // The DISPATCH accessor: with a pipeline bound this is its compute stage program
@@ -7568,7 +7858,16 @@ void main() {
         VkMemoryBarrier memoryBarrier = BuildMemoryBarrierForGlBarriers(barriers);
 
         MGLOG_D("DirectVulkan: glMemoryBarrier(0x%x)", static_cast<Uint32>(barriers));
-        vkCmdPipelineBarrier(frame.commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        vkCmdPipelineBarrier(frame.commandBuffer,
+#if MOBILEGL_BUILD_DISAGGREGATED
+                             // ALL_COMMANDS does not include HOST. The barrier's
+                             // HOST_WRITE access must have a matching source stage.
+                             MG_Config::Transport != MG_Config::TransportMode::Monolith
+                                 ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT
+                                 : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+#else
+                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+#endif
                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
                              1, &memoryBarrier, 0, nullptr, 0, nullptr);
     }
@@ -7581,7 +7880,8 @@ void main() {
         }
 
         auto* activeRenderPass = VkRenderPassManager::GetActiveRenderPass();
-        auto* renderPassEntry = m_renderPassManager->GetOrCreateRenderPass(framebuffer, m_imageIndexAcquired);
+        auto* renderPassEntry = m_renderPassManager->GetOrCreateRenderPass(
+            framebuffer, DefaultFramebufferWriteIndex(framebuffer.IsDefaultFramebuffer()));
         // A declined render pass is the same answer as an empty one for a clear: there is nothing
         // attached that can be cleared inside a pass. The builder has already logged the reason.
         if (renderPassEntry == nullptr || renderPassEntry->attachmentCount == 0 ||
@@ -7614,7 +7914,8 @@ void main() {
             activeRenderPass = nullptr;
             // Re-resolve: ending the pass updates tracked attachment layouts, which feed the
             // entry's load ops and initial layouts.
-            renderPassEntry = m_renderPassManager->GetOrCreateRenderPass(framebuffer, m_imageIndexAcquired);
+            renderPassEntry = m_renderPassManager->GetOrCreateRenderPass(
+                framebuffer, DefaultFramebufferWriteIndex(framebuffer.IsDefaultFramebuffer()));
             if (renderPassEntry == nullptr) {
                 return ScissoredClearPrep::NoOp;
             }
@@ -7636,7 +7937,105 @@ void main() {
         return ScissoredClearPrep::Ready;
     }
 
+    // A tightly packed depth/stencil readback, one aspect or both, in the client's own width.
+    // The two arms that read depth or stencil off a Vulkan image - the monolith
+    // ReadDepthStencilImageToClient and the wire ReadTextureImageWire - copy their aspect into a
+    // host-visible buffer and both owe the application the same bytes, so they share this one
+    // encoding rather than each carrying a copy of it. A copy is exactly the kind of pair where
+    // a fix landed on one side only: the signed ranges and GL_HALF_FLOAT were added to the wire
+    // caller and the monolith caller kept scaling a GL_SHORT depth into 65535, which put a 0.5
+    // depth at 0x8000 - a negative index.
+    static Bool PackDepthStencilTight(const Uint8* depth, const Uint8* stencil, VkFormat sourceFormat, SizeT count,
+                                      GLenum format, GLenum type, Vector<Uint8>& result) {
+        const Bool stencilOnly = format == GL_STENCIL_INDEX;
+        const auto readDepth = [&](SizeT i) -> Float {
+            if (sourceFormat == VK_FORMAT_D16_UNORM) {
+                Uint16 word{}; Memcpy(&word, depth + i * 2, sizeof(word));
+                return static_cast<Float>(word) / 65535.0f;
+            }
+            if (sourceFormat == VK_FORMAT_X8_D24_UNORM_PACK32 || sourceFormat == VK_FORMAT_D24_UNORM_S8_UINT) {
+                Uint32 word{}; Memcpy(&word, depth + i * 4, sizeof(word));
+                return static_cast<Float>(word & 0xffffffu) / 16777215.0f;
+            }
+            Float value{}; Memcpy(&value, depth + i * sizeof(value), sizeof(value));
+            return value;
+        };
+        SizeT size = 0;
+        switch (type) {
+        case GL_BYTE: case GL_UNSIGNED_BYTE: size = 1; break;
+        case GL_SHORT: case GL_UNSIGNED_SHORT: case GL_HALF_FLOAT: size = 2; break;
+        case GL_INT: case GL_UNSIGNED_INT: case GL_FLOAT: size = 4; break;
+        case GL_UNSIGNED_INT_24_8: size = 4; break;
+        case GL_FLOAT_32_UNSIGNED_INT_24_8_REV: size = 8; break;
+        default: return false;
+        }
+        const Bool packed = type == GL_UNSIGNED_INT_24_8 || type == GL_FLOAT_32_UNSIGNED_INT_24_8_REV;
+        if ((format == GL_DEPTH_STENCIL) != packed) return false;
+        result.resize(count * size);
+        for (SizeT i = 0; i < count; ++i) {
+            Uint8* dst = result.data() + i * size;
+            const Uint32 s = stencil ? stencil[i] : 0;
+            const Float d = stencilOnly ? 0.0f : readDepth(i);
+            switch (type) {
+            case GL_FLOAT: {
+                const Float value = stencilOnly ? static_cast<Float>(s) : d;
+                Memcpy(dst, &value, sizeof(value)); break;
+            }
+            case GL_HALF_FLOAT: {
+                const Uint16 value = MG_Util::EncodeFloatToHalfBits(stencilOnly ? static_cast<Float>(s) : d);
+                Memcpy(dst, &value, sizeof(value)); break;
+            }
+            case GL_UNSIGNED_INT_24_8: {
+                Uint32 depth24 = 0;
+                if (sourceFormat == VK_FORMAT_D24_UNORM_S8_UINT) {
+                    Memcpy(&depth24, depth + i * 4, sizeof(depth24));
+                    depth24 &= 0xffffffu;
+                } else {
+                    depth24 = static_cast<Uint32>(std::llround(std::clamp<double>(d, 0.0, 1.0) * 16777215.0));
+                }
+                const Uint32 value = (depth24 << 8) | s;
+                Memcpy(dst, &value, sizeof(value)); break;
+            }
+            case GL_FLOAT_32_UNSIGNED_INT_24_8_REV:
+                Memcpy(dst, &d, sizeof(d)); Memcpy(dst + 4, &s, sizeof(s)); break;
+            default: {
+                const Bool signedType = type == GL_BYTE || type == GL_SHORT || type == GL_INT;
+                const Uint64 maximum = signedType ? ((Uint64{1} << (size * 8 - 1)) - 1)
+                                                 : ((Uint64{1} << (size * 8)) - 1);
+                const Uint32 value = stencilOnly ? s : static_cast<Uint32>(
+                    std::llround(std::clamp<double>(d, 0.0, 1.0) * static_cast<double>(maximum)));
+                Memcpy(dst, &value, size); break;
+            }
+            }
+        }
+        return true;
+    }
+
+    #include "WireFramebuffer.inc"
+    #include "WireTextureReadback.inc"
+    #include "WireColorBlit.inc"
+    // AFTER WireColorBlit.inc: the depth mip reuses that file's window-Y convention and is
+    // written to be read beside it.
+    #include "WireDepthMipmap.inc"
+    // AFTER WireDepthMipmap.inc for the same reason: the multisample depth/stencil resolve is
+    // that file's pass with the box filter taken out and a sample index put in.
+    #include "WireMultisampleResolve.inc"
+    #include "WireDraw.inc"
+
     void VulkanRenderer::Clear(GLbitfield mask) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+            const auto* fbo = MG_Pipe::MGPipeApplier().DrawFramebuffer();
+            if (!fbo) MagmaWireFatal("clear-framebuffer-record");
+            ClearAttachmentPayload payload{};
+            payload.mask = mask;
+            payload.color = MGB_CTX->GetClearColor();
+            payload.depth = MGB_CTX->GetClearDepth();
+            payload.stencil = MGB_CTX->GetClearStencil();
+            ClearWireFramebuffer(*fbo, payload);
+            return;
+        }
+#endif
         m_clearManager->CollectGarbage();
         if ((mask & (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)) == 0) {
             return;
@@ -8013,6 +8412,14 @@ void main() {
 
     void VulkanRenderer::QueueClearBufferPayload(GLenum buffer, GLint drawbuffer,
                                                  const ClearAttachmentPayload& clearPayload) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+            const auto* fbo = MG_Pipe::MGPipeApplier().DrawFramebuffer();
+            if (!fbo) MagmaWireFatal("clear-buffer-framebuffer-record");
+            ClearWireFramebuffer(*fbo,clearPayload,buffer == GL_COLOR ? drawbuffer : -1);
+            return;
+        }
+#endif
         auto* fbo = MGB_CTX->GetFramebufferBindingSlot(FramebufferTarget::Draw).GetBoundObject().get();
         if (!fbo) {
             return;
@@ -8670,7 +9077,10 @@ void main() {
     Bool VulkanRenderer::MaterializePendingDepthStencilClearForDefaultFramebuffer(
         VkCommandBuffer commandBuffer, const MG_State::GLState::FramebufferAttachmentObject& attachment,
         const ClearAttachmentPayload& payload) {
-        const VkImage depthStencilImage = m_swapchainObject.GetDepthStencilImage(m_imageIndexAcquired);
+        // The image the readback that triggered this materialization resolves; a parked clear
+        // must land where the read looks (see m_defaultFramebufferImageIndex).
+        const Uint32 swapchainImageIndex = DefaultFramebufferReadIndex(true);
+        const VkImage depthStencilImage = m_swapchainObject.GetDepthStencilImage(swapchainImageIndex);
         if (depthStencilImage == VK_NULL_HANDLE) {
             return false;
         }
@@ -8686,7 +9096,7 @@ void main() {
             return true;
         }
 
-        VkImageLayout currentLayout = m_swapchainObject.GetDepthStencilImageLayout(m_imageIndexAcquired);
+        VkImageLayout currentLayout = m_swapchainObject.GetDepthStencilImageLayout(swapchainImageIndex);
         VkPipelineStageFlags srcStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
         VkAccessFlags srcAccessMask = 0;
         GetImageTransitionSourceState(currentLayout, srcStageMask, srcAccessMask);
@@ -8721,16 +9131,16 @@ void main() {
                                                      VK_ACCESS_TRANSFER_WRITE_BIT, dstAccessMask, imageAspects)) {
             return false;
         }
-        m_swapchainObject.SetDepthStencilImageLayout(m_imageIndexAcquired,
+        m_swapchainObject.SetDepthStencilImageLayout(swapchainImageIndex,
                                                      VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
         // The image now holds real values, so the next render pass must LOAD them rather than
         // treat the attachment as undefined and discard the clear that just executed.
-        m_swapchainObject.SetDepthStencilContentDefined(m_imageIndexAcquired, true);
+        m_swapchainObject.SetDepthStencilContentDefined(swapchainImageIndex, true);
 
         m_clearManager->PopPendingClear(attachment);
         MGLOG_D("MaterializePendingClearForDefaultFramebuffer: swapchain depth/stencil image %u pending clear "
                 "materialized (aspects=0x%x)",
-                m_imageIndexAcquired, static_cast<Uint32>(clearAspects));
+                swapchainImageIndex, static_cast<Uint32>(clearAspects));
         return true;
     }
 
@@ -8765,11 +9175,14 @@ void main() {
             return MaterializePendingDepthStencilClearForDefaultFramebuffer(commandBuffer, attachment, payload);
         }
 
-        const VkImage swapchainImage = m_swapchainObject.GetImage(m_imageIndexAcquired);
+        // Same rule as the depth/stencil twin below: the parked clear has to land on the image
+        // the readback that reaches this resolves.
+        const Uint32 swapchainImageIndex = DefaultFramebufferReadIndex(true);
+        const VkImage swapchainImage = m_swapchainObject.GetImage(swapchainImageIndex);
         if (swapchainImage == VK_NULL_HANDLE) {
             return false;
         }
-        VkImageLayout currentLayout = m_swapchainObject.GetImageLayout(m_imageIndexAcquired);
+        VkImageLayout currentLayout = m_swapchainObject.GetImageLayout(swapchainImageIndex);
         VkPipelineStageFlags srcStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
         VkAccessFlags srcAccessMask = 0;
         GetImageTransitionSourceState(currentLayout, srcStageMask, srcAccessMask);
@@ -8810,13 +9223,13 @@ void main() {
                                                      VK_IMAGE_ASPECT_COLOR_BIT)) {
             return false;
         }
-        m_swapchainObject.SetImageLayout(m_imageIndexAcquired, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        m_swapchainObject.SetImageLayout(swapchainImageIndex, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
         // Popped, not left behind: the clear has executed, so letting the next render pass load
         // it again as a loadOp would erase whatever is drawn between here and there.
         m_clearManager->PopPendingClear(attachment);
         MGLOG_D("MaterializePendingClearForDefaultFramebuffer: swapchain image %u pending clear materialized",
-                m_imageIndexAcquired);
+                swapchainImageIndex);
         return true;
     }
 
@@ -8833,9 +9246,14 @@ void main() {
 
         BlitImageBinding srcBinding{};
         BlitImageBinding dstBinding{};
-        if (!ResolveColorBlitBinding(readFbo, true, m_imageIndexAcquired, m_swapchainObject, *m_textureManager,
+        // The source reads the image the app last rendered into, the destination re-points the
+        // default framebuffer at the acquired one - see m_defaultFramebufferImageIndex. The
+        // source resolves first, so a default-FBO source still names the pre-present image.
+        const Uint32 readDefaultImageIndex = DefaultFramebufferReadIndex(readFbo.IsDefaultFramebuffer());
+        const Uint32 drawDefaultImageIndex = DefaultFramebufferWriteIndex(drawIsDefaultFbo);
+        if (!ResolveColorBlitBinding(readFbo, true, readDefaultImageIndex, m_swapchainObject, *m_textureManager,
                                      *m_renderPassManager, srcBinding) ||
-            !ResolveColorBlitBinding(drawFbo, false, m_imageIndexAcquired, m_swapchainObject, *m_textureManager,
+            !ResolveColorBlitBinding(drawFbo, false, drawDefaultImageIndex, m_swapchainObject, *m_textureManager,
                                      *m_renderPassManager, dstBinding)) {
             return false;
         }
@@ -8856,6 +9274,53 @@ void main() {
         MOBILEGL_ASSERT(clearReady,
                         "TryBlitToDefaultFramebufferWithShader: failed to materialize pending clear for textureId=%d",
                         sourceTexture->GetExternalIndex());
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // P7 wave 2-B2 (CONTRACT-P7 §5.2, (B')): THE MONOLITH ARM ON THE BAKED MODULE. Below
+        // this line the pull build binds a hidden GL program, writes three default-block
+        // uniforms into its global UBO and hands the sampler to the application's descriptor
+        // binder. A disaggregated build has no such program on either arm: the same pass, with
+        // the same vertex shader (WireColorBlit.vert IS this one, ported), takes its rects on a
+        // push constant and its sampler from its own descriptor set.
+        //
+        // The pre-amble above stays shared because it is not about the program: resolving the
+        // two bindings, ending an open render pass and materializing a pending clear on the
+        // source are what makes the blit legal, whichever pass performs it. What the baked path
+        // does NOT need is the sampling transition, the descriptor sync and the cached sampled
+        // view - it makes its own view and moves the layouts through TransitionWireImage, whose
+        // tracker is the same `trackedLayout` these bindings carry.
+        {
+            const auto toWire = [](const BlitImageBinding& binding) {
+                WireImage out{};
+                out.image = binding.image;
+                out.format = binding.format;
+                out.extent = {static_cast<Uint32>(binding.extent.x()), static_cast<Uint32>(binding.extent.y())};
+                out.samples = binding.sampleCount;
+                out.aspect = binding.aspectMask;
+                out.level = binding.mipLevel;
+                out.levels = binding.mipLevelCount;
+                out.layer = binding.baseArrayLayer;
+                out.layers = binding.layerCount;
+                out.viewType = binding.layerCount > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+                out.trackedLayout = binding.trackedLayout;
+                out.layout = binding.trackedLayout ? *binding.trackedLayout : VK_IMAGE_LAYOUT_UNDEFINED;
+                return out;
+            };
+            WireImage source = toWire(srcBinding);
+            WireImage destination = toWire(dstBinding);
+            // The default framebuffer's layout lives in the swapchain object, not in a
+            // per-resource slot, which is what ResolveWireImage does for the same surface and
+            // what TransitionWireImage writes back through.
+            destination.isDefault = true;
+            destination.swapchainImageIndex = drawDefaultImageIndex;
+            destination.trackedLayout = nullptr;
+            destination.layout = m_swapchainObject.GetImageLayout(drawDefaultImageIndex);
+            // `false` here means "not serviced by the shader pass", and the caller falls
+            // through to the native vkCmdBlitImage arm - the same contract the pull build's
+            // early returns above have.
+            return BlitWireColorToDefault(source, destination, srcX0, srcY0, srcX1, srcY1,
+                                          dstX0, dstY0, dstX1, dstY1, filter);
+        }
+#else
         const Bool ready = m_textureManager->TransitionTextureForSampling(frame.commandBuffer, *sourceTexture);
         if (!ready) {
             MGLOG_E_ONCE("BlitFramebuffer skipped: failed to transition source textureId=%d for sampling",
@@ -8876,7 +9341,7 @@ void main() {
         // A color-only blit never touches depth/stencil: let the default-FBO pass
         // it opens skip the depth attachment (depth-less flavor).
         auto* renderPassEntryPtr =
-            m_renderPassManager->GetOrCreateRenderPass(drawFbo, m_imageIndexAcquired, /*drawUsesDepthStencil=*/false);
+            m_renderPassManager->GetOrCreateRenderPass(drawFbo, drawDefaultImageIndex, /*drawUsesDepthStencil=*/false);
         if (renderPassEntryPtr == nullptr) {
             // Declined (the builder logged which attachment). The caller's contract for `false` is
             // "this blit was not serviced here", which is the honest answer.
@@ -8966,59 +9431,68 @@ void main() {
         MOBILEGL_ASSERT(bound, "TryBlitToDefaultFramebufferWithShader: BindProgramUniformBuffers failed");
         vkCmdDraw(frame.commandBuffer, 3, 1, 0, 0);
         return true;
+#endif
+    }
+
+    // A single-aspect depth/stencil copy between two images of the same format. An image copy
+    // moves the format's own native representation, and for a packed depth-stencil format that
+    // representation is one word holding both aspects: a region that names only the depth aspect
+    // still carries the source's stencil byte into the destination, and the other way round, so a
+    // depth-only resolve silently replaces the destination's stencil (and a stencil-only resolve
+    // its depth). Staging the requested aspect through a buffer makes the region's aspectMask
+    // authoritative - a buffer copy names one aspect and moves exactly its texels - which is the
+    // same reason the wire resolve (WireFramebuffer.inc, ResolveWireDepthStencil) copies its
+    // resolved aspect through a buffer instead of patching the image copy.
+    //
+    // Both images are in a TRANSFER layout when this is called, so no transition is needed here.
+    Bool VulkanRenderer::CopyDepthStencilAspectThroughBuffer(
+        FrameContext::FrameData& frame, VkImage srcImage, VkImage dstImage, VkFormat format, Uint32 srcMipLevel,
+        Uint32 srcBaseArrayLayer, Uint32 dstMipLevel, Uint32 dstBaseArrayLayer, GLint srcX, GLint srcY, GLint dstX,
+        GLint dstY, GLsizei width, GLsizei height, VkImageAspectFlagBits aspect) {
+        // The aspect's own tightly defined copy layout: a stencil texel is one byte whatever the
+        // format, and the depth half of a packed format copies on its own at 2 or 4 bytes.
+        const VkDeviceSize texelSize = aspect == VK_IMAGE_ASPECT_STENCIL_BIT
+            ? 1
+            : (format == VK_FORMAT_D16_UNORM || format == VK_FORMAT_D16_UNORM_S8_UINT ? 2 : 4);
+        const VkDeviceSize bytes = static_cast<VkDeviceSize>(width) * static_cast<VkDeviceSize>(height) * texelSize;
+        VkBufferObject staging;
+        if (!staging.Create({.allocator = m_allocator, .size = bytes,
+                .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                .memoryUsage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE})) {
+            MGLOG_E_ONCE("CopyDepthStencilAspectThroughBuffer: failed to create the aspect staging buffer");
+            return false;
+        }
+        VkBufferImageCopy region{};
+        region.imageSubresource = {aspect, srcMipLevel, srcBaseArrayLayer, 1};
+        region.imageOffset = {srcX, srcY, 0};
+        region.imageExtent = {static_cast<Uint32>(width), static_cast<Uint32>(height), 1};
+        vkCmdCopyImageToBuffer(frame.commandBuffer, srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               staging.GetHandle(), 1, &region);
+        VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = staging.GetHandle();
+        barrier.size = bytes;
+        vkCmdPipelineBarrier(frame.commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 1, &barrier, 0, nullptr);
+        region.imageSubresource = {aspect, dstMipLevel, dstBaseArrayLayer, 1};
+        region.imageOffset = {dstX, dstY, 0};
+        vkCmdCopyBufferToImage(frame.commandBuffer, staging.GetHandle(), dstImage,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        // The commands above still name this buffer and this frame's submission has not happened
+        // yet, so the buffer retires with the frame rather than with this scope.
+        m_bufferManager.DeferRelease(Move(staging));
+        return true;
     }
 
     void VulkanRenderer::BlitFramebuffer(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
                                          GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1,
                                          GLbitfield mask, GLenum filter) {
 #if MOBILEGL_BUILD_DISAGGREGATED
-        // P5c (G6, CONTRACT-P5C §3.3/§5.4): MAGMA'S NAMED ARM. A blit record whose
-        // ReadFbo/DrawFbo are non-null is a glBlitNamedFramebuffer: both framebuffers resolve
-        // from the record's handles, and the sink is told the pair was consumed - a backend
-        // that leaves the flag clear has no named arm and the verb declines there, loudly.
-        // Magma has no FBO twin registry (it reads the frontend object wherever it syncs), so
-        // the resolution here is frontend-keyed - the handle was minted over the frontend
-        // object's lifetime id, and the two probes below (the client allocator's slot entry
-        // and the frontend context's framebuffer pool) are named debt inside the scope, the
-        // same shape as Espryt's StateForHandle arm: P7 retires it by carrying the object
-        // identity in the record. P5e (id), ruling 12: the third of Magma's four debts, so the
-        // scope it rides in is MagmaP7AllocatorDebtScope. Magma stays lockstep for the whole of
-        // P5e (CONTRACT-P5E §6.1), so the record being applied here is always barriered and the
-        // exemption still holds.
         if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
-            auto& applierState = MG_Pipe::MGPipeApplier();
-            const MG_Pipe::MGPipeHandle readHandle = applierState.VerbBlitReadFbo;
-            const MG_Pipe::MGPipeHandle drawHandle = applierState.VerbBlitDrawFbo;
-            if (!MG_Pipe::MGPipeHandleIsNull(readHandle) || !MG_Pipe::MGPipeHandleIsNull(drawHandle)) {
-                const auto resolveEndpoint = [](MG_Pipe::MGPipeHandle handle)
-                        -> SharedPtr<MG_State::GLState::FramebufferObject> {
-                    const MG_Pipe::MagmaP7AllocatorDebtScope magmaP7AllocatorDebt;
-                    if (handle == MG_Pipe::kMGPipeDefaultFramebuffer) {
-                        return MG_State::pGLContext ? MG_State::pGLContext->GetFramebufferObject(0) : nullptr;
-                    }
-                    if (!MG_Pipe::MGPipeSlots().IsLive(MG_Pipe::MGPipeKind::Framebuffer, handle)) {
-                        return nullptr;
-                    }
-                    const Uint64 lifetimeId =
-                        MG_Pipe::MGPipeSlots().LifetimeIdOfSlot(MG_Pipe::MGPipeKind::Framebuffer, handle.Slot);
-                    if (lifetimeId == 0 || MG_State::pGLContext == nullptr) return nullptr;
-                    return MG_State::pGLContext->FindFramebufferObjectByLifetimeId(lifetimeId);
-                };
-                auto readFbo = resolveEndpoint(readHandle);
-                auto drawFbo = resolveEndpoint(drawHandle);
-                if (!readFbo || !drawFbo) {
-                    // Leave the pair UNCONSUMED: the sink's decline is the loud answer a
-                    // missing endpoint deserves, not a silent blit of whatever is bound.
-                    MGLOG_E_ONCE("MGPipe: Magma's named blit could not resolve an endpoint (read {%u, %u}, draw "
-                                 "{%u, %u}) to a frontend framebuffer; the verb declines at the sink",
-                                 readHandle.Slot, readHandle.Gen, drawHandle.Slot, drawHandle.Gen);
-                    return;
-                }
-                applierState.VerbBlitNamedConsumed = true;
-                BlitNamedFramebuffer(readFbo, drawFbo, srcX0, srcY0, srcX1, srcY1, dstX0, dstY0,
-                                     dstX1, dstY1, mask, filter);
-                return;
-            }
+            BlitWireFramebuffers(srcX0,srcY0,srcX1,srcY1,dstX0,dstY0,dstX1,dstY1,mask,filter);
+            return;
         }
 #endif
         auto readFbo = MGB_CTX->GetFramebufferBindingSlot(FramebufferTarget::Read).GetBoundObject();
@@ -9120,10 +9594,16 @@ void main() {
         for (const VkImageAspectFlagBits depthStencilAspect : depthStencilAspects) {
             BlitImageBinding srcBinding{};
             BlitImageBinding dstBinding{};
-            if (!ResolveFramebufferBlitBinding(*readFbo, true, m_imageIndexAcquired, m_swapchainObject,
+            // A default-FBO source resolves the image the app last rendered into; a default-FBO
+            // destination re-points it at the image Present() acquired (see
+            // m_defaultFramebufferImageIndex). The source's index is taken first, so a blit
+            // whose two sides are both the default framebuffer still names one image.
+            const Uint32 srcImageIndex = DefaultFramebufferReadIndex(readIsDefaultFbo);
+            const Uint32 dstImageIndex = DefaultFramebufferWriteIndex(drawIsDefaultFbo);
+            if (!ResolveFramebufferBlitBinding(*readFbo, true, srcImageIndex, m_swapchainObject,
                                                *m_textureManager, *m_renderPassManager,
                                                depthStencilAspect, srcBinding) ||
-                !ResolveFramebufferBlitBinding(*drawFbo, false, m_imageIndexAcquired, m_swapchainObject,
+                !ResolveFramebufferBlitBinding(*drawFbo, false, dstImageIndex, m_swapchainObject,
                                                *m_textureManager, *m_renderPassManager,
                                                depthStencilAspect, dstBinding)) {
                 // A buffer named in the mask but absent from either framebuffer copies
@@ -9196,7 +9676,7 @@ void main() {
             }
 
             const VkImageLayout srcOriginalLayout = readIsDefaultFbo
-                ? m_swapchainObject.GetDepthStencilImageLayout(m_imageIndexAcquired)
+                ? m_swapchainObject.GetDepthStencilImageLayout(srcImageIndex)
                 : *srcBinding.trackedLayout;
             if (srcOriginalLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
                 MGLOG_E_ONCE("BlitFramebuffer skipped: depth source image layout is undefined");
@@ -9204,7 +9684,7 @@ void main() {
             }
 
             const VkImageLayout dstOriginalLayout = drawIsDefaultFbo
-                ? m_swapchainObject.GetDepthStencilImageLayout(m_imageIndexAcquired)
+                ? m_swapchainObject.GetDepthStencilImageLayout(dstImageIndex)
                 : *dstBinding.trackedLayout;
             const VkImageLayout dstRestoreLayout = dstOriginalLayout == VK_IMAGE_LAYOUT_UNDEFINED
                 ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
@@ -9244,7 +9724,7 @@ void main() {
                     srcAccessMask, VK_ACCESS_TRANSFER_READ_BIT, srcBinding.aspectMask,
                     srcBinding.mipLevel, srcBinding.mipLevelCount);
                 MOBILEGL_ASSERT(ok, "%s: failed to transition swapchain depth source image", __func__);
-                m_swapchainObject.SetDepthStencilImageLayout(m_imageIndexAcquired, srcTrackedLayout);
+                m_swapchainObject.SetDepthStencilImageLayout(srcImageIndex, srcTrackedLayout);
             } else {
                 Bool ok = VkTextureManager::TransitionImageLayout(
                     frame.commandBuffer, srcBinding.image, *srcBinding.trackedLayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -9265,7 +9745,7 @@ void main() {
                     dstAccessMask, VK_ACCESS_TRANSFER_WRITE_BIT, dstBinding.aspectMask,
                     dstBinding.mipLevel, dstBinding.mipLevelCount);
                 MOBILEGL_ASSERT(ok, "%s: failed to transition swapchain depth destination image", __func__);
-                m_swapchainObject.SetDepthStencilImageLayout(m_imageIndexAcquired, dstTrackedLayout);
+                m_swapchainObject.SetDepthStencilImageLayout(dstImageIndex, dstTrackedLayout);
             } else {
                 Bool ok = VkTextureManager::TransitionImageLayout(
                     frame.commandBuffer, dstBinding.image, *dstBinding.trackedLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -9311,6 +9791,20 @@ void main() {
                                srcBinding.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                dstBinding.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                1, &blitRegion, VK_FILTER_NEAREST);
+            } else if (isDepthBlit != isStencilBlit && srcBinding.layerCount == 1 && dstBinding.layerCount == 1 &&
+                       (GetDepthStencilAspectMaskForFormat(srcBinding.format) &
+                        ~static_cast<VkImageAspectFlags>(depthStencilAspect)) != 0) {
+                // Exactly one aspect of a packed depth-stencil format is being copied into a
+                // destination that carries the other one as well. A whole-image copy moves the
+                // packed native word and would replace that other aspect with the source's; see
+                // CopyDepthStencilAspectThroughBuffer. Same format, same size, one layer - the
+                // shapes the buffer round trip can express. A scaled or display-oriented copy
+                // takes the blit above, and a multi-layer one keeps the image copy.
+                (void)CopyDepthStencilAspectThroughBuffer(frame, srcBinding.image, dstBinding.image,
+                                                          srcBinding.format, srcBinding.mipLevel,
+                                                          srcBinding.baseArrayLayer, dstBinding.mipLevel,
+                                                          dstBinding.baseArrayLayer, srcX0, srcY0, dstX0, dstY0,
+                                                          srcWidth, srcHeight, depthStencilAspect);
             } else {
                 VkImageCopy copyRegion{};
                 copyRegion.srcSubresource.aspectMask = srcBinding.aspectMask;
@@ -9335,14 +9829,14 @@ void main() {
             VkAccessFlags srcRestoreAccessMask = 0;
             GetImageTransitionDestinationState(srcOriginalLayout, srcRestoreStageMask, srcRestoreAccessMask);
             if (readIsDefaultFbo) {
-                VkImageLayout srcTrackedLayout = m_swapchainObject.GetDepthStencilImageLayout(m_imageIndexAcquired);
+                VkImageLayout srcTrackedLayout = m_swapchainObject.GetDepthStencilImageLayout(srcImageIndex);
                 Bool ok = VkTextureManager::TransitionImageLayout(
                     frame.commandBuffer, srcBinding.image, srcTrackedLayout, srcOriginalLayout,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, srcRestoreStageMask,
                     VK_ACCESS_TRANSFER_READ_BIT, srcRestoreAccessMask, srcBinding.aspectMask,
                     srcBinding.mipLevel, srcBinding.mipLevelCount);
                 MOBILEGL_ASSERT(ok, "%s: failed to restore swapchain depth source image layout", __func__);
-                m_swapchainObject.SetDepthStencilImageLayout(m_imageIndexAcquired, srcTrackedLayout);
+                m_swapchainObject.SetDepthStencilImageLayout(srcImageIndex, srcTrackedLayout);
             } else {
                 Bool ok = VkTextureManager::TransitionImageLayout(
                     frame.commandBuffer, srcBinding.image, *srcBinding.trackedLayout, srcOriginalLayout,
@@ -9356,14 +9850,14 @@ void main() {
             VkAccessFlags dstRestoreAccessMask = 0;
             GetImageTransitionDestinationState(dstRestoreLayout, dstRestoreStageMask, dstRestoreAccessMask);
             if (drawIsDefaultFbo) {
-                VkImageLayout dstTrackedLayout = m_swapchainObject.GetDepthStencilImageLayout(m_imageIndexAcquired);
+                VkImageLayout dstTrackedLayout = m_swapchainObject.GetDepthStencilImageLayout(dstImageIndex);
                 Bool ok = VkTextureManager::TransitionImageLayout(
                     frame.commandBuffer, dstBinding.image, dstTrackedLayout, dstRestoreLayout,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, dstRestoreStageMask,
                     VK_ACCESS_TRANSFER_WRITE_BIT, dstRestoreAccessMask, dstBinding.aspectMask,
                     dstBinding.mipLevel, dstBinding.mipLevelCount);
                 MOBILEGL_ASSERT(ok, "%s: failed to restore swapchain depth destination image layout", __func__);
-                m_swapchainObject.SetDepthStencilImageLayout(m_imageIndexAcquired, dstTrackedLayout);
+                m_swapchainObject.SetDepthStencilImageLayout(dstImageIndex, dstTrackedLayout);
             } else {
                 Bool ok = VkTextureManager::TransitionImageLayout(
                     frame.commandBuffer, dstBinding.image, *dstBinding.trackedLayout, dstRestoreLayout,
@@ -9379,9 +9873,13 @@ void main() {
 
         BlitImageBinding srcBinding{};
         BlitImageBinding dstBinding{};
-        if (!ResolveColorBlitBinding(*readFbo, true, m_imageIndexAcquired, m_swapchainObject, *m_textureManager,
+        // Same split as the depth/stencil loop above, and the same ordering rule: the source's
+        // index is read before the destination's write re-points it.
+        const Uint32 srcImageIndex = DefaultFramebufferReadIndex(readIsDefaultFbo);
+        const Uint32 dstImageIndex = DefaultFramebufferWriteIndex(drawIsDefaultFbo);
+        if (!ResolveColorBlitBinding(*readFbo, true, srcImageIndex, m_swapchainObject, *m_textureManager,
                                      *m_renderPassManager, srcBinding) ||
-            !ResolveColorBlitBinding(*drawFbo, false, m_imageIndexAcquired, m_swapchainObject, *m_textureManager,
+            !ResolveColorBlitBinding(*drawFbo, false, dstImageIndex, m_swapchainObject, *m_textureManager,
                                      *m_renderPassManager, dstBinding)) {
             return;
         }
@@ -9435,10 +9933,10 @@ void main() {
         }
 
         VkImageLayout srcLayout = readIsDefaultFbo
-            ? m_swapchainObject.GetImageLayout(m_imageIndexAcquired)
+            ? m_swapchainObject.GetImageLayout(srcImageIndex)
             : *srcBinding.trackedLayout;
         VkImageLayout dstLayout = drawIsDefaultFbo
-            ? m_swapchainObject.GetImageLayout(m_imageIndexAcquired)
+            ? m_swapchainObject.GetImageLayout(dstImageIndex)
             : *dstBinding.trackedLayout;
         const VkImageLayout srcOriginalLayout = srcLayout;
         const VkImageLayout dstOriginalLayout = dstLayout;
@@ -9464,7 +9962,7 @@ void main() {
                 srcStageMask, VK_PIPELINE_STAGE_TRANSFER_BIT,
                 srcAccessMask, VK_ACCESS_TRANSFER_READ_BIT, srcBinding.aspectMask);
             MOBILEGL_ASSERT(ok, "%s: failed to transition swapchain source image", __func__);
-            m_swapchainObject.SetImageLayout(m_imageIndexAcquired, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            m_swapchainObject.SetImageLayout(srcImageIndex, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         } else {
             Bool ok = VkTextureManager::TransitionImageLayout(
                 frame.commandBuffer, srcBinding.image, *srcBinding.trackedLayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -9482,7 +9980,7 @@ void main() {
                 dstStageMask, VK_PIPELINE_STAGE_TRANSFER_BIT,
                 dstAccessMask, VK_ACCESS_TRANSFER_WRITE_BIT, dstBinding.aspectMask);
             MOBILEGL_ASSERT(ok, "%s: failed to transition swapchain destination image", __func__);
-            m_swapchainObject.SetImageLayout(m_imageIndexAcquired, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            m_swapchainObject.SetImageLayout(dstImageIndex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         } else {
             Bool ok = VkTextureManager::TransitionImageLayout(
                 frame.commandBuffer, dstBinding.image, *dstBinding.trackedLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -9596,13 +10094,13 @@ void main() {
         VkAccessFlags srcRestoreAccessMask = 0;
         GetImageTransitionDestinationState(srcOriginalLayout, srcRestoreStageMask, srcRestoreAccessMask);
         if (readIsDefaultFbo) {
-            VkImageLayout srcTrackedLayout = m_swapchainObject.GetImageLayout(m_imageIndexAcquired);
+            VkImageLayout srcTrackedLayout = m_swapchainObject.GetImageLayout(srcImageIndex);
             Bool ok = VkTextureManager::TransitionImageLayout(
                 frame.commandBuffer, srcBinding.image, srcTrackedLayout, srcOriginalLayout,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, srcRestoreStageMask,
                 VK_ACCESS_TRANSFER_READ_BIT, srcRestoreAccessMask, srcBinding.aspectMask);
             MOBILEGL_ASSERT(ok, "%s: failed to restore swapchain source image layout", __func__);
-            m_swapchainObject.SetImageLayout(m_imageIndexAcquired, srcTrackedLayout);
+            m_swapchainObject.SetImageLayout(srcImageIndex, srcTrackedLayout);
         } else {
             Bool ok = VkTextureManager::TransitionImageLayout(
                 frame.commandBuffer, srcBinding.image, *srcBinding.trackedLayout, srcOriginalLayout,
@@ -9615,13 +10113,13 @@ void main() {
         VkAccessFlags dstRestoreAccessMask = 0;
         GetImageTransitionDestinationState(dstRestoreLayout, dstRestoreStageMask, dstRestoreAccessMask);
         if (drawIsDefaultFbo) {
-            VkImageLayout dstTrackedLayout = m_swapchainObject.GetImageLayout(m_imageIndexAcquired);
+            VkImageLayout dstTrackedLayout = m_swapchainObject.GetImageLayout(dstImageIndex);
             Bool ok = VkTextureManager::TransitionImageLayout(
                 frame.commandBuffer, dstBinding.image, dstTrackedLayout, dstRestoreLayout,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, dstRestoreStageMask,
                 VK_ACCESS_TRANSFER_WRITE_BIT, dstRestoreAccessMask, dstBinding.aspectMask);
             MOBILEGL_ASSERT(ok, "%s: failed to restore swapchain destination image layout", __func__);
-            m_swapchainObject.SetImageLayout(m_imageIndexAcquired, dstTrackedLayout);
+            m_swapchainObject.SetImageLayout(dstImageIndex, dstTrackedLayout);
         } else {
             Bool ok = VkTextureManager::TransitionImageLayout(
                 frame.commandBuffer, dstBinding.image, *dstBinding.trackedLayout, dstRestoreLayout,
@@ -9633,6 +10131,12 @@ void main() {
 
     void VulkanRenderer::CopyTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset,
                                            GLint x, GLint y, GLsizei width, GLsizei height) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+            CopyWireFramebufferToTexture(target,level,xoffset,yoffset,x,y,width,height);
+            return;
+        }
+#endif
         if (width <= 0 || height <= 0) {
             return;
         }
@@ -9679,6 +10183,10 @@ void main() {
         }
 
         const Bool readIsDefaultFbo = readFbo->IsDefaultFramebuffer();
+        // CopyTexSubImage2D only ever READS the default framebuffer, so it resolves the image
+        // the app last rendered into (see m_defaultFramebufferImageIndex) - never the one
+        // Present() has already acquired for the next frame.
+        const Uint32 srcImageIndex = DefaultFramebufferReadIndex(readIsDefaultFbo);
 
         BlitImageBinding dstBinding{};
         if (!ResolveTextureCopyDestinationBinding(*destinationTexture, static_cast<Uint32>(level), *m_textureManager,
@@ -9689,7 +10197,7 @@ void main() {
         }
 
         BlitImageBinding srcBinding{};
-        if (!ResolveTextureCopySourceBinding(*readFbo, m_imageIndexAcquired, m_swapchainObject, *m_textureManager,
+        if (!ResolveTextureCopySourceBinding(*readFbo, srcImageIndex, m_swapchainObject, *m_textureManager,
                                              *m_renderPassManager, dstBinding.aspectMask, srcBinding)) {
             RecordTextureCopyError(__func__, ErrorCode::InvalidOperation,
                                    "CopyTexSubImage2D requires a complete read attachment compatible with the destination texture.");
@@ -9719,8 +10227,8 @@ void main() {
         const Bool srcUsesSwapchainDepth = readIsDefaultFbo && (srcBinding.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) == 0;
         const VkImageLayout srcOriginalLayout = readIsDefaultFbo
             ? (srcUsesSwapchainDepth
-                ? m_swapchainObject.GetDepthStencilImageLayout(m_imageIndexAcquired)
-                : m_swapchainObject.GetImageLayout(m_imageIndexAcquired))
+                ? m_swapchainObject.GetDepthStencilImageLayout(srcImageIndex)
+                : m_swapchainObject.GetImageLayout(srcImageIndex))
             : *srcBinding.trackedLayout;
         if (srcOriginalLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
             RecordTextureCopyError(__func__, ErrorCode::InvalidOperation,
@@ -9747,9 +10255,9 @@ void main() {
                 srcBinding.mipLevel, srcBinding.mipLevelCount);
             MOBILEGL_ASSERT(ok, "%s: failed to transition swapchain source image", __func__);
             if (srcUsesSwapchainDepth) {
-                m_swapchainObject.SetDepthStencilImageLayout(m_imageIndexAcquired, srcTrackedLayout);
+                m_swapchainObject.SetDepthStencilImageLayout(srcImageIndex, srcTrackedLayout);
             } else {
-                m_swapchainObject.SetImageLayout(m_imageIndexAcquired, srcTrackedLayout);
+                m_swapchainObject.SetImageLayout(srcImageIndex, srcTrackedLayout);
             }
         } else {
             Bool ok = VkTextureManager::TransitionImageLayout(
@@ -9805,8 +10313,8 @@ void main() {
         GetImageTransitionDestinationState(srcOriginalLayout, srcRestoreStageMask, srcRestoreAccessMask);
         if (readIsDefaultFbo) {
             VkImageLayout srcTrackedLayout = srcUsesSwapchainDepth
-                ? m_swapchainObject.GetDepthStencilImageLayout(m_imageIndexAcquired)
-                : m_swapchainObject.GetImageLayout(m_imageIndexAcquired);
+                ? m_swapchainObject.GetDepthStencilImageLayout(srcImageIndex)
+                : m_swapchainObject.GetImageLayout(srcImageIndex);
             Bool ok = VkTextureManager::TransitionImageLayout(
                 frame.commandBuffer, srcBinding.image, srcTrackedLayout, srcOriginalLayout,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, srcRestoreStageMask,
@@ -9814,9 +10322,9 @@ void main() {
                 srcBinding.mipLevel, srcBinding.mipLevelCount);
             MOBILEGL_ASSERT(ok, "%s: failed to restore swapchain source image layout", __func__);
             if (srcUsesSwapchainDepth) {
-                m_swapchainObject.SetDepthStencilImageLayout(m_imageIndexAcquired, srcTrackedLayout);
+                m_swapchainObject.SetDepthStencilImageLayout(srcImageIndex, srcTrackedLayout);
             } else {
-                m_swapchainObject.SetImageLayout(m_imageIndexAcquired, srcTrackedLayout);
+                m_swapchainObject.SetImageLayout(srcImageIndex, srcTrackedLayout);
             }
         } else {
             Bool ok = VkTextureManager::TransitionImageLayout(
@@ -9942,6 +10450,10 @@ void main() {
         }
 
         Uint CopyImageEndpointName(const CopyImageEndpoint& endpoint) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+            if (MG_Config::Transport != MG_Config::TransportMode::Monolith)
+                return endpoint.IsRenderbuffer() ? endpoint.RenderbufferHandle.Slot : endpoint.TextureHandle.Slot;
+#endif
             if (endpoint.IsRenderbuffer()) return endpoint.Renderbuffer->GetExternalIndex();
             return endpoint.Texture ? endpoint.Texture->GetExternalIndex() : 0u;
         }
@@ -9952,6 +10464,11 @@ void main() {
                                           const CopyImageEndpoint& dstEndpoint,
                                           GLenum dstTarget, GLint dstLevel, GLint dstX, GLint dstY, GLint dstZ,
                                           GLsizei srcWidth, GLsizei srcHeight, GLsizei srcDepth) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        const Bool wire = MG_Config::Transport != MG_Config::TransportMode::Monolith;
+        MG_Pipe::MGPipeHandle dstStorageHandle = dstEndpoint.TextureHandle;
+        if (wire && HasPendingRecordedWork() && !FlushPendingCommands()) MagmaWireFatal("copy-image-flush");
+#endif
         MOBILEGL_ASSERT(srcEndpoint.Exists() && dstEndpoint.Exists(),
                         "CopyImageSubData requires valid source and destination images.");
         // The frontend already declines a zero or negative extent, so anything else here is a
@@ -9978,7 +10495,11 @@ void main() {
             srcEndpoint.Texture ? &VkTextureManager::StorageTextureOf(*srcEndpoint.Texture) : nullptr;
         const auto* dstStorageTexture =
             dstEndpoint.Texture ? &VkTextureManager::StorageTextureOf(*dstEndpoint.Texture) : nullptr;
-        if (srcStorageTexture == dstStorageTexture && srcEndpoint.Renderbuffer == dstEndpoint.Renderbuffer) {
+        if (
+#if MOBILEGL_BUILD_DISAGGREGATED
+            !wire &&
+#endif
+            srcStorageTexture == dstStorageTexture && srcEndpoint.Renderbuffer == dstEndpoint.Renderbuffer) {
             MGLOG_E_ONCE("%s: in-place copy on objectId=%u is not supported; declining the copy", __func__,
                          CopyImageEndpointName(srcEndpoint));
             return;
@@ -9997,6 +10518,26 @@ void main() {
         // SyncTextureAndGetDescriptor the copy always used; the renderbuffer arm goes through the
         // render-pass manager, which is where a renderbuffer's VkImage lives.
         const auto resolveImage = [this](const CopyImageEndpoint& endpoint, CopyImageVkImage& out) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+            if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+                const Bool renderbuffer = endpoint.IsRenderbuffer();
+                // The same handle-keyed allocation used by wire FBO clear/draw/read.
+                // The legacy render-pass manager owns a different, frontend-keyed map.
+                auto* resource = m_textureManager->SyncTextureResourceByHandle(
+                    renderbuffer ? endpoint.RenderbufferHandle : endpoint.TextureHandle, renderbuffer);
+                if (!resource) MagmaWireFatal("copy-image-resource");
+                out.isRenderbuffer = renderbuffer;
+                out.image = resource->image;
+                out.trackedLayout = &resource->layout;
+                out.aspect = resource->aspect;
+                out.mipLevels = resource->mipLevels;
+                out.extent = resource->extent;
+                out.depth = resource->depth;
+                out.arrayLayers = resource->arrayLayers;
+                out.format = resource->format;
+                return out.image != VK_NULL_HANDLE;
+            }
+#endif
             if (endpoint.IsRenderbuffer()) {
                 auto* resource = m_renderPassManager->GetOrCreateRenderbufferResource(endpoint.Renderbuffer);
                 if (resource == nullptr) return false;
@@ -10031,6 +10572,26 @@ void main() {
         CopyImageVkImage dstImage{};
         const Bool srcResolved = resolveImage(srcEndpoint, srcImage);
         const Bool dstResolved = resolveImage(dstEndpoint, dstImage);
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // P7 wave 2-B, CONTRACT-P7 §3.2: `copy-image-in-place@P7` RETIRES.
+        //
+        // What the Fatal here used to say was true of the code below it and of nothing else: the
+        // TRANSFER_SRC/TRANSFER_DST pair cannot describe one image, because both endpoints share
+        // one VkImageLayout and the second transition undoes the first. VK_IMAGE_LAYOUT_GENERAL
+        // can describe it - it is a legal layout for both sides of vkCmdCopyImage - so a
+        // same-image copy takes ONE transition of the whole image to GENERAL, GENERAL on both
+        // sides of the command, and ONE restore. The monolith arm declines this shape outright
+        // (a few lines up, `!wire &&`); the wire arm is now the one that performs it, which is
+        // what §3.2 asks for and more than parity would give.
+        //
+        // `inPlace` is constexpr false in the pull build so that every branch it guards folds
+        // away: this function is in the monolith image too and G1 pins that image's .text.
+        const Bool inPlace = wire && srcImage.image != VK_NULL_HANDLE &&
+                             srcImage.image == dstImage.image;
+        if (wire) m_textureManager->FlushPendingUploads();
+#else
+        constexpr Bool inPlace = false;
+#endif
         // Real checks, not MOBILEGL_ASSERT: the assertions this replaces compile to nothing in
         // a release build, which is where both observed failures happened - a null resource
         // dereferenced right below (lavapipe) and a mip level the VkImage does not have handed
@@ -10055,6 +10616,24 @@ void main() {
         // dstLevel and the z origins below arrived relative to whichever name the application
         // passed - so a view's level 0 has to become the parent level it opened onto before it
         // can index a subresource, exactly as at every other attachment boundary.
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (wire) {
+            const auto mapSubresource = [this](const CopyImageEndpoint& endpoint, GLint& mip, GLint& layer) {
+                if (endpoint.IsRenderbuffer()) {
+                    if (mip != 0 || layer != 0) MagmaWireFatal("copy-image-renderbuffer-subresource");
+                    return endpoint.RenderbufferHandle;
+                }
+                Uint32 mappedMip = static_cast<Uint32>(mip), mappedLayer = static_cast<Uint32>(layer);
+                const auto storage = m_textureManager->ResolveWireTextureStorage(
+                    endpoint.TextureHandle, mappedMip, mappedLayer);
+                if (MG_Pipe::MGPipeHandleIsNull(storage)) MagmaWireFatal("copy-image-view-record");
+                mip = static_cast<GLint>(mappedMip); layer = static_cast<GLint>(mappedLayer);
+                return storage;
+            };
+            (void)mapSubresource(srcEndpoint, srcLevel, srcZ);
+            dstStorageHandle = mapSubresource(dstEndpoint, dstLevel, dstZ);
+        }
+#endif
         srcLevel = static_cast<GLint>(ToStorageMipLevel(srcEndpoint.Texture.get(), srcLevel));
         dstLevel = static_cast<GLint>(ToStorageMipLevel(dstEndpoint.Texture.get(), dstLevel));
         srcZ = static_cast<GLint>(ToStorageArrayLayer(srcEndpoint.Texture.get(), srcZ));
@@ -10157,8 +10736,39 @@ void main() {
                          __func__, srcZ, srcSlices.availableSlices, dstZ, dstSlices.availableSlices, srcDepth);
             return;
         }
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // THE ONE IN-PLACE SHAPE THAT STAYS A DECLINE (§3.2). GL 4.6 core 18.3.2: if the source
+        // and destination name the same image AND the same level AND the same layers, the result
+        // is UNDEFINED where the regions overlap. GENERAL makes the command legal to record, not
+        // meaningful to execute - vkCmdCopyImage has no ordering between its own reads and writes
+        // within one region, so what a tiler produces is whichever half of each texel it reached
+        // first. Declining says that, once, instead of shipping it.
+        //
+        // The test is ALL THREE dimensions at once: same level, overlapping slice range, and
+        // overlapping rectangle. A copy from level 0 to level 1, or between disjoint layers, or
+        // between disjoint rectangles of one level, is perfectly defined and is performed.
+        if (inPlace && srcMipLevel == dstMipLevel) {
+            const Uint32 srcSliceBegin = srcSlices.baseSlice, dstSliceBegin = dstSlices.baseSlice;
+            const Bool slicesOverlap = srcSliceBegin < dstSliceBegin + copySliceCount &&
+                                       dstSliceBegin < srcSliceBegin + copySliceCount;
+            const Bool rectOverlaps = srcX < dstX + srcWidth && dstX < srcX + srcWidth &&
+                                      srcY < dstY + srcHeight && dstY < srcY + srcHeight;
+            if (slicesOverlap && rectOverlaps) {
+                MGLOG_E_ONCE("%s: in-place copy on objectId=%u overlaps itself at level %u "
+                             "(src %dx%d+%d+%d slice %u, dst +%d+%d slice %u, %u slice(s)); GL leaves "
+                             "the result undefined, so the copy is declined rather than recorded",
+                             __func__, CopyImageEndpointName(srcEndpoint), srcMipLevel,
+                             srcWidth, srcHeight, srcX, srcY, srcSliceBegin, dstX, dstY,
+                             dstSliceBegin, copySliceCount);
+                return;
+            }
+        }
+#endif
 
         const auto materializeClear = [this, &frame](const CopyImageEndpoint& endpoint) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+            if (MG_Config::Transport != MG_Config::TransportMode::Monolith) return true;
+#endif
             if (endpoint.IsRenderbuffer()) {
                 return MaterializePendingClearForRenderbuffer(frame.commandBuffer, endpoint.Renderbuffer);
             }
@@ -10198,6 +10808,19 @@ void main() {
         const VkImageLayout srcRestoreLayout = resolveRestoreLayout(srcOriginalLayout, srcImage.isRenderbuffer);
         const VkImageLayout dstRestoreLayout = resolveRestoreLayout(dstOriginalLayout, dstImage.isRenderbuffer);
 
+        // ONE IMAGE, ONE LAYOUT, ONE TRANSITION. For a same-image copy both endpoints are the same
+        // VkImage behind the same tracked layout, so the two transitions below would describe one
+        // subresource twice and the second would undo the first. GENERAL is the layout both sides
+        // of vkCmdCopyImage accept at once, the barrier covers the WHOLE image (both the source
+        // level and the destination level are in it), and the access mask carries both directions
+        // because this one barrier is the edge for both.
+        const VkImageLayout copySourceLayout =
+            inPlace ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        const VkImageLayout copyDestinationLayout =
+            inPlace ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        const VkAccessFlags copySourceAccess =
+            inPlace ? (VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT)
+                    : VK_ACCESS_TRANSFER_READ_BIT;
         VkPipelineStageFlags srcStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
         VkAccessFlags srcAccessMask = 0;
         GetImageTransitionSourceState(srcOriginalLayout, srcStageMask, srcAccessMask);
@@ -10207,17 +10830,19 @@ void main() {
         // [baseSlice, baseSlice + depth) the slice mapping above hands the copy.
         if (srcOriginalLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
             Bool srcReady = VkTextureManager::TransitionImageLayout(
-                frame.commandBuffer, srcImage.image, *srcImage.trackedLayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                frame.commandBuffer, srcImage.image, *srcImage.trackedLayout, copySourceLayout,
                 srcStageMask, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                srcAccessMask, VK_ACCESS_TRANSFER_READ_BIT,
+                srcAccessMask, copySourceAccess,
                 srcImage.aspect, 0, srcImage.mipLevels);
             MOBILEGL_ASSERT(srcReady, "%s: failed to transition undefined source image", __func__);
             srcCopyLayout = *srcImage.trackedLayout;
         } else {
             Bool srcReady = VkTextureManager::TransitionImageLayout(
-                frame.commandBuffer, srcImage.image, srcCopyLayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                frame.commandBuffer, srcImage.image, srcCopyLayout, copySourceLayout,
                 srcStageMask, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                srcAccessMask, VK_ACCESS_TRANSFER_READ_BIT, copyAspectMask, srcMipLevel, 1);
+                srcAccessMask, copySourceAccess,
+                inPlace ? srcImage.aspect : copyAspectMask,
+                inPlace ? 0u : srcMipLevel, inPlace ? srcImage.mipLevels : 1u);
             MOBILEGL_ASSERT(srcReady, "%s: failed to transition source image", __func__);
         }
 
@@ -10225,7 +10850,10 @@ void main() {
         VkAccessFlags dstAccessMask = 0;
         GetImageTransitionSourceState(dstOriginalLayout, dstStageMask, dstAccessMask);
         VkImageLayout dstCopyLayout = dstOriginalLayout;
-        if (dstOriginalLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
+        if (inPlace) {
+            // Already moved, by the barrier above: trackedLayout is the same field.
+            dstCopyLayout = *dstImage.trackedLayout;
+        } else if (dstOriginalLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
             Bool dstReady = VkTextureManager::TransitionImageLayout(
                 frame.commandBuffer, dstImage.image, *dstImage.trackedLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 dstStageMask, VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -10267,9 +10895,15 @@ void main() {
                 copyRegion.dstSubresource.baseArrayLayer, copyRegion.dstSubresource.layerCount,
                 copyRegion.dstOffset.z, srcWidth, srcHeight, copyRegion.extent.depth);
         vkCmdCopyImage(frame.commandBuffer,
-                       srcImage.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       dstImage.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       srcImage.image, copySourceLayout,
+                       dstImage.image, copyDestinationLayout,
                        1, &copyRegion);
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // The copy coordinates above are already storage-relative. Name that
+        // storage here too, so a texture view's offsets are not applied twice.
+        if (wire && !dstImage.isRenderbuffer) m_textureManager->MarkWireTextureGpuWritten(dstStorageHandle,
+            dstMipLevel, dstSlices.BaseArrayLayer(), dstSlices.slicesAreDepth ? 1u : copySliceCount);
+#endif
 
         VkPipelineStageFlags srcRestoreStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
         VkAccessFlags srcRestoreAccessMask = 0;
@@ -10278,21 +10912,27 @@ void main() {
             Bool srcRestored = VkTextureManager::TransitionImageLayout(
                 frame.commandBuffer, srcImage.image, *srcImage.trackedLayout, srcRestoreLayout,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, srcRestoreStageMask,
-                VK_ACCESS_TRANSFER_READ_BIT, srcRestoreAccessMask,
+                copySourceAccess, srcRestoreAccessMask,
                 srcImage.aspect, 0, srcImage.mipLevels);
             MOBILEGL_ASSERT(srcRestored, "%s: failed to restore undefined source image layout", __func__);
         } else {
             Bool srcRestored = VkTextureManager::TransitionImageLayout(
                 frame.commandBuffer, srcImage.image, srcCopyLayout, srcRestoreLayout,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, srcRestoreStageMask,
-                VK_ACCESS_TRANSFER_READ_BIT, srcRestoreAccessMask, copyAspectMask, srcMipLevel, 1);
+                copySourceAccess, srcRestoreAccessMask,
+                inPlace ? srcImage.aspect : copyAspectMask,
+                inPlace ? 0u : srcMipLevel, inPlace ? srcImage.mipLevels : 1u);
             MOBILEGL_ASSERT(srcRestored, "%s: failed to restore source image layout", __func__);
         }
 
         VkPipelineStageFlags dstRestoreStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
         VkAccessFlags dstRestoreAccessMask = 0;
         GetImageTransitionDestinationState(dstRestoreLayout, dstRestoreStageMask, dstRestoreAccessMask);
-        if (dstOriginalLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
+        if (inPlace) {
+            // The restore above already moved the whole image off GENERAL, and the destination
+            // is that same image: a second restore would barrier a layout the tracker has
+            // already left, which is the mirror of the bug the retired Fatal was guarding.
+        } else if (dstOriginalLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
             Bool dstRestored = VkTextureManager::TransitionImageLayout(
                 frame.commandBuffer, dstImage.image, *dstImage.trackedLayout, dstRestoreLayout,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, dstRestoreStageMask,
@@ -10339,7 +10979,47 @@ void main() {
             return false;
         }
 
+        // EVERY OUTSTANDING SUBMISSION, NOT ONLY THE ONE JUST MADE (P7 wave 2-B, exit gate 3).
+        //
+        // This used to wait one fence and then call OnSubmitsCompletedUpTo(frame.lastSubmitIndex),
+        // and the comment below said the wait "proved every submission complete". On the monolith
+        // arm that is true - nothing flushes before a readback, so the frame's draws and the copy
+        // are one submission under one fence. On the WIRE arm it is not: ReadWirePixels calls
+        // FlushPendingCommands first, which submits the draws under a POOLED FENCE OF ITS OWN and
+        // returns without waiting, so the copy is a later, separately fenced submission. Two
+        // submissions on one queue start in order; they do not finish in order unless something
+        // makes them, and a fence says nothing about a submission it does not belong to.
+        //
+        // Measured, on this host, at the copy: submit=72 completed=71. The old code then called
+        // OnSubmitsCompletedUpTo(73), which RECORDED 72 as complete and retired its fence - so
+        // after the fact nothing could even observe that it had not been waited for.
+        //
+        // The cost is nothing a readback does not already pay: it is a full CPU stall by
+        // construction, and the fences gathered here are exactly the ones already in flight.
+        //
+        // UNDER #if, although this function serves both arms of the disaggregated build: the PULL
+        // build has no wire arm, cannot flush before a readback, and is the image G1 pins to
+        // 0xa52203. Its single-fence wait stays the statement it always was.
+#if MOBILEGL_BUILD_DISAGGREGATED
+        Vector<VkFence> readbackFences;
+        readbackFences.reserve(m_inFlightSubmits.size() + 1);
+        for (const auto& record : m_inFlightSubmits) {
+            if (record.fence != VK_NULL_HANDLE && record.submitIndex <= frame.lastSubmitIndex) {
+                readbackFences.push_back(record.fence);
+            }
+        }
+        if (readbackFences.empty()) {
+            readbackFences.push_back(frame.imageInFlightFence);
+        }
+        // Measured here on the host (OpenRA, DirectVulkan, inproc, at the frame readback):
+        // fences=2 upTo=73 submitCounter=73 completed=71. Two fences, because submission 72 -
+        // the frame's draws, flushed by ReadWirePixels under a pooled fence - was still
+        // outstanding; the code this replaces waited on one.
+        VkResult result = vkWaitForFences(m_device, static_cast<Uint32>(readbackFences.size()),
+                                          readbackFences.data(), VK_TRUE, UINT64_MAX);
+#else
         VkResult result = vkWaitForFences(m_device, 1, &frame.imageInFlightFence, VK_TRUE, UINT64_MAX);
+#endif
         if (result != VK_SUCCESS) {
             MGLOG_E_ONCE("DirectVulkan readback: vkWaitForFences returned %d", result);
             return false;
@@ -10353,8 +11033,8 @@ void main() {
 
         frame.hasCommandBufferRecorded = false;
         frame.isCommandRecording = false;
-        // The wait proved every submission complete, so the full frame-boundary
-        // drain applies: descriptor cursors, transient arenas, deferred
+        // The wait above covered every submission at or below this one, so the full
+        // frame-boundary drain applies: descriptor cursors, transient arenas, deferred
         // texture/buffer releases, retired command buffers and the converted
         // vertex-stream cache all rewind here, keeping present-less readback
         // loops bounded (Present is the only other drain point).
@@ -10364,6 +11044,12 @@ void main() {
 
     void VulkanRenderer::ReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type,
                                     void* pixels) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+            ReadWirePixels(x,y,width,height,format,type,pixels);
+            return;
+        }
+#endif
         if (width <= 0 || height <= 0) {
             return;
         }
@@ -10425,13 +11111,26 @@ void main() {
         }
 
         BlitImageBinding srcBinding{};
-        if (!ResolveColorBlitBinding(*readFbo, true, m_imageIndexAcquired, m_swapchainObject, *m_textureManager,
+        // A read resolves the image the app last rendered into, not the one Present() has
+        // already acquired for the frame that is starting (see m_defaultFramebufferImageIndex).
+        // A retrace snapshot taken just before a swap is applied after it, and must still find
+        // the colour the app drew.
+        const Uint32 srcImageIndex = DefaultFramebufferReadIndex(readIsDefaultFbo);
+        if (readIsDefaultFbo && !m_swapchainObject.IsImageContentDefined(srcImageIndex)) {
+            // Named rather than silent: the readback hands back whatever the image holds. The
+            // ordinary cause is a read of the default framebuffer applied after the Present that
+            // consumed it, where the app's own colour is still what is expected.
+            MGLOG_W_ONCE("DirectVulkan::ReadPixels: no write is recorded for swapchain image %u of the "
+                         "default framebuffer; the readback returns its raw pixels",
+                         srcImageIndex);
+        }
+        if (!ResolveColorBlitBinding(*readFbo, true, srcImageIndex, m_swapchainObject, *m_textureManager,
                                      *m_renderPassManager, srcBinding)) {
             return;
         }
 
         const VkImageLayout srcOriginalLayout = readIsDefaultFbo
-            ? m_swapchainObject.GetImageLayout(m_imageIndexAcquired)
+            ? m_swapchainObject.GetImageLayout(srcImageIndex)
             : *srcBinding.trackedLayout;
         if (srcOriginalLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
             MGLOG_E_ONCE("DirectVulkan::ReadPixels skipped: source image layout is undefined");
@@ -10472,7 +11171,7 @@ void main() {
                 srcStageMask, VK_PIPELINE_STAGE_TRANSFER_BIT,
                 srcAccessMask, VK_ACCESS_TRANSFER_READ_BIT, srcBinding.aspectMask);
             MOBILEGL_ASSERT(ok, "%s: failed to transition swapchain source image", __func__);
-            m_swapchainObject.SetImageLayout(m_imageIndexAcquired, trackedLayout);
+            m_swapchainObject.SetImageLayout(srcImageIndex, trackedLayout);
         } else {
             Bool ok = VkTextureManager::TransitionImageLayout(
                 frame.commandBuffer, srcBinding.image, *srcBinding.trackedLayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -10509,13 +11208,13 @@ void main() {
         VkAccessFlags restoreAccessMask = 0;
         GetImageTransitionDestinationState(srcOriginalLayout, restoreStageMask, restoreAccessMask);
         if (readIsDefaultFbo) {
-            VkImageLayout trackedLayout = m_swapchainObject.GetImageLayout(m_imageIndexAcquired);
+            VkImageLayout trackedLayout = m_swapchainObject.GetImageLayout(srcImageIndex);
             Bool ok = VkTextureManager::TransitionImageLayout(
                 frame.commandBuffer, srcBinding.image, trackedLayout, srcOriginalLayout,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, restoreStageMask,
                 VK_ACCESS_TRANSFER_READ_BIT, restoreAccessMask, srcBinding.aspectMask);
             MOBILEGL_ASSERT(ok, "%s: failed to restore swapchain source image layout", __func__);
-            m_swapchainObject.SetImageLayout(m_imageIndexAcquired, trackedLayout);
+            m_swapchainObject.SetImageLayout(srcImageIndex, trackedLayout);
         } else {
             Bool ok = VkTextureManager::TransitionImageLayout(
                 frame.commandBuffer, srcBinding.image, *srcBinding.trackedLayout, srcOriginalLayout,
@@ -10778,7 +11477,10 @@ void main() {
         // GL_STENCIL_INDEX) of the default framebuffer leave the caller's buffer untouched -
         // the whole KHR-GL*.framebuffer_blit family checks exactly that before it blits.
         if (readIsDefaultFbo) {
-            const VkImage swapchainDepthImage = m_swapchainObject.GetDepthStencilImage(m_imageIndexAcquired);
+            // A read names the image the app last rendered into, not the one Present() has
+            // already acquired (see m_defaultFramebufferImageIndex).
+            const Uint32 srcImageIndex = DefaultFramebufferReadIndex(true);
+            const VkImage swapchainDepthImage = m_swapchainObject.GetDepthStencilImage(srcImageIndex);
             if (swapchainDepthImage == VK_NULL_HANDLE) {
                 MGLOG_E_ONCE("DirectVulkan::ReadDepthStencilPixels skipped: the default framebuffer has no "
                         "depth/stencil image");
@@ -10802,12 +11504,12 @@ void main() {
                                 "stencil clear");
             }
             const VkFormat swapchainDepthFormat = m_swapchainObject.GetDepthStencilFormat();
-            VkImageLayout trackedLayout = m_swapchainObject.GetDepthStencilImageLayout(m_imageIndexAcquired);
+            VkImageLayout trackedLayout = m_swapchainObject.GetDepthStencilImageLayout(srcImageIndex);
             ReadDepthStencilImageToClient(swapchainDepthImage, swapchainDepthFormat, &trackedLayout,
                                           GetDepthStencilAspectMaskForFormat(swapchainDepthFormat), 0, 0, x, y,
                                           width, height, format, type, pixels,
                                           /*defaultFramebufferOrientation=*/true);
-            m_swapchainObject.SetDepthStencilImageLayout(m_imageIndexAcquired, trackedLayout);
+            m_swapchainObject.SetDepthStencilImageLayout(srcImageIndex, trackedLayout);
             return;
         }
 
@@ -11020,109 +11722,26 @@ void main() {
             }
         }
 
-        const auto depthValueAt = [&](SizeT i) -> Float {
-            switch (vkFormat) {
-            case VK_FORMAT_D16_UNORM: {
-                Uint16 raw = 0;
-                Memcpy(&raw, depthSrc + i * 2, sizeof(raw));
-                return static_cast<Float>(raw) / 65535.0f;
-            }
-            case VK_FORMAT_X8_D24_UNORM_PACK32:
-            case VK_FORMAT_D24_UNORM_S8_UINT: {
-                Uint32 raw = 0;
-                Memcpy(&raw, depthSrc + i * 4, sizeof(raw));
-                return static_cast<Float>(raw & 0xFFFFFFu) / static_cast<Float>(0xFFFFFFu);
-            }
-            default: { // D32_SFLOAT / D32_SFLOAT_S8_UINT
-                Float raw = 0.0f;
-                Memcpy(&raw, depthSrc + i * 4, sizeof(raw));
-                return raw;
-            }
-            }
-        };
-
-        SizeT dstPixelBytes = 0;
-        switch (type) {
-        case GL_FLOAT:
-        case GL_UNSIGNED_INT:
-        case GL_INT:
-        case GL_UNSIGNED_INT_24_8:
-            dstPixelBytes = 4;
-            break;
-        case GL_UNSIGNED_SHORT:
-        case GL_SHORT:
-            dstPixelBytes = 2;
-            break;
-        case GL_UNSIGNED_BYTE:
-        case GL_BYTE:
-            dstPixelBytes = 1;
-            break;
-        case GL_FLOAT_32_UNSIGNED_INT_24_8_REV:
-            dstPixelBytes = 8;
-            break;
-        default:
+        // The packing is the SHARED PackDepthStencilTight, so this arm and the wire arm cannot
+        // disagree about the encoding again: one aspect or both, in the client's own width, with
+        // the signed integer widths scaled into their own signed range and GL_HALF_FLOAT written
+        // as the half word the caller asked for.
+        Vector<Uint8> packed;
+        if (!PackDepthStencilTight(wantDepth ? depthSrc : nullptr, wantStencil ? stencilSrc : nullptr, vkFormat,
+                                   pixelCount, format, type, packed)) {
             MGLOG_E_ONCE("DirectVulkan::ReadDepthStencilPixels skipped: unsupported type=0x%x", type);
             return;
         }
-
-        // GL 4.6 core 18.2.8: a GL_STENCIL_INDEX read reports the index itself, unconverted, in
-        // whatever width the client asked for. Only the packed types mix depth in. Deciding this
-        // once - rather than per type, where GL_FLOAT and GL_UNSIGNED_SHORT used to emit a depth
-        // value that is meaningless for a stencil-only image - is what makes the CTS's
-        // (GL_STENCIL_INDEX, GL_INT) read return 7 instead of nothing.
-        const Bool stencilOnly = format == GL_STENCIL_INDEX;
-
-        Vector<Uint8> packed(pixelCount * dstPixelBytes);
-        for (SizeT i = 0; i < pixelCount; ++i) {
-            Uint8* dst = packed.data() + i * dstPixelBytes;
-            switch (type) {
-            case GL_FLOAT: {
-                const Float value = stencilOnly ? static_cast<Float>(stencilSrc[i]) : depthValueAt(i);
-                Memcpy(dst, &value, sizeof(value));
-                break;
-            }
-            case GL_UNSIGNED_SHORT:
-            case GL_SHORT: {
-                const Uint16 value = stencilOnly
-                    ? static_cast<Uint16>(stencilSrc[i])
-                    : static_cast<Uint16>(std::lround(static_cast<double>(depthValueAt(i)) * 65535.0));
-                Memcpy(dst, &value, sizeof(value));
-                break;
-            }
-            case GL_UNSIGNED_INT:
-            case GL_INT: {
-                const Uint32 value = stencilOnly
-                    ? stencilSrc[i]
-                    : static_cast<Uint32>(static_cast<double>(depthValueAt(i)) * 4294967295.0);
-                Memcpy(dst, &value, sizeof(value));
-                break;
-            }
-            case GL_UNSIGNED_BYTE:
-            case GL_BYTE: {
-                dst[0] = stencilSrc[i];
-                break;
-            }
-            case GL_UNSIGNED_INT_24_8: {
-                const Uint32 depth24 =
-                    static_cast<Uint32>(std::lround(static_cast<double>(depthValueAt(i)) * 16777215.0)) & 0xFFFFFFu;
-                const Uint32 value = (depth24 << 8) | stencilSrc[i];
-                Memcpy(dst, &value, sizeof(value));
-                break;
-            }
-            case GL_FLOAT_32_UNSIGNED_INT_24_8_REV: {
-                const Float depthValue = depthValueAt(i);
-                const Uint32 stencilValue = stencilSrc[i];
-                Memcpy(dst, &depthValue, sizeof(depthValue));
-                Memcpy(dst + 4, &stencilValue, sizeof(stencilValue));
-                break;
-            }
-            default:
-                break;
-            }
-        }
+        const SizeT dstPixelBytes = packed.size() / pixelCount;
 
         // Store honoring the client pack state (single slice).
+#if MOBILEGL_BUILD_DISAGGREGATED
+        const SharedPtr<MG_State::GLState::BufferObject> wireReplyHasNoPackBuffer;
+#endif
         const auto& pixelPackBufferObject =
+#if MOBILEGL_BUILD_DISAGGREGATED
+            MG_Config::Transport != MG_Config::TransportMode::Monolith ? wireReplyHasNoPackBuffer :
+#endif
             MGB_CTX->GetBufferBindingSlot(BufferTarget::PixelPack).GetBoundObject();
         const auto packParams = MGB_CTX->GetPixelStoreParameters(false);
         const SizeT rowPixels = static_cast<SizeT>(packParams.RowLength > 0 ? packParams.RowLength : width);
@@ -11236,6 +11855,10 @@ void main() {
         const Int glCubeFaceLayer = isCubeFaceTarget
             ? static_cast<Int>(textureUploadTarget) - static_cast<Int>(TextureUploadTarget::CubeMapPositiveX)
             : 0;
+        // The storage-image layer a copy starts at: the view's layer origin plus, for the one shape
+        // that names a face, the face the target token chose. Every copy below asks here, so the
+        // depth branch and the colour path cannot disagree about which layer was read.
+        const Uint32 baseArrayLayer = ToStorageArrayLayer(textureObject.get(), glCubeFaceLayer);
 
         if ((resource->aspect & VK_IMAGE_ASPECT_COLOR_BIT) == 0) {
             if (format == GL_DEPTH_COMPONENT || format == GL_DEPTH_STENCIL || format == GL_STENCIL_INDEX) {
@@ -11243,7 +11866,7 @@ void main() {
                     textureMipmapObject->GetMipmapTexelSize(textureUploadTarget, static_cast<Uint>(level));
                 // Storage space: `resource` is the storage texture's, so a view's level and
                 // layer have to be shifted into its numbering (see ToStorageMipLevel).
-                const Uint32 arrayLayer = ToStorageArrayLayer(textureObject.get(), glCubeFaceLayer);
+                const Uint32 arrayLayer = baseArrayLayer;
                 const Uint32 storageLevel = ToStorageMipLevel(textureObject.get(), level);
                 // A 1D array's levelSize.y() is its LAYER count, and those layers are the rows
                 // GL wants back - but in Vulkan they are array layers of a one-row image, not
@@ -11278,7 +11901,21 @@ void main() {
                                   imageTextureTarget == TextureTarget::Texture2DArray ||
                                   imageTextureTarget == TextureTarget::TextureCubeMapArray;
         const GLsizei depthSlices = is3dImage ? std::max<GLsizei>(texelSize.z(), 1) : 1;
-        const GLsizei arrayLayers = isArrayImage ? static_cast<GLsizei>(resource->arrayLayers) : 1;
+        // How many layers of the CALLER's texture a copy has to cover. `texelSize` above is already
+        // measured in the caller's space - a view's layer axis is the VIEW's, and the destination
+        // size the frontend validates a by-name readback against is built from the same extents -
+        // so the copy has to cover exactly those layers. resource->arrayLayers is the STORAGE
+        // owner's count: reading that many layers through a layer-windowed view covers layers the
+        // view does not name and, because the copy starts at the view's layer origin, runs past the
+        // last layer the image has.
+        const Uint32 storageArrayLayers = static_cast<Uint32>(resource->arrayLayers);
+        const Uint32 layersFromOrigin =
+            baseArrayLayer < storageArrayLayers ? storageArrayLayers - baseArrayLayer : 0u;
+        const GLsizei arrayLayers = static_cast<GLsizei>(
+            isArrayImage ? (textureObject->IsTextureView()
+                                ? std::min(static_cast<Uint32>(textureObject->GetViewNumLayers()), layersFromOrigin)
+                                : storageArrayLayers)
+                         : 1u);
         // A 1D array level comes back as ONE two-dimensional image whose rows are its layers
         // (GL 4.6 core 8.11.4), so its layers are already counted by `height` above and must not
         // multiply the slice count the way a 2D-array's or a cube-array's do. Vulkan still keeps
@@ -11338,10 +11975,11 @@ void main() {
         // Storage space, as above: a texture view reads its own level 0 out of whichever level
         // and layer of the parent it opened onto.
         copyRegion.imageSubresource.mipLevel = ToStorageMipLevel(textureObject.get(), level);
-        // glCubeFaceLayer, not 0: the cube face the target token named (see above). Non-zero for
-        // exactly one shape - a plain cube map read one face at a time - and layerCount is 1 there,
-        // so the copy stays inside the six layers the image has.
-        copyRegion.imageSubresource.baseArrayLayer = ToStorageArrayLayer(textureObject.get(), glCubeFaceLayer);
+        // baseArrayLayer, not 0: the cube face the target token named, plus the view's layer origin
+        // (see above). The face is non-zero for exactly one shape - a plain cube map read one face
+        // at a time - and layerCount is 1 there, so the copy stays inside the six layers the image
+        // has.
+        copyRegion.imageSubresource.baseArrayLayer = baseArrayLayer;
         copyRegion.imageSubresource.layerCount = static_cast<Uint32>(arrayLayers);
         copyRegion.imageExtent = {static_cast<Uint32>(width),
                                   is1dArrayImage ? 1u : static_cast<Uint32>(height),
@@ -11376,6 +12014,12 @@ void main() {
     }
 
     void VulkanRenderer::GenerateMipmap(GLenum target) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+            GenerateWireMipmap();
+            return;
+        }
+#endif
         const auto textureTarget = MG_Util::ConvertGLEnumToTextureTarget(target);
         // Whatever is left here is a coverage gap in this backend, not a broken invariant, so it
         // declines (leaving the mip chain unwritten) rather than asserting the process down. What
@@ -11384,10 +12028,10 @@ void main() {
         //
         // Every ARRAY target - 1D array, 2D array, cube map array - needs no blit code of its own:
         // its layers live in the VkImage's arrayLayers, so resource->extent/depth already describe
-        // one layer's image and the loop below already copies every layer per level via
-        // srcSubresource.layerCount = resource->arrayLayers. The one thing they DO need is that the
-        // GL-space storage allocation not shrink the layer count down the chain, which
-        // MipShrinkingComponentCount handles.
+        // one layer's image and the loop below already copies every layer of the window per level
+        // via srcSubresource.layerCount. The one thing they DO need is that the GL-space storage
+        // allocation not shrink the layer count down the chain, which MipShrinkingComponentCount
+        // handles.
         if (textureTarget != TextureTarget::Texture2D && textureTarget != TextureTarget::Texture2DArray &&
             textureTarget != TextureTarget::Texture3D && textureTarget != TextureTarget::TextureCubeMap &&
             textureTarget != TextureTarget::TextureCubeMapArray &&
@@ -11409,7 +12053,21 @@ void main() {
         const Uint32 currentMipLevelCount = static_cast<Uint32>(mipmapTexture->GetMipmapLevelCount());
         MOBILEGL_ASSERT(currentMipLevelCount > 0, "GenerateMipmap requires level 0 storage.");
 
-        const Uint32 baseMipLevel = std::min(static_cast<Uint32>(texture->GetLevelRange().x()), currentMipLevelCount - 1);
+        const auto& uploadTargets = mipmapTexture->GetUploadTargets();
+        MOBILEGL_ASSERT(!uploadTargets.empty(), "GenerateMipmap requires at least one upload target.");
+
+        // The generation window the call names, in the BOUND object's coordinates: BASE_LEVEL is
+        // where generation starts, and it runs to the smaller of the base image's full chain and
+        // MAX_LEVEL + 1 (GL 4.6 core 8.17). Two things make this the FRONTEND's plan rather than
+        // an arithmetic of this function's own: that window is what the storage allocation below
+        // has to cover, and through a view the numbers are the VIEW's own - BASE_LEVEL 1 of a view
+        // whose MIN_LEVEL is 1 describes the STORAGE's level 2, and MAX_LEVEL 2 ends the chain at
+        // the storage's level 3.
+        const auto mipmapPlan = MG_Impl::GLImpl::ComputeMipmapGenerationRange(*mipmapTexture, uploadTargets.front());
+        const Uint32 baseMipLevel = std::min(mipmapPlan.Base, currentMipLevelCount - 1);
+        // A base level the storage does not reach leaves nothing to generate; the storage window
+        // below collapses to a single level, which every consumer reads as a no-op.
+        const Uint32 endMipLevel = std::max(mipmapPlan.End, baseMipLevel + 1);
 
         // A texture that has only ever defined level 0 carries a single-level backing, so defining
         // the rest of the chain below recreates the image and carries the old contents over with a
@@ -11467,10 +12125,11 @@ void main() {
         // level storage is never written; in monolith the client-object path runs unchanged.
         const Bool allocatedMipmapStorage =
             MG_Config::Transport != MG_Config::TransportMode::Monolith
-                ? EnsureGenerateMipmapShadowAllocated(*resource, baseMipLevel, texture->GetUploadTargets())
-                : EnsureGenerateMipmapStorageAllocated(*mipmapTexture, baseMipLevel);
+                ? EnsureGenerateMipmapShadowAllocated(*resource, baseMipLevel, uploadTargets)
+                : EnsureGenerateMipmapStorageAllocated(*mipmapTexture, baseMipLevel, endMipLevel);
 #else
-        const Bool allocatedMipmapStorage = EnsureGenerateMipmapStorageAllocated(*mipmapTexture, baseMipLevel);
+        const Bool allocatedMipmapStorage =
+            EnsureGenerateMipmapStorageAllocated(*mipmapTexture, baseMipLevel, endMipLevel);
 #endif
         MOBILEGL_ASSERT(allocatedMipmapStorage, "GenerateMipmap could not allocate a full mip chain for this texture.");
 
@@ -11487,18 +12146,42 @@ void main() {
             return;
         }
 
+        // Every blit below runs in the STORAGE image's coordinates. A view owns no image of its
+        // own (VkTextureManager::StorageTextureOf), so the window the application named through
+        // the view - its BASE_LEVEL..MAX_LEVEL and its layer slice - has to land at the levels and
+        // layers the view aliases, and everything outside that window belongs to the storage owner
+        // and must not move (GL 4.6 core 8.18).
+        const Uint32 storageBaseMipLevel = ToStorageMipLevel(texture.get(), baseMipLevel);
+        const Uint32 storageEndMipLevel = ToStorageMipLevel(texture.get(), endMipLevel);
+
+        // The chain may also stop where the base image's extent stops: levels past 1x1 are not
+        // generatable, and a chain the storage does not carry cannot be written.
         const IntVec3 storageBaseTexelSize = {
             static_cast<Int>(resource->extent.width),
             static_cast<Int>(resource->extent.height),
             static_cast<Int>(resource->depth),
         };
-        const IntVec3 baseTexelSize = ComputeMipTexelSize(storageBaseTexelSize, baseMipLevel);
-        const Uint32 requiredMipLevelCount = baseMipLevel + ComputeFullMipLevelCount(baseTexelSize);
-        const Uint32 generateMipLevelCount = std::min(requiredMipLevelCount, resource->mipLevels);
-        if (generateMipLevelCount <= baseMipLevel + 1) {
+        const IntVec3 baseTexelSize = ComputeMipTexelSize(storageBaseTexelSize, storageBaseMipLevel);
+        const Uint32 storageChainEndMipLevel = storageBaseMipLevel + ComputeFullMipLevelCount(baseTexelSize);
+        const Uint32 generateMipLevelCount =
+            std::min({storageEndMipLevel, storageChainEndMipLevel, static_cast<Uint32>(resource->mipLevels)});
+        if (generateMipLevelCount <= storageBaseMipLevel + 1) {
             resource->layout = ResolveGenerateMipmapFinalLayout(resource->aspect);
             return;
         }
+
+        // A view writes ONLY the layers it names; the storage owner keeps every other one. A
+        // texture that is not a view addresses the whole image, which is what layerCount
+        // resource->arrayLayers already means.
+        Uint32 baseArrayLayer = 0;
+        Uint32 arrayLayerCount = static_cast<Uint32>(resource->arrayLayers);
+        if (texture->IsTextureView()) {
+            baseArrayLayer = std::min(ToStorageArrayLayer(texture.get(), 0), arrayLayerCount);
+            arrayLayerCount = std::min(static_cast<Uint32>(texture->GetViewNumLayers()),
+                                       static_cast<Uint32>(resource->arrayLayers) - baseArrayLayer);
+        }
+        MOBILEGL_ASSERT(arrayLayerCount > 0, "GenerateMipmap: empty layer window for textureId=%d",
+                        texture->GetExternalIndex());
 
         const VkImageLayout originalLayout = resource->layout;
         const VkImageLayout finalLayout = ResolveGenerateMipmapFinalLayout(resource->aspect);
@@ -11514,7 +12197,7 @@ void main() {
                             "GenerateMipmap: depth texture format %d lacks sampled/depth-attachment support for shader fallback.",
                             static_cast<Int>(resource->format));
             const Bool depthReady = GenerateDepthMipmapWithShader(frame, *texture, *resource,
-                                                                  baseMipLevel, generateMipLevelCount,
+                                                                  storageBaseMipLevel, generateMipLevelCount,
                                                                   storageBaseTexelSize, originalLayout, finalLayout);
             MOBILEGL_ASSERT(depthReady,
                             "GenerateMipmap: depth fallback failed for textureId=%d target=%d internalFormat=%d vkFormat=%d",
@@ -11538,13 +12221,13 @@ void main() {
         GetImageTransitionDestinationState(finalLayout, finalDstStageMask, finalDstAccessMask);
 
         if (originalLayout != finalLayout) {
-            if (baseMipLevel > 0) {
+            if (storageBaseMipLevel > 0) {
                 VkImageLayout lowerMipLayout = originalLayout;
                 const Bool lowerReady = VkTextureManager::TransitionImageLayout(
                     frame.commandBuffer, resource->image, lowerMipLayout, finalLayout,
                     originalSrcStageMask, finalDstStageMask,
                     originalSrcAccessMask, finalDstAccessMask,
-                    resource->aspect, 0, baseMipLevel);
+                    resource->aspect, 0, storageBaseMipLevel);
                 MOBILEGL_ASSERT(lowerReady, "%s: failed to transition lower untouched mip levels", __func__);
             }
 
@@ -11564,7 +12247,7 @@ void main() {
             frame.commandBuffer, resource->image, srcMipLayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             originalSrcStageMask, VK_PIPELINE_STAGE_TRANSFER_BIT,
             originalSrcAccessMask, VK_ACCESS_TRANSFER_READ_BIT,
-            resource->aspect, baseMipLevel, 1);
+            resource->aspect, storageBaseMipLevel, 1);
         MOBILEGL_ASSERT(srcReady, "%s: failed to transition base mip level to transfer source", __func__);
 
         // Every generated level starts from originalLayout and ends up TRANSFER_DST_OPTIMAL, and
@@ -11573,31 +12256,31 @@ void main() {
         // 12-level chain's 3(N-1)+1 barrier commands into 2(N-1)+2. Each level is still
         // individually transitioned to TRANSFER_SRC before it is read, so the write-then-read
         // dependency between consecutive levels is unchanged.
-        if (generateMipLevelCount > baseMipLevel + 1) {
+        if (generateMipLevelCount > storageBaseMipLevel + 1) {
             VkImageLayout dstRangeLayout = originalLayout;
             const Bool dstRangeReady = VkTextureManager::TransitionImageLayout(
                 frame.commandBuffer, resource->image, dstRangeLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 originalSrcStageMask, VK_PIPELINE_STAGE_TRANSFER_BIT,
                 originalSrcAccessMask, VK_ACCESS_TRANSFER_WRITE_BIT,
-                resource->aspect, baseMipLevel + 1, generateMipLevelCount - (baseMipLevel + 1));
+                resource->aspect, storageBaseMipLevel + 1, generateMipLevelCount - (storageBaseMipLevel + 1));
             MOBILEGL_ASSERT(dstRangeReady, "%s: failed to transition mip levels to transfer destination", __func__);
         }
 
-        for (Uint32 level = baseMipLevel + 1; level < generateMipLevelCount; ++level) {
+        for (Uint32 level = storageBaseMipLevel + 1; level < generateMipLevelCount; ++level) {
             const IntVec3 srcTexelSize = ComputeMipTexelSize(storageBaseTexelSize, level - 1);
             const IntVec3 dstTexelSize = ComputeMipTexelSize(storageBaseTexelSize, level);
 
             VkImageBlit blitRegion{};
             blitRegion.srcSubresource.aspectMask = resource->aspect;
             blitRegion.srcSubresource.mipLevel = level - 1;
-            blitRegion.srcSubresource.baseArrayLayer = 0;
-            blitRegion.srcSubresource.layerCount = resource->arrayLayers;
+            blitRegion.srcSubresource.baseArrayLayer = baseArrayLayer;
+            blitRegion.srcSubresource.layerCount = arrayLayerCount;
             blitRegion.srcOffsets[0] = {0, 0, 0};
             blitRegion.srcOffsets[1] = {srcTexelSize.x(), srcTexelSize.y(), srcTexelSize.z()};
             blitRegion.dstSubresource.aspectMask = resource->aspect;
             blitRegion.dstSubresource.mipLevel = level;
-            blitRegion.dstSubresource.baseArrayLayer = 0;
-            blitRegion.dstSubresource.layerCount = resource->arrayLayers;
+            blitRegion.dstSubresource.baseArrayLayer = baseArrayLayer;
+            blitRegion.dstSubresource.layerCount = arrayLayerCount;
             blitRegion.dstOffsets[0] = {0, 0, 0};
             blitRegion.dstOffsets[1] = {dstTexelSize.x(), dstTexelSize.y(), dstTexelSize.z()};
 
@@ -11722,10 +12405,6 @@ void main() {
         if (MGB_CTX->IsTransformFeedbackPaused()) {
             return false;
         }
-        const auto& program = MGB_CTX->GetTransformFeedbackProgram();
-        if (!program || program->GetTransformFeedbackVaryingCount() == 0) {
-            return false;
-        }
         // The bound pipeline's last pre-rasterization stage has to have been declared with Xfb
         // (VUID-vkCmdBeginTransformFeedbackEXT-None-04128). Everything above this line reads GL
         // state, which cannot answer that: a program can be built as a capture variant and still
@@ -11739,28 +12418,24 @@ void main() {
                          "undefined behaviour rather than a capture");
             return false;
         }
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith)
+            return BeginWireXfbCaptureForDraw(frame);
+#endif
+        const auto& program = MGB_CTX->GetTransformFeedbackProgram();
+        if (!program || program->GetTransformFeedbackVaryingCount() == 0) {
+            return false;
+        }
         const SizeT bufferCount = std::min<SizeT>(program->GetTransformFeedbackBufferCount(), 4);
         if (bufferCount == 0) {
             return false;
-        }
-
-        if (!m_xfbCounterBuffer.IsValid()) {
-            if (!m_xfbCounterBuffer.Create({
-                    .allocator = m_allocator,
-                    .size = 16 * kXfbCounterObjectSlots,
-                    .usage = VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT |
-                             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                    .memoryUsage = VMA_MEMORY_USAGE_AUTO,
-                })) {
-                MGLOG_E_ONCE("BeginXfbCaptureForDraw: failed to create the counter buffer");
-                return false;
-            }
         }
 
         VkBuffer buffers[4] = {};
         VkDeviceSize offsets[4] = {};
         VkDeviceSize sizes[4] = {};
         for (SizeT i = 0; i < bufferCount; ++i) {
+            if (!program->GetTransformFeedbackStride(static_cast<Uint>(i))) continue;
             auto& point = MGB_CTX->GetBufferBindingPoint(BufferTarget::TransformFeedback,
                                                                       static_cast<Uint>(i));
             const auto& bufferObject = point.GetBoundObject();
@@ -11794,8 +12469,31 @@ void main() {
             sizes[i] = rangeSize;
         }
 
-        s_vkCmdBindTransformFeedbackBuffersEXT(frame.commandBuffer, 0, static_cast<Uint32>(bufferCount), buffers,
-                                               offsets, sizes);
+        return BeginXfbCaptureWithBuffers(frame, static_cast<Uint32>(bufferCount), buffers, offsets, sizes);
+    }
+
+    Bool VulkanRenderer::BeginXfbCaptureWithBuffers(FrameContext::FrameData& frame, Uint32 bufferCount,
+            const VkBuffer* buffers, const VkDeviceSize* offsets, const VkDeviceSize* sizes) {
+        if (!m_xfbCounterBuffer.IsValid()) {
+            if (!m_xfbCounterBuffer.Create({
+                    .allocator = m_allocator,
+                    .size = 16 * kXfbCounterObjectSlots,
+                    .usage = VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT |
+                             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                    .memoryUsage = VMA_MEMORY_USAGE_AUTO,
+                })) {
+                MGLOG_E_ONCE("BeginXfbCaptureForDraw: failed to create the counter buffer");
+                return false;
+            }
+        }
+        m_currentDrawXfbBufferCount = bufferCount;
+        m_currentDrawXfbBufferMask = 0;
+        for (Uint32 i = 0; i < bufferCount; ++i) {
+            if (buffers[i] == VK_NULL_HANDLE) continue;
+            m_currentDrawXfbBufferMask |= 1u << i;
+            s_vkCmdBindTransformFeedbackBuffersEXT(frame.commandBuffer, i, 1, buffers + i,
+                                                   offsets + i, sizes + i);
+        }
 
         const Uint32 counterSlot = CurrentXfbCounterSlot();
         const Uint64 generation = MGB_CTX->GetTransformFeedbackGeneration();
@@ -11805,6 +12503,7 @@ void main() {
         VkBuffer counterBuffers[4] = {};
         VkDeviceSize counterOffsets[4] = {};
         for (SizeT i = 0; i < bufferCount; ++i) {
+            if (!(m_currentDrawXfbBufferMask & (1u << i))) continue;
             counterBuffers[i] = m_xfbCounterBuffer.GetHandle();
             counterOffsets[i] = static_cast<VkDeviceSize>(counterSlot) * 16 + static_cast<VkDeviceSize>(i) * 4;
         }
@@ -11821,12 +12520,14 @@ void main() {
         if (!began) {
             return;
         }
-        const auto& program = MGB_CTX->GetTransformFeedbackProgram();
-        const SizeT bufferCount = program ? std::min<SizeT>(program->GetTransformFeedbackBufferCount(), 4) : 0;
+        // Exactly the targets used by this draw's Begin, independent of frontend
+        // objects and of whether the span came from the wire or monolith state.
+        const Uint32 bufferCount = m_currentDrawXfbBufferCount;
         const Uint32 counterSlot = CurrentXfbCounterSlot();
         VkBuffer counterBuffers[4] = {};
         VkDeviceSize counterOffsets[4] = {};
         for (SizeT i = 0; i < bufferCount; ++i) {
+            if (!(m_currentDrawXfbBufferMask & (1u << i))) continue;
             counterBuffers[i] = m_xfbCounterBuffer.GetHandle();
             counterOffsets[i] = static_cast<VkDeviceSize>(counterSlot) * 16 + static_cast<VkDeviceSize>(i) * 4;
         }
@@ -12735,10 +13436,51 @@ void main() {
         }
 
         // The command parameters live on the GPU, so the vertex range is unknown here;
-        // resident vertex buffers are uploaded in full regardless.
+        // resident vertex buffers are uploaded in full regardless. A CLIENT-MEMORY ARRAY is the
+        // one exception: its bytes have to be staged BEFORE the GPU reads the command, so for
+        // exactly that case the words are resolved on the CPU and this range is what bounds the
+        // staging. The draw itself stays native - the GPU reads the same commands.
         DrawCmdParam vertexRange{};
         vertexRange.vertexCount = 0;
         vertexRange.instanceCount = 1;
+        // MONOLITH ONLY: with a transport the frontend VAO is not this side's to read at all
+        // (the client owns those bytes and stages them itself), and this runs on the apply thread.
+        if (MG_Config::Transport == MG_Config::TransportMode::Monolith) {
+            const auto& currentVAO = MGB_CTX->GetBoundVertexArray();
+            Bool clientArray = false;
+            if (currentVAO) {
+                for (const auto& attribute : currentVAO->GetAllAttributes()) {
+                    if (attribute.Enabled && !attribute.Buffer) {
+                        clientArray = true;
+                        break;
+                    }
+                }
+            }
+            if (clientArray) {
+                // The commands may be shader-written, and a stale shadow would size the upload
+                // off words no shader ever wrote.
+                drawBuffer->SyncGpuWrites();
+                const Uint8* commandHostBytes = drawBuffer->MappedData();
+                if (commandHostBytes == nullptr) {
+                    MGLOG_E_ONCE("MultiDrawArraysIndirect skipped: a client-memory vertex array needs "
+                                 "the commands on the CPU and the indirect buffer has no readable shadow");
+                    return;
+                }
+                Uint64 lastElement = 0;
+                for (GLsizei idraw = 0; idraw < drawcount; ++idraw) {
+                    VkDrawIndirectCommand command{};
+                    Memcpy(&command,
+                           commandHostBytes + commandOffset + static_cast<SizeT>(idraw) * static_cast<SizeT>(stride),
+                           sizeof(command));
+                    lastElement = std::max<Uint64>(lastElement,
+                                                   static_cast<Uint64>(command.firstVertex) + command.vertexCount);
+                    vertexRange.firstInstance = std::max(vertexRange.firstInstance, command.firstInstance);
+                    vertexRange.instanceCount = std::max(vertexRange.instanceCount, command.instanceCount);
+                }
+                vertexRange.firstVertex = 0;
+                vertexRange.vertexCount = static_cast<Uint32>(lastElement);
+            }
+        }
 
         if (!SetupDraw(frame, mode, DrawSetupAspect::IndirectDrawBuffer, vertexRange)) {
             return;
@@ -12803,12 +13545,32 @@ void main() {
             return false;
         }
         if (m_device == VK_NULL_HANDLE || m_graphicsQueue == VK_NULL_HANDLE) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+            return IsFrameSerialComplete(serial);
+#else
             return true;
+#endif
         }
-        // Every submission is recorded with the frame serial it was made under, so the wait can be
-        // narrowed to the first submission at or past the requested serial instead of draining the
-        // whole queue. OnSubmitsCompletedUpTo calls NotifyFrameSerialComplete for every record it
-        // retires, so the completed-serial floor still advances correctly after one fence wait.
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // More than one submit can carry the same frame serial (mid-frame flush,
+        // then Present). The completed floor is clamped below any serial still
+        // held by an in-flight record; the first matching fence is not proof.
+        // OnSubmitsCompletedUpTo erases records, so copy fields and restart the
+        // search after every wait instead of continuing an invalidated iterator.
+        for (;;) {
+            const auto record = std::find_if(m_inFlightSubmits.begin(), m_inFlightSubmits.end(),
+                [serial](const auto& candidate) {
+                    return candidate.frameSerial >= serial && candidate.fence != VK_NULL_HANDLE;
+                });
+            if (record == m_inFlightSubmits.end()) break;
+            const Uint64 submitIndex = record->submitIndex;
+            if (!WaitForSubmitsUpTo(submitIndex, UINT64_MAX))
+                break; // fall through to the queue drain below
+            TryDrainFrameTransients();
+            if (IsFrameSerialComplete(serial)) return true;
+        }
+#else
+        // Pull build's historical one-fence wait stays byte-identical.
         for (const auto& record : m_inFlightSubmits) {
             if (record.frameSerial < serial || record.fence == VK_NULL_HANDLE) {
                 continue;
@@ -12822,6 +13584,7 @@ void main() {
             TryDrainFrameTransients();
             return true;
         }
+#endif
 
         // No usable record - fall back to draining the graphics queue. This over-waits (bounded by
         // the in-flight frame count) but never deadlocks.
@@ -12835,7 +13598,11 @@ void main() {
         // The queue was just drained; take the free frame-boundary drain when
         // nothing is recorded (present-less timer-query loops). No-op otherwise.
         TryDrainFrameTransients();
+#if MOBILEGL_BUILD_DISAGGREGATED
+        return IsFrameSerialComplete(serial);
+#else
         return true;
+#endif
     }
 
     Uint64 VulkanRenderer::GetSyncPointSubmitIndex() const {
@@ -12849,8 +13616,43 @@ void main() {
             return false;
         }
         const auto& frame = m_frameContext.GetCurrent();
+#if MOBILEGL_BUILD_DISAGGREGATED
+        return frame.isCommandRecording || frame.hasCommandBufferRecorded ||
+               frame.isPreCommandRecording || frame.hasPreCommandBufferRecorded;
+#else
         return frame.isCommandRecording || frame.hasCommandBufferRecorded;
+#endif
     }
+
+#if MOBILEGL_BUILD_DISAGGREGATED
+    void VulkanRenderer::RewindWireDescriptorSetsIfDue() {
+        if (!m_uniformManager || m_frameContext.GetFrameCount() == 0) return;
+        const Uint32 frameIndex = m_frameContext.GetCurrentFrameIndex();
+        if (!m_uniformManager->WireDescriptorSetBudgetReached(frameIndex)) return;
+
+        // A set cannot be rewritten while a recorded or submitted command
+        // buffer might still read it. This wire-only boundary first submits
+        // the current recording, then idles the graphics queue before reuse.
+        if (HasPendingRecordedWork() && !FlushPendingCommands())
+            MagmaWireFatal("descriptor-rewind-flush");
+        const Uint64 through = m_submitCounter;
+        if (through > m_completedSubmitCounter) {
+            // B4 has not yet made every old retirement site aggregate-safe.
+            // Queue idle proves even a submission a previous single-fence path
+            // prematurely removed from m_inFlightSubmits has finished; only
+            // then may any layout cursor be rewound and its sets rewritten.
+            if (vkQueueWaitIdle(m_graphicsQueue) != VK_SUCCESS)
+                MagmaWireFatal("descriptor-rewind-wait");
+            OnSubmitsCompletedUpTo(through);
+        }
+        if (HasPendingRecordedWork() || m_completedSubmitCounter < through)
+            MagmaWireFatal("descriptor-rewind-proof");
+        const SizeT cachedSets = m_uniformManager->RewindWireDescriptorSets(frameIndex);
+        MGLOG_I("Magma descriptor rewind: frame=%u retiredSubmit=%llu budget=%u cached=%zu",
+                frameIndex, static_cast<unsigned long long>(through),
+                UniformManager::kWireDescriptorSetBudget, cachedSets);
+    }
+#endif
 
     Bool VulkanRenderer::IsSubmitIndexComplete(Uint64 submitIndex) {
         if (submitIndex <= m_completedSubmitCounter) {
@@ -12885,15 +13687,67 @@ void main() {
         }
     }
 
+#if MOBILEGL_BUILD_DISAGGREGATED
+    Bool VulkanRenderer::WaitForSubmitsUpTo(Uint64 submitIndex, Uint64 timeoutNs) {
+        if (submitIndex <= m_completedSubmitCounter) return true;
+        if (submitIndex > m_submitCounter || m_device == VK_NULL_HANDLE) return false;
+        Vector<VkFence> fences;
+        if (!CollectSubmitFencePrefix(m_inFlightSubmits, submitIndex, VkFence{}, fences))
+            return false;
+        const VkResult result = vkWaitForFences(m_device, static_cast<Uint32>(fences.size()),
+                                                fences.data(), VK_TRUE, timeoutNs);
+        if (result == VK_SUCCESS) {
+            OnSubmitsCompletedUpTo(submitIndex);
+            return true;
+        }
+        if (result != VK_TIMEOUT)
+            MGLOG_E_ONCE("WaitForSubmitsUpTo: vkWaitForFences returned %d", result);
+        return false;
+    }
+#endif
+
     void VulkanRenderer::OnSubmitsCompletedUpTo(Uint64 submitIndex) {
         m_completedSubmitCounter = std::max(m_completedSubmitCounter, submitIndex);
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // ---- P7 wave 2 package B3: THE COMPLETED-FRAME-SERIAL FLOOR MUST BE PROVABLE --------
+        //
+        // "Frame-serial completion piggybacks on submission completion" holds only while a
+        // frame serial has ONE submission. On the wire arm it has at least two: the per-frame
+        // palette glTexImage2D reaches UploadPendingWireLevels ->
+        // FlushWirePendingCommandsForTextureUpdate -> FlushPendingCommands at the first
+        // palette-sampling draw and submits S1 under a POOLED fence, and the frame's draws
+        // (and the barriered vkCmdCopyBuffer that StagedWireRangeCopy records for every
+        // streamed glBufferSubData) then go out in the Present submission S2.
+        //
+        // S1 is tiny and signals almost immediately. Retiring it used to advance the floor to
+        // ITS frameSerial - which is also S2's - so VkBufferManager was told "frame N-1 is
+        // complete" while S2(N-1), the submission actually carrying frame N-1's buffer copies,
+        // was still executing. The next frame's first write to that buffer then failed
+        // WriteWireBuffer's busy predicate and took the unordered host memcpy, and S2(N-1)'s
+        // queued copies landed on top of it afterwards: a PREFIX TEAR of one draw's vertex
+        // range, no log line, no GL error, no Fatal.
+        //
+        // The floor now advances only to a serial NO remaining in-flight submission still
+        // carries. NotifyFrameSerialComplete is monotone and already refuses the still-
+        // recording serial, so this can only ever advance the floor later, never further.
+        // On the disaggregated build's MONOLITH arm this is behaviour-identical (one
+        // submission per serial). The #else branch below is the pull build's statement,
+        // unchanged, which is what keeps G1's .text byte-identical.
+        Bool retiredAny = false;
+        Uint64 advanceTo = 0;
+#endif
         while (!m_inFlightSubmits.empty() && m_inFlightSubmits.front().submitIndex <= submitIndex) {
             SubmitRecord record = m_inFlightSubmits.front();
             m_inFlightSubmits.erase(m_inFlightSubmits.begin());
+#if MOBILEGL_BUILD_DISAGGREGATED
+            retiredAny = true;
+            advanceTo = std::max(advanceTo, record.frameSerial);
+#else
             // Frame-serial completion piggybacks on submission completion.
             // NotifyFrameSerialComplete refuses the current (still-recording)
             // serial, so mid-frame flush records do not mark it early.
             m_bufferManager.NotifyFrameSerialComplete(record.frameSerial);
+#endif
             if (!record.pooledFence || m_device == VK_NULL_HANDLE) {
                 continue; // frame-slot fences are reset/destroyed by FrameContext
             }
@@ -12903,12 +13757,62 @@ void main() {
                 vkDestroyFence(m_device, record.fence, nullptr);
             }
         }
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (retiredAny) {
+            // Clamp to one below the lowest serial still in flight.
+            for (const auto& remaining : m_inFlightSubmits) {
+                advanceTo = std::min(advanceTo, remaining.frameSerial > 0 ? remaining.frameSerial - 1 : Uint64{0});
+            }
+            // Lens C's probe, and the red-once's reading: an advance that names a serial some
+            // remaining submission still carries. Unreachable with the clamp above; the R-16
+            // revert is to delete the clamp loop, and then this counts.
+            for (const auto& remaining : m_inFlightSubmits) {
+                if (remaining.frameSerial <= advanceTo) {
+                    WireDeclineTally::CountUnsoundSerialComplete();
+                    // Logged per event, not once: this is the red-once's reading and the log is
+                    // the only place it can be read from: the renderer this trace builds is
+                    // never Shutdown() (the process exits), so a teardown dump reports the
+                    // start-up context's zero instead of the replay's count.
+                    MGLOG_W("MGWIRE-FLOOR unsound-serial-complete #%llu: advancing the completed "
+                            "frame-serial floor to %llu, which submission %llu (serial %llu) still carries",
+                            static_cast<unsigned long long>(WireDeclineTally::UnsoundSerialCompleteEvents()),
+                            static_cast<unsigned long long>(advanceTo),
+                            static_cast<unsigned long long>(remaining.submitIndex),
+                            static_cast<unsigned long long>(remaining.frameSerial));
+                    break;
+                }
+            }
+            {
+                static const Bool probe = [] {
+                    const char* value = std::getenv("MOBILEGL_MAGMA_WIREBUF_PROBE");
+                    return value && value[0] == '1';
+                }();
+                if (probe) {
+                    Uint64 minRemaining = ~Uint64{0};
+                    for (const auto& r : m_inFlightSubmits) minRemaining = std::min(minRemaining, r.frameSerial);
+                    MGLOG_I("FLOOR retire upTo=%llu advanceTo=%llu remaining=%zu minRemainingSerial=%lld "
+                            "frameSerial=%llu",
+                            static_cast<unsigned long long>(submitIndex),
+                            static_cast<unsigned long long>(advanceTo), m_inFlightSubmits.size(),
+                            m_inFlightSubmits.empty() ? -1LL : static_cast<long long>(minRemaining),
+                            static_cast<unsigned long long>(m_bufferManager.GetFrameSerial()));
+                }
+            }
+            m_bufferManager.NotifyFrameSerialComplete(advanceTo);
+        }
+#endif
         // Mid-frame-flushed command buffers whose submission just completed can
         // be freed now; present-less flush loops have no other reclaim point.
         m_frameContext.FreeRetiredCommandBuffersCompletedUpTo(m_completedSubmitCounter);
+#if MOBILEGL_BUILD_DISAGGREGATED
+        CollectWireObjects(m_completedSubmitCounter);
+#endif
     }
 
     Bool VulkanRenderer::TryDrainFrameTransients() {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (m_wirePreparationDepth != 0) return false;
+#endif
         if (m_device == VK_NULL_HANDLE || m_frameContext.GetFrameCount() == 0) {
             return false;
         }
@@ -12921,6 +13825,19 @@ void main() {
         if (HasPendingRecordedWork()) {
             return false;
         }
+
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+            // Texture uploads submit on this queue with their own fences. The
+            // renderer watermark alone cannot prove images/views are idle.
+            if (m_textureManager && !m_textureManager->WireUploadsAreIdle()) return false;
+            // No preparation, recording or GPU work remains. A minimized Present
+            // may have abandoned a recording tagged for a submission that will
+            // never occur, so reclaim those future-tagged objects as well.
+            CollectWireObjects(m_completedSubmitCounter, true);
+            ClearAllWireDrawPassCaches();
+        }
+#endif
 
         // Every submission is complete and nothing recorded references the
         // per-frame transients. Pure-reclaim work runs on every drain: it only
@@ -12953,6 +13870,25 @@ void main() {
         // loops still rewind the arena and age their caches every 8 iterations -
         // bounded by 8 iterations' transient usage.
         ++m_drainsSinceLastPresent;
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // B3 probe: a drain that reaches here found the GPU caught up and nothing recording.
+        // Every 8th one is treated as a FRAME BOUNDARY - mid-frame. This probe is what REFUTED
+        // that as the OpenRA mechanism (one successful drain, zero boundary works across the
+        // replay; magma-b3.md §2.4): the cause was the floor in OnSubmitsCompletedUpTo.
+        {
+            static const Bool probe = [] {
+                const char* value = std::getenv("MOBILEGL_MAGMA_WIREBUF_PROBE");
+                return value && value[0] == '1';
+            }();
+            if (probe) {
+                MGLOG_I("WBUF drain#%llu%s submit=%llu completed=%llu",
+                        static_cast<unsigned long long>(m_drainsSinceLastPresent),
+                        (m_drainsSinceLastPresent % 8) == 0 ? " ***FRAME-BOUNDARY-WORK***" : "",
+                        static_cast<unsigned long long>(m_submitCounter),
+                        static_cast<unsigned long long>(m_completedSubmitCounter));
+            }
+        }
+#endif
         if ((m_drainsSinceLastPresent % 8) != 0) {
             return true;
         }
@@ -13025,6 +13961,9 @@ void main() {
     }
 
     Bool VulkanRenderer::SubmitPendingCommandBuffer(FrameContext::FrameData& frame, VkFence fence, Bool pooledFence) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        RetireWireDrawPass();
+#endif
         // Batched texture uploads must reach the queue before the frame's
         // commands: the recording being submitted may sample images whose
         // texels only exist in the texture manager's open upload batch.
@@ -13073,7 +14012,12 @@ void main() {
         // pooled fences and mid-frame command buffers.
         RefreshCompletedSubmits();
         auto& frame = m_frameContext.GetCurrent();
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (!frame.isCommandRecording && !frame.hasCommandBufferRecorded &&
+            !frame.isPreCommandRecording && !frame.hasPreCommandBufferRecorded) {
+#else
         if (!frame.isCommandRecording && !frame.hasCommandBufferRecorded) {
+#endif
             // GL flush semantics still demand batched texture uploads start
             // executing in finite time even when no draw was recorded.
             if (m_textureManager) {
@@ -13116,9 +14060,15 @@ void main() {
         const VkResult retireResult = m_frameContext.RetireCurrentCommandBuffer(submittingPreCommandBuffer);
         if (retireResult != VK_SUCCESS) {
             MGLOG_E_ONCE("FlushPendingCommands: RetireCurrentCommandBuffer returned %d; draining submission", retireResult);
+#if MOBILEGL_BUILD_DISAGGREGATED
+            if (WaitForSubmitsUpTo(m_submitCounter, UINT64_MAX)) {
+                // Every registered fence through this submission was waited.
+            } else if (vkQueueWaitIdle(m_graphicsQueue) == VK_SUCCESS) {
+#else
             if (vkWaitForFences(m_device, 1, &fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS) {
                 OnSubmitsCompletedUpTo(m_submitCounter);
             } else if (vkQueueWaitIdle(m_graphicsQueue) == VK_SUCCESS) {
+#endif
                 m_bufferManager.NotifyDeviceIdle();
                 OnSubmitsCompletedUpTo(m_submitCounter);
             } else {
@@ -13156,6 +14106,12 @@ void main() {
                 return false;
             }
         }
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (!WaitForSubmitsUpTo(submitIndex, timeoutNs)) return false;
+        // A blocking wait can drain a present-less loop's frame transients.
+        TryDrainFrameTransients();
+        return true;
+#else
         for (const auto& record : m_inFlightSubmits) {
             if (record.submitIndex >= submitIndex) {
                 const VkResult result = vkWaitForFences(m_device, 1, &record.fence, VK_TRUE, timeoutNs);
@@ -13176,6 +14132,7 @@ void main() {
         // No in-flight record at or beyond the index: it was already observed
         // complete via a fence wait on a later submission.
         return true;
+#endif
     }
 
     void VulkanRenderer::OnFrameCommandRecordingBegan(VkCommandBuffer commandBuffer) {
@@ -13290,6 +14247,11 @@ void main() {
     }
 
     void VulkanRenderer::Present() {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // Present has its own submit path. Tag its last wire pass before that
+        // submission, rather than retaining it until a draw in the next frame.
+        RetireWireDrawPass();
+#endif
         if (m_swapchainObject.GetHandle() == VK_NULL_HANDLE || m_presentSuspended) {
             // No usable swapchain: the window was zero-area at initialization, or
             // presentation was suspended when the window minimized. Try to bring a
@@ -13319,6 +14281,15 @@ void main() {
                 return;
             }
             m_presentSuspended = false;
+#if MOBILEGL_BUILD_DISAGGREGATED
+            // A slot's Present fence alone does not prove its older pooled
+            // flushes retired. Wait the full prefix before FrameContext may
+            // free its retired command buffers and reset the slot fence.
+            const Uint64 slotSubmit = m_frameContext.GetCurrent().lastSubmitIndex;
+            if (slotSubmit > m_completedSubmitCounter &&
+                !WaitForSubmitsUpTo(slotSubmit, UINT64_MAX))
+                MagmaWireFatal("deferred-acquire-submit-wait");
+#endif
             const VkResult acquireResult =
                 m_frameContext.WaitAndAcquireNextImage(m_device, m_swapchainObject.GetHandle(), m_imageIndexAcquired);
             if (acquireResult == VK_SUBOPTIMAL_KHR) {
@@ -13449,6 +14420,16 @@ void main() {
         // 3) Advance frame slot.
         m_frameContext.AdvanceToNext();
 
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // FrameContext waits then resets the slot fence and frees retired
+        // command buffers. A later Present fence is not aggregate proof for
+        // earlier pooled flushes, so wait every registered submission in this
+        // slot's prefix BEFORE the reset/free happens.
+        const Uint64 slotSubmit = m_frameContext.GetCurrent().lastSubmitIndex;
+        if (slotSubmit > m_completedSubmitCounter &&
+            !WaitForSubmitsUpTo(slotSubmit, UINT64_MAX))
+            MagmaWireFatal("present-slot-submit-wait");
+#endif
         // 4) Wait/reset/acquire for next frame.
         result = m_frameContext.WaitAndAcquireNextImage(m_device, m_swapchainObject.GetHandle(), m_imageIndexAcquired);
         if (result == VK_SUBOPTIMAL_KHR) {
@@ -13473,12 +14454,16 @@ void main() {
                 m_frameContext.WaitAndAcquireNextImage(m_device, m_swapchainObject.GetHandle(), m_imageIndexAcquired);
         }
         VK_VERIFY(result, "Present, vkAcquireNextImageKHR");
-        // The acquired slot's fence has been waited: its last submission
-        // (and, in queue order, everything before it) is complete. The frame
-        // serials those submissions carried advance the buffer-manager floor
-        // inside OnSubmitsCompletedUpTo.
+        // Pull keeps its historical slot-fence inference. In a disaggregated
+        // build the aggregate wait above already retired the registered prefix
+        // before FrameContext reset the slot fence; this repeat is idempotent.
         OnSubmitsCompletedUpTo(m_frameContext.GetCurrent().lastSubmitIndex);
         CollectDeferredDepthMipmapCleanup(m_frameContext.GetCurrentFrameIndex());
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // Its previous recording has completed. Drop cached attachment views
+        // before the texture manager can release their retired images.
+        ClearWireDrawPassCache(m_frameContext.GetCurrentFrameIndex());
+#endif
         m_textureManager->BeginFrame(m_frameContext.GetCurrentFrameIndex());
         m_bufferManager.BeginFrame(m_frameContext.GetCurrentFrameIndex());
         m_convertedVertexStreams.clear();
@@ -14111,7 +15096,14 @@ void main() {
         descriptorIndexingFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
         VkPhysicalDeviceDescriptorIndexingProperties descriptorIndexingProperties{};
         descriptorIndexingProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES;
-        const Bool descriptorIndexingCore = m_physicalDevice.properties.apiVersion >= VK_API_VERSION_1_2;
+        const Bool descriptorIndexingCore =
+#if MOBILEGL_BUILD_DISAGGREGATED && !defined(VK_USE_PLATFORM_WIN32_KHR)
+            // CreateInstance requests Vulkan 1.1 on these platforms. A 1.2+ GPU
+            // does not promote descriptor indexing into that application's core
+            // API; the wire path must enable VK_EXT_descriptor_indexing instead.
+            (MG_Config::Transport == MG_Config::TransportMode::Monolith) &&
+#endif
+            m_physicalDevice.properties.apiVersion >= VK_API_VERSION_1_2;
         const Bool descriptorIndexingExtension =
             IsExtensionSupported(availableExtensions, VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME);
         auto getPhysicalDeviceProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
@@ -14120,6 +15112,51 @@ void main() {
             getPhysicalDeviceProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
                 vkGetInstanceProcAddr(m_instance, "vkGetPhysicalDeviceProperties2KHR"));
         }
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // Linux/Android request Vulkan 1.1: a 1.2 physical device alone does
+        // not expose the promoted renderpass2/depth-resolve API to this app.
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+        const Bool wireDepthResolveCore = m_physicalDevice.properties.apiVersion >= VK_API_VERSION_1_2;
+#else
+        const Bool wireDepthResolveCore = false;
+#endif
+        const Bool wireDepthResolveExtensions =
+            m_physicalDevice.properties.apiVersion >= VK_API_VERSION_1_1 &&
+            IsExtensionSupported(availableExtensions, VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME) &&
+            IsExtensionSupported(availableExtensions, VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME);
+        const Bool wireDepthResolveEnabled = MG_Config::Transport != MG_Config::TransportMode::Monolith &&
+            getPhysicalDeviceProperties2 && (wireDepthResolveCore || wireDepthResolveExtensions);
+        m_wireCreateRenderPass2 = nullptr;
+        m_wireDepthResolveModes = m_wireStencilResolveModes = 0;
+        if (wireDepthResolveEnabled) {
+            if (!wireDepthResolveCore) {
+                EnableOptionalDeviceExtension(availableExtensions, enabledDeviceExtensions,
+                                              VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME);
+                EnableOptionalDeviceExtension(availableExtensions, enabledDeviceExtensions,
+                                              VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME);
+            }
+            VkPhysicalDeviceDepthStencilResolveProperties resolveProperties{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES};
+            VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+            properties.pNext = &resolveProperties;
+            getPhysicalDeviceProperties2(m_physicalDevice.handle, &properties);
+            m_wireDepthResolveModes = resolveProperties.supportedDepthResolveModes;
+            m_wireStencilResolveModes = resolveProperties.supportedStencilResolveModes;
+        }
+        // P7 wave 2-B2, CONTRACT-P7 §3.2 (`multisample-blit-aspect`): the shader resolve's
+        // stencil half needs SPV_EXT_shader_stencil_export, because a fragment shader cannot
+        // write the stencil aspect without it. Enabled on the same terms as the resolve
+        // extensions above - wire arms only - and the arm declines stencil where it is absent
+        // rather than producing an undefined aspect.
+        m_wireShaderStencilExport = MG_Config::Transport != MG_Config::TransportMode::Monolith &&
+            IsExtensionSupported(availableExtensions, VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
+        if (m_wireShaderStencilExport)
+            EnableOptionalDeviceExtension(availableExtensions, enabledDeviceExtensions,
+                                          VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
+        // P7 gate 5 (g5-msprobe): which multisample depth/stencil resolve arm goes first is measured
+        // once the device exists (ArmWireDepthResolveOrder, below), not keyed on the vendor.
+        m_wirePreferShaderDepthResolve = false;
+#endif
         if ((descriptorIndexingCore || descriptorIndexingExtension) && getPhysicalDeviceFeatures2 != nullptr &&
             getPhysicalDeviceProperties2 != nullptr) {
             VkPhysicalDeviceFeatures2 featureQuery{};
@@ -14593,6 +15630,41 @@ void main() {
             }
         }
 
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // Codex closeout finding 2 (cf-magma): GL 4.6 core 8.26 makes an access through an
+        // invalid image unit load zero and DISCARD stores and atomics. A null storage-image
+        // descriptor is that rule exactly, so the wire arm binds one for such a unit
+        // (UniformManager::SetWireInvalidStorageImageArm). ONLY nullDescriptor is requested:
+        // robustBufferAccess2 / robustImageAccess2 would put a bounds check on every access of
+        // every draw. Wire arms only, on the same terms as the depth-resolve extensions above -
+        // the monolith arm resolves image units elsewhere and keeps its device as it was.
+        m_wireNullDescriptor = false;
+        VkPhysicalDeviceRobustness2FeaturesEXT robustness2Features{};
+        robustness2Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT;
+        const char* robustness2Name =
+            IsExtensionSupported(availableExtensions, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) ? VK_EXT_ROBUSTNESS_2_EXTENSION_NAME
+            : IsExtensionSupported(availableExtensions, VK_KHR_ROBUSTNESS_2_EXTENSION_NAME) ? VK_KHR_ROBUSTNESS_2_EXTENSION_NAME
+                                                                                            : nullptr;
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith && robustness2Name != nullptr &&
+            getPhysicalDeviceFeatures2 != nullptr) {
+            VkPhysicalDeviceFeatures2 featureQuery{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            featureQuery.pNext = &robustness2Features;
+            getPhysicalDeviceFeatures2(m_physicalDevice.handle, &featureQuery);
+            if (robustness2Features.nullDescriptor == VK_TRUE) {
+                EnableOptionalDeviceExtension(availableExtensions, enabledDeviceExtensions, robustness2Name);
+                robustness2Features.robustBufferAccess2 = VK_FALSE;
+                robustness2Features.robustImageAccess2 = VK_FALSE;
+                robustness2Features.pNext = const_cast<void*>(deviceCreateInfo.pNext);
+                deviceCreateInfo.pNext = &robustness2Features;
+                m_wireNullDescriptor = true;
+            }
+        }
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+            MGLOG_I("Magma wire: robustness2 nullDescriptor %s (%s)", m_wireNullDescriptor ? "enabled" : "unavailable",
+                    robustness2Name != nullptr ? robustness2Name : "no robustness2 extension");
+        }
+#endif
+
         deviceCreateInfo.enabledExtensionCount = static_cast<Uint32>(enabledDeviceExtensions.size());
         deviceCreateInfo.ppEnabledExtensionNames = enabledDeviceExtensions.data();
         MGLOG_I("Device feature support: robustBufferAccess=%s geometryShader=%s independentBlend=%s logicOp=%s shaderClipDistance=%s "
@@ -14637,6 +15709,13 @@ void main() {
             deviceFeatures.multiDrawIndirect ? "true" : "false",
             m_shaderDrawParametersFeatureEnabled ? "true" : "false");
         VK_VERIFY(vkCreateDevice(m_physicalDevice.handle, &deviceCreateInfo, nullptr, &m_device), "vkCreateDevice");
+
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (wireDepthResolveEnabled) {
+            m_wireCreateRenderPass2 = reinterpret_cast<PFN_vkCreateRenderPass2>(
+                vkGetDeviceProcAddr(m_device, wireDepthResolveCore ? "vkCreateRenderPass2" : "vkCreateRenderPass2KHR"));
+        }
+#endif
 
         s_vkCmdDrawIndexedIndirectCount = reinterpret_cast<PFNDrawIndexedIndirectCountFunc>(
             vkGetDeviceProcAddr(m_device, "vkCmdDrawIndexedIndirectCountKHR"));
@@ -14768,7 +15847,93 @@ void main() {
         // Last, because it records on m_graphicsQueue: decide the PRIMITIVES_GENERATED
         // reroute for XFB-inactive draws. Nothing else has touched the queue yet.
         ArmPrimGenReroute();
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // Same terms: it records on m_graphicsQueue, which nothing but the probe above has used.
+        ArmWireDepthResolveOrder();
+#endif
     }
+
+#if MOBILEGL_BUILD_DISAGGREGATED
+    // P7 gate 5 (g5-msprobe): THE ARM ORDER OF THE MULTISAMPLE DEPTH/STENCIL RESOLVE IS A MEASURED
+    // PROPERTY OF THIS DEVICE. WireDepthResolveArm.h says why (the Adreno 830's no-draw
+    // VK_KHR_depth_stencil_resolve pass writes nothing), WireDepthResolveProbe.h what is run. The
+    // answer is a device property, so it is memoized per DEVICE IDENTITY (WireDepthResolveArmCache:
+    // vendor, device, driver version, pipeline-cache UUID - codex closeout finding 7), and logged once
+    // per identity with every reading - the line the device evidence quotes.
+    //
+    // THE MEASUREMENT CAN BE REPLACED, AND ONLY HERE: MGITEST_MAGMA_DEPTH_RESOLVE_PROBE=bug|clean
+    // hands ChooseWireDepthResolveArm a canned measurement instead of running the probe - no host
+    // lane runs on a device with the defect - and the DirectVulkan.{Split,Spawn}.MsResolveBug./
+    // MsFlipBug. entries force `bug` and read ResolveWireDepthStencil's arm line back from the
+    // server log. The canned measurement is evaluated like a real one, so those entries go red
+    // when the evaluation stops detecting the defect. MGITEST_MAGMA_DEPTH_RESOLVE_PROBE=elide-subject
+    // runs the REAL probe with its render-pass resolve left unrecorded (the sentinel survives, the
+    // shader control still resolves), so the DirectVulkan.{Split,Spawn}.MsResolveElide. entries go
+    // red when the real recording, readback or tally stops detecting it too.
+    void VulkanRenderer::ArmWireDepthResolveOrder() {
+        m_wirePreferShaderDepthResolve = false;
+        if (MG_Config::Transport == MG_Config::TransportMode::Monolith) return;
+        // ResolveWireDepthStencil's own test for the render-pass arm, less its per-format half
+        // (the probe asks that per format): without it the shader pass is the only arm.
+        const Bool renderPassArmAvailable = !MagmaWireForcedShaderDepthResolve() && m_wireCreateRenderPass2 &&
+            (m_wireDepthResolveModes & VK_RESOLVE_MODE_SAMPLE_ZERO_BIT) != 0;
+        const char* knobValue = std::getenv("MGITEST_MAGMA_DEPTH_RESOLVE_PROBE");
+        const WireDepthResolveProbeKnob knob = ParseWireDepthResolveProbeKnob(knobValue);
+        // Memoized per DEVICE IDENTITY, not per process (codex closeout finding 7; see
+        // WireDepthResolveArmCache): a second renderer on another device or driver probes for itself.
+        const WireDepthResolveDeviceIdentity identity =
+            MakeWireDepthResolveDeviceIdentity(m_physicalDevice.properties, renderPassArmAvailable, knob);
+        static WireDepthResolveArmCache s_choices;
+        const WireDepthResolveArmChoice resolved = s_choices.Resolve(identity, [&]() {
+            if (knob == WireDepthResolveProbeKnob::Unrecognised)
+                MGLOG_W("DirectVulkan: MGITEST_MAGMA_DEPTH_RESOLVE_PROBE=%s is not `bug`, `clean` or "
+                        "`elide-subject`; the resolve probe runs as if it were unset", knobValue);
+            WireDepthResolveArmChoice choice = ChooseWireDepthResolveArm(knob, renderPassArmAvailable, [&]() {
+                WireDepthResolveProbeContext context;
+                context.physicalDevice = m_physicalDevice.handle;
+                context.device = m_device;
+                context.queue = m_graphicsQueue;
+                context.queueFamilyIndex = static_cast<Uint32>(m_physicalDevice.queueFamilies.graphicsFamily);
+                context.createRenderPass2 = m_wireCreateRenderPass2;
+                context.depthResolveModes = m_wireDepthResolveModes;
+                context.stencilResolveModes = m_wireStencilResolveModes;
+                context.shaderStencilExport = m_wireShaderStencilExport;
+                context.elideSubject = knob == WireDepthResolveProbeKnob::ElideSubject;
+                return RunWireDepthResolveProbe(context);
+            });
+            if (choice.measurement.fenceWaitTimedOut) {
+                // Its objects are leaked on purpose (see the PRIMITIVES_GENERATED probe above for
+                // why this device must not be idle-waited on their account).
+                MGLOG_W("DirectVulkan: the depth/stencil resolve probe timed out waiting on its own "
+                        "submission; its Vulkan objects are deliberately leaked and the render-pass arm "
+                        "keeps its place");
+            } else if (choice.verdict == WireDepthResolveProbeVerdict::Inconclusive) {
+                MGLOG_W("DirectVulkan: depth/stencil resolve probe verdict=inconclusive - the shader "
+                        "control did not resolve the probe's inputs either, so nothing is concluded about "
+                        "the render pass and the default arm order stands");
+            }
+            MGLOG_I("DirectVulkan: depth/stencil resolve probe (%s) verdict=%s: %s%s%s",
+                    choice.measurement.fromKnob ? "forced by MGITEST_MAGMA_DEPTH_RESOLVE_PROBE"
+                    : choice.measurement.subjectElided
+                        ? "measured on this device with its render-pass resolve elided by "
+                          "MGITEST_MAGMA_DEPTH_RESOLVE_PROBE=elide-subject"
+                    : renderPassArmAvailable ? "measured on this device"
+                                             : "not run: no render-pass arm",
+                    WireDepthResolveProbeVerdictName(choice.verdict),
+                    choice.preferShader ? "the shader pass resolves first, the no-draw render pass is the fallback"
+                    : (renderPassArmAvailable || choice.measurement.fromKnob)
+                        ? "the VK_KHR_depth_stencil_resolve render pass resolves first"
+                        : "the shader pass is the only arm",
+                    choice.measurement.failureReason.empty() ? "" : "; ",
+                    choice.measurement.failureReason.c_str());
+            for (const WireDepthResolveFormatReading& reading : choice.measurement.formats)
+                MGLOG_I("DirectVulkan: depth/stencil resolve probe %s",
+                        DescribeWireDepthResolveFormat(reading).c_str());
+            return choice;
+        });
+        m_wirePreferShaderDepthResolve = resolved.preferShader;
+    }
+#endif
 
     void VulkanRenderer::ArmPrimGenReroute() {
         using namespace MG_Util::SelfTest;
@@ -15269,6 +16434,13 @@ void main() {
 
         vkDeviceWaitIdle(m_device);
         OnSubmitsCompletedUpTo(m_submitCounter);
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // The old swapchain will be destroyed below, including recordings that
+        // are being abandoned instead of submitted. Release all their views now.
+        DestroyWireDrawPass();
+        CollectWireObjects(m_submitCounter, true);
+        ClearAllWireDrawPassCaches();
+#endif
 
         if (m_timerQueryManager) {
             // The in-progress command buffer is abandoned below (its recording
@@ -15284,6 +16456,11 @@ void main() {
         ShutdownSwapchain();
 
         CreateSwapchain();
+        // Every image of the fresh swapchain holds garbage, so the default framebuffer restarts
+        // at index 0: the next write into it re-points the GL-visible index at whatever the next
+        // acquire returns (see m_defaultFramebufferImageIndex). Without this the index could name
+        // an image of the swapchain just destroyed.
+        m_defaultFramebufferImageIndex = 0;
         VK_VERIFY(m_frameContext.InitializeSwapchainSemaphores(m_device,
                                                                static_cast<Uint32>(m_swapchainObject.GetImageCount())),
                   "RecreateSwapchain, InitializeSwapchainSemaphores");

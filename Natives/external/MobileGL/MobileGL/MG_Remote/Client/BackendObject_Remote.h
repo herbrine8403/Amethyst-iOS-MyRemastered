@@ -36,7 +36,8 @@
 // and SwapEGLBuffers' route into GetBackendFunctions().Present() - and the client needs all of
 // it, because Present is a class-B emitter reached through exactly that route (the verb census's
 // trap 3: Present has zero MG_Impl call sites). So each override does BOTH: it runs the real
-// EGL work on the apply thread, through v1's ServerLoop::RunOnApplyThread, and then lets the
+// EGL work on the apply thread, through ServerLoop's control-frame channel (P5f fc; v1's
+// function-pointer mailbox before it), and then lets the
 // base class keep the client-side books.
 //
 // SetEGLSwapInterval IS THE ONE THAT MUST NOT REACH THE TABLE. The base implementation
@@ -87,6 +88,11 @@ namespace MobileGL::MG_Remote::Client {
         Bool InitPbufferSurface(EGLint width, EGLint height) override;
 
     private:
+        // P12 (on-screen server window), D1: MOBILEGL_IPC_SURFACE=server's arm of
+        // CreateEGLWindowSurface - ONE ServerOwned frame, no SetWindowHandle, the server's real
+        // geometry adopted before it returns, and every refusal named in this process's log.
+        Bool CreateServerOwnedWindowSurface(EGLSurface surface, const MG_Backend::WindowHandle& handle);
+
         // The generation of the snapshot m_formatCapabilities was filled from. Exposed only
         // through the log line on a refresh: a cache that silently stopped tracking the mirror
         // is exactly the shape trap 2 exists to prevent.

@@ -9,6 +9,7 @@
 #include "PipeStats.h"
 
 #include <Config.h>
+#include <MG_Util/Debug/Log.h>
 
 #include <fstream>
 
@@ -93,10 +94,29 @@
 //                        above. The two are different questions about the same bytes under
 //                        split, and adding them is wrong.
 //   residual-value-block Placeholder, always 0 until P2 (plan section 6.3).
+//   stage-segment-bytes  P6 gate 8, and the only class in this list that is neither a backend's
+//                        copy nor a client's blob declaration: it counts what the WIRE put into
+//                        SEG_STAGE. One site, PipeWireEncoder::StageAllocate, which is the single
+//                        allocation call behind PipeWireEncoder::StageBytes - so every writer
+//                        (the buffer content walks, the texture slabs, the CSO archives, the
+//                        storage-block names) is covered by construction rather than by being on
+//                        a list. Align8 slack and the allocator's wrap skip are real occupancy
+//                        and are deliberately NOT counted; see the ByteClass comment. It is a
+//                        per-frame average by construction, so the per-blob SHAPE - the thing
+//                        that says whether the chunk budget is cutting where it should - is the
+//                        staged-blob histogram in the JSON dump, not this number.
 //
 // Call classes
 //   draws                DirectGLES PrepareForDraw and DirectVulkan SetupDraw's entry. A
 //                        dispatch is not a draw and is not counted.
+//   wire-records         P6 gate 8: one per record the wire encoder COMMITTED, on
+//                        PipeWireEncoder::EncodeRecord's successful path. Post-chunking by
+//                        construction - an application call whose content is cut at
+//                        MGPipeStageChunkBytes() produces several. A kRecPad ring filler is not a
+//                        record and is not counted; an emission Reserve refused is counted once,
+//                        when the retry succeeds. The emitter-side Client*Emissions counters
+//                        answer a different question and the two together are what show what the
+//                        suppressors absorbed.
 //   accessor-calls       STATIC TALLIES at the instrumented entry points, NOT a wrapper
 //                        around all 293 pGLContext-> sites. Each instrumented function adds
 //                        the number of GLContext accessor calls that its OWN body executed
@@ -144,6 +164,11 @@ namespace MobileGL::MG_Util::PipeStats {
         Counter g_totalGateMiss[kGateCount];
         Counter g_totalPayloadBuckets[kPayloadHistogramBuckets];
         Counter g_frameCount{0};
+#if MOBILEGL_PIPE_PUSH
+        // P6 gate 8's second histogram, and push-only for the same reason its accessor is: its
+        // only sampler is the wire encoder, which a pull build does not compile.
+        Counter g_totalStagedBlobBuckets[kStagedBlobHistogramBuckets];
+#endif
 
         // Window bases: the run totals as of the previous summary line. Only ever touched
         // from OnPresent()/Shutdown() (the present thread), so plain integers.
@@ -201,7 +226,7 @@ namespace MobileGL::MG_Util::PipeStats {
             "stage-ubo-named",     "stage-vertex-client", "stage-index-client",
             "stage-indirect-cmd",  "persistent-map-push", "residual-value-block",
 #if MOBILEGL_PIPE_PUSH
-            "cso-blob-bytes",
+            "cso-blob-bytes", "stage-segment-bytes",
 #endif
         };
         const char* const kCallClassNames[kCallClassCount] = {
@@ -211,7 +236,8 @@ namespace MobileGL::MG_Util::PipeStats {
             "render-state-cso-mints", "render-state-cso-binds", "map-persistent-roundtrips",
             "framebuffer-emissions", "sampler-view-emissions", "sampler-state-emissions",
             "shader-image-emissions", "client-tex-upload-emissions", "tex-remint-pulls",
-            "residual-pulls",
+            "resident-subdata-emissions",
+            "residual-pulls", "server-verb-boundaries", "wire-records",
 #endif
         };
         const char* const kGateNames[kGateCount] = {
@@ -236,7 +262,7 @@ namespace MobileGL::MG_Util::PipeStats {
         const char* const kByteClassShort[kByteClassCount] = {"buf",  "tex",  "ubog", "ubon", "vtxc",
                                                               "idxc", "icmd", "pmap", "resid",
 #if MOBILEGL_PIPE_PUSH
-                                                              "csob-blob",
+                                                              "csob-blob", "seg",
 #endif
         };
         const char* const kGateShort[kGateCount] = {"ers", "etl", "eub", "mfp", "mpm", "mdt"};
@@ -266,6 +292,11 @@ namespace MobileGL::MG_Util::PipeStats {
             g_frameCount.store(0, std::memory_order_relaxed);
             g_windowBaseFrames = 0;
 #if MOBILEGL_PIPE_PUSH
+            for (Uint32 i = 0; i < kStagedBlobHistogramBuckets; ++i) {
+                g_totalStagedBlobBuckets[i].store(0, std::memory_order_relaxed);
+            }
+#endif
+#if MOBILEGL_PIPE_PUSH
             for (Uint32 i = 0; i < kGaugeCount; ++i) {
                 g_gauges[i].store(0, std::memory_order_relaxed);
             }
@@ -284,13 +315,57 @@ namespace MobileGL::MG_Util::PipeStats {
         }
 
         void WriteJsonDump() {
+#if MOBILEGL_BUILD_DISAGGREGATED
+            // ---- THE DUMP PATH IS ROLE-DERIVED, AND THIS BLOCK IS WHY IT IS INSIDE A GUARD ----
+            //
+            // Same reason as the log path it mirrors: under `spawn` there are two processes with
+            // two independent sets of counters, each reaching PipeStats::Shutdown(), and one
+            // configured path would have the second truncate and overwrite the first. A reader
+            // would then hold one role's numbers under a name that claims to be the run's, which is
+            // worse than a missing file because nothing about it looks wrong.
+            //
+            // THE BASE NAME RESOLVES TO NO FILE, deliberately. `<base>.client.json` and
+            // `<base>.server.json` are what exist; opening the bare configured name fails loudly.
+            // That is the log sink's own design ("with both names moved, an un-updated reader gets
+            // ENOENT and says so") and it is the right trade here too: a caller that has not been
+            // updated gets an error it must look at, rather than a file that is silently half a run.
+            //
+            // THE RULE IS NOT COPIED. MG_Util/Debug/Log.cpp owns `<stem>.<role><ext>` and exports
+            // it; a second implementation is a second thing to keep in step, and the one that falls
+            // behind opens a path nothing writes and reads as "the counters never dumped".
+            //
+            // ---- AND G1 IS WHY THE PULL ARM BELOW IS THE ORIGINAL, STATEMENT FOR STATEMENT ----
+            //
+            // A monolith build has exactly ONE role, so deriving the path there is a no-op - but
+            // "a no-op" is not "no bytes", and the gate caught three separate leaks as this was
+            // written. They are worth recording because none is guessable from the code:
+            //
+            //   1. deriving UNCONDITIONALLY put a std::string temporary and a call into the
+            //      monolith body: .text +24 bytes.
+            //   2. guarding it but keeping ONE shared `String` local in both arms still reds: the
+            //      two arms are different code even when they compute the same value, and
+            //      `Shutdown()` came out one byte different.
+            //   3. rewriting the two MGLOG_W format strings to name both the base and the derived
+            //      path moved .rodata by 64 bytes, because a literal is a literal in whichever
+            //      branch it sits and .rodata is measured too.
+            //
+            // So the rule for this file is stronger than "guard the new code": the OLD code must be
+            // left alone, character for character, and every addition lives inside the `#if`.
+            const String path = RoleDerivedJsonDumpPathForTesting();
+            if (path.empty()) {
+                return;
+            }
+#else
+            // The monolith arm, byte for byte as it was. Do not "tidy" this into the arm above.
             const String& path = MG_Config::Features.PipeStatsFile;
             if (path.empty()) {
                 return;
             }
+#endif
             std::ofstream out(path, std::ios::out | std::ios::trunc);
             if (!out) {
-                MGLOG_W("PipeStats: could not open MOBILEGL_PIPE_STATS_FILE='%s' for writing", path.c_str());
+                MGLOG_W("PipeStats: could not open MOBILEGL_PIPE_STATS_FILE='%s' for writing",
+                        path.c_str());
                 return;
             }
             out << FormatJson();
@@ -311,10 +386,27 @@ namespace MobileGL::MG_Util::PipeStats {
                               ? kDefaultSummaryFramePeriod
                               : static_cast<Uint64>(MG_Config::Features.PipeStatsPeriod);
         if (g_pipeStatsEnabled) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+            // THE ROLE-DERIVED PATH IS WHAT IS PRINTED, not the base name. An operator reading
+            // this banner wants to know which file the run will write, and under split the base
+            // name is not it - printing the base would send them to a path that is deliberately
+            // never opened (see WriteJsonDump).
+            //
+            // THE PULL ARM OF THIS `#if` IS THE ORIGINAL LINE, and the split arm repeats the same
+            // format literal rather than sharing one, for the reason WriteJsonDump's header spells
+            // out: a shared literal or a shared temporary is a byte the monolith build gains for a
+            // branch it can never take. Two copies of one format string in two arms of one `#if` is
+            // the price G1 charges for adding anything to this file at all.
+            const String dumpPath = RoleDerivedJsonDumpPathForTesting();
+            MGLOG_I("MGPipe stats: counters ON (MOBILEGL_PIPE_STATS), summary every %llu frames%s%s",
+                    static_cast<unsigned long long>(g_summaryPeriod),
+                    dumpPath.empty() ? "" : ", JSON dump to ", dumpPath.c_str());
+#else
             MGLOG_I("MGPipe stats: counters ON (MOBILEGL_PIPE_STATS), summary every %llu frames%s%s",
                     static_cast<unsigned long long>(g_summaryPeriod),
                     MG_Config::Features.PipeStatsFile.empty() ? "" : ", JSON dump to ",
                     MG_Config::Features.PipeStatsFile.c_str());
+#endif
         }
     }
 
@@ -366,6 +458,15 @@ namespace MobileGL::MG_Util::PipeStats {
     }
 
     void RecordDrawPayloadBytes(Uint64 bytes) { Bump(g_totalPayloadBuckets[PayloadBucketOf(bytes)], 1); }
+
+#if MOBILEGL_PIPE_PUSH
+    // P6 gate 8's staged-blob distribution. A count, not a sum: the bytes already have a home
+    // in stage-segment-bytes, and what this exists to answer is the SHAPE (how many blobs there
+    // were and how big each one was), which a total cannot express.
+    void RecordStagedBlobBytes(Uint64 bytes) {
+        Bump(g_totalStagedBlobBuckets[PayloadBucketOf(bytes)], 1);
+    }
+#endif
 
     void OnPresent() {
         // Every frame accumulator is EXCHANGED for zero, and the exchanged value is what gets
@@ -422,6 +523,11 @@ namespace MobileGL::MG_Util::PipeStats {
     Uint64 TotalPayloadBucket(Uint32 bucket) {
         return bucket < kPayloadHistogramBuckets ? Read(g_totalPayloadBuckets[bucket]) : 0;
     }
+#if MOBILEGL_PIPE_PUSH
+    Uint64 TotalStagedBlobBucket(Uint32 bucket) {
+        return bucket < kStagedBlobHistogramBuckets ? Read(g_totalStagedBlobBuckets[bucket]) : 0;
+    }
+#endif
     Uint64 FrameCount() { return Read(g_frameCount); }
 
     const char* NameOf(ByteClass byteClass) { return kByteClassNames[static_cast<Uint32>(byteClass)]; }
@@ -507,6 +613,14 @@ namespace MobileGL::MG_Util::PipeStats {
         // Espryt had already allocated and then had to re-mint image-bindable, replaying its
         // levels from the client's shadow, because ImageBindableHint reached it too late.
         line += " trp=" + std::to_string(calls[static_cast<Uint32>(CallClass::TextureRemintPulls)]);
+        // rsd is P7's resident sub-data emission count (OQ-10): one per buffer_subdata_resident
+        // record (opcode 49) the client put on the wire. It is the ONLY observable that
+        // separates the resident arm from the in-place memcpy beside it - the bytes in the
+        // buffer are identical either way - so it is what the white-box cases read. Zero under
+        // monolith by construction, and zero under split too until the server publishes
+        // kCapResidentSubData off its own wire resource table (MG_Backend/Init.cpp).
+        line += " rsd=" +
+                std::to_string(calls[static_cast<Uint32>(CallClass::ResidentSubDataEmissions)]);
         // rsp is P5's residual-pull count: reads, on the server side, of a PipeInputs field no
         // pushed record supplies, answered out of the client's residual fill under the verb
         // barrier. It is the SIZE OF THE P6/P7/P8 DEBT and it is published on this line rather
@@ -514,6 +628,32 @@ namespace MobileGL::MG_Util::PipeStats {
         // tracks the draw count is a pull inside a loop, and one that tracks the frame count is
         // a pull per verb. Zero in every monolith lane by construction.
         line += " rsp=" + std::to_string(calls[static_cast<Uint32>(CallClass::ResidualPulls)]);
+        // P5e (gl), ID-115: `vbs` is the server's verb-boundary stamp count, and it is on this
+        // line so that "strict was armed on this entry" is a number a lane can read rather than
+        // an inference from an absence. Everything strict checks is downstream of that stamp and
+        // the monolith arm never stamps, so a green lane with vbs=0 says only that the mechanism
+        // never ran. It is deliberately NOT rsp: rsp reaches zero when the phase SUCCEEDS, so a
+        // positive control built on it would fail on the day the debt is paid.
+        line += " vbs=" +
+                std::to_string(calls[static_cast<Uint32>(CallClass::ServerVerbBoundaries)]);
+        // P6 GATE 8's SECOND NUMBER (CONTRACT-P6.md §9 item 8): records/frame AFTER chunking, i.e.
+        // the count of records the wire encoder actually committed this window rather than the
+        // number of times an emitter was asked for one. The gap between the two is the whole
+        // point of the counter: once the stage chunk budget landed, one application call can
+        // produce several records, so `wrec` is what a frame really costs SEG_CMD and the
+        // emitter-side counts can no longer answer it. It follows the line's ordinary
+        // per-frame/window rule - the run total when the window held no Present - like every
+        // field that is not one of the gauges, and the label says which it is.
+        //
+        // `wrec/f` AND NOT `wrec` ALONE, so the deliverable reads off the line directly. Both are
+        // printed because the pair is self-checking: a per-frame figure whose window total is not
+        // its numerator times the frame count is a formatting bug, and a per-frame figure over a
+        // window with no Present in it is the 47x overstatement PipeStatsTest already pins.
+        line += " wrec=" + std::to_string(calls[static_cast<Uint32>(CallClass::WireRecords)]);
+        line += " wrec/f=" + (perFrame
+                                  ? FormatFixed2(calls[static_cast<Uint32>(CallClass::WireRecords)],
+                                                 windowFrames)
+                                  : std::to_string(calls[static_cast<Uint32>(CallClass::WireRecords)]));
         // P5's three wire gauges, and THEY ARE RUN TOTALS on a line whose every other field is
         // a window - see the Gauge enum for the argument. `maxrec` is R-10's proof obligation
         // (BRIEF 8 item 3): the largest single record this run wrote, in BYTES, beside the cap
@@ -542,6 +682,13 @@ namespace MobileGL::MG_Util::PipeStats {
         line += " srvpark=" + std::to_string(Read(g_gauges[static_cast<Uint32>(Gauge::ServerParks)]));
         line += " cli=" + std::to_string(Read(g_gauges[static_cast<Uint32>(Gauge::ClientWaits)]));
         line += " clipark=" + std::to_string(Read(g_gauges[static_cast<Uint32>(Gauge::ClientParks)]));
+        // P7 wave 4 M2: the Magma wire arm's buffer stores (see the Gauge enum). RUN MAXIMA on
+        // a windowed line for the wait ledger's reason and one more: the number that matters is
+        // the peak INSIDE a frame, which no swap-time sample can see.
+        line += "] wbuf[wbufs=" + std::to_string(Read(g_gauges[static_cast<Uint32>(Gauge::WireBuffers)]));
+        line += " wlivepk=" + std::to_string(Read(g_gauges[static_cast<Uint32>(Gauge::WireStoresPeak)]));
+        line += " wdefpk=" + std::to_string(Read(g_gauges[static_cast<Uint32>(Gauge::WireDeferredBytesPeak)]));
+        line += " wdefsync=" + std::to_string(Read(g_gauges[static_cast<Uint32>(Gauge::WireDeferredSyncs)]));
 #endif
         line += "] gates[";
         for (Uint32 i = 0; i < kGateCount; ++i) {
@@ -618,7 +765,16 @@ namespace MobileGL::MG_Util::PipeStats {
         json += "    \"client-waits\": " +
                 std::to_string(Read(g_gauges[static_cast<Uint32>(Gauge::ClientWaits)])) + ",\n";
         json += "    \"client-parks\": " +
-                std::to_string(Read(g_gauges[static_cast<Uint32>(Gauge::ClientParks)])) + "\n";
+                std::to_string(Read(g_gauges[static_cast<Uint32>(Gauge::ClientParks)])) + ",\n";
+        // P7 wave 4 M2's four, run maxima / a run count as on the summary line's wbuf[].
+        json += "    \"wire-buffers\": " +
+                std::to_string(Read(g_gauges[static_cast<Uint32>(Gauge::WireBuffers)])) + ",\n";
+        json += "    \"wire-stores-peak\": " +
+                std::to_string(Read(g_gauges[static_cast<Uint32>(Gauge::WireStoresPeak)])) + ",\n";
+        json += "    \"wire-deferred-bytes-peak\": " +
+                std::to_string(Read(g_gauges[static_cast<Uint32>(Gauge::WireDeferredBytesPeak)])) + ",\n";
+        json += "    \"wire-deferred-syncs\": " +
+                std::to_string(Read(g_gauges[static_cast<Uint32>(Gauge::WireDeferredSyncs)])) + "\n";
 #endif
         json += "  },\n  \"cmd-bytes-per-draw-histogram\": [";
         for (Uint32 i = 0; i < kPayloadHistogramBuckets; ++i) {
@@ -627,6 +783,23 @@ namespace MobileGL::MG_Util::PipeStats {
             }
             json += std::to_string(Read(g_totalPayloadBuckets[i]));
         }
+#if MOBILEGL_PIPE_PUSH
+        // P6 gate 8's two per-frame numbers have their JSON homes where every other ByteClass and
+        // CallClass already does - the `bytes` and `calls` blocks above, under their long names
+        // (stage-segment-bytes, wire-records) - so there is nothing to add for them here. The
+        // staged-blob DISTRIBUTION does need one: it is the deliverable MEASUREMENTS.md:342 says
+        // has never been measured, and like the draw-payload histogram above it is a run-total
+        // distribution, which is exactly what Tracy cannot plot and this dump exists to carry.
+        // Bucket 0 is "0 bytes" and bucket n>0 is [2^(n-1), 2^n): the same edges PayloadBucketOf
+        // gives both histograms, so the two are read the same way.
+        json += "],\n  \"staged-blob-bytes-histogram\": [";
+        for (Uint32 i = 0; i < kStagedBlobHistogramBuckets; ++i) {
+            if (i != 0) {
+                json += ", ";
+            }
+            json += std::to_string(Read(g_totalStagedBlobBuckets[i]));
+        }
+#endif
         json += "]\n}\n";
         return json;
     }
@@ -634,5 +807,19 @@ namespace MobileGL::MG_Util::PipeStats {
     void SetEnabledForTesting(Bool enabled) { g_pipeStatsEnabled = enabled; }
 
     void ResetForTesting() { ResetCounters(); }
+
+#if MOBILEGL_BUILD_DISAGGREGATED
+    String RoleDerivedJsonDumpPathForTesting() {
+        // The SAME expression WriteJsonDump and the Init banner use, reached through the same
+        // helper - so a change that stopped deriving at either site has to change this too, and the
+        // test reds. That is the whole point: see the header for why asserting on RoleLogPath
+        // directly was not a control.
+        if (MG_Config::Features.PipeStatsFile.empty()) {
+            return String();
+        }
+        return MG_Util::Debug::RoleLogPath(MG_Config::Features.PipeStatsFile.c_str(),
+                                           MG_Util::Debug::CurrentThreadRole());
+    }
+#endif
 
 } // namespace MobileGL::MG_Util::PipeStats

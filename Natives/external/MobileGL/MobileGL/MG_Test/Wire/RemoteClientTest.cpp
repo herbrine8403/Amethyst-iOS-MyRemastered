@@ -18,6 +18,7 @@
 // assert ITS OWN failure string (R-16) instead of asserting that something, somewhere, died.
 
 #include <gtest/gtest.h>
+#include <MG_Util/Debug/Log.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -42,11 +43,14 @@
 #include <MG_Remote/Client/PersistentMapTracker.h>
 #include <MG_Remote/Client/BackendObject_Remote.h>
 #include <MG_Remote/Server/ServerLoop.h>
+#include <MG_Remote/Server/ServerSession.h>
 #include <MG_State/GLState/Core.h>
 #include <MG_Impl/GLImpl/Texture/GL_Texture.h>
 #include <MG_Impl/GLImpl/Buffer/GL_Buffer.h>
 #include <MG_Pipe/PipeMutation.h>
 #include <MG_Pipe/PipeApply.h>
+#include <MG_Backend/MGPipe/PipeInputs.h>
+#include <MG_Backend/DirectGLES/Managers.h>
 #include <MG_Impl/Pipe/PipeFill.h>
 #include <Init.h>
 #include <MG_Impl/EGLImpl/EGLImpl.h>
@@ -75,12 +79,17 @@ namespace {
 
     std::string g_logPath;
 
+    // BOTH ROLES' LOGS. P6 gives the client and the server role a file each, and a death test
+    // asserts that the CHILD said something - which role's thread said it is not what these
+    // cases are about. The refusals raised on the apply thread (RefuseFromApplyThread and every
+    // guard that rides it) are written under the SERVER role by construction, so a reader that
+    // took only g_logPath would report "the child aborted, but said nothing" for the very
+    // diagnostics it exists to check.
     std::string ReadLog() {
-        std::ifstream in(g_logPath, std::ios::binary);
-        if (!in) return {};
-        std::ostringstream out;
-        out << in.rdbuf();
-        return out.str();
+        // BOTH ROLES' LOGS (P6). A death test asserts that the CHILD said something; which
+        // role's thread said it is not what these cases are about, and refusals raised on the
+        // apply thread are written under the SERVER role by construction.
+        return MobileGL::MG_Util::Debug::ReadRoleLogs(g_logPath.c_str());
     }
 
     int ProcessId() {
@@ -143,7 +152,7 @@ namespace {
         // child's output. That is how the second death case in this file came to see the first
         // one's slot name and assert on it: a control reading another control's message, which
         // is one of the three shapes R-16 was written after.
-        { std::ofstream truncate(g_logPath, std::ios::trunc | std::ios::binary); }
+        MobileGL::MG_Util::Debug::TruncateRoleLogs(g_logPath.c_str());
         std::fflush(nullptr);
         const pid_t pid = ::fork();
         if (pid < 0) return result;
@@ -178,8 +187,8 @@ namespace {
 TEST(RemoteEmitTable, TheThreeClassesPartitionAllSeventyOneSlots) {
     // P5 baseline five + f1 eleven + i1 seven + t2 six emitted slots.
     EXPECT_EQ(LocallyAnsweredSlotCount(), 2u);
-    EXPECT_EQ(ImplementedVerbCount(), 54u);
-    EXPECT_EQ(UnmigratedSlotCount(), 15u);
+    EXPECT_EQ(ImplementedVerbCount(), 68u);
+    EXPECT_EQ(UnmigratedSlotCount(), 1u);
     EXPECT_EQ(LocallyAnsweredSlotCount() + ImplementedVerbCount() + UnmigratedSlotCount(),
               kRemoteEmitSlotCount);
 }
@@ -267,8 +276,9 @@ TEST(RemoteEmitTable, DeleteTransformFeedbackHasNoRowAndStillAbortsByItsOwnName)
     // failed.
     const ChildResult r = RunInChild([] { RemoteEmitTable().GL.DeleteTransformFeedback(7); });
     ASSERT_TRUE(DiedOfAbort(r)) << DescribeStatus(r) << "\n" << r.Log;
-    EXPECT_NE(r.Log.find("Fatal{UnmigratedVerb, \"DeleteTransformFeedback\"}"), std::string::npos)
+    EXPECT_NE(r.Log.find("Fatal{NoClientSession, \"DeleteTransformFeedback\"}"), std::string::npos)
         << r.Log;
+    EXPECT_EQ(r.Log.find("Fatal{UnmigratedVerb"), std::string::npos) << r.Log;
 }
 #endif // MGTEST_HAVE_FORK
 
@@ -323,12 +333,9 @@ TEST(RemoteEmitTable, AnUnmigratedSlotAbortsAndNamesItself) {
     // GetTexImage is the wave-3 tail (CONTRACT-P5B.md §7): no P5b package flips it, so this
     // case keeps its subject across the four P5b landings. (It was DrawElements until d1 made
     // that a class-B emitter.)
-    const ChildResult r = RunInChild([] {
-        RemoteEmitTable().GL.GetTexImage(0x0DE1 /*GL_TEXTURE_2D*/, 0, 0x1908 /*GL_RGBA*/,
-                                         0x1401 /*GL_UNSIGNED_BYTE*/, nullptr);
-    });
+    const ChildResult r = RunInChild([] { RemoteEmitTable().SetSwapInterval(1); });
     ASSERT_TRUE(DiedOfAbort(r)) << DescribeStatus(r) << "\n" << r.Log;
-    EXPECT_NE(r.Log.find("Fatal{UnmigratedVerb, \"GetTexImage\"}"), std::string::npos) << r.Log;
+    EXPECT_NE(r.Log.find("Fatal{UnmigratedVerb, \"SetSwapInterval\"}"), std::string::npos) << r.Log;
 }
 
 TEST(RemoteEmitTable, EachUnmigratedSlotNamesItsOwnSlot) {
@@ -380,7 +387,7 @@ TEST(RemoteEmitTable, TheSevenI1SlotsAreClassBAndAreNotTheFatalThunk) {
     // assignment would look like (class C is assigned FIRST in BuildRemoteEmitTable precisely so
     // that the mistake is loud rather than null).
     const MG_Backend::GlobalBackendFunctionsTable& table = RemoteEmitTable();
-    const void* fatal = reinterpret_cast<const void*>(table.GL.GetTexImage); // wave-3 tail, class C
+    const void* fatal = reinterpret_cast<const void*>(table.SetSwapInterval);
     ASSERT_NE(fatal, nullptr);
     const void* const i1[] = {
         reinterpret_cast<const void*>(table.GL.BindImageTexture),
@@ -575,17 +582,253 @@ TEST(CapsMirrorTest, AMaskWithoutAFamilyRefusesItAndNamesIt) {
     EXPECT_EQ(LastRefusedSubsystem(), kMGPipeSubsystemTextureResources);
 }
 
-TEST(CapsMirrorTest, APlaceholderMirrorConsumesNothing) {
-    // The safe direction, stated as a case. With no snapshot the mask is zero, every family
-    // answers "no consumer", the client emits nothing and the legacy pull path runs. The unsafe
-    // direction - emitting to a server that has no consumer - is ID-39's 66 lost uploads.
+// =====================================================================================
+// F1 (P7 wave 2): the placeholder is not an answer
+// =====================================================================================
+//
+// THE CASE THIS REPLACES SAID THE OPPOSITE, and it was wrong in the one way a green test can
+// be. `APlaceholderMirrorConsumesNothing` asserted that a mirror with no snapshot answers
+// "no consumer" for every family, and called it "the safe direction ... the client emits
+// nothing and the legacy pull path runs". There is no legacy pull path on the CLIENT under
+// split. What actually happened, measured on lavapipe and on an Adreno 830: MG_State::Init()
+// built GLContext's default texture objects before MG_Backend::Init() had started the session,
+// every one of their resource_create records was withheld against callMask=0 at generation 0,
+// and the only trace of it was one WARN line. The mirror must refuse, not answer.
+
+TEST(CapsMirrorTest, APlaceholderMirrorRefusesToAnswerAndNamesTheFamily) {
+#if MGTEST_HAVE_FORK
+    // A DEATH, AND ITS OWN STRING (R-16). The family word and the subsystem both have to be in
+    // the line, because "something aborted" is satisfied by any of the other 43 families.
+    const ChildResult result = RunInChild([] {
+        MG_Config::Transport = MG_Config::TransportMode::InProcess;
+        // AND THE SECOND HALF OF THE ARMING CONDITION, set by hand here because this suite
+        // does not run MG_ConfigLoader::Init: the gate is for a process whose CONFIGURATION
+        // asked for a split transport, i.e. one that is going to bring a client half up.
+        MG_Config::SplitTransportRequestedByConfig = true;
+        CapsMirror mirror;
+        EXPECT_FALSE(mirror.Valid());
+        // No session, no bring-up in flight: the wait cannot succeed and must not be taken.
+        (void)mirror.ServerConsumes(kMGPipeSubsystemTextureResources);
+        std::fflush(nullptr);
+        ::_exit(0);
+    });
+    ASSERT_TRUE(DiedOfAbort(result)) << DescribeStatus(result) << "\n" << result.Log;
+    EXPECT_NE(result.Log.find("Fatal{CapsBeforeFirstSnapshot, \"TextureResources\"}"),
+              std::string::npos)
+        << "the refusal must name the family that asked; a death with no word is invisible to "
+           "the census, to run_trace_case.cmake and to every red-once:\n"
+        << result.Log;
+    EXPECT_NE(result.Log.find("0x400"), std::string::npos)
+        << "the subsystem bit belongs in the line beside its word:\n"
+        << result.Log;
+#else
+    GTEST_SKIP() << "the Fatal arm is only observable through a fork";
+#endif
+}
+
+TEST(CapsMirrorTest, ThePlaceholderWaitsForASnapshotAnotherThreadIsFetching) {
+#if MGTEST_HAVE_FORK
+    // THE POSITIVE HALF OF THE WAIT, and the only shape in which "block with a bounded wait" is
+    // a correct answer to F1: a bring-up that is genuinely in flight, on a thread that is not
+    // the asking one. The case above is why the wait cannot be the WHOLE fix - the production
+    // defect had the emitter and the handshake on ONE thread, in sequence, and no wait can
+    // help there.
+    //
+    // DRIVEN THROUGH THE PRODUCTION BRING-UP, not a flag this case sets: MG_Backend::Init() is
+    // what creates the server's backend, publishes its real mask and starts the session, and
+    // the in-flight fact the wait reads is ClientSession's own BringUpScope. The server's first
+    // snapshot is held back by the F1 test knob so the window is wide enough to enter on
+    // purpose rather than by luck - and by LESS than the wait's own budget, so a wait that is
+    // taken succeeds instead of expiring.
+    const ChildResult result = RunInChild([] {
+        ::alarm(30);
+        ::setenv("MOBILEGL_TEST_DELAY_FIRST_CAPS_MS", "50", 1);
+        // A FORK CHILD INHERITS WHATEVER THE PREVIOUS CASE ADOPTED, and a mirror that is
+        // already valid would make this case a statement about that snapshot rather than about
+        // the placeholder window. Back to generation 0 first, deliberately and by name.
+        ResetCapsMirrorForTest();
+        MG_Config::Transport = MG_Config::TransportMode::InProcess;
+        MG_Config::SplitTransportRequestedByConfig = true;
+        MG_Config::ActiveBackendType = BackendType::DirectVulkan;
+        MG_Config::Features.PipePush = kMGPipeSubsystemsMigratedAtP5e;
+        MG_Pipe::MGPipeSetResourceOps(nullptr);
+
+        std::atomic<bool> answered{false};
+        std::atomic<bool> consumes{false};
+        std::thread reader([&] {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (!BringUpInFlight() && PublishedCapsGeneration() == 0 &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            consumes.store(CapsMirrorInstance().ServerConsumes(kMGPipeSubsystemResources));
+            answered.store(true);
+        });
+        MG_Backend::Init();
+        reader.join();
+
+        EXPECT_TRUE(answered.load()) << "the reader never returned from ServerConsumes";
+        EXPECT_TRUE(consumes.load())
+            << "a reader that asked DURING the bring-up must get the server's real answer - "
+               "Magma publishes the resource family - rather than the placeholder's false";
+        EXPECT_GT(PublishedCapsGeneration(), 0u);
+        ClientSessionInstance().Stop();
+        MG_Remote::Server::ServerLoopInstance().Stop();
+        std::fflush(nullptr);
+        ::_exit(::testing::Test::HasFailure() ? 1 : 0);
+    });
+    ASSERT_GE(result.Status, 0) << "fork/waitpid failed";
+    ASSERT_TRUE(WIFEXITED(result.Status)) << DescribeStatus(result) << "\n" << result.Log;
+    EXPECT_EQ(WEXITSTATUS(result.Status), 0) << result.Log;
+#else
+    GTEST_SKIP() << "the production bring-up is process-global and needs fork to isolate";
+#endif
+}
+
+TEST(CapsMirrorTest, ARealSnapshotThatWithholdsAFamilyStillAnswersFalse) {
+    // THE OTHER NEGATIVE CONTROL, and the one that keeps this package from being a mask
+    // defaulted to all-ones: a server that really does not consume a family is still answered
+    // "no", counted and named. Only the PLACEHOLDER is refused.
+    AdoptSnapshot(MakeSnapshot(kMGPipeSubsystemPrograms, 0));
+    ResetConsumerRefusalsForTest();
+    EXPECT_TRUE(CapsMirrorInstance().Valid());
+    EXPECT_FALSE(CapsMirrorInstance().ServerConsumes(kMGPipeSubsystemTextureResources));
+    EXPECT_EQ(ConsumerRefusals(), 1u);
+    EXPECT_EQ(LastRefusedSubsystem(), kMGPipeSubsystemTextureResources);
+}
+
+TEST(CapsMirrorTest, TheReadAccessorsStillAnswerFromThePlaceholder) {
+    // P5's ruling for the READ accessors is NOT narrowed by F1, and it must not be: LogBackendInfo
+    // reads GetRendererInfo() during MG_Backend::Init() and an abort there is a process that
+    // cannot start. Only ServerConsumes - a decision, not a read - changed.
     MGPCaps empty{};
     CapsMirror mirror;
     EXPECT_FALSE(mirror.Valid());
-    EXPECT_FALSE(mirror.ServerConsumes(kMGPipeSubsystemResources));
-    EXPECT_FALSE(mirror.ServerConsumes(kMGPipeSubsystemPrograms));
+    EXPECT_EQ(mirror.Generation(), 0u);
+    // (F1 made ServerConsumes on a placeholder a refusal, so the two decision reads that used to
+    // sit here belong to the case above; the READ accessors below are what this case pins.)
+    // P7 wave 2 package C, OQ-10: the NEGATIVE half of the resident-sub-data pair. It used to
+    // be vacuous - nothing in the tree ever set kCapResidentSubData, so every reading of it was
+    // false - and MagmaTransportPublishesRealBufferConsumersWithoutRunAhead below is the
+    // positive half that makes this one mean "a mirror with no snapshot withholds the bit"
+    // rather than "the bit does not exist". Withholding is the SAFE direction: the client then
+    // keeps the ordered in-place host write (BufferObject::LandBytesIntoResidentStore) instead
+    // of emitting opcode 49 at a server that might have no arm for it - ID-39 in miniature.
     EXPECT_FALSE(mirror.HasCap(kCapResidentSubData));
+    EXPECT_EQ(mirror.CallMask(), 0u);
+    EXPECT_EQ(mirror.Backend(), BackendType::Unknown);
     (void)empty;
+}
+
+TEST(CapsMirrorTest, ObjectFamilyEmissionTracksIndependentConsumerCapsWithoutBufferOps) {
+#if MGTEST_HAVE_FORK
+    // Deliberately synthetic masks with no buffer consumer: production Magma now
+    // publishes one, but object-family independence must survive a restricted peer.
+    // Isolate transport, push mask, caps generation and cached supply environment.
+    const ChildResult result = RunInChild([] {
+        MG_Config::Transport = MG_Config::TransportMode::InProcess;
+        MG_Config::Features.PipePush = kMGPipeSubsystemsMigratedAtP5e;
+        MG_Pipe::MGPipeSetResourceOps(nullptr);
+        const auto emits = [](Uint64 family) { return MGPipeP4aFamilyEmits(family, family); };
+        Snapshot snapshot = MakeSnapshot(kMGPipeSubsystemTextureResources, 0);
+        snapshot.Backend = BackendType::DirectVulkan;
+        AdoptSnapshot(snapshot);
+        const Uint64 firstGeneration = CapsMirrorInstance().Generation();
+        EXPECT_FALSE(CapsMirrorInstance().ServerConsumes(kMGPipeSubsystemResources));
+        EXPECT_TRUE(emits(kMGPipeSubsystemTextureResources));
+        EXPECT_FALSE(emits(kMGPipeSubsystemFramebuffer));
+
+        // The former shared buffer-consumer gate cannot distinguish these two
+        // snapshots: both withhold bit 7. The production per-family gate must.
+        snapshot.Caps.CallMask = MGCapsConsumerBits(kMGPipeSubsystemFramebuffer);
+        AdoptSnapshot(snapshot);
+        EXPECT_GT(CapsMirrorInstance().Generation(), firstGeneration);
+        EXPECT_FALSE(CapsMirrorInstance().ServerConsumes(kMGPipeSubsystemResources));
+        EXPECT_FALSE(emits(kMGPipeSubsystemTextureResources));
+        EXPECT_TRUE(emits(kMGPipeSubsystemFramebuffer));
+        snapshot.Caps.CallMask = MGCapsConsumerBits(kMGPipeSubsystemTextureResources);
+        AdoptSnapshot(snapshot);
+        EXPECT_TRUE(emits(kMGPipeSubsystemTextureResources));
+        EXPECT_FALSE(emits(kMGPipeSubsystemFramebuffer));
+        // Object accessors were retired by P5f rather than made record-supplied;
+        // this checks the actual per-family emitter gate, not a synthetic field mask.
+        std::fflush(nullptr);
+        ::_exit(::testing::Test::HasFailure() ? 1 : 0);
+    });
+    ASSERT_GE(result.Status, 0) << "fork/waitpid failed";
+    ASSERT_TRUE(WIFEXITED(result.Status)) << DescribeStatus(result) << result.Log;
+    EXPECT_EQ(WEXITSTATUS(result.Status), 0) << result.Log;
+#else
+    GTEST_SKIP() << "process-global consumer isolation requires fork";
+#endif
+}
+
+// Historical name retained; the real bootstrap must now publish and arm Magma readiness.
+TEST(CapsMirrorTest, MagmaTransportPublishesRealBufferConsumersWithoutRunAhead) {
+#if MGTEST_HAVE_FORK
+    const ChildResult result = RunInChild([] {
+        ::alarm(15);
+        MG_Config::Transport = MG_Config::TransportMode::InProcess;
+        MG_Config::ActiveBackendType = BackendType::DirectVulkan;
+        MG_Config::Features.PipePush = kMGPipeSubsystemsMigratedAtP5e;
+        MG_Config::Ipc.RunAhead = 1;
+        MG_Pipe::MGPipeSetResourceOps(nullptr);
+        // The production bootstrap creates the server backend and publishes its
+        // real mask before any native EGL/Vulkan context exists. No invented caps
+        // snapshot or fake resource table can make this test pass.
+        MG_Backend::Init();
+        auto& server = MG_Remote::Server::ServerSessionInstance();
+        EXPECT_TRUE(server.Accepted());
+        EXPECT_TRUE(server.CallMaskIsSet());
+        if (server.CallMaskIsSet()) {
+            const Uint64 mask = server.CallMask();
+            EXPECT_TRUE(MGCapsServerConsumes(mask, kMGPipeSubsystemResources));
+            EXPECT_TRUE(MGCapsServerConsumes(mask, kMGPipeSubsystemBufferBindings));
+            EXPECT_EQ(mask & static_cast<Uint64>(kCapRunAheadApply), static_cast<Uint64>(kCapRunAheadApply));
+        }
+        const auto* ops = MG_Pipe::MGPipeGetResourceOps();
+        EXPECT_NE(ops, nullptr);
+        if (ops) {
+            EXPECT_NE(ops->Create, nullptr);
+            EXPECT_NE(ops->Respecify, nullptr);
+            EXPECT_NE(ops->SubData, nullptr);
+            EXPECT_NE(ops->FlushRange, nullptr);
+            EXPECT_NE(ops->Readback, nullptr);
+            EXPECT_NE(ops->Destroy, nullptr);
+            EXPECT_NE(ops->MapPersistent, nullptr);
+            if (ops->MapPersistent) EXPECT_EQ(ops->MapPersistent({7, 1}, 64, nullptr), nullptr)
+                << "Magma must not donate a server address as a client persistent map";
+            // P7 wave 2 package C, OQ-10 (CONTRACT-P7 §5.4): THE TABLE DECIDES THE BIT, and
+            // this is the assertion that says so rather than asserting a constant. Magma
+            // registers a SubDataResident arm (VkBufferManager.cpp's g_vulkanWireResourceOps),
+            // so the published mask must carry kCapResidentSubData - and it must carry it
+            // BECAUSE of the arm, which is why the two sides are compared to each other
+            // instead of both to `true`. Written this way the case also covers the backend
+            // that does NOT have the arm, on the day one exists: no enum is consulted here,
+            // and deleting the `|=` in MG_Backend/Init.cpp reds exactly this line (red-once).
+            EXPECT_EQ((server.CallMask() & static_cast<Uint64>(kCapResidentSubData)) != 0,
+                      ops->SubDataResident != nullptr)
+                << "kCapResidentSubData must be published from the server's own wire resource "
+                   "table (ID-39: never from the backend enum). Without it "
+                   "MGPipeResourceOpsHaveSubDataResident answers false under every transport "
+                   "and both backends fall back to the in-place memcpy, which makes Magma's "
+                   "SubDataResident arm dead code on the wire";
+            EXPECT_NE(ops->SubDataResident, nullptr)
+                << "Magma's wire resource table lost its resident sub-data arm; the bit above "
+                   "would then correctly go dark and opcode 49 would stop crossing";
+        }
+        EXPECT_TRUE(ClientSessionInstance().RunAheadArmed());
+        ClientSessionInstance().Stop();
+        MG_Remote::Server::ServerLoopInstance().Stop();
+        std::fflush(nullptr);
+        ::_exit(::testing::Test::HasFailure() ? 1 : 0);
+    });
+    ASSERT_GE(result.Status, 0) << "fork/waitpid failed";
+    ASSERT_TRUE(WIFEXITED(result.Status)) << DescribeStatus(result) << result.Log;
+    EXPECT_EQ(WEXITSTATUS(result.Status), 0) << result.Log;
+#else
+    GTEST_SKIP() << "process-global backend bootstrap isolation requires fork";
+#endif
 }
 
 TEST(CapsMirrorTest, TheConsumerBlockDoesNotCollideWithTheFeatureBits) {
@@ -983,6 +1226,174 @@ TEST(RemoteReadback, TheFastPathIsTakenExactlyWhenTheScatterWouldChangeNothing) 
 }
 
 // =====================================================================================
+// P7 gate 5 (g5-readback): a read larger than one reply slot is BANDED, not refused
+// =====================================================================================
+
+namespace {
+    // The bands the production walk visits, in order - the emitter iterates the same walk.
+    std::vector<ReadbackBand> CollectReadbackBands(Uint64 width, Uint64 height, Uint64 bpp, Uint64 cap,
+                                                   Bool* planned = nullptr) {
+        ReadbackBandPlan plan;
+        const Bool ok = PlanReadbackBands(width, height, bpp, cap, plan);
+        if (planned != nullptr) *planned = ok;
+        std::vector<ReadbackBand> bands;
+        if (ok) ForEachReadbackBand(width, height, plan, [&](const ReadbackBand& band) { bands.push_back(band); });
+        return bands;
+    }
+} // namespace
+
+TEST(RemoteReadback, TheCtsReadOfExactlyTwoMiBIsTwoBandsThatEachFitASlot) {
+    // KHR-GL46.direct_state_access.renderbuffers_storage's own read: 256x512 RGBA/FLOAT is
+    // 2,097,152 bytes against ID-47's 2,097,136. It used to be Fatal{ReplyTooLarge}; it is now two
+    // records - 511 rows (2,093,056 bytes) and the single top row - and BOTH are answers one slot
+    // holds, and each record's DstSize is its own tight extent, so the server's PH-3 bound (its
+    // tight answer against its own maxReplyBytes) is met per record.
+    constexpr Uint64 kCap = 2u * 1024u * 1024u - 16u;
+    const Uint64 bpp = 16;
+    ASSERT_EQ(TightReadbackByteCount(256, 512, 0x1908 /*RGBA*/, 0x1406 /*FLOAT*/), 2097152u);
+    const auto bands = CollectReadbackBands(256, 512, bpp, kCap);
+    ASSERT_EQ(bands.size(), 2u);
+    EXPECT_EQ(bands[0].FirstRow, 0u);
+    EXPECT_EQ(bands[0].Rows, 511u);
+    EXPECT_EQ(bands[1].FirstRow, 511u);
+    EXPECT_EQ(bands[1].Rows, 1u);
+    for (const ReadbackBand& band : bands) {
+        EXPECT_EQ(band.FirstColumn, 0u);
+        EXPECT_EQ(band.Columns, 256u);
+        EXPECT_LE(TightReadbackByteCount(static_cast<GLsizei>(band.Columns), static_cast<GLsizei>(band.Rows),
+                                         0x1908, 0x1406),
+                  kCap);
+    }
+    // A read that already fits is ONE record, unchanged from before: exactly the cap, and E2's
+    // 640x480 RGBA8 snapshot.
+    EXPECT_EQ(CollectReadbackBands(131071, 1, 16, kCap).size(), 1u) << "exactly the cap is one band";
+    EXPECT_EQ(CollectReadbackBands(640, 480, 4, kCap).size(), 1u);
+    // More than the whole 16 MiB SEG_REPLY: 2048x2100 RGBA8 is 255-row bands, nine of them.
+    EXPECT_EQ(CollectReadbackBands(2048, 2100, 4, kCap).size(), 9u);
+}
+
+TEST(RemoteReadback, EveryPlanCoversTheReadOnceInRowMajorOrderWithBandsThatFitAndStayContiguous) {
+    // The plan's invariants over a sweep that includes both shapes - whole-width row bands and,
+    // for a row wider than a reply, single-row column pieces - at small caps so every boundary is
+    // hit: the cap exactly one row, one byte short of a row, one pixel, one pixel short of two.
+    struct Shape { Uint64 w, h, bpp, cap; };
+    const Shape shapes[] = {
+        {7, 5, 4, 28},   {7, 5, 4, 27},  {7, 5, 4, 4},   {7, 5, 4, 7},   {7, 5, 16, 1000},
+        {20, 3, 16, 100}, {1, 9, 3, 3},  {9, 1, 3, 26},  {256, 512, 16, 2097136}, {5, 5, 8, 8},
+        {33, 17, 4, 131}, {1024, 513, 4, 2097136},
+    };
+    int rowShapes = 0, pieceShapes = 0;
+    for (const Shape& s : shapes) {
+        SCOPED_TRACE(std::to_string(s.w) + "x" + std::to_string(s.h) + " bpp " + std::to_string(s.bpp) +
+                     " cap " + std::to_string(s.cap));
+        Bool planned = false;
+        const auto bands = CollectReadbackBands(s.w, s.h, s.bpp, s.cap, &planned);
+        ASSERT_TRUE(planned);
+        std::vector<int> covered(static_cast<size_t>(s.w * s.h), 0);
+        Uint64 previousTightEnd = 0;
+        Bool pieces = false;
+        for (const ReadbackBand& band : bands) {
+            ASSERT_GT(band.Rows, 0u);
+            ASSERT_GT(band.Columns, 0u);
+            EXPECT_LE(band.Rows * band.Columns * s.bpp, s.cap) << "a band's answer does not fit a reply";
+            // CONTIGUOUS IN THE TIGHT LAYOUT (whole-width rows, or a piece of one row), and in
+            // order: the direct path reads each answer straight into the application's buffer at
+            // exactly this offset, so a gap or an overlap here is a torn picture there.
+            EXPECT_TRUE(band.Columns == s.w || band.Rows == 1);
+            if (band.Columns != s.w) pieces = true;
+            const Uint64 tightStart = band.FirstRow * s.w + band.FirstColumn;
+            EXPECT_EQ(tightStart, previousTightEnd) << "bands are not consecutive in row-major order";
+            previousTightEnd = tightStart + (band.Rows - 1) * s.w + band.Columns;
+            for (Uint64 r = 0; r < band.Rows; ++r)
+                for (Uint64 c = 0; c < band.Columns; ++c)
+                    ++covered[static_cast<size_t>((band.FirstRow + r) * s.w + band.FirstColumn + c)];
+        }
+        EXPECT_EQ(previousTightEnd, s.w * s.h);
+        for (size_t i = 0; i < covered.size(); ++i) ASSERT_EQ(covered[i], 1) << "pixel " << i;
+        // AS FEW RECORDS AS THE SHAPE ALLOWS: a whole-width band takes every row a reply holds.
+        if (!pieces) {
+            const Uint64 rowsPerReply = s.cap / (s.w * s.bpp);
+            EXPECT_EQ(bands.size(), (s.h + rowsPerReply - 1) / rowsPerReply);
+            ++rowShapes;
+        } else {
+            EXPECT_GT(s.w * s.bpp, s.cap) << "a row that fits a reply was cut into pieces";
+            ++pieceShapes;
+        }
+    }
+    EXPECT_GT(rowShapes, 0);
+    EXPECT_GT(pieceShapes, 0) << "the sweep never reached the column-piece arm";
+}
+
+TEST(RemoteReadback, NotEvenOnePixelFittingIsTheOnlyReadWithNoPlan) {
+    // The one read banding cannot answer, left to ID-47's named Fatal at the emitter: a single
+    // pixel larger than a reply (a server that declared a cap below 16 bytes), or no reply pool.
+    Bool planned = true;
+    EXPECT_TRUE(CollectReadbackBands(4, 4, 16, 15, &planned).empty());
+    EXPECT_FALSE(planned);
+    EXPECT_TRUE(CollectReadbackBands(4, 4, 4, 0, &planned).empty());
+    EXPECT_FALSE(planned);
+    // And one byte more is a plan, of single-pixel pieces.
+    const auto bands = CollectReadbackBands(4, 4, 16, 16, &planned);
+    EXPECT_TRUE(planned);
+    EXPECT_EQ(bands.size(), 16u);
+    // Degenerate reads plan nothing (the emitter returns before planning them).
+    EXPECT_TRUE(CollectReadbackBands(0, 4, 4, 64, &planned).empty());
+    EXPECT_FALSE(planned);
+}
+
+TEST(RemoteReadback, ABandedScatterWritesExactlyTheBytesTheWholeScatterWrites) {
+    // The bounce path's composition: every band scattered on its own must leave the destination
+    // byte-identical to one whole-read scatter, gaps included, for pack states that pad, skip,
+    // and - the ill-formed 0 < ROW_LENGTH < width case m6 keeps verbatim - overlap. Both band
+    // shapes are driven: row bands at a cap of two rows and a bit, pieces at a cap under a row.
+    constexpr GLsizei kW = 11;
+    constexpr GLsizei kH = 7;
+    constexpr Uint8 kSentinel = 0xEE;
+    for (const Uint64 bpp : {Uint64{3}, Uint64{4}, Uint64{16}}) {
+        std::vector<Uint8> tight(static_cast<size_t>(kW) * kH * bpp);
+        for (size_t i = 0; i < tight.size(); ++i) tight[i] = static_cast<Uint8>(i * 13 + 5);
+        std::vector<PixelStoreParameters> layouts(6);
+        layouts[1].Alignment = 8;
+        layouts[2].RowLength = kW + 3;
+        layouts[2].Alignment = 8;
+        layouts[3].SkipRows = 2;
+        layouts[3].SkipPixels = 3;
+        layouts[4].RowLength = kW + 1;
+        layouts[4].SkipRows = 1;
+        layouts[4].SkipPixels = 1;
+        layouts[4].Alignment = 2;
+        layouts[5].RowLength = 4; // < width: consecutive rows overlap, so ORDER decides the bytes
+        for (const Uint64 cap : {kW * bpp * 2 + 5, kW * bpp - 1, bpp * 3}) {
+            for (size_t l = 0; l < layouts.size(); ++l) {
+                SCOPED_TRACE("bpp " + std::to_string(bpp) + " cap " + std::to_string(cap) + " layout " +
+                             std::to_string(l));
+                const PixelStoreParameters& pack = layouts[l];
+                std::vector<Uint8> whole(4096, kSentinel);
+                ScatterTightReadbackIntoPackState(tight.data(), whole.data(), kW, kH, bpp, pack);
+
+                ReadbackBandPlan plan;
+                ASSERT_TRUE(PlanReadbackBands(kW, kH, bpp, cap, plan));
+                std::vector<Uint8> banded(4096, kSentinel);
+                int bandCount = 0;
+                ForEachReadbackBand(kW, kH, plan, [&](const ReadbackBand& band) {
+                    // What the server would answer for this band: its own tight rectangle.
+                    std::vector<Uint8> answer(static_cast<size_t>(band.Rows * band.Columns * bpp));
+                    for (Uint64 r = 0; r < band.Rows; ++r) {
+                        std::memcpy(answer.data() + r * band.Columns * bpp,
+                                    tight.data() + ((band.FirstRow + r) * kW + band.FirstColumn) * bpp,
+                                    static_cast<size_t>(band.Columns * bpp));
+                    }
+                    ScatterReadbackBandIntoPackState(answer.data(), banded.data(), kW, band, bpp, pack);
+                    ++bandCount;
+                });
+                EXPECT_GT(bandCount, 1) << "the cap did not band this read, so the comparison is vacuous";
+                EXPECT_EQ(banded, whole);
+            }
+        }
+    }
+}
+
+// =====================================================================================
 // R-17: the routing, its reply mailbox, and the arm that is actually installed
 // =====================================================================================
 
@@ -1124,6 +1535,10 @@ TEST(PipeRouting, TheInstalledClientArmIsWireAndNotMonolithAndEveryRoutedRowMove
     C1F_MOVED(Context, SetSamplerViews);
     C1F_MOVED(Context, BindSamplerStates);
     C1F_MOVED(Context, SetShaderImages);
+    // P5e (sb, CONTRACT-P5E.md §5.6): set_shader_buffers is the 35th routed row. It rides both
+    // tables like every other set_* with an applier entry point - the class is a FIELD of the
+    // payload, so all three binding-point classes go through this one cell.
+    C1F_MOVED(Context, SetShaderBuffers);
     C1F_MOVED(Context, SetGlobalConstants);
     C1F_MOVED(Context, SetVertexAttribDefaults);
     C1F_MOVED(Context, SetPixelPackState);
@@ -1144,18 +1559,21 @@ TEST(PipeRouting, TheInstalledClientArmIsWireAndNotMonolithAndEveryRoutedRowMove
     C1F_ESCAPE(ResourceFlushRange);
     C1F_ESCAPE(MapPersistent);
     C1F_ESCAPE(CreateShaderState);
+    // P5e (pg): set_program_bindings is the fifth escape - three tails in three index spaces
+    // plus a parallel name array, which no generated row can express (MG_Pipe/PipeRoute.h).
+    C1F_ESCAPE(SetProgramBindings);
 #undef C1F_ESCAPE
     const SizeT movedContext = CountDifferingCells(gMGPipeContext, MGPipeMonolithContext());
-    EXPECT_EQ(movedScreen + movedContext, 34u)
-        << "exactly the 34 generated routed rows must differ from the monolith adapters "
-           "(33 at P5, + set_context_values at P5c rv); "
+    EXPECT_EQ(movedScreen + movedContext, 35u)
+        << "exactly the 35 generated routed rows must differ from the monolith adapters "
+           "(33 at P5, + set_context_values at P5c rv, + set_shader_buffers at P5e sb); "
         << movedScreen + movedContext
         << " did, so a row was left on the monolith adapter (it would run the applier on the GL "
            "thread under split) or an unrouted row was overwritten";
 
     const SizeT movedEscapes = CountDifferingCells(gMGPipeRouteEscapes, MGPipeMonolithEscapes());
-    EXPECT_EQ(movedEscapes, 4u)
-        << "the four escape routes must move off the monolith escapes too";
+    EXPECT_EQ(movedEscapes, 5u)
+        << "the five escape routes must move off the monolith escapes too";
 
     // Restore the monolith arm for the sibling cases that assert it (and for a clean binary).
     MGPipeInstallMonolithTables();
@@ -1244,7 +1662,7 @@ struct F1Peer : Codec::WireVerbSink {
     Bool OnGenerateMipmap(const MGPMipPlan& v) override { mip = v; ++calls; return true; }
     Bool OnBlit(const MGPBlit& v) override { blit = v; ++calls; return true; }
     void Install() {
-        if (Srv::ServerLoopInstance().RunOnApplyThread([](void* self) {
+        if (Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting([](void* self) {
             auto& decoder = Srv::ServerSessionInstance().Applier().*PeerMember(DecoderTag{});
             decoder.SetVerbSink(static_cast<F1Peer*>(self));
             return MOBILEGL_OK;
@@ -1470,64 +1888,106 @@ TEST(RemoteF1, GenerateMipmapFieldsCross) {
 
 #if MGTEST_HAVE_FORK
 
-TEST(RemoteF1, UnboundNamedfvRefusesByName) {
-    // Red once (executed, reverted): disable the named-FBO refusal; its exact Fatal disappears.
-    const auto child = RunInChild([] {
+namespace {
+    MGPipeHandle observedNamedClear{}, observedNamedClearRead{};
+    Uint32 observedNamedClearValues[4]{};
+    Uint32 observedNamedClearCalls = 0;
+    GLenum observedNamedClearTarget = 0;
+    GLint observedNamedClearIndex = 0;
+    GLfloat observedNamedClearDepth = 0;
+    GLint observedNamedClearStencil = 0;
+    Bool observedNamedClearRecord = false;
+
+    void ObserveNamedClear(GLenum target, GLint index) {
+        const auto& state = MGPipeApplier();
+        observedNamedClear = state.BoundFramebuffer[0];
+        observedNamedClearRead = state.BoundFramebuffer[1];
+        observedNamedClearRecord = state.FramebufferRecordFor(observedNamedClear) != nullptr;
+        observedNamedClearTarget = target;
+        observedNamedClearIndex = index;
+        ++observedNamedClearCalls;
+    }
+
+    void CheckNamedClearScopedTarget(Uint8 kind, Uint8 valueClass) {
+        MGPipeApplierReset();
+        MGPipeResourceOps resources{};
+        MGPipeSetResourceOps(&resources);
+        MGPFramebufferState state{};
+        state.Fbo = {31, 1};
+        state.Target = static_cast<Uint8>(MGPipeFramebufferTarget::Draw);
+        MGPipeApplySetFramebufferState(state);
+        const auto originalDraw = state.Fbo;
+        state.Fbo = {32, 2};
+        state.Target = static_cast<Uint8>(MGPipeFramebufferTarget::Read);
+        MGPipeApplySetFramebufferState(state);
+        const auto originalRead = state.Fbo;
+        state.Fbo = {33, 3};
+        state.Target = static_cast<Uint8>(MGPipeFramebufferTarget::Named);
+        MGPipeApplySetFramebufferState(state);
         CapsPeer backend;
+        backend.table.GL.ClearBufferfv = +[](GLenum target, GLint index, const GLfloat* values) {
+            ObserveNamedClear(target, index);
+            std::memcpy(observedNamedClearValues, values, sizeof(observedNamedClearValues));
+        };
+        backend.table.GL.ClearBufferiv = +[](GLenum target, GLint index, const GLint* values) {
+            ObserveNamedClear(target, index);
+            std::memcpy(observedNamedClearValues, values, sizeof(observedNamedClearValues));
+        };
+        backend.table.GL.ClearBufferuiv = +[](GLenum target, GLint index, const GLuint* values) {
+            ObserveNamedClear(target, index);
+            std::memcpy(observedNamedClearValues, values, sizeof(observedNamedClearValues));
+        };
+        backend.table.GL.ClearBufferfi = +[](GLenum target, GLint index, GLfloat depth, GLint stencil) {
+            ObserveNamedClear(target, index);
+            observedNamedClearDepth = depth;
+            observedNamedClearStencil = stencil;
+        };
         Srv::ServerVerbSink sink;
         sink.SetBackend(&backend);
-        MGPClear r{};
-        r.Fbo = {701, 1};
-        r.Kind = kMGPipeClearKindColor;
-        r.ValueClass = kMGPipeClearValueClassFloat;
-        sink.OnClear(r);
-    });
-    ExpectNamedAbort(child, "Fatal{UnmigratedVerb, \"ClearNamedFramebufferfv+UNBOUND\"}");
+        MGPClear clear{};
+        clear.Fbo = state.Fbo;
+        clear.Kind = kind;
+        clear.ValueClass = valueClass;
+        clear.DrawBufferIndex = kind == kMGPipeClearKindDepthStencil ? 0 : 3;
+        const Uint32 bits[4]{0x3e800000u, 0x3f000000u, 0xff000011u, 0x3f800000u};
+        std::memcpy(clear.ColorValue, bits, sizeof(bits));
+        clear.DepthValue = 0.375f;
+        clear.StencilValue = 91;
+        if (!sink.OnClear(clear) || observedNamedClearCalls != 1) ::_exit(101);
+        if (observedNamedClear != clear.Fbo || !observedNamedClearRecord ||
+            observedNamedClearRead != originalRead) ::_exit(102);
+        if (MGPipeApplier().BoundFramebuffer[0] != originalDraw ||
+            MGPipeApplier().BoundFramebuffer[1] != originalRead) ::_exit(103);
+        if (observedNamedClearIndex != clear.DrawBufferIndex) ::_exit(104);
+        if (kind == kMGPipeClearKindDepthStencil) {
+            if (observedNamedClearTarget != GL_DEPTH_STENCIL || observedNamedClearDepth != clear.DepthValue ||
+                observedNamedClearStencil != clear.StencilValue) ::_exit(105);
+        } else if (observedNamedClearTarget != GL_COLOR ||
+                   std::memcmp(observedNamedClearValues, clear.ColorValue, sizeof(bits))) ::_exit(106);
+        MGPipeSetResourceOps(nullptr);
+        sink.SetBackend(nullptr);
+    }
+}
+
+TEST(RemoteF1, UnboundNamedfvRefusesByName) {
+    // Historical name retained; a named target now reaches the native clear hook.
+    const auto child = RunInChild([] { CheckNamedClearScopedTarget(kMGPipeClearKindColor, kMGPipeClearValueClassFloat); });
+    ExpectChildSuccess(child);
 }
 
 TEST(RemoteF1, UnboundNamedivRefusesByName) {
-    // Red once (executed, reverted): disable the named-FBO refusal; its exact Fatal disappears.
-    const auto child = RunInChild([] {
-        CapsPeer backend;
-        Srv::ServerVerbSink sink;
-        sink.SetBackend(&backend);
-        MGPClear r{};
-        r.Fbo = {701, 1};
-        r.Kind = kMGPipeClearKindColor;
-        r.ValueClass = kMGPipeClearValueClassInt;
-        sink.OnClear(r);
-    });
-    ExpectNamedAbort(child, "Fatal{UnmigratedVerb, \"ClearNamedFramebufferiv+UNBOUND\"}");
+    const auto child = RunInChild([] { CheckNamedClearScopedTarget(kMGPipeClearKindColor, kMGPipeClearValueClassInt); });
+    ExpectChildSuccess(child);
 }
 
 TEST(RemoteF1, UnboundNameduivRefusesByName) {
-    // Red once (executed, reverted): disable the named-FBO refusal; its exact Fatal disappears.
-    const auto child = RunInChild([] {
-        CapsPeer backend;
-        Srv::ServerVerbSink sink;
-        sink.SetBackend(&backend);
-        MGPClear r{};
-        r.Fbo = {701, 1};
-        r.Kind = kMGPipeClearKindColor;
-        r.ValueClass = kMGPipeClearValueClassUint;
-        sink.OnClear(r);
-    });
-    ExpectNamedAbort(child, "Fatal{UnmigratedVerb, \"ClearNamedFramebufferuiv+UNBOUND\"}");
+    const auto child = RunInChild([] { CheckNamedClearScopedTarget(kMGPipeClearKindColor, kMGPipeClearValueClassUint); });
+    ExpectChildSuccess(child);
 }
 
 TEST(RemoteF1, UnboundNamedfiRefusesByName) {
-    // Red once (executed, reverted): disable the named-FBO refusal; its exact Fatal disappears.
-    const auto child = RunInChild([] {
-        CapsPeer backend;
-        Srv::ServerVerbSink sink;
-        sink.SetBackend(&backend);
-        MGPClear r{};
-        r.Fbo = {701, 1};
-        r.Kind = kMGPipeClearKindDepthStencil;
-        r.ValueClass = kMGPipeClearValueClassFloat;
-        sink.OnClear(r);
-    });
-    ExpectNamedAbort(child, "Fatal{UnmigratedVerb, \"ClearNamedFramebufferfi+UNBOUND\"}");
+    const auto child = RunInChild([] { CheckNamedClearScopedTarget(kMGPipeClearKindDepthStencil, kMGPipeClearValueClassFloat); });
+    ExpectChildSuccess(child);
 }
 #endif
 
@@ -1763,7 +2223,7 @@ TEST(RemoteF1, DispatchIndirectStashesTheCommandBuffer) {
 TEST(RemoteGuards, AllocatorAcquireFromTheApplyThreadIsFatalByName) {
     const auto child = RunInChild([] {
         StartControlSession();
-        Srv::ServerLoopInstance().RunOnApplyThread([](void*) {
+        Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting([](void*) {
             MGPipeSlots().Acquire(MGPipeKind::Texture, 424242);
             return MOBILEGL_OK;
         }, nullptr);
@@ -1775,7 +2235,7 @@ TEST(RemoteGuards, AllocatorAcquireFromTheApplyThreadIsFatalByName) {
 TEST(RemoteGuards, AllocatorFindByLifetimeIdFromTheApplyThreadIsFatalByName) {
     const auto child = RunInChild([] {
         StartControlSession();
-        Srv::ServerLoopInstance().RunOnApplyThread([](void*) {
+        Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting([](void*) {
             MGPipeSlots().FindByLifetimeId(MGPipeKind::Texture, 424242);
             return MOBILEGL_OK;
         }, nullptr);
@@ -1787,7 +2247,7 @@ TEST(RemoteGuards, AllocatorFindByLifetimeIdFromTheApplyThreadIsFatalByName) {
 TEST(RemoteGuards, AllocatorFreeFromTheApplyThreadIsFatalByName) {
     const auto child = RunInChild([] {
         StartControlSession();
-        Srv::ServerLoopInstance().RunOnApplyThread([](void*) {
+        Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting([](void*) {
             MGPipeSlots().Free(MGPipeKind::Texture, {7, 1});
             return MOBILEGL_OK;
         }, nullptr);
@@ -1808,7 +2268,7 @@ namespace {
 TEST(RemoteGuards, SlotTableHandleOfFromTheApplyThreadIsFatalByName) {
     const auto child = RunInChild([] {
         StartControlSession();
-        Srv::ServerLoopInstance().RunOnApplyThread([](void*) {
+        Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting([](void*) {
             MG_State::pGLContext = MakeUnique<MG_State::GLState::GLContext>();
             TestTextureTable table;
             MG_State::GLState::TextureObject2D tex(44);
@@ -1823,7 +2283,7 @@ TEST(RemoteGuards, SlotTableHandleOfFromTheApplyThreadIsFatalByName) {
 TEST(RemoteGuards, SlotTableMintingGetOrCreateFromTheApplyThreadIsFatalByName) {
     const auto child = RunInChild([] {
         StartControlSession();
-        Srv::ServerLoopInstance().RunOnApplyThread([](void*) {
+        Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting([](void*) {
             MG_State::pGLContext = MakeUnique<MG_State::GLState::GLContext>();
             TestTextureTable table;
             auto tex = MakeShared<MG_State::GLState::TextureObject2D>(45);
@@ -1838,7 +2298,7 @@ TEST(RemoteGuards, SlotTableMintingGetOrCreateFromTheApplyThreadIsFatalByName) {
 // The four accessor drives share one shape: the BufferObject is constructed on the CLIENT
 // thread (its own resource_create publication is a legal client-side emit), and only the
 // accessor runs on the apply thread, where it must die at the accessor's own guard.
-#define MGL_BUFFER_GUARD_TEST(Name, Id, Call)                                                          TEST(RemoteGuards, Name) {                                                                                 const auto child = RunInChild([] {                                                                         StartControlSession();                                                                                 MG_State::GLState::BufferObject buffer(Id);                                                            Srv::ServerLoopInstance().RunOnApplyThread([](void* self) {                                                auto& buffer = *static_cast<MG_State::GLState::BufferObject*>(self);                                   Call;                                                                                                  return MOBILEGL_OK;                                                                                }, &buffer);                                                                                           ClientSessionInstance().Stop();                                                                    });                                                                                                    ExpectNamedAbort(child, "Fatal{RoleViolation, \"buffer-legacy-arm\"}");                           }
+#define MGL_BUFFER_GUARD_TEST(Name, Id, Call)                                                          TEST(RemoteGuards, Name) {                                                                                 const auto child = RunInChild([] {                                                                         StartControlSession();                                                                                 MG_State::GLState::BufferObject buffer(Id);                                                            Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting([](void* self) {                                                auto& buffer = *static_cast<MG_State::GLState::BufferObject*>(self);                                   Call;                                                                                                  return MOBILEGL_OK;                                                                                }, &buffer);                                                                                           ClientSessionInstance().Stop();                                                                    });                                                                                                    ExpectNamedAbort(child, "Fatal{RoleViolation, \"buffer-legacy-arm\"}");                           }
 MGL_BUFFER_GUARD_TEST(BufferMappedDataFromTheApplyThreadIsFatalByName, 703, (void)buffer.MappedData())
 MGL_BUFFER_GUARD_TEST(BufferIsMappedFromTheApplyThreadIsFatalByName, 704, (void)buffer.IsMapped())
 MGL_BUFFER_GUARD_TEST(BufferChangeSerialFromTheApplyThreadIsFatalByName, 705, (void)buffer.GetChangeSerial())
@@ -1847,33 +2307,13 @@ MGL_BUFFER_GUARD_TEST(BufferSyncPersistentMappedRangeFromTheApplyThreadIsFatalBy
 MGL_BUFFER_GUARD_TEST(BufferHasDefinedContentFromTheApplyThreadIsFatalByName, 707, (void)buffer.HasDefinedContent())
 #undef MGL_BUFFER_GUARD_TEST
 
-// P5d round 3 (package D): the two NAMED EXEMPTION scopes of CONTRACT-P5C §3.1 / §5.4 stopped
-// keeping their depth in a thread_local and now count ONLY while ServerLoop::OnApplyThread() is
-// true (SlotAllocator.cpp). The claim that makes that legal is "the apply-thread guard is the
-// counter's only reader, so a depth kept on any other thread cannot change an answer" - and
-// these three cases are that claim in executable form. They are the red-once for the change:
-//
-//   (a) drop the `if (m_counted)` from the constructor (or make it unconditional again on a
-//       thread that is not the apply thread) and (c) goes red - a GL-thread scope would start
-//       exempting the apply thread, which is exactly the leak the thread_local used to prevent;
-//   (b) drop the increment altogether and (a) goes red - the exemption stops exempting and
-//       the debt's own sites (DirectGLES' HandleOf probes) abort the server;
-//   (c) drop the guard's `MagmaP7AllocatorDebtScope::ActiveOnApplyThread()` /
-//       `FrontendKeyedRegistryScope::ActiveOnApplyThread()` rows and (b) - the control - stops
-//       being the only aborting arm.
-//
-// P5e (id), CONTRACT-P5E §4.4 REPLACED (b). The case that used to sit there -
-// `AnAllocatorProbeInsideAnExemptionScopeOnTheApplyThreadIsAllowed` - asserted that a scope
-// exempts UNCONDITIONALLY, which is exactly the rule §4.4 retires: an exemption is a debt the
-// CLIENT'S WAIT pays for, so it holds only while the record being applied is barriered. Its
-// replacement below drives the same scope with the barriered flag forced false and expects the
-// abort. The green half of the old case did not need a test of its own: every Espryt
-// `integration-split` entry runs the frontend-keyed scope's surviving sites on the apply thread
-// behind barriered records, so a guard that stopped exempting would take the whole lane down.
+// Historical P5d/P5e probes remain named for compatibility. P5f retires both
+// scope exemptions, including barriered records; all allocator access on apply is
+// client-memory access regardless of whether that memory happens to be stable.
 TEST(RemoteGuards, AnAllocatorProbeFromTheApplyThreadOutsideEveryScopeIsFatalByName) {
     const auto child = RunInChild([] {
         StartControlSession();
-        Srv::ServerLoopInstance().RunOnApplyThread(
+        Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting(
             +[](void*) -> MobileGLResult {
                 MG_Pipe::MGPipeRefuseAllocatorFromApplyThread("FindByLifetimeId");
                 return MOBILEGL_OK;
@@ -1884,24 +2324,8 @@ TEST(RemoteGuards, AnAllocatorProbeFromTheApplyThreadOutsideEveryScopeIsFatalByN
     ExpectNamedAbort(child, "Fatal{RoleViolation, \"MGPipeSlots\"}");
 }
 
-// P5e (id) RED-ONCE, CONTRACT-P5E §4.4. The exemption scope is OPEN and the probe is the one
-// the debt is named for - `HandleOf`, the frontend-keyed registry's own entry - and it still
-// aborts, because the record being applied is unbarriered: the client is running ahead and the
-// allocator's free list and lifetimeId -> slot map are moving under the read.
-//
-// THE HOOK IS THE APPLIER FIELD ITSELF and that is deliberate: `CurrentRecordBarriered` is what
-// PipeApplier::ApplyOne stamps from MGPipeBarriered() on every record, so forcing it here drives
-// the production path rather than a test-only branch beside it. Until ra lands the wait rule
-// MGPipeBarriered answers true for every record, so this is the ONLY way to reach the arm - and
-// the arm has to exist before ra, because ra is what makes it reachable in production.
-//
-// The red: put §4.4's `if (MGPipeApplierCurrentRecordIsBarriered())` back to an unconditional
-// exemption in MGPipeRefuseAllocatorFromApplyThread and this case stops aborting - red by
-// expectation, which is the shape a guard case fails in.
-// EVERYTHING BUT THE PROBE RUNS ON THE CLIENT THREAD, which is the buffer/texture guard cases'
-// shape one block down and is load-bearing here rather than tidy: a TextureObject2D's
-// constructor MINTS a resource handle, and building it on the apply thread would abort at the
-// mint with the same diagnostic - a case that passes for a reason other than the one it names.
+// Construct on the client and run only HandleOf on apply. The false barrier stamp
+// keeps the original P5e scenario; the tests below add the old barriered loophole.
 TEST(RemoteGuards, AnAllocatorProbeInsideAnExemptionScopeFromTheApplyThreadIsFatalEvenAtTheOldDebtSites) {
     struct Probe {
         TestTextureTable* table;
@@ -1912,7 +2336,7 @@ TEST(RemoteGuards, AnAllocatorProbeInsideAnExemptionScopeFromTheApplyThreadIsFat
         MG_State::GLState::TextureObject2D texture(46);
         TestTextureTable table;
         Probe probe{&table, &texture};
-        Srv::ServerLoopInstance().RunOnApplyThread(
+        Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting(
             +[](void* self) -> MobileGLResult {
                 auto& probe = *static_cast<Probe*>(self);
                 // The record being applied is one the client did NOT park behind. The stamp is
@@ -1929,16 +2353,128 @@ TEST(RemoteGuards, AnAllocatorProbeInsideAnExemptionScopeFromTheApplyThreadIsFat
     ExpectNamedAbort(child, "Fatal{RoleViolation, \"MGPipeSlots\"}");
 }
 
-// THE ONE THAT PINS THE SINGLE-WRITER ARGUMENT. The scope is open on the GL thread for the
-// whole of the posted request; the apply thread's probe must still abort, because the exemption
-// belongs to the thread that entered the scope and never to another one. With the depth kept in
-// a plain counter that every thread incremented, this case would go green - and a real
-// apply-thread violation would be silently exempted for as long as any GL thread held a scope.
+// P5f (fr): barriers and old named scopes no longer admit frontend identity.
+// Construct the object and table on the client so each death comes from the exact
+// probed member, not a constructor's resource_create or a missing record.
+TEST(RemoteGuards, BarrieredLegacyScopesCannotExemptAllocator) {
+    for (const auto backend : {BackendType::DirectGLES, BackendType::DirectVulkan}) {
+        const auto child = RunInChild([backend] {
+            StartControlSession();
+            auto selectedBackend = backend;
+            Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting(+[](void* self) -> MobileGLResult {
+                MG_Pipe::MGPipeApplierSetCurrentRecordBarriered(true);
+                MG_Config::ActiveBackendType = *static_cast<BackendType*>(self);
+                const MG_Pipe::MGPipeFrontendKeyedRegistryScope registryScope;
+                const MG_Pipe::MagmaP7AllocatorDebtScope magmaScope;
+                // HighWater had no per-method guard in the old implementation.
+                (void)MGPipeSlots().HighWater(MGPipeKind::Texture);
+                return MOBILEGL_OK;
+            }, &selectedBackend);
+            ClientSessionInstance().Stop();
+        });
+        ExpectNamedAbort(child, "Fatal{RoleViolation, \"MGPipeSlots\"}");
+    }
+}
+
+TEST(RemoteGuards, BarrieredFrontendRegistryMembersRefuseBothLegacyScopes) {
+    struct Probe {
+        TestTextureTable* table;
+        SharedPtr<MG_State::GLState::TextureObject2D>* texture;
+        MGPipeHandle handle;
+        int operation;
+    };
+    const char* members[] = {"HandleOf", "GetOrCreate(StatePtr)", "NoteStateForHandle", "StateForHandle"};
+    for (int operation = 0; operation != 4; ++operation) {
+        SCOPED_TRACE(members[operation]);
+        const auto child = RunInChild([operation] {
+            StartControlSession();
+            auto texture = MakeShared<MG_State::GLState::TextureObject2D>(47);
+            TestTextureTable table;
+            table.GetOrCreate(texture) = MakeShared<FakeTwin>();
+            Probe probe{&table, &texture, table.HandleOf(texture.get()), operation};
+            Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting(+[](void* self) -> MobileGLResult {
+                auto& probe = *static_cast<Probe*>(self);
+                MG_Pipe::MGPipeApplierSetCurrentRecordBarriered(true);
+                MG_Config::ActiveBackendType = BackendType::DirectVulkan;
+                const MG_Pipe::MGPipeFrontendKeyedRegistryScope registryScope;
+                const MG_Pipe::MagmaP7AllocatorDebtScope magmaScope;
+                switch (probe.operation) {
+                case 0: probe.table->HandleOf(probe.texture->get()); break;
+                case 1: probe.table->GetOrCreate(*probe.texture); break;
+                case 2: probe.table->NoteStateForHandle(probe.handle, *probe.texture); break;
+                case 3: probe.table->StateForHandle(probe.handle); break;
+                }
+                return MOBILEGL_OK;
+            }, &probe);
+            ClientSessionInstance().Stop();
+        });
+        ExpectNamedAbort(child, "Fatal{RoleViolation, \"MGPipeSlots\"}");
+        EXPECT_NE(child.Log.find(std::string{"BackendSlotTable::"} + members[operation]), std::string::npos);
+    }
+}
+
+TEST(RemoteGuards, LegacyRegistryWrapperCannotExposeFrontendKeysOnApply) {
+    using Registry = MG_Backend::DirectGLES::StateBackendObjectRegistry<
+        MG_State::GLState::TextureObject2D, FakeTwin, MGPipeKind::Texture>;
+    struct Probe { Registry* registry; SharedPtr<MG_State::GLState::TextureObject2D>* texture; int operation; };
+    for (int operation = 0; operation != 3; ++operation) {
+        const auto child = RunInChild([operation] {
+            StartControlSession();
+            auto texture = MakeShared<MG_State::GLState::TextureObject2D>(48);
+            Registry registry;
+            Probe probe{&registry, &texture, operation};
+            Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting(+[](void* self) -> MobileGLResult {
+                auto& probe = *static_cast<Probe*>(self);
+                MG_Pipe::MGPipeApplierSetCurrentRecordBarriered(true);
+                const MG_Pipe::MGPipeFrontendKeyedRegistryScope scope;
+                switch (probe.operation) {
+                case 0: probe.registry->Find(probe.texture->get()); break;
+                case 1: probe.registry->GetOrCreate(*probe.texture); break;
+                case 2: (void)probe.registry->begin(); break;
+                }
+                return MOBILEGL_OK;
+            }, &probe);
+            ClientSessionInstance().Stop();
+        });
+        ExpectNamedAbort(child, "Fatal{RoleViolation, \"MGPipeSlots\"}");
+        EXPECT_NE(child.Log.find("BackendSlotTable::Registry."), std::string::npos);
+    }
+}
+
+TEST(RemoteGuards, HandleRegistryMembersWorkOnBarrieredAndUnbarrieredApply) {
+    const auto child = RunInChild([] {
+        StartControlSession();
+        Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting(+[](void*) -> MobileGLResult {
+            TestTextureTable table;
+            for (const bool barriered : {true, false}) {
+                MG_Pipe::MGPipeApplierSetCurrentRecordBarriered(barriered);
+                const MGPipeHandle handle{71, barriered ? 1u : 2u};
+                auto& twin = table.GetOrCreate(handle);
+                twin = MakeShared<FakeTwin>();
+                twin->marker = 19;
+                auto* found = table.FindByHandle(handle);
+                if (!found || !*found || (*found)->marker != 19) _exit(81);
+                unsigned live = 0;
+                table.ForEachLive([&](MGPipeHandle actual, const auto& backend) {
+                    if (actual.Slot != handle.Slot || actual.Gen != handle.Gen || backend->marker != 19) _exit(82);
+                    ++live;
+                });
+                if (live != 1 || !table.ReleaseByHandle(handle) || table.FindByHandle(handle)) _exit(83);
+            }
+            return MOBILEGL_OK;
+        }, nullptr);
+        ClientSessionInstance().Stop();
+    });
+    ASSERT_TRUE(WIFEXITED(child.Status)) << child.Log;
+    EXPECT_EQ(WEXITSTATUS(child.Status), 0) << child.Log;
+}
+
+// A marker held by the GL thread never affects the apply guard either.
 TEST(RemoteGuards, AnExemptionScopeHeldOnTheGLThreadDoesNotExemptTheApplyThread) {
     const auto child = RunInChild([] {
         StartControlSession();
         const MG_Pipe::MGPipeFrontendKeyedRegistryScope frontendKeyedRegistry;
-        Srv::ServerLoopInstance().RunOnApplyThread(
+        Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting(
             +[](void*) -> MobileGLResult {
                 MG_Pipe::MGPipeRefuseAllocatorFromApplyThread("FindByLifetimeId");
                 return MOBILEGL_OK;
@@ -1971,16 +2507,29 @@ TEST(RemoteGuards, CapsMirrorFallbackWithNoServerBackendIsFatalByName) {
 //   MarkStorageDirty, MarkStorageDirtyRegion, IsStorageDirty, GetStorageDirtyRegion,
 //   GetStorageDirtyRects
 //
-// Deliberately NOT in the list: the shape reads (GetMipmapTexelSize / GetMipmapByteSize /
-// GetMipmapLevelCount / GetUploadTargets / GetTarget / IsComplete), which the pinned
-// BARRIER-PULLED object-class rows still answer through the unit-object pointer
-// (FieldOwnershipTest's list, P3b/P4b/P7) - the per-draw binding walk reads them every draw.
+// P5e (tx2): THE SHAPE READS JOIN THE LIST, and the sentence that stood here is why they could
+// not before - "the per-draw binding walk reads them every draw". P5e is the commit that makes
+// that untrue: the unit work list is st.BoundSamplerViews[], the clean gate is
+// IsDrawSyncCleanByRecord, and the three sync bodies read the resource record and the server's
+// staged-texture store. Nothing on the draw path asks a frontend texture for a level count, a
+// level extent, a level byte size or a compressed level any more, so the exemption becomes a
+// guard and reverting any handle arm aborts BY ACCESSOR NAME:
+//
+//   GetMipmapLevelCount, GetMipmapTexelSize, GetMipmapByteSize,
+//   GetCompressedFormat, GetCompressedByteSize, MapCompressedMipmapData,
+//   GetRequestedCompressedFormat
+//
+// Keyed on the SERVER BACKEND being DirectGLES (ruling 12's shape): Magma is lockstep through
+// P7 and its named blit still asks a frontend texture IsComplete(), which is legal for a client
+// parked in its own wait. Still NOT in the list: GetUploadTargets / GetTarget / IsComplete,
+// which are TextureObject's own and not MipmapStorage's - their rows retire with the object
+// class in P7/P9.
 #define MGL_TEXTURE_GUARD_TEST(Name, Id, Call)                                                         \
     TEST(RemoteGuards, Name) {                                                                         \
         const auto child = RunInChild([] {                                                             \
             StartControlSession();                                                                     \
             MG_State::GLState::TextureObject2D texture(Id);                                            \
-            Srv::ServerLoopInstance().RunOnApplyThread(                                                \
+            Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting(                                                \
                 [](void* self) {                                                                       \
                     auto& texture = *static_cast<MG_State::GLState::TextureObject2D*>(self);           \
                     Call;                                                                              \
@@ -2012,6 +2561,21 @@ MGL_TEXTURE_GUARD_TEST(TextureGetStorageDirtyRegionFromTheApplyThreadIsFatalByNa
 MGL_TEXTURE_GUARD_TEST(TextureGetStorageDirtyRectsFromTheApplyThreadIsFatalByName, 719,
                        (void)texture.GetStorageDirtyRects(TextureUploadTarget::Texture2D, 0,
                                                           nullptr, 0))
+// ---- P5e (tx2): the seven shape reads the P4a/P5c list exempted ----------------------------
+MGL_TEXTURE_GUARD_TEST(TextureGetMipmapLevelCountFromTheApplyThreadIsFatalByName, 721,
+                       (void)texture.GetMipmapLevelCount())
+MGL_TEXTURE_GUARD_TEST(TextureGetMipmapTexelSizeFromTheApplyThreadIsFatalByName, 722,
+                       (void)texture.GetMipmapTexelSize(TextureUploadTarget::Texture2D, 0))
+MGL_TEXTURE_GUARD_TEST(TextureGetMipmapByteSizeFromTheApplyThreadIsFatalByName, 723,
+                       (void)texture.GetMipmapByteSize(TextureUploadTarget::Texture2D, 0))
+MGL_TEXTURE_GUARD_TEST(TextureGetCompressedFormatFromTheApplyThreadIsFatalByName, 724,
+                       (void)texture.GetMipmapCompressedFormat(TextureUploadTarget::Texture2D, 0))
+MGL_TEXTURE_GUARD_TEST(TextureGetCompressedByteSizeFromTheApplyThreadIsFatalByName, 725,
+                       (void)texture.GetMipmapCompressedByteSize(TextureUploadTarget::Texture2D, 0))
+MGL_TEXTURE_GUARD_TEST(TextureMapCompressedMipmapDataFromTheApplyThreadIsFatalByName, 726,
+                       (void)texture.MapMipmapCompressedImage(TextureUploadTarget::Texture2D, 0))
+MGL_TEXTURE_GUARD_TEST(TextureGetRequestedCompressedFormatFromTheApplyThreadIsFatalByName, 727,
+                       (void)texture.GetMipmapRequestedCompressedFormat(TextureUploadTarget::Texture2D, 0))
 #undef MGL_TEXTURE_GUARD_TEST
 
 // P5c (gt, CONTRACT-P5C §6 layer 2 / audit A1): the client-side half of the gPipeInputs
@@ -2062,8 +2626,626 @@ TEST(RemoteGuards, ClientPipeInputsFillWithTheApplierIdleIsAllowed) {
     });
     ExpectChildSuccess(child);
 }
+
+// ===========================================================================================
+// P5e (ra) - the wait rule, the present credit and gPipeInputs' ownership
+// (MG_Remote/CONTRACT-P5E.md §1, §2.3, §2.4, §3.1, §3.3, §3.5)
+// ===========================================================================================
+//
+// EVERY CASE BELOW ARMS RUN-AHEAD BY PUBLISHING THE CAP BIT, because that is the only thing
+// that arms it: RunAheadArmed() is a conjunction whose third term is the SERVER's own
+// statement that it applies an unbarriered record without reading client memory, and in a
+// tree where kMGPipeP5eRunAheadReady is still false no production session sets it. Driving the
+// arm through the caps mirror rather than through a test-only setter is deliberate (ID-102's
+// lesson): what these cases exercise is then the production latch and not a branch beside it.
+//
+// NONE OF THEM DRAWS. The draw path is the family packages' to migrate; until they land, a
+// draw under run-ahead would abort inside the backend for a reason that has nothing to do with
+// what is being asserted here.
+void StartRunAheadSession() {
+    ::alarm(15);
+    MG_Config::Transport = MG_Config::TransportMode::InProcess;
+    MG_Config::Ipc.RunAhead = 1;
+    Srv::ServerSessionInstance().SetCapabilityBits(
+        static_cast<Uint64>(MG_Pipe::kCapRunAheadApply));
+    Srv::ServerSessionInstance().SetConsumedSubsystems(kMGPipeSubsystemsMigratedAtP4a);
+    // The test peer publishes the first snapshot through the real handshake.
+    Srv::ServerSessionInstance().SetBackend(ControlCapsPeer());
+    if (ClientSessionInstance().Start(MG_Config::TransportMode::InProcess, {}) != MOBILEGL_OK) {
+        ::_exit(81);
+    }
+    if (!ClientSessionInstance().RunAheadArmed()) ::_exit(83); // the latch never took
+}
+
+// THE SERVER HALF OF §2.4, SUBSTITUTED - and it is substituted because this fixture has no
+// backend object at all, so ServerVerbSink::OnPresent DECLINES before it can reach
+// ServerSession::ReturnPresentCredit ("present arrived with no backend object"). What the
+// cases below assert is therefore the CLIENT's half of the credit: that it pays, when, and in
+// whose id space. That the server returns exactly one credit per swap, after Present() has
+// returned, is PipeApplier::OnPresent's own three lines and the device exit's `credit-waits`
+// reading; a peer here cannot pin it without a backend to swap on.
+struct PresentCreditPeer : Codec::WireVerbSink {
+    std::atomic<Uint64> lastSerial{0};
+    Bool OnPresent(const MGPPresent& present) override {
+        lastSerial.store(present.FrameSerial);
+        Srv::ServerSessionInstance().ReturnPresentCredit(present.FrameSerial);
+        return true;
+    }
+    void Install() {
+        if (Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting(
+                [](void* self) {
+                    auto& decoder = Srv::ServerSessionInstance().Applier().*PeerMember(DecoderTag{});
+                    decoder.SetVerbSink(static_cast<PresentCreditPeer*>(self));
+                    return MOBILEGL_OK;
+                },
+                this) != MOBILEGL_OK) {
+            ::_exit(82);
+        }
+    }
+};
+
+// §1: the conjunction, and the half of it that is not the client's to decide. The cap bit is
+// absent here, so the knob alone changes nothing - which is the whole reason the knob is
+// parsed on every arm rather than only where it means something (Config.h).
+TEST(RemoteRunAhead, TheKnobAloneDoesNotArmRunAheadWithoutTheServersCapBit) {
+    const auto child = RunInChild([] {
+        MG_Config::Ipc.RunAhead = 1;
+        StartControlSession(); // SetCapabilityBits(0)
+        if (ClientSessionInstance().RunAheadArmed()) ::_exit(101);
+        ClientSessionInstance().Stop();
+    });
+    ExpectChildSuccess(child);
+}
+
+// §1 again, from the other side: MOBILEGL_IPC_VERB_BARRIER=0 is the LOCKSTEP arm's negative
+// control and it disarms run-ahead outright, because the barrier is the first term of the
+// conjunction. Under run-ahead its documented red is the first barriered row's stale pull -
+// that one is a scenario, not a unit case; what is pinned here is that the two controls do not
+// silently compose into a third mode nobody designed.
+TEST(RemoteRunAhead, ClearingTheVerbBarrierDisarmsRunAheadEvenWithTheCapBit) {
+    const auto child = RunInChild([] {
+        MG_Config::Ipc.RunAhead = 1;
+        MG_Config::Ipc.VerbBarrier = 0;
+        ::alarm(15);
+        MG_Config::Transport = MG_Config::TransportMode::InProcess;
+        Srv::ServerSessionInstance().SetCapabilityBits(
+            static_cast<Uint64>(MG_Pipe::kCapRunAheadApply));
+        Srv::ServerSessionInstance().SetConsumedSubsystems(kMGPipeSubsystemsMigratedAtP4a);
+        Srv::ServerSessionInstance().SetBackend(ControlCapsPeer());
+        if (ClientSessionInstance().Start(MG_Config::TransportMode::InProcess, {}) != MOBILEGL_OK) {
+            ::_exit(81);
+        }
+        if (ClientSessionInstance().RunAheadArmed()) ::_exit(101);
+        ClientSessionInstance().Stop();
+    });
+    ExpectChildSuccess(child);
+}
+
+// §2.4's RED-ONCE, BY COUNT. With a credit of 1 the client may have one present in flight, so
+// the second and third presents each pay the credit before they encode - `credit-waits` is 2
+// after three presents and the present-ack watermark has reached 2. Delete the
+// WaitForPresentAck arm from ClientSession::AcquirePresentCredit and the counter stays 0 while
+// all three presents publish: red by count, which is the only way a wait that is usually
+// already satisfied can be tested at all.
+//
+// The serial is asserted too, because the counter alone would survive a credit paid against
+// the wrong id space (the pre-P5e FrameSerial was 0 and the server stamped its own).
+TEST(RemoteRunAhead, ACreditOneClientPaysTheCreditAtEveryPresentAfterTheFirst) {
+    const auto child = RunInChild([] {
+        MG_Config::Ipc.PresentCredit = 1;
+        StartRunAheadSession();
+        PresentCreditPeer peer;
+        peer.Install();
+        ClientSession& session = ClientSessionInstance();
+        if (session.PresentCreditWaits() != 0) ::_exit(101);
+        RemoteEmitTable().Present();
+        if (session.PresentCreditWaits() != 0) ::_exit(102); // the first one is free
+        RemoteEmitTable().Present();
+        RemoteEmitTable().Present();
+        if (session.PresentCreditWaits() != 2) ::_exit(103);
+        // ONE CREDIT PER SWAP, in the client's own 1-based space: the server returned the
+        // second present's credit, so the watermark is at least 2.
+        if (session.Control() == nullptr ||
+            session.Control()->Progress.presentAckSerial.load() < 2u) {
+            ::_exit(104);
+        }
+        session.Stop();
+    });
+    ExpectChildSuccess(child);
+}
+
+// §2.4's other half: with the credit raised the client stops paying until it is that far
+// ahead. It is the control that keeps the case above from passing because of an unconditional
+// counter rather than because of the credit.
+TEST(RemoteRunAhead, ACreditThreeClientPaysNothingForItsFirstThreePresents) {
+    const auto child = RunInChild([] {
+        MG_Config::Ipc.PresentCredit = 3;
+        StartRunAheadSession();
+        PresentCreditPeer peer;
+        peer.Install();
+        ClientSession& session = ClientSessionInstance();
+        RemoteEmitTable().Present();
+        RemoteEmitTable().Present();
+        RemoteEmitTable().Present();
+        if (session.PresentCreditWaits() != 0) ::_exit(101);
+        RemoteEmitTable().Present();
+        if (session.PresentCreditWaits() != 1) ::_exit(102);
+        session.Stop();
+    });
+    ExpectChildSuccess(child);
+}
+
+// §3.1 / §3.5's RED-ONCE. `Clear` is a kWaitNone row, so under run-ahead the client publishes
+// it and moves on - and therefore does not fill gPipeInputs for it. This case is the GREEN
+// half: the validate point runs the tracker walk and the emitters and touches the block not at
+// all, so nothing aborts.
+//
+// THE RED: in MGPipeValidateForVerb change `const Bool fillOwed = barriered;` to `= true` -
+// which is exactly "leave one CopyField in an unbarriered fill" - and the guard below it fires
+// Fatal{RoleViolation, "gPipeInputs"} on this very call.
+TEST(RemoteRunAhead, AnUnbarrieredVerbDoesNotFillPipeInputsAndIsAllowed) {
+    const auto child = RunInChild([] {
+        StartRunAheadSession();
+        MGPipeValidateForVerb(MGPipeVerb::Clear);
+        MGPipeLeaveVerb();
+        ClientSessionInstance().Stop();
+    });
+    ExpectChildSuccess(child);
+}
+
+// §3.5, the aborting arm, driven at the guard itself: a GL-thread touch that is NOT the
+// residual fill of a barriered record. Under lockstep this same call is a no-op (the apply
+// thread is not inside the applier and MOBILEGL_IPC_BATCH_WAITS is 1); under run-ahead there
+// is no such window to be outside of, because the client never parks for an unbarriered
+// record - so the answer stops depending on timing and becomes the rule.
+TEST(RemoteGuards, ClientPipeInputsTouchOutsideABarrieredFillUnderRunAheadIsFatalByName) {
+    const auto child = RunInChild([] {
+        StartRunAheadSession();
+        ClientSession::RefusePipeInputsTouchWhileApplierOwnsIt("ra-test-surface",
+                                                               /*isBarrieredFill=*/false);
+        ClientSessionInstance().Stop();
+    });
+    ExpectNamedAbort(child, "Fatal{RoleViolation, \"gPipeInputs\"}");
+}
+
+// ... and the control: the barriered fill says so and is let through. Without this the case
+// above would pass just as well against "abort unconditionally".
+//
+// P5e (ra2): THIS CONTROL IS NOW ALSO HALF OF A PAIR, and the half it does NOT state is the
+// one that cost the flip its lane. "The applier is not inside" is true here because nothing in
+// this child ever entered it; the case below is the same call with that one fact reversed.
+TEST(RemoteGuards, ClientPipeInputsTouchInsideABarrieredFillUnderRunAheadIsAllowed) {
+    const auto child = RunInChild([] {
+        StartRunAheadSession();
+        ClientSession::RefusePipeInputsTouchWhileApplierOwnsIt("ra-test-surface",
+                                                               /*isBarrieredFill=*/true);
+        ClientSessionInstance().Stop();
+    });
+    ExpectChildSuccess(child);
+}
+
+// ---- P5e (ra2): THE FLIP'S OWN RED-ONCE, AND THE CLASS THE STRICT LANE CANNOT SEE ----------
+//
+// The strict lane runs under LOCKSTEP - ApplyOne stamps every record barriered - so nothing
+// that happens only once the client stops waiting is visible to it, by construction (ID-132).
+// This pair is what measures it instead, and it runs in the ordinary unit lane on any head,
+// flip thrown or not, because StartRunAheadSession arms run-ahead itself.
+//
+// WHAT IT PINS: `isBarrieredFill` is the caller's sentence "this touch is the residual fill of
+// a record this thread is about to park behind". That is a claim about the FUTURE. The order at
+// the validate point is fill, then emit, then park, so at the instant of the write the apply
+// thread is still draining the UNBARRIERED records the client ran ahead of - and the exemption
+// that took the claim on trust made this guard unfireable on precisely the class it exists for.
+// Measured on the flipped head: the GL thread bumped CurrentVerbSerial, withdrew the server's
+// stamp and renamed m_currentVerb underneath a record the applier was inside, and the applier
+// aborted with `Fatal{UnmigratedPipeInput, "<field>@<the CLIENT's verb>"}` - a verb no applier
+// stamp can produce, which is what identifies the writer.
+//
+// THE PROBE IS THE GUARD CALL ITSELF (ID-102): the flag is raised by the same raw entry point
+// PipeApplier's ScopedApplierEntry uses, on the client thread, BEFORE the call under test - so
+// what aborts is this probe and not some object built on the wrong thread.
+//
+// THE RED: in ClientSession::RefusePipeInputsTouchWhileApplierOwnsIt put the run-ahead arm back
+// to `if (isBarrieredFill) return;` and this case stops aborting, while the control above keeps
+// passing - which is the difference between a rule and an exemption.
+TEST(RemoteGuards, ClientBarrieredFillWhileTheApplierIsInsideUnderRunAheadIsFatalByName) {
+    const auto child = RunInChild([] {
+        StartRunAheadSession();
+        ClientSession::NoteApplyThreadEnteredApplier();
+        ClientSession::RefusePipeInputsTouchWhileApplierOwnsIt("ra-test-surface",
+                                                               /*isBarrieredFill=*/true);
+        ClientSession::NoteApplyThreadLeftApplier();
+        ClientSessionInstance().Stop();
+    });
+    ExpectNamedAbort(child, "Fatal{RoleViolation, \"gPipeInputs\"}");
+}
+
+// ---- P5e (ra2): AND THE OTHER HALF - AN INDEXED DRAW IS AN UNBARRIERED VERB ----------------
+//
+// MGP_VERB_OP_LIST joins the whole draw family through ONE row, `DrawVbo -> DrawArrays`, so
+// inverting it verb-first answers kOpCount for DrawElements and for every other indexed /
+// instanced / multi / indirect verb. The "unknown verb answers barriered" default then made the
+// client FILL for each of them while never parking, because the wait is decided per record and
+// the record is a draw_vbo (kWaitNone). On the flipped lane that was 21 of the 69 red entries.
+//
+// The case states it where it is decidable without a GL context: the guard runs before the
+// validate point's null-context return, so a verb that answers UNBARRIERED never reaches the
+// guard at all and the child exits 0 even with the applier flag up.
+//
+// THE RED: delete the kDraw fallback in ClientVerbIsBarriered (PipeFill.cpp) and DrawElements
+// answers barriered again - the fill runs, the guard above it sees the raised flag, and this
+// case aborts with Fatal{RoleViolation, "gPipeInputs"} instead of exiting 0.
+TEST(RemoteRunAhead, AnIndexedDrawVerbIsUnbarrieredAndTouchesPipeInputsNotAtAll) {
+    const auto child = RunInChild([] {
+        StartRunAheadSession();
+        ClientSession::NoteApplyThreadEnteredApplier();
+        MGPipeValidateForVerb(MGPipeVerb::DrawElements);
+        ClientSession::NoteApplyThreadLeftApplier();
+        MGPipeLeaveVerb();
+        ClientSessionInstance().Stop();
+    });
+    ExpectChildSuccess(child);
+}
+
+// §3.3's RED-ONCE, and the one that turns the strict lane into a gate. The probe is the
+// sticky forward itself, run on the apply thread inside a server-stamped verb with the
+// current record marked UNBARRIERED - which is the state the sink puts that thread in for
+// every kWaitNone row once the wait rule is live. MOBILEGL_IPC_STRICT_ERRORS is deliberately
+// NOT set: the point is that the knob has stopped being the deciding input, because a row the
+// client never filled has no value to count.
+//
+// THE RED: put CountBarrierPull's first line back to `if (MG_Config::Ipc.StrictErrors)` only
+// and this case stops aborting - and, on the lane, every scenario that still pulls a row goes
+// from a named abort to a wrong picture with a number beside it.
+TEST(RemoteGuards, AResidualPullUnderAnUnbarrieredRecordIsFatalWithoutTheStrictKnob) {
+    const auto child = RunInChild([] {
+        MG_Config::Ipc.StrictErrors = false;
+        StartRunAheadSession();
+        Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting(
+            +[](void*) -> MobileGLResult {
+                MG_Pipe::MGPipeServerStampVerbBoundary(MGPipeVerb::Clear);
+                MG_Pipe::MGPipeApplierSetCurrentRecordBarriered(false);
+                MG_Pipe::MGPipeStickyForwardPull(MGPipeInputField::GetProgramObject);
+                return MOBILEGL_OK;
+            },
+            nullptr);
+        ClientSessionInstance().Stop();
+    });
+    ExpectNamedAbort(child, "Fatal{UnmigratedPipeInput, \"GetProgramObject@Clear\"}");
+}
+
+// P5f retires this formerly admitted read. A barrier can order a record but cannot
+// turn a client ProgramObject into a server-owned value. The historical name stays
+// registered for G14; both barrier states now have the same named refusal.
+TEST(RemoteGuards, AResidualPullUnderABarrieredRecordStillOnlyCounts) {
+    const auto child = RunInChild([] {
+        MG_Config::Ipc.StrictErrors = false;
+        StartRunAheadSession();
+        Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting(
+            +[](void*) -> MobileGLResult {
+                MG_Pipe::MGPipeServerStampVerbBoundary(MGPipeVerb::Clear);
+                MG_Pipe::MGPipeApplierSetCurrentRecordBarriered(true);
+                const Uint64 before = MG_Pipe::MGPipeResidualPullCount();
+                MG_Pipe::MGPipeStickyForwardPull(MGPipeInputField::GetProgramObject);
+                if (MG_Pipe::MGPipeResidualPullCount() != before + 1) ::_exit(101);
+                return MOBILEGL_OK;
+            },
+            nullptr);
+        ClientSessionInstance().Stop();
+    });
+    ExpectNamedAbort(child, "Fatal{UnmigratedPipeInput, \"GetProgramObject@Clear\"}");
+}
+
+// §2.6's RED-ONCE, and the one the brief names: ~300 KiB of kEventGpuWritten published from
+// the apply thread behind a sequence nobody waited for. SEG_EVENT is 256 KiB, so this is
+// several ringfuls; under P5C's rule the FIRST Reserve that failed was Fatal{EventRingOverflow}
+// and this case aborts by that name. With flow control the producer publishes, rings, parks on
+// the latch and retries, and the burst completes.
+//
+// THE DRAIN RUNS ON A THREAD OF ITS OWN, and that is forced by the fixture rather than chosen:
+// RunSurfaceControlFrame is synchronous, so the thread that posted the burst cannot also be the
+// thread that empties the ring. In production it is the GL thread draining at its own waits
+// (§2.6's deadlock argument); here it is a drainer beside the poster, which puts the producer
+// in exactly the state that argument describes.
+TEST(RemoteRunAhead, AnEventBurstBehindAnUnwaitedSequenceFlowControlsInsteadOfAborting) {
+    const auto child = RunInChild([] {
+        StartRunAheadSession();
+        std::atomic<bool> stop{false};
+        std::atomic<Uint64> delivered{0};
+        std::thread drainer([&stop, &delivered] {
+            // THE FIRST DRAIN IS DELAYED ON PURPOSE. A drainer that starts immediately can
+            // keep a 256 KiB ring from ever being full, and a red-once that depends on the
+            // scheduler losing a race is not a red-once. 50 ms is four orders of magnitude
+            // more than the burst needs to fill the ring, so the producer is provably parked
+            // on the latch before anything empties it.
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            while (!stop.load(std::memory_order_acquire)) {
+                delivered.fetch_add(ClientSessionInstance().DrainPublishedEvents());
+                std::this_thread::yield();
+            }
+            delivered.fetch_add(ClientSessionInstance().DrainPublishedEvents());
+        });
+        // 3000 records of 64 ranges each is ~3 MB against a 256 KiB ring - twelve ringfuls,
+        // with a drainer racing it - so the full latch is hit many times over rather than
+        // maybe once. That margin is what makes the red-once (restore the Fatal) reliable:
+        // a burst that merely might fill the ring would be a red-once that merely might be red.
+        Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting(
+            +[](void*) -> MobileGLResult {
+                MG_Pipe::MGPRange ranges[64];
+                for (Uint32 r = 0; r < 64; ++r) ranges[r] = MG_Pipe::MGPRange{r * 64ull, 64ull};
+                for (Uint32 i = 0; i < 3000; ++i) {
+                    MG_Pipe::gMGPipeCallbacks.OnGpuWritten(MG_Pipe::MGPipeHandle{7, 1}, 64, ranges);
+                }
+                return MOBILEGL_OK;
+            },
+            nullptr);
+        stop.store(true, std::memory_order_release);
+        drainer.join();
+        // LOSSLESS, which is the property flow control had to preserve: every one of the 3000
+        // records crossed. A drop policy would have been the other way to survive a full ring,
+        // and P5C's §4.4 refuses it - a writeback or a GPU-write mark that did not arrive is a
+        // stale buffer, not a missing statistic.
+        if (delivered.load() < 3000u) ::_exit(101);
+        ClientSessionInstance().Stop();
+    });
+    ExpectChildSuccess(child);
+}
+
+// ===========================================================================================
+// PH-6 (ID-P7-2): a client that does not drain SEG_EVENT FORFEITS the reverse channel
+// ===========================================================================================
+//
+// The flow-control case above is the healthy half: a client that drains late gets every event.
+// These two are the other half, and they are why ReserveEventOrBlock's two BUSY refusals became
+// a latch. Each child reads its OWN outcome - the latch, the server's drop tally, the shared
+// page's eventDropped the client sees, the time spent against MOBILEGL_IPC_EVENT_WAIT_MS, and the
+// apply thread leaving by itself - and exits non-zero on the first that is wrong; the parent then
+// asserts the named line and the ABSENCE of Fatal{EventRingOverflow}.
+namespace {
+    // Waits for mgl-srv-apply to leave on its own: the forfeit's stop is the ordinary one, so
+    // nobody calls Stop() to get it out.
+    bool ApplyThreadLeavesWithin(std::chrono::milliseconds budget) {
+        const auto until = std::chrono::steady_clock::now() + budget;
+        while (std::chrono::steady_clock::now() < until) {
+            if (!Srv::ServerLoopInstance().Running()) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return false;
+    }
+
+    Uint64 MillisecondsSince(std::chrono::steady_clock::time_point start) {
+        return static_cast<Uint64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::steady_clock::now() - start)
+                                       .count());
+    }
+} // namespace
+
+// STONEWALL: the client never drains. 3000 GPU-write marks of ~1 KiB against a 256 KiB ring:
+// ~250 fit, the next one waits MOBILEGL_IPC_EVENT_WAIT_MS (300 ms here) and forfeits, and the
+// remaining ~2750 are drops that cost no wait at all - so the whole burst returns in a little over
+// the knob, not in 30 s and not with an abort.
+//
+// THE RED (recorded in the F2 package note): put ReserveEventOrBlock back to its two 30000 ms
+// rounds and this child is killed by StartRunAheadSession's alarm(15) inside the first wait -
+// before that change it would have aborted at 30 s with Fatal{EventRingOverflow} "waited 30000 ms".
+TEST(RemoteRunAhead, AStonewallingClientForfeitsTheReverseChannelWithinTheWaitKnob) {
+    const auto child = RunInChild([] {
+        MG_Config::Ipc.EventWaitMs = 300;
+        StartRunAheadSession();
+        const auto start = std::chrono::steady_clock::now();
+        Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting(
+            +[](void*) -> MobileGLResult {
+                MG_Pipe::MGPRange ranges[64];
+                for (Uint32 r = 0; r < 64; ++r) ranges[r] = MG_Pipe::MGPRange{r * 64ull, 64ull};
+                for (Uint32 i = 0; i < 3000; ++i) {
+                    MG_Pipe::gMGPipeCallbacks.OnGpuWritten(MG_Pipe::MGPipeHandle{7, 1}, 64, ranges);
+                }
+                return MOBILEGL_OK;
+            },
+            nullptr);
+        const Uint64 elapsedMs = MillisecondsSince(start);
+        auto& server = Srv::ServerSessionInstance();
+        if (!server.ReverseChannelForfeited()) ::_exit(101);
+        const Uint64 drops = server.ForfeitDrops();
+        // Some fitted (the ring was empty) and some did not (it holds ~250 of 3000).
+        if (drops == 0 || drops >= 3000u) ::_exit(102);
+        // The shared page's counter is the one a client can read; the server's own tally is the
+        // one a peer cannot write. They agree when nothing else counts.
+        if (ClientSessionInstance().Events().DroppedEvents() != drops) ::_exit(103);
+        // The knob, spent once: at least most of it, and nowhere near the old 30 s.
+        if (elapsedMs < 250u || elapsedMs > 5000u) ::_exit(104);
+        if (!ApplyThreadLeavesWithin(std::chrono::milliseconds(3000))) ::_exit(105);
+        ClientSessionInstance().Stop();
+    });
+    ExpectChildSuccess(child);
+    EXPECT_NE(child.Log.find("ReverseChannelForfeit{NotDraining} - kEventGpuWritten"), std::string::npos)
+        << child.Log;
+    EXPECT_NE(child.Log.find("mgl-srv-apply stops on ReverseChannelForfeit"), std::string::npos) << child.Log;
+    EXPECT_EQ(child.Log.find("Fatal{EventRingOverflow"), std::string::npos) << child.Log;
+}
+
+// TRICKLE: the client drains, one record per 50 ms, and the record the server is waiting to place
+// is twenty times bigger than what each drain frees. Every drain clears the latch and rings the
+// server; every retry still does not fit. The old shape gave up after TWO such rounds and called
+// it "a drained ring that still refuses a record it fits is a corrupt cursor set" - ~100 ms into a
+// session whose only fault was a slow reader, and a Fatal. Now the rounds share one deadline:
+// the server keeps retrying for the whole knob (600 ms here) and then forfeits by name, TooSlow,
+// with the short drains counted.
+//
+// THE RED (recorded in the F2 package note): the old two-round ReserveEventOrBlock aborts this
+// child with Fatal{EventRingOverflow} "could not reserve ... on an emptied SEG_EVENT".
+TEST(RemoteRunAhead, ATricklingClientGetsTheWholeWaitThenForfeitsByNameInsteadOfAborting) {
+    const auto child = RunInChild([] {
+        MG_Config::Ipc.EventWaitMs = 600;
+        StartRunAheadSession();
+        std::atomic<bool> stop{false};
+        std::atomic<Uint32> popped{0};
+        std::thread trickler([&stop, &popped] {
+            Transport::EventRingConsumer& events = ClientSessionInstance().Events();
+            while (!stop.load(std::memory_order_acquire)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                Transport::RingRecordView view;
+                if (events.Pop(view)) popped.fetch_add(1);
+                // Releases what was popped, clears the latch and rings the server: a real drain,
+                // just a stingy one.
+                events.Drained();
+            }
+        });
+        const auto start = std::chrono::steady_clock::now();
+        Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting(
+            +[](void*) -> MobileGLResult {
+                // Fill with ONE-range marks (48 bytes a record) until under 4 KiB is left, without
+                // ever blocking - so the fill is not paced by the trickle - then ask for 64-range
+                // marks (~1 KiB each). The first of those that does not fit is the one the server
+                // waits for, and one popped 48-byte record never makes room for it.
+                auto& ring = Srv::ServerSessionInstance().Events().Ring();
+                const MG_Pipe::MGPRange one{0, 64};
+                while (ring.FreeBytes() > 4096u) {
+                    MG_Pipe::gMGPipeCallbacks.OnGpuWritten(MG_Pipe::MGPipeHandle{7, 1}, 1, &one);
+                }
+                MG_Pipe::MGPRange ranges[64];
+                for (Uint32 r = 0; r < 64; ++r) ranges[r] = MG_Pipe::MGPRange{r * 64ull, 64ull};
+                for (Uint32 i = 0; i < 16; ++i) {
+                    MG_Pipe::gMGPipeCallbacks.OnGpuWritten(MG_Pipe::MGPipeHandle{7, 1}, 64, ranges);
+                }
+                return MOBILEGL_OK;
+            },
+            nullptr);
+        const Uint64 elapsedMs = MillisecondsSince(start);
+        stop.store(true, std::memory_order_release);
+        trickler.join();
+        auto& server = Srv::ServerSessionInstance();
+        if (!server.ReverseChannelForfeited()) ::_exit(101);
+        if (server.ForfeitDrops() == 0) ::_exit(102);
+        // The trickle really happened while the server waited - otherwise this is the stonewall
+        // case under another name.
+        if (popped.load() < 2u) ::_exit(103);
+        // The WHOLE budget was spent retrying, not two rounds of it.
+        if (elapsedMs < 540u || elapsedMs > 5000u) ::_exit(104);
+        if (!ApplyThreadLeavesWithin(std::chrono::milliseconds(3000))) ::_exit(105);
+        ClientSessionInstance().Stop();
+    });
+    ExpectChildSuccess(child);
+    EXPECT_NE(child.Log.find("ReverseChannelForfeit{TooSlow} - kEventGpuWritten"), std::string::npos)
+        << child.Log;
+    EXPECT_EQ(child.Log.find("Fatal{EventRingOverflow"), std::string::npos) << child.Log;
+}
+
+// STOP WHILE THE SERVER WAITS (PH-6 fix round). ServerLoop::Stop() arrives while the apply thread is
+// parked inside the reservation, on a bell that is still ALIVE - the spawn session's shape when its
+// control stream ends (EOF on a half-close, a malformed frame, a LogFlush ack) while the client is
+// not draining. The knob is 20 s, four times Stop()'s 5000 ms bounded join, so this child can only
+// exit cleanly if the wait ends on the stop request itself and forfeits as `Stopped`.
+//
+// THE RED: take ApplyStopRequested() out of ReserveEventOrBlock's predicate and the ring Stop()
+// sends is swallowed by a wait that re-tests only "has the client drained?"; the reservation sits
+// out its 20 s and Stop() aborts the child after 5 s with Fatal{ApplyThreadJoinTimeout}.
+TEST(RemoteRunAhead, AStopWhileTheServerWaitsForADrainEndsTheWaitByNameInsteadOfTheJoinTimeout) {
+    const auto child = RunInChild([] {
+        MG_Config::Ipc.EventWaitMs = 20000;
+        StartRunAheadSession();
+        // The producer's probe blocks inside the reservation, so it is posted from a thread of its
+        // own: RunProbeOnApplyThreadForTesting waits for the probe to return.
+        std::thread producer([] {
+            (void)Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting(
+                +[](void*) -> MobileGLResult {
+                    MG_Pipe::MGPRange ranges[64];
+                    for (Uint32 r = 0; r < 64; ++r) ranges[r] = MG_Pipe::MGPRange{r * 64ull, 64ull};
+                    for (Uint32 i = 0; i < 3000; ++i) {
+                        MG_Pipe::gMGPipeCallbacks.OnGpuWritten(MG_Pipe::MGPipeHandle{7, 1}, 64, ranges);
+                    }
+                    return MOBILEGL_OK;
+                },
+                nullptr);
+        });
+        // The reservation is waiting once SEG_EVENT's latch is up: nothing in this child drains.
+        const auto signals = Srv::ServerSessionInstance().DataLink()->Signals();
+        const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(5000);
+        while (signals.EventRingFull->load(std::memory_order_acquire) == 0) {
+            if (std::chrono::steady_clock::now() > until) ::_exit(106);
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200)); // well into the park
+        const auto start = std::chrono::steady_clock::now();
+        Srv::ServerLoopInstance().Stop();
+        const Uint64 stopMs = MillisecondsSince(start);
+        producer.join();
+        auto& server = Srv::ServerSessionInstance();
+        if (!server.ReverseChannelForfeited()) ::_exit(101);
+        if (server.ForfeitDrops() == 0) ::_exit(102);
+        // Stop() came back on the request, not on the join's 5000 ms or the knob's 20 s.
+        if (stopMs > 2000u) ::_exit(104);
+        ClientSessionInstance().Stop();
+    });
+    ExpectChildSuccess(child);
+    EXPECT_NE(child.Log.find("ReverseChannelForfeit{Stopped} - kEventGpuWritten"), std::string::npos)
+        << child.Log;
+    EXPECT_EQ(child.Log.find("Fatal{ApplyThreadJoinTimeout"), std::string::npos) << child.Log;
+    EXPECT_EQ(child.Log.find("Fatal{EventRingOverflow"), std::string::npos) << child.Log;
+}
+
+// §2.7 / ruling 13: the deferred-destroy queue stays, and an enqueue from an unbarriered
+// apply is the finding. Under strict it is the abort; this is the arm the lane owns.
+TEST(RemoteGuards, ADeferredDestroyFromAnUnbarrieredApplyIsFatalUnderStrict) {
+    const auto child = RunInChild([] {
+        MG_Config::Ipc.StrictErrors = true;
+        StartRunAheadSession();
+        Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting(
+            +[](void*) -> MobileGLResult {
+                MG_Pipe::MGPipeApplierSetCurrentRecordBarriered(false);
+                (void)MG_Pipe::MGPipeDeferDestroyAndFreeIfOnApplyThread(MG_Pipe::MGPipeKind::Texture,
+                                                                        4242);
+                return MOBILEGL_OK;
+            },
+            nullptr);
+        ClientSessionInstance().Stop();
+    });
+    ExpectNamedAbort(child, "Fatal{RoleViolation, \"deferred-destroy\"}");
+}
+
+// The control, and the whole of ruling 13: a BARRIERED apply may still be a last owner (its
+// fill's O-class rows, XFB's pinned targets), so the queue takes the death and the GL thread
+// replays it. Deleting the queue would have made this an allocator touch from the server role.
+TEST(RemoteGuards, ADeferredDestroyFromABarrieredApplyIsStillServed) {
+    const auto child = RunInChild([] {
+        MG_Config::Ipc.StrictErrors = true;
+        StartRunAheadSession();
+        Srv::ServerLoopInstance().RunProbeOnApplyThreadForTesting(
+            +[](void*) -> MobileGLResult {
+                MG_Pipe::MGPipeApplierSetCurrentRecordBarriered(true);
+                if (!MG_Pipe::MGPipeDeferDestroyAndFreeIfOnApplyThread(MG_Pipe::MGPipeKind::Texture,
+                                                                        4243)) {
+                    ::_exit(101);
+                }
+                return MOBILEGL_OK;
+            },
+            nullptr);
+        MG_Pipe::MGPipeDrainDeferredDestroys();
+        ClientSessionInstance().Stop();
+    });
+    ExpectChildSuccess(child);
+}
 #endif
 
+// §2.5 / ruling 15 (ID-93): which half of resource_subdata wants its answer. One predicate,
+// read by MGPipeRouteResourceSubData and by Wire_ResourceSubData - a second spelling of it is
+// how the client comes to wait for an answer the emitter told the server not to bother with.
+// The buffer target's whole packed field is 0 (MGPipeTypes.h asserts it beside the packer),
+// which is what makes the test a comparison and not a mask.
+TEST(RemoteRunAhead, OnlyTheTextureHalfOfResourceSubDataWantsItsReply) {
+    MG_Pipe::MGPSubData buffer{};
+    buffer.Target = MG_Pipe::MGPipePackSubDataTarget(MG_Pipe::kMGPipeResourceTargetBuffer, 0u);
+    EXPECT_FALSE(MG_Pipe::MGPipeSubDataWantsItsReply(buffer));
+
+    MG_Pipe::MGPSubData texture{};
+    texture.Target = MG_Pipe::MGPipePackSubDataTarget(
+        static_cast<Uint32>(MG_Pipe::MGPipeResourceTarget::Tex2D),
+        static_cast<Uint32>(TextureUploadTarget::Texture2D));
+    EXPECT_TRUE(MG_Pipe::MGPipeSubDataWantsItsReply(texture));
+}
+
+
+#include "RemoteClientE1Controls.inc"
 
 int main(int argc, char** argv) {
     namespace fs = std::filesystem;

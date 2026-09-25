@@ -16,6 +16,7 @@
 
 #include "../Server/ServerLoop.h"
 
+#include <MG_State/EGLState/Core.h>
 #include <MG_Util/Debug/Log.h>
 
 // Declared rather than included: MG_Backend/BackendObjects.h drags in both concrete backend
@@ -32,7 +33,7 @@ namespace MobileGL::MG_Remote::Client {
         // ---- the EGL seam ------------------------------------------------------------------
         //
         // THE NINE EGL VIRTUALS CALL v1's TWELVE FORWARDERS AND NOTHING ELSE. c1 round 1 built
-        // its own trampolines over ServerLoop::RunOnApplyThread and ServerLoop::Backend(),
+        // its own trampolines over ServerLoop's control channel and ServerLoop::Backend(),
         // which ran the right driver call on the right thread and was still wrong, because
         // three of the twelve do MORE than forward:
         //
@@ -48,11 +49,12 @@ namespace MobileGL::MG_Remote::Client {
         // That is the failure this seam exists to make impossible: there is no second route to
         // the server's EGL, so there is no route that can skip what the forwarder does.
         //
-        // The forwarders block on mgl-srv-apply themselves and run INLINE when the caller is
-        // already on that thread, so this file no longer needs RunOnApplyThread, a per-call
-        // args struct, or a null-backend check of its own - ServerBackendOrNull() inside each
-        // forwarder is the one place that answers "the bring-up did not complete", and it
-        // answers `false` rather than crashing or succeeding locally.
+        // The forwarders pack a SurfaceControlFrame and block on mgl-srv-apply themselves (P5f
+        // fc; the channel was a function-pointer mailbox before that) and run INLINE when the
+        // caller is already on that thread, so this file needs no frame, no per-call args
+        // struct, and no null-backend check of its own - the dispatch's null-backend arm is the
+        // one place that answers "the bring-up did not complete", and it answers `false` rather
+        // than crashing or succeeding locally.
 
         // CapsMirror's adoption hook. A free function because the hook is a raw function
         // pointer (ID-8: this can fire on a path that must not allocate), and it reaches the
@@ -172,6 +174,27 @@ namespace MobileGL::MG_Remote::Client {
         return CapsMirrorInstance().Backend();
     }
 
+    namespace {
+        // P5e (ra), CONTRACT-P5E §2.5: THE WAIT BEFORE EVERY `Server*` EGL FORWARDER.
+        //
+        // These calls do not travel on SEG_CMD. They go through ServerLoop's control mailbox,
+        // which is pumped BETWEEN drain batches (ServerLoop.cpp's PumpControlRequest, above
+        // DrainRing) - so a make-current, a surface creation or a resize can land between two
+        // records the client published and never waited for. Under lockstep that was
+        // impossible: the client had waited out every record it issued before it could reach
+        // this line. Under run-ahead it is one queued frame wide, and a context switch applied
+        // in the middle of another context's draws is not a wrong pixel, it is a wrong
+        // everything.
+        //
+        // ServerSwapEGLBuffers is deliberately NOT on this list, and its own virtual says why:
+        // present IS the swap and it travels as a record, in order, with its own credit.
+        void WaitForApplyBeforeEglForwarder(const char* forwarder) {
+            if (ClientSession* session = ClientSession::Active()) {
+                session->WaitForApplyToCatchUp(forwarder);
+            }
+        }
+    } // namespace
+
     // ---- the nine EGL lifecycle virtuals ---------------------------------------------------
     //
     // FORWARD FIRST, THEN RUN THE BASE. The server has to own the context before the client's
@@ -180,6 +203,7 @@ namespace MobileGL::MG_Remote::Client {
     // InitCapabilities has run.
 
     Bool BackendObject_Remote::InitializeEGLDisplay(EGLDisplay dpy, EGLint* major, EGLint* minor) {
+        WaitForApplyBeforeEglForwarder("InitializeEGLDisplay");
         if (!Server::ServerInitializeEGLDisplay(dpy, major, minor)) return false;
         return MG_Backend::BackendObject::InitializeEGLDisplay(dpy, major, minor);
     }
@@ -188,6 +212,9 @@ namespace MobileGL::MG_Remote::Client {
                                                       const MG_Backend::WindowHandle& handle) {
         // The handle first: the server's backend has to know which window it is about to make
         // a surface for, and ServerSetWindowHandle is the only way to tell it.
+        WaitForApplyBeforeEglForwarder("CreateEGLWindowSurface");
+        // P12 (D1): unless the window is the SERVER's - then there is no handle of ours to tell.
+        if (MG_Config::ServerOwnedWindowSurfaces()) return CreateServerOwnedWindowSurface(surface, handle);
         Server::ServerSetWindowHandle(handle);
         if (!Server::ServerCreateEGLWindowSurface(surface, handle)) return false;
         // The server's surface init published the default framebuffer's shape as a
@@ -202,6 +229,37 @@ namespace MobileGL::MG_Remote::Client {
     }
 
     Bool BackendObject_Remote::ResizeEGLWindowSurface(EGLSurface surface, Uint32 width, Uint32 height) {
+        WaitForApplyBeforeEglForwarder("ResizeEGLWindowSurface");
+        // P12 review fix: a surface on the SERVER's window is resized by resizing that window. The
+        // server asks its display for the size and answers with the extent the window really took,
+        // and that - not the size asked for, which EGLImpl already wrote into the EGL state - is what
+        // eglQuerySurface answers from here on.
+        if (ClientSession::IsServerOwnedWindowSurface(surface)) {
+            const Server::ServerOwnedWindowReply reply =
+                Server::ServerResizeServerOwnedWindowSurface(surface, width, height);
+            if (!reply.ok) {
+                MGLOG_E("MG_Remote client: the server could not resize the server-owned window surface to %ux%u "
+                        "(channel rc=%d, refusal %s)",
+                        width, height, static_cast<int>(reply.transport), Server::SurfaceRefusalCodeName(reply.refusal));
+                return false;
+            }
+            const Uint32 realWidth = reply.width != 0 ? reply.width : width;
+            const Uint32 realHeight = reply.height != 0 ? reply.height : height;
+            if (MG_State::pEGLContext) {
+                (void)MG_State::pEGLContext->SetSurfaceExtent(surface, static_cast<EGLint>(realWidth),
+                                                              static_cast<EGLint>(realHeight));
+            }
+            if (ClientSession* session = ClientSession::Active()) {
+                session->NoteServerOwnedWindowSurface(surface, realWidth, realHeight);
+                session->DrainPublishedEvents();
+            }
+            if (realWidth != width || realHeight != height) {
+                MGLOG_W("MG_Remote client: the server window took %ux%u, not the %ux%u asked for; the surface "
+                        "reports the window's size",
+                        realWidth, realHeight, width, height);
+            }
+            return MG_Backend::BackendObject::ResizeEGLWindowSurface(surface, realWidth, realHeight);
+        }
         if (!Server::ServerResizeEGLWindowSurface(surface, width, height)) return false;
         // A resize re-creates the server's swapchain, which re-posts the surface-changed
         // event - same drain, same reason as CreateEGLWindowSurface.
@@ -210,11 +268,95 @@ namespace MobileGL::MG_Remote::Client {
     }
 
     Bool BackendObject_Remote::CreateEGLPbufferSurface(EGLSurface surface, EGLint width, EGLint height) {
-        if (!Server::ServerCreateEGLPbufferSurface(surface, width, height)) return false;
+        WaitForApplyBeforeEglForwarder("CreateEGLPbufferSurface");
+        Server::SurfaceRefusalCode refusal = Server::SurfaceRefusalCode::None;
+        if (!Server::ServerCreateEGLPbufferSurface(surface, width, height, &refusal)) {
+            if (refusal == Server::SurfaceRefusalCode::SurfaceModeMismatch) {
+                // P12 (D4), named on THIS side too: the server logged its half.
+                MGLOG_E("MG_Remote client: SurfaceModeMismatch - eglCreatePbufferSurface (%dx%d) in a session "
+                        "whose surface mode is on-screen: its first surface was the server's own window "
+                        "(MOBILEGL_IPC_SURFACE=server), and only one rendering path is active per session. "
+                        "The server refused it; the session carries on",
+                        width, height);
+            }
+            return false;
+        }
         // Same drain as the window surface: InitPbufferSurface publishes the default
         // framebuffer's depth/stencil format on SEG_EVENT from inside this very RPC.
         if (ClientSession* session = ClientSession::Active()) session->DrainPublishedEvents();
         return MG_Backend::BackendObject::CreateEGLPbufferSurface(surface, width, height);
+    }
+
+    namespace {
+        // THE CLIENT'S OWN RECORD OF A SERVER-OWNED WINDOW NEEDS A NON-NULL HANDLE, and a headless
+        // client has none: BackendObject::RegisterEGLWindowSurface refuses a null handle, and that
+        // base class is in the pull build (G1). This address stands in for it. It is never
+        // dereferenced - the client's InitWindowSurface is a no-op - and never crosses the wire
+        // (the ServerOwned frame carries token 0).
+        char g_serverOwnedWindowPlaceholder = 0;
+    } // namespace
+
+    Bool BackendObject_Remote::CreateServerOwnedWindowSurface(EGLSurface surface,
+                                                              const MG_Backend::WindowHandle& handle) {
+        const Server::ServerOwnedWindowReply reply =
+            Server::ServerCreateServerOwnedWindowSurface(surface, handle.Width, handle.Height);
+        if (!reply.ok) {
+            // P12: FAILS BY NAME ON THIS SIDE TOO. The server logged its reason; the reply's refusal
+            // code is what lets this line say the same thing instead of "ok=false".
+            switch (reply.refusal) {
+            case Server::SurfaceRefusalCode::NoServerDisplay:
+                MGLOG_E("MG_Remote client: Refuse ServerOwned (NoServerDisplay) - MOBILEGL_IPC_SURFACE=server asked "
+                        "the server to create this %ux%u window surface on its own window, and the server owns no "
+                        "display: it is an offscreen server. eglCreateWindowSurface fails with "
+                        "EGL_BAD_NATIVE_WINDOW; connect to the on-screen display server, or unset "
+                        "MOBILEGL_IPC_SURFACE",
+                        handle.Width, handle.Height);
+                break;
+            case Server::SurfaceRefusalCode::NoServerWindow:
+                MGLOG_E("MG_Remote client: Refuse ServerOwned (NoServerWindow) - the server owns a display but no "
+                        "window came up for this %ux%u surface within its wait (is the display's surface visible?). "
+                        "eglCreateWindowSurface fails with EGL_BAD_NATIVE_WINDOW",
+                        handle.Width, handle.Height);
+                break;
+            case Server::SurfaceRefusalCode::SurfaceModeMismatch:
+                MGLOG_E("MG_Remote client: SurfaceModeMismatch - eglCreateWindowSurface on the server's window "
+                        "(MOBILEGL_IPC_SURFACE=server) in a session whose surface mode is offscreen: its first "
+                        "surface was a pbuffer, and only one rendering path is active per session. The server "
+                        "refused it; the session carries on");
+                break;
+            default:
+                MGLOG_E("MG_Remote client: the server could not create the server-owned window surface "
+                        "(MOBILEGL_IPC_SURFACE=server, %ux%u requested; channel rc=%d, refusal %s)",
+                        handle.Width, handle.Height, static_cast<int>(reply.transport),
+                        Server::SurfaceRefusalCodeName(reply.refusal));
+                break;
+            }
+            return false;
+        }
+        // D1: THE GEOMETRY FLOWS BACK BEFORE THIS RETURNS. The reply carries the server window's real
+        // extent, and it goes into the EGL state here, so eglQuerySurface(EGL_WIDTH/EGL_HEIGHT)
+        // answers the server's size the moment eglCreateWindowSurface returns - whatever the backend
+        // (Magma builds its swapchain, and publishes its extent, only at the first MakeCurrent). The
+        // session records the surface as the server-owned one, so every later surface-changed event
+        // that carries an extent (the window resized or rotated) resizes it too; then the same drain
+        // as the ordinary window path, for the default framebuffer's shape the server's surface init
+        // may have published from inside this very RPC.
+        if (MG_State::pEGLContext && reply.width != 0 && reply.height != 0) {
+            (void)MG_State::pEGLContext->SetSurfaceExtent(surface, static_cast<EGLint>(reply.width),
+                                                          static_cast<EGLint>(reply.height));
+        }
+        if (ClientSession* session = ClientSession::Active()) {
+            session->NoteServerOwnedWindowSurface(surface, reply.width, reply.height);
+            session->DrainPublishedEvents();
+        }
+        MGLOG_I("MG_Remote client: surface=window %ux%u owner=server (MOBILEGL_IPC_SURFACE=server, %ux%u requested)",
+                reply.width, reply.height, handle.Width, handle.Height);
+        MG_Backend::WindowHandle local = handle;
+        if (local.Backend == MG_Backend::WindowBackend::Unknown) local.Backend = MG_Backend::WindowBackend::Android;
+        if (local.Handle == nullptr) local.Handle = &g_serverOwnedWindowPlaceholder;
+        local.Width = reply.width;
+        local.Height = reply.height;
+        return MG_Backend::BackendObject::CreateEGLWindowSurface(surface, local);
     }
 
     Bool BackendObject_Remote::MakeEGLCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read,
@@ -223,6 +365,7 @@ namespace MobileGL::MG_Remote::Client {
         // class latches "the surface is initialised" and calls InitCapabilities, because
         // InitCapabilities' answer comes from a snapshot the server can only publish once its
         // own InitCapabilities has run - and ServerMakeEGLCurrent is what publishes it.
+        WaitForApplyBeforeEglForwarder("MakeEGLCurrent");
         if (!Server::ServerMakeEGLCurrent(dpy, draw, read, ctx)) return false;
         if (!MG_Backend::BackendObject::MakeEGLCurrent(dpy, draw, read, ctx)) return false;
 
@@ -271,6 +414,8 @@ namespace MobileGL::MG_Remote::Client {
     }
 
     void BackendObject_Remote::ReleaseEGLSurface(EGLSurface surface) {
+        // P12: a released server-owned surface stops taking the server window's geometry.
+        if (ClientSession* session = ClientSession::Active()) session->ForgetServerOwnedWindowSurface(surface);
         Server::ServerReleaseEGLSurface(surface);
         MG_Backend::BackendObject::ReleaseEGLSurface(surface);
     }

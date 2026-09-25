@@ -11,6 +11,12 @@
 #include <Config.h>
 #include <MG_Backend/DirectVulkan/Renderer/PipelineFactory.h>
 #include <MG_Backend/DirectVulkan/Renderer/ProgramFactory.h>
+#if MOBILEGL_BUILD_DISAGGREGATED
+#include <MG_Backend/DirectVulkan/Renderer/WireRenderPassCompatibility.h>
+#include <MG_Backend/DirectVulkan/Renderer/WireColorBlitFilter.h>
+#include <MG_Backend/DirectVulkan/Renderer/WireDepthResolveArm.h>
+#include <MG_Backend/DirectVulkan/Renderer/WirePlaceholderKey.h>
+#endif
 
 using namespace MobileGL;
 using MobileGL::MG_Backend::DirectVulkan::PipelineFactory;
@@ -456,4 +462,538 @@ TEST(ReflectedReadsInstanceIndexBuiltin, FalseForAShaderWithNoInputBuiltins) {
 TEST(ReflectedReadsInstanceIndexBuiltin, FalseForAnEmptyModule) {
     SpvReflectShaderModule emptyModule{};
     EXPECT_FALSE(ProgramFactory::ReflectedReadsInstanceIndexBuiltin(emptyModule));
+}
+
+
+TEST(WirePipelineCompatibility, ExactCompatibilitySurvivesNativeObjectTurnover) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+    using namespace MobileGL::MG_Backend::DirectVulkan;
+    WireRenderPassCompatibilityTable table;
+    WireRenderPassCompatibilityKey a{{(Uint64(VK_FORMAT_R8G8B8A8_UNORM) << 32) | VK_SAMPLE_COUNT_1_BIT}, {0},
+                                      VK_ATTACHMENT_UNUSED};
+    const Uint64 first = table.Intern(a);
+    ASSERT_NE(first, 0u);
+    auto b = a;
+    b.attachmentFormatsAndSamples[0] = (Uint64(VK_FORMAT_R8G8B8A8_SRGB) << 32) | VK_SAMPLE_COUNT_1_BIT;
+    EXPECT_NE(table.Intern(b), first);
+    b = a;
+    b.attachmentFormatsAndSamples[0] = (Uint64(VK_FORMAT_R8G8B8A8_UNORM) << 32) | VK_SAMPLE_COUNT_4_BIT;
+    EXPECT_NE(table.Intern(b), first);
+    b = a;
+    b.colorReferences = {VK_ATTACHMENT_UNUSED, 0};
+    EXPECT_NE(table.Intern(b), first);
+    b = a;
+    b.depthReference = 0;
+    EXPECT_NE(table.Intern(b), first);
+    // Native pass/image turnover and swapchain changes never reset this table.
+    EXPECT_EQ(table.Intern(a), first);
+#else
+    GTEST_SKIP() << "wire pipeline compatibility requires disaggregated build";
+#endif
+}
+
+TEST(WirePipelineCompatibility, HashUsesCompatibilityIdentityAndSeparatesNativeDomain) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+    using namespace MobileGL::MG_Backend::DirectVulkan;
+    VulkanRendererConfig config{};
+    config.DisablePipelineCache = true;
+    // Hash-only unit: DisablePipelineCache prevents all device calls, and no
+    // pipeline is created. These tokens are never passed to a Vulkan driver.
+    PipelineFactory factory(reinterpret_cast<VkDevice>(uintptr_t{1}), config);
+    PipelineFactory::PipelineCreatePayload payload{};
+    payload.renderPass = (VkRenderPass)(uintptr_t{1});
+    payload.wireRenderPassCompatibilityId = 1;
+    const auto a = factory.ComputeHash(payload);
+    payload.renderPass = (VkRenderPass)(uintptr_t{2});
+    EXPECT_EQ(factory.ComputeHash(payload), a) << "compatible passes must reuse the pipeline across native handles";
+    payload.wireRenderPassCompatibilityId = 2;
+    EXPECT_NE(factory.ComputeHash(payload), a) << "a recycled native handle must not alias incompatible passes";
+    payload.renderPass = (VkRenderPass)(uintptr_t{1});
+    payload.wireRenderPassCompatibilityId = 0;
+    EXPECT_NE(factory.ComputeHash(payload), a) << "native handles and wire identities are different domains";
+    const auto native = factory.ComputeHash(payload);
+    payload.renderPass = (VkRenderPass)(uintptr_t{2});
+    EXPECT_NE(factory.ComputeHash(payload), native);
+#else
+    GTEST_SKIP() << "wire pipeline compatibility requires disaggregated build";
+#endif
+}
+
+// P7 gate 5 (g5-msrbo, g5-msprobe): the multisample depth/stencil resolve's arm order is the
+// resolve probe's VERDICT (WireDepthResolveArm.h), not the device's vendor. On the Redmi (Adreno
+// 830) the no-draw VK_KHR_depth_stencil_resolve render pass left its target unwritten while the
+// shader arm resolved correctly; the probe reproduces that on the actual device with the shader
+// arm as its control. These tests pin every mapping from a measurement to the order through a
+// FAKE RESULT SOURCE - a canned measurement handed to ChooseWireDepthResolveArm in place of the
+// Vulkan probe.
+#if MOBILEGL_BUILD_DISAGGREGATED
+namespace {
+    using MobileGL::MG_Backend::DirectVulkan::ChooseWireDepthResolveArm;
+    using MobileGL::MG_Backend::DirectVulkan::DescribeWireDepthResolveProbe;
+    using MobileGL::MG_Backend::DirectVulkan::EvaluateWireDepthResolveProbe;
+    using MobileGL::MG_Backend::DirectVulkan::ParseWireDepthResolveProbeKnob;
+    using MobileGL::MG_Backend::DirectVulkan::WireDepthResolveAspectReading;
+    using MobileGL::MG_Backend::DirectVulkan::WireDepthResolveFormatReading;
+    using MobileGL::MG_Backend::DirectVulkan::WireDepthResolveProbeKnob;
+    using MobileGL::MG_Backend::DirectVulkan::WireDepthResolveProbeMeasurement;
+    using MobileGL::MG_Backend::DirectVulkan::WireDepthResolveProbeVerdict;
+
+    // How one aspect's two arms read back, out of 16 texels.
+    struct FakeArms {
+        Uint32 renderPassMatches = 16;
+        Bool shaderRan = true;
+        Uint32 shaderMatches = 16;
+    };
+
+    WireDepthResolveAspectReading FakeAspect(Uint32 expected, Uint32 sentinel, FakeArms arms) {
+        WireDepthResolveAspectReading aspect;
+        aspect.measured = true;
+        aspect.texels = 16;
+        aspect.expected = expected;
+        aspect.sentinel = sentinel;
+        aspect.renderPassMatches = arms.renderPassMatches;
+        aspect.renderPassSentinels = 16 - arms.renderPassMatches;
+        aspect.renderPassFirst = arms.renderPassMatches == 16 ? expected : sentinel;
+        aspect.shaderRan = arms.shaderRan;
+        aspect.shaderMatches = arms.shaderRan ? arms.shaderMatches : 0;
+        aspect.shaderFirst = arms.shaderMatches == 16 ? expected : 0;
+        return aspect;
+    }
+
+    // A packed format (both aspects) or a depth-only one (stencil = nullptr-like: not measured).
+    WireDepthResolveFormatReading FakeFormat(const char* name, FakeArms depth, Optional<FakeArms> stencil) {
+        WireDepthResolveFormatReading reading;
+        reading.name = name;
+        reading.samples = 4;
+        reading.ran = true;
+        reading.depth = FakeAspect(0x400000u, 0xBFFFFFu, depth);
+        if (stencil) reading.stencil = FakeAspect(0x5Au, 0xA5u, *stencil);
+        return reading;
+    }
+
+    WireDepthResolveProbeMeasurement FakeMeasurement(Vector<WireDepthResolveFormatReading> formats) {
+        WireDepthResolveProbeMeasurement measurement;
+        measurement.ran = true;
+        measurement.formats = Move(formats);
+        return measurement;
+    }
+
+    // The Adreno 830's reading: the render pass left the sentinel in every texel of both aspects,
+    // the shader control resolved all of them.
+    constexpr FakeArms kRenderPassWroteNothing{0, true, 16};
+    constexpr FakeArms kBothArmsResolve{16, true, 16};
+    // Neither arm resolved: the probe measured its own setup, or a device that cannot resolve.
+    constexpr FakeArms kControlFailsToo{0, true, 0};
+    constexpr FakeArms kNoStencilExport{0, false, 0};
+} // namespace
+#endif
+
+TEST(PipelineQuirkTest, WireDepthResolveProbeDetectsARenderPassThatWritesNothing) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+    Int measured = 0;
+    const auto choice = ChooseWireDepthResolveArm(WireDepthResolveProbeKnob::Measure, true, [&] {
+        ++measured;
+        return FakeMeasurement({FakeFormat("D24_UNORM_S8_UINT", kRenderPassWroteNothing, kRenderPassWroteNothing),
+                                FakeFormat("D32_SFLOAT", kRenderPassWroteNothing, std::nullopt)});
+    });
+    EXPECT_EQ(measured, 1);
+    EXPECT_EQ(choice.verdict, WireDepthResolveProbeVerdict::RenderPassResolveBroken);
+    EXPECT_TRUE(choice.preferShader) << "the render pass writes nothing and the shader control resolves: the "
+                                        "shader arm must go first";
+    // Writing WRONG values is the same defect as writing none.
+    auto wrong = FakeMeasurement({FakeFormat("D16_UNORM", kBothArmsResolve, std::nullopt)});
+    wrong.formats[0].depth.renderPassMatches = 15;
+    wrong.formats[0].depth.renderPassSentinels = 0;
+    EXPECT_EQ(EvaluateWireDepthResolveProbe(wrong), WireDepthResolveProbeVerdict::RenderPassResolveBroken);
+    // One aspect of one format is enough: the render pass resolves every aspect in one pass.
+    EXPECT_EQ(EvaluateWireDepthResolveProbe(FakeMeasurement(
+                  {FakeFormat("D24_UNORM_S8_UINT", kBothArmsResolve, kRenderPassWroteNothing),
+                   FakeFormat("D32_SFLOAT", kBothArmsResolve, std::nullopt)})),
+              WireDepthResolveProbeVerdict::RenderPassResolveBroken);
+    EXPECT_NE(DescribeWireDepthResolveProbe(choice.measurement).find("render pass 0/16"), String::npos);
+#else
+    GTEST_SKIP() << "the wire resolve arms exist only in the disaggregated build";
+#endif
+}
+
+TEST(PipelineQuirkTest, WireDepthResolveProbeKeepsTheRenderPassFirstWhereItResolves) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+    const auto choice = ChooseWireDepthResolveArm(WireDepthResolveProbeKnob::Measure, true, [] {
+        return FakeMeasurement({FakeFormat("D24_UNORM_S8_UINT", kBothArmsResolve, kBothArmsResolve),
+                                FakeFormat("D32_SFLOAT", kBothArmsResolve, std::nullopt)});
+    });
+    EXPECT_EQ(choice.verdict, WireDepthResolveProbeVerdict::Clean);
+    EXPECT_FALSE(choice.preferShader) << "lavapipe's reading: the fast arm keeps its place";
+#else
+    GTEST_SKIP() << "the wire resolve arms exist only in the disaggregated build";
+#endif
+}
+
+// THE CONTROL (DriverBugProbes.h's iron rule): a render pass that failed where the shader pass
+// failed too is not evidence about the render pass.
+TEST(PipelineQuirkTest, WireDepthResolveProbeIsInconclusiveWhenTheShaderControlFailsToo) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+    const auto choice = ChooseWireDepthResolveArm(WireDepthResolveProbeKnob::Measure, true, [] {
+        return FakeMeasurement({FakeFormat("D24_UNORM_S8_UINT", kControlFailsToo, kControlFailsToo),
+                                FakeFormat("D32_SFLOAT", kControlFailsToo, std::nullopt)});
+    });
+    EXPECT_EQ(choice.verdict, WireDepthResolveProbeVerdict::Inconclusive);
+    EXPECT_FALSE(choice.preferShader) << "an inconclusive probe must never move the arm order";
+    // No control at all (no shader kit) is the same answer.
+    auto uncontrolled = FakeMeasurement({FakeFormat("D32_SFLOAT", kNoStencilExport, std::nullopt)});
+    EXPECT_EQ(EvaluateWireDepthResolveProbe(uncontrolled), WireDepthResolveProbeVerdict::Inconclusive);
+    // A stencil aspect with no control (no VK_EXT_shader_stencil_export) is not counted, either
+    // way: its render-pass failure proves nothing, and the controlled depth aspect decides.
+    EXPECT_EQ(EvaluateWireDepthResolveProbe(
+                  FakeMeasurement({FakeFormat("D24_UNORM_S8_UINT", kBothArmsResolve, kNoStencilExport)})),
+              WireDepthResolveProbeVerdict::Clean);
+    // A format whose control failed does not veto another format's conclusive defect.
+    EXPECT_EQ(EvaluateWireDepthResolveProbe(
+                  FakeMeasurement({FakeFormat("D16_UNORM", kControlFailsToo, std::nullopt),
+                                   FakeFormat("D32_SFLOAT", kRenderPassWroteNothing, std::nullopt)})),
+              WireDepthResolveProbeVerdict::RenderPassResolveBroken);
+    // Skipped formats and a probe that did not run (or timed out) conclude nothing.
+    auto skipped = FakeMeasurement({FakeFormat("X8_D24_UNORM_PACK32", kRenderPassWroteNothing, std::nullopt)});
+    skipped.formats[0].ran = false;
+    EXPECT_EQ(EvaluateWireDepthResolveProbe(skipped), WireDepthResolveProbeVerdict::Inconclusive);
+    auto timedOut = FakeMeasurement({FakeFormat("D32_SFLOAT", kRenderPassWroteNothing, std::nullopt)});
+    timedOut.fenceWaitTimedOut = true;
+    EXPECT_EQ(EvaluateWireDepthResolveProbe(timedOut), WireDepthResolveProbeVerdict::NotRun);
+    EXPECT_EQ(EvaluateWireDepthResolveProbe(WireDepthResolveProbeMeasurement{}), WireDepthResolveProbeVerdict::NotRun);
+#else
+    GTEST_SKIP() << "the wire resolve arms exist only in the disaggregated build";
+#endif
+}
+
+TEST(PipelineQuirkTest, WireDepthResolveProbeRunsOnlyWhereThereIsARenderPassArmToJudge) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+    Int measured = 0;
+    const auto choice = ChooseWireDepthResolveArm(WireDepthResolveProbeKnob::Measure, false, [&] {
+        ++measured;
+        return FakeMeasurement({FakeFormat("D32_SFLOAT", kRenderPassWroteNothing, std::nullopt)});
+    });
+    EXPECT_EQ(measured, 0) << "without VK_KHR_depth_stencil_resolve the shader pass is the only arm";
+    EXPECT_EQ(choice.verdict, WireDepthResolveProbeVerdict::NotRun);
+    EXPECT_FALSE(choice.preferShader);
+#else
+    GTEST_SKIP() << "the wire resolve arms exist only in the disaggregated build";
+#endif
+}
+
+// MGITEST_MAGMA_DEPTH_RESOLVE_PROBE replaces the MEASUREMENT, not the verdict: the canned one goes
+// through the same evaluation, which is what lets the MsResolveBug./MsFlipBug. entries red when
+// the evaluation stops detecting the defect.
+TEST(PipelineQuirkTest, WireDepthResolveProbeKnobReplacesTheMeasurementNotTheVerdict) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+    EXPECT_EQ(ParseWireDepthResolveProbeKnob(nullptr), WireDepthResolveProbeKnob::Measure);
+    EXPECT_EQ(ParseWireDepthResolveProbeKnob(""), WireDepthResolveProbeKnob::Measure);
+    EXPECT_EQ(ParseWireDepthResolveProbeKnob("bug"), WireDepthResolveProbeKnob::ForceBug);
+    EXPECT_EQ(ParseWireDepthResolveProbeKnob("clean"), WireDepthResolveProbeKnob::ForceClean);
+    EXPECT_EQ(ParseWireDepthResolveProbeKnob("0x5143"), WireDepthResolveProbeKnob::Unrecognised);
+    Int measured = 0;
+    const auto measure = [&] {
+        ++measured;
+        return FakeMeasurement({FakeFormat("D32_SFLOAT", kBothArmsResolve, std::nullopt)});
+    };
+    const auto bug = ChooseWireDepthResolveArm(WireDepthResolveProbeKnob::ForceBug, true, measure);
+    EXPECT_TRUE(bug.measurement.fromKnob);
+    EXPECT_EQ(bug.verdict, WireDepthResolveProbeVerdict::RenderPassResolveBroken);
+    EXPECT_TRUE(bug.preferShader);
+    const auto clean = ChooseWireDepthResolveArm(WireDepthResolveProbeKnob::ForceClean, true, measure);
+    EXPECT_TRUE(clean.measurement.fromKnob);
+    EXPECT_EQ(clean.verdict, WireDepthResolveProbeVerdict::Clean);
+    EXPECT_FALSE(clean.preferShader);
+    EXPECT_EQ(measured, 0) << "a forced verdict must not also run the device probe";
+    const auto other = ChooseWireDepthResolveArm(WireDepthResolveProbeKnob::Unrecognised, true, measure);
+    EXPECT_EQ(measured, 1) << "an unrecognised value runs the probe as if the knob were unset";
+    EXPECT_FALSE(other.measurement.fromKnob);
+    EXPECT_EQ(other.verdict, WireDepthResolveProbeVerdict::Clean);
+    // `elide-subject` is the REAL probe's negative control: it decides nothing here - the device
+    // probe runs (the caller elides its render-pass resolve) and its reading is evaluated as-is.
+    EXPECT_EQ(ParseWireDepthResolveProbeKnob("elide-subject"), WireDepthResolveProbeKnob::ElideSubject);
+    const auto elided = ChooseWireDepthResolveArm(WireDepthResolveProbeKnob::ElideSubject, true, [&] {
+        ++measured;
+        return FakeMeasurement({FakeFormat("D24_UNORM_S8_UINT", kRenderPassWroteNothing, kRenderPassWroteNothing)});
+    });
+    EXPECT_EQ(measured, 2) << "elide-subject must run the device probe, not a canned reading";
+    EXPECT_FALSE(elided.measurement.fromKnob);
+    EXPECT_EQ(elided.verdict, WireDepthResolveProbeVerdict::RenderPassResolveBroken);
+    EXPECT_TRUE(elided.preferShader);
+    const auto noArm = ChooseWireDepthResolveArm(WireDepthResolveProbeKnob::ElideSubject, false, measure);
+    EXPECT_EQ(measured, 2) << "without a render-pass arm there is nothing to elide or measure";
+    EXPECT_EQ(noArm.verdict, WireDepthResolveProbeVerdict::NotRun);
+#else
+    GTEST_SKIP() << "the wire resolve arms exist only in the disaggregated build";
+#endif
+}
+
+// Codex closeout finding 7 (cf-magma): THE VERDICT BELONGS TO A DEVICE, NOT TO THE PROCESS. The
+// choice was a function-static in VulkanRenderer::ArmWireDepthResolveOrder, so a renderer on a
+// second physical device, or under a changed driver, in the same process took the first device's
+// order without probing. ArmWireDepthResolveOrder now asks WireDepthResolveArmCache, keyed by
+// (vendor, device, driver version, pipeline-cache UUID) plus the choice's own inputs; this pins that
+// two identities are decided independently and that one identity is still decided once. Every
+// identity is built by MakeWireDepthResolveDeviceIdentity - the helper ArmWireDepthResolveOrder
+// fills its key with - from VkPhysicalDeviceProperties, so a property the helper drops goes red too.
+TEST(PipelineQuirkTest, WireDepthResolveVerdictIsMemoizedPerDeviceIdentityNotPerProcess) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+    using MobileGL::MG_Backend::DirectVulkan::MakeWireDepthResolveDeviceIdentity;
+    using MobileGL::MG_Backend::DirectVulkan::WireDepthResolveArmCache;
+    using MobileGL::MG_Backend::DirectVulkan::WireDepthResolveArmChoice;
+    using MobileGL::MG_Backend::DirectVulkan::WireDepthResolveDeviceIdentity;
+    WireDepthResolveArmCache cache;
+    Int probes = 0;
+    const auto probeReading = [&](FakeArms arms) {
+        return [&probes, arms] {
+            ++probes;
+            return ChooseWireDepthResolveArm(WireDepthResolveProbeKnob::Measure, true, [arms] {
+                return FakeMeasurement({FakeFormat("D24_UNORM_S8_UINT", arms, arms)});
+            });
+        };
+    };
+    // The Redmi's device, whose render pass writes nothing ...
+    VkPhysicalDeviceProperties adrenoDevice{};
+    adrenoDevice.vendorID = 0x5143;
+    adrenoDevice.deviceID = 0x44050001;
+    adrenoDevice.driverVersion = 0x80000000u | 512;
+    adrenoDevice.pipelineCacheUUID[0] = 0xA8;
+    const WireDepthResolveDeviceIdentity adreno =
+        MakeWireDepthResolveDeviceIdentity(adrenoDevice, true, WireDepthResolveProbeKnob::Measure);
+    // ... and, later in the same process, a device whose render pass resolves.
+    VkPhysicalDeviceProperties lavapipeDevice{};
+    lavapipeDevice.vendorID = 0x10005;
+    lavapipeDevice.deviceID = 0;
+    lavapipeDevice.driverVersion = 1;
+    lavapipeDevice.pipelineCacheUUID[0] = 0x3E;
+    const WireDepthResolveDeviceIdentity lavapipe =
+        MakeWireDepthResolveDeviceIdentity(lavapipeDevice, true, WireDepthResolveProbeKnob::Measure);
+    // The helper copies every property it is given, the UUID's last byte included.
+    adrenoDevice.pipelineCacheUUID[VK_UUID_SIZE - 1] = 0x5A;
+    const WireDepthResolveDeviceIdentity copied =
+        MakeWireDepthResolveDeviceIdentity(adrenoDevice, false, WireDepthResolveProbeKnob::ForceBug);
+    EXPECT_EQ(copied.vendorID, 0x5143u);
+    EXPECT_EQ(copied.deviceID, 0x44050001u);
+    EXPECT_EQ(copied.driverVersion, 0x80000000u | 512);
+    EXPECT_EQ(copied.pipelineCacheUUID[0], 0xA8);
+    EXPECT_EQ(copied.pipelineCacheUUID[VK_UUID_SIZE - 1], 0x5A);
+    EXPECT_FALSE(copied.renderPassArmAvailable);
+    EXPECT_EQ(copied.knob, WireDepthResolveProbeKnob::ForceBug);
+    adrenoDevice.pipelineCacheUUID[VK_UUID_SIZE - 1] = 0;
+
+    Bool decided = false;
+    const WireDepthResolveArmChoice first = cache.Resolve(adreno, probeReading(kRenderPassWroteNothing), &decided);
+    EXPECT_TRUE(decided);
+    EXPECT_TRUE(first.preferShader);
+    const WireDepthResolveArmChoice second = cache.Resolve(lavapipe, probeReading(kBothArmsResolve), &decided);
+    EXPECT_TRUE(decided) << "a second device in the process must run its OWN probe";
+    EXPECT_EQ(second.verdict, WireDepthResolveProbeVerdict::Clean);
+    EXPECT_FALSE(second.preferShader) << "the second device took the first device's verdict";
+    EXPECT_EQ(probes, 2);
+
+    // The same device again is still decided once: the probe stays once per device per process.
+    const WireDepthResolveArmChoice again = cache.Resolve(adreno, probeReading(kBothArmsResolve), &decided);
+    EXPECT_FALSE(decided);
+    EXPECT_TRUE(again.preferShader);
+    EXPECT_EQ(probes, 2);
+
+    // Each property separates, through the helper: a driver update (version or pipeline-cache UUID
+    // alone), another device of the vendor, and the choice's own inputs.
+    const auto separates = [&](const VkPhysicalDeviceProperties& other, Bool renderPassArm,
+                               WireDepthResolveProbeKnob knob, const char* what) {
+        const Int before = probes;
+        const auto choice = cache.Resolve(MakeWireDepthResolveDeviceIdentity(other, renderPassArm, knob),
+                                          probeReading(kBothArmsResolve), &decided);
+        EXPECT_TRUE(decided) << what << " reused another identity's verdict";
+        EXPECT_EQ(probes, before + 1) << what;
+        EXPECT_FALSE(choice.preferShader) << what;
+    };
+    const auto measured = WireDepthResolveProbeKnob::Measure;
+    auto updatedDriver = adrenoDevice;
+    updatedDriver.driverVersion += 1;
+    separates(updatedDriver, true, measured, "a changed driver version");
+    auto rebuiltDriver = adrenoDevice;
+    rebuiltDriver.pipelineCacheUUID[VK_UUID_SIZE - 1] = 0x01;
+    separates(rebuiltDriver, true, measured, "a changed pipeline-cache UUID (its last byte)");
+    auto sibling = adrenoDevice;
+    sibling.deviceID += 1;
+    separates(sibling, true, measured, "another device of the same vendor");
+    auto otherVendor = adrenoDevice;
+    otherVendor.vendorID = 0x13B5;
+    separates(otherVendor, true, measured, "another vendor with the same device id");
+    separates(adrenoDevice, false, measured, "a renderer without the render-pass arm");
+    separates(adrenoDevice, true, WireDepthResolveProbeKnob::ForceClean, "a different probe knob");
+    EXPECT_EQ(cache.Size(), 8u);
+    // A property the identity does not hold does not split it: the device NAME is not the device.
+    auto renamed = adrenoDevice;
+    std::snprintf(renamed.deviceName, sizeof(renamed.deviceName), "%s", "Adreno (TM) 830 renamed");
+    (void)cache.Resolve(MakeWireDepthResolveDeviceIdentity(renamed, true, measured), probeReading(kBothArmsResolve),
+                        &decided);
+    EXPECT_FALSE(decided) << "the device name is not part of the identity";
+    EXPECT_EQ(cache.Size(), 8u);
+#else
+    GTEST_SKIP() << "the wire resolve arms exist only in the disaggregated build";
+#endif
+}
+
+// Codex closeout finding 2, the cf-magma critic's follow-up: WHICH PLACEHOLDER AN INVALID OR EMPTY
+// STORAGE UNIT TAKES on the arm without a null descriptor. Private per (shape, UNIT) - GL aliases per
+// unit, so the unit is the no-alias guarantee (the ImageUnitPrivate integration entries go red when it
+// leaves the key) and the binding is not in the key at all - and bounded: every private placeholder
+// is an allocation freed only at Shutdown, so past kWirePrivateStoragePlaceholderCap a NEW (shape,
+// unit) shares its shape's placeholder while the units that have one keep it. A sampled placeholder
+// is never written and stays shared.
+TEST(PipelineQuirkTest, WirePlaceholderKeysArePrivatePerShapeAndUnitAndBounded) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+    using MobileGL::MG_Backend::DirectVulkan::ChooseWirePlaceholderKey;
+    using MobileGL::MG_Backend::DirectVulkan::kWirePrivateStoragePlaceholderCap;
+    using MobileGL::MG_Backend::DirectVulkan::WirePlaceholderKey;
+    using MobileGL::MG_Backend::DirectVulkan::WirePlaceholderKeyHash;
+    constexpr Uint32 kUnits = MobileGL::MG_Pipe::kMGPipeMaxImageUnits;
+    static_assert(kWirePrivateStoragePlaceholderCap >= kUnits,
+                  "one shape on every image unit must stay private");
+    UnorderedMap<WirePlaceholderKey, Int, WirePlaceholderKeyHash> cache;
+    SizeT privateCount = 0;
+    // What ResolveWirePlaceholderImage does with the key: find it, or make (and count) it.
+    const auto take = [&](Uint64 shape, Bool storage, Uint32 unit) {
+        const WirePlaceholderKey key = ChooseWirePlaceholderKey(shape, storage, unit, privateCount,
+            [&](const WirePlaceholderKey& candidate) { return cache.count(candidate) != 0; });
+        if (cache.emplace(key, 0).second && key.unit != WirePlaceholderKey::kShared) ++privateCount;
+        return key;
+    };
+    const Uint64 rgba8Storage2D = 37u | (1ull << 48);
+    const Uint64 r32uiStorage3D = 98u | (4ull << 32) | (1ull << 48);
+    const Uint64 rgba8Sampled2D = 37u;
+
+    // Units A and B of one shape: two placeholders (the finding) ...
+    const WirePlaceholderKey a = take(rgba8Storage2D, true, 2);
+    const WirePlaceholderKey b = take(rgba8Storage2D, true, 3);
+    EXPECT_FALSE(a == b) << "two invalid units of one shape share a placeholder";
+    EXPECT_EQ(a.unit, 2u);
+    // ... and unit A through a second binding is A's own placeholder, not a third allocation.
+    EXPECT_TRUE(take(rgba8Storage2D, true, 2) == a) << "a second binding on unit A made another placeholder";
+    EXPECT_EQ(privateCount, 2u);
+    // A sampled placeholder is shared by shape, whatever unit it came from.
+    EXPECT_EQ(take(rgba8Sampled2D, false, 2).unit, WirePlaceholderKey::kShared);
+    EXPECT_TRUE(take(rgba8Sampled2D, false, 7) == take(rgba8Sampled2D, false, 2));
+    EXPECT_EQ(privateCount, 2u);
+
+    // A peer rotating two shapes across every unit, then a third: the map stops at the cap (plus
+    // the shared placeholders), every unit that got a private placeholder keeps it, and the ones
+    // past the cap share their shape's.
+    for (Uint32 unit = 0; unit < kUnits; ++unit) {
+        (void)take(rgba8Storage2D, true, unit);
+        (void)take(r32uiStorage3D, true, unit);
+    }
+    for (Uint32 unit = 0; unit < kUnits; ++unit) {
+        const WirePlaceholderKey rotated = take(37u | (2ull << 32) | (1ull << 48), true, unit);
+        EXPECT_EQ(rotated.unit, WirePlaceholderKey::kShared) << "unit " << unit << " past the cap still allocated";
+    }
+    EXPECT_EQ(privateCount, kWirePrivateStoragePlaceholderCap);
+    EXPECT_LE(cache.size(), kWirePrivateStoragePlaceholderCap + 3u);
+    EXPECT_TRUE(take(rgba8Storage2D, true, 3) == b) << "a unit that had its private placeholder lost it at the cap";
+    EXPECT_EQ(take(r32uiStorage3D, true, kUnits - 1).unit, kUnits - 1);
+#else
+    GTEST_SKIP() << "the wire placeholders exist only in the disaggregated build";
+#endif
+}
+
+// P7 g3-blit (g3det, ~/w7/logs/g3det/VERDICT.md section 3): WHICH SAMPLER THE WIRE ARM'S SHADER
+// COLOUR BLIT USES (WireColorBlitFilter.h). GL filters only a STRETCHED blit, so a 1:1 blit is a copy
+// whatever `filter` says. The wire pass sampled every GL_LINEAR blit through its linear sampler; on
+// Adreno 830 the sub-texel coordinate quantisation moved create-instancing's 1:1 GL_LINEAR blit into
+// FB 0 by 1 LSB on 712 edge pixels, while the monolith's vkCmdBlitImage copied them exactly.
+// Lavapipe samples texel centres exactly and shows the same picture on both samplers, so no host
+// lane can see this; the choice is pinned here instead.
+//
+// Red once (executed, reverted): WireColorBlitFilterFor reduced to the old mapping
+// (`filter == GL_LINEAR ? VK_FILTER_LINEAR : VK_FILTER_NEAREST`) fails all 29 sampler expectations
+// of the first test and none of the second.
+#if MOBILEGL_BUILD_DISAGGREGATED
+namespace {
+    using MobileGL::MG_Backend::DirectVulkan::WireBlitIsUnscaled;
+    using MobileGL::MG_Backend::DirectVulkan::WireBlitRect;
+    using MobileGL::MG_Backend::DirectVulkan::WireColorBlitFilterFor;
+
+    // Identity and the three turns BlitWireColorImage expresses.
+    constexpr VkSurfaceTransformFlagBitsKHR kExpressedTransforms[] = {
+        VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR, VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR,
+        VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR, VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR};
+} // namespace
+#endif
+
+TEST(PipelineQuirkTest, WireColorBlitSamplesNearestWhereTheBlitIsACopy) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+    // create-instancing's last pass (trace call 530331): glBlitFramebuffer(0,0,854,480 -> 0,0,854,480,
+    // GL_COLOR_BUFFER_BIT, GL_LINEAR) into FB 0, on an identity pbuffer.
+    EXPECT_EQ(WireColorBlitFilterFor({0, 0, 854, 480}, {0, 0, 854, 480}, GL_LINEAR,
+                                     VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR),
+              VK_FILTER_NEAREST)
+        << "a 1:1 GL_LINEAR blit is a copy (GL 4.6 core 18.3.1); linear sampling of it is not exact on Adreno";
+    const struct {
+        const char* what;
+        WireBlitRect source, destination;
+    } copies[] = {
+        {"offset on both sides", {10, 20, 110, 70}, {300, 5, 400, 55}},
+        {"source reversed on x", {854, 0, 0, 480}, {0, 0, 854, 480}},
+        {"destination reversed on both axes", {0, 0, 6, 4}, {48, 36, 42, 32}},
+        {"both reversed", {6, 4, 0, 0}, {42, 32, 48, 36}},
+        {"one texel", {3, 3, 4, 4}, {0, 0, 1, 1}},
+        {"negative corners", {-8, -4, 8, 4}, {100, 100, 116, 108}},
+        // 64-bit extents: INT_MAX - INT_MIN overflows a GLint.
+        {"full GLint range", {INT_MIN, 0, INT_MAX, 1}, {INT_MAX, 1, INT_MIN, 0}},
+    };
+    for (const auto& copy : copies) {
+        EXPECT_TRUE(WireBlitIsUnscaled(copy.source, copy.destination)) << copy.what;
+        // A quarter turn maps logical pixel centres onto native ones (the native extent is the
+        // logical one swapped), so a copy is still a copy on every rotated surface.
+        for (const auto transform : kExpressedTransforms) {
+            EXPECT_EQ(WireColorBlitFilterFor(copy.source, copy.destination, GL_LINEAR, transform), VK_FILTER_NEAREST)
+                << copy.what << ", surface transform 0x" << std::hex << static_cast<Uint32>(transform);
+        }
+    }
+#else
+    GTEST_SKIP() << "the wire shader blit exists only in the disaggregated build";
+#endif
+}
+
+TEST(PipelineQuirkTest, WireColorBlitKeepsLinearWhereTheBlitStretches) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+    const struct {
+        const char* what;
+        WireBlitRect source, destination;
+    } stretches[] = {
+        {"2x on both axes", {0, 0, 854, 480}, {0, 0, 1708, 960}},
+        {"half on y only", {0, 0, 854, 480}, {0, 0, 854, 240}},
+        {"one texel wider on x only", {0, 0, 854, 480}, {0, 0, 855, 480}},
+        // GL has no transpose: swapped extents are a stretch on both axes, not a rotation.
+        {"extents transposed", {0, 0, 480, 854}, {0, 0, 854, 480}},
+        {"reversed and stretched", {0, 0, 6, 4}, {48, 36, 36, 28}},
+        // What GenerateMipmap's attachable arm asks for (source level -> the next level).
+        {"a mip step", {0, 0, 64, 32}, {0, 0, 32, 16}},
+        {"a 1xN mip step", {0, 0, 1, 8}, {0, 0, 1, 4}},
+        {"full GLint range against one texel", {INT_MIN, 0, INT_MAX, 1}, {0, 0, -1, 1}},
+    };
+    for (const auto& stretch : stretches) {
+        EXPECT_FALSE(WireBlitIsUnscaled(stretch.source, stretch.destination)) << stretch.what;
+        for (const auto transform : kExpressedTransforms) {
+            EXPECT_EQ(WireColorBlitFilterFor(stretch.source, stretch.destination, GL_LINEAR, transform),
+                      VK_FILTER_LINEAR)
+                << stretch.what << ": GL_LINEAR filters a stretched blit, surface transform 0x" << std::hex
+                << static_cast<Uint32>(transform);
+            EXPECT_EQ(WireColorBlitFilterFor(stretch.source, stretch.destination, GL_NEAREST, transform),
+                      VK_FILTER_NEAREST)
+                << stretch.what << ": GL_NEAREST never becomes linear";
+        }
+    }
+    for (const auto transform : kExpressedTransforms) {
+        EXPECT_EQ(WireColorBlitFilterFor({0, 0, 854, 480}, {0, 0, 854, 480}, GL_NEAREST, transform), VK_FILTER_NEAREST);
+    }
+    // A transform the pass cannot express is declined before a sampler is chosen; the helper keeps
+    // the filter's own mapping for one rather than claiming the copy is exact.
+    EXPECT_EQ(WireColorBlitFilterFor({0, 0, 854, 480}, {0, 0, 854, 480}, GL_LINEAR,
+                                     VK_SURFACE_TRANSFORM_HORIZONTAL_MIRROR_BIT_KHR),
+              VK_FILTER_LINEAR);
+#else
+    GTEST_SKIP() << "the wire shader blit exists only in the disaggregated build";
+#endif
 }

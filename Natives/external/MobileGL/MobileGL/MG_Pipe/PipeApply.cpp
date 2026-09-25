@@ -33,6 +33,9 @@
 #endif
 
 #if MOBILEGL_BUILD_DISAGGREGATED
+// P7 wave 0: the seam the Magma wire funnels in MG_Backend die through. Declared in MG_Pipe and
+// DEFINED below, so MG_Backend names no MG_Remote symbol of its own to reach Session::Fail.
+#include <MG_Pipe/PipeSessionFail.h>
 // R-6's tier gate. One spelling, asked at the one place the decline is decided. Outside the
 // MOBILEGL_PIPE_VERIFY block above on purpose: the tier is a property of the BUILD, not of the
 // comparator, and a split build without the comparator still declines every acquisition.
@@ -44,10 +47,15 @@
 // server-role-only fixture: there the direct call is the only reset that exists).
 #include <MG_Remote/Client/ClientSession.h>
 #include <MG_Remote/Server/ServerLoop.h>
+#include <MG_Remote/Server/ServerSession.h>
+#include <MG_Remote/Server/StagedTextureStore.h>
+#include <MG_Remote/CapsCodec.h>
 #endif
 
 #include <algorithm>
 #include <cmath>
+#include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <utility>
@@ -105,6 +113,49 @@
     X(ProgramPointSize)
 
 namespace MobileGL::MG_Pipe {
+
+#if MOBILEGL_BUILD_DISAGGREGATED
+    // ----------------------------------------------------------------------------
+    // THE BACKEND-SIDE SESSION-FAIL SEAM (P7 wave 0). PipeSessionFail.h holds the argument;
+    // this is the whole implementation.
+    //
+    // It lives in this file for the reason MGP_TRIP_WIRE_REPORT does, forty lines up: this is
+    // where MG_Pipe already states "the verdict of every trip wire, in one place", and a seam
+    // whose default is an abort belongs next to the other one rather than in a file of its own
+    // that a reader has to be told about. Split-only, so a pull build gains nothing (G1) and a
+    // push-monolith build - where the three Magma wire funnels are not compiled either - gains
+    // nothing to call.
+    namespace {
+        MGPipeSessionFailHook g_sessionFailHook = nullptr;
+    } // namespace
+
+    void MGPipeInstallSessionFailHook(MGPipeSessionFailHook hook) { g_sessionFailHook = hook; }
+
+    MGPipeSessionFailHook MGPipeSessionFailHookInstalled() { return g_sessionFailHook; }
+
+    void MGPipeSessionFail(MGPipeFatalFamily family, const char* fmt, ...) {
+        // The same 512-byte buffer and the same fallback SessionFail and WireLogFatal use, so a
+        // death that travels this seam reads identically to one that did not.
+        char line[512];
+        va_list args;
+        va_start(args, fmt);
+        const int written = std::vsnprintf(line, sizeof(line), fmt, args);
+        va_end(args);
+        if (written < 0) {
+            std::snprintf(line, sizeof(line),
+                          "MGPipe: unformattable Fatal diagnostic (format=%s)", fmt);
+        }
+        if (g_sessionFailHook != nullptr) g_sessionFailHook(family, line);
+        // NO HOOK: exactly what the three funnels did before this seam existed - the line, then
+        // the abort. Reached in a server image whose role init has not run (a unit case that
+        // drives the applier headless) and in the client process, where there is no session to
+        // fail. The abort carries no `Fatal{` of its own because `line` already does;
+        // fatal_census.py's FUNNEL_SITES names this function for that reason.
+        MGLOG_F("%s", line);
+        std::abort();
+    }
+#endif
+
     namespace {
         // ----------------------------------------------------------------------------
         // WHICH CHUNKS EACH DERIVATION READS.
@@ -896,27 +947,74 @@ namespace MobileGL::MG_Pipe {
 #endif
 
 #if MOBILEGL_PIPE_VERIFY
-        // P5's pin, the same shape and for the same reason. The respecify SCOPE now has a wire
-        // carrier (MGPResourceDesc's HasRespecifiedLevel + the pair) and no producer: every
-        // descriptor P5 builds is whole-resource, and the per-level scope still arrives the old
-        // way, as the trailing MGPRespecifiedLevel* this function does not look at.
+        // P5's pin, RELAXED BY P7 WAVE 3 (CONTRACT-P7 §6) - and relaxed rather than deleted,
+        // because the thing it was guarding is now reachable instead of hypothetical.
         //
-        // The two must not disagree, and when a later package wires the carrier it will set the
-        // fields at a call site that also still passes the pointer - so the first thing that can
-        // go wrong is exactly one of the two moving. A verify build refuses to let that arrive
-        // unannounced, because a descriptor that says "whole resource" while the pointer says
-        // "level 1" drops every other level's pending upload with nothing saying so.
-        void PinWholeResourceRespecifyScope(const MGPResourceDesc& desc, MGPipeHandle res, const char* call) {
+        // WHAT IT USED TO SAY. "The respecify SCOPE has a wire carrier (MGPResourceDesc's
+        // HasRespecifiedLevel + the pair) and NO PRODUCER: every descriptor P5 builds is
+        // whole-resource, and the per-level scope still arrives the old way, as the trailing
+        // MGPRespecifiedLevel* this function does not look at." So any descriptor arriving with
+        // the carrier set was, by definition, a producer nobody had announced, and a verify
+        // build refused it.
+        //
+        // WHY THAT IS NOW WRONG, AND EXACTLY HOW FAR. The producer landed:
+        // Wire_Escape_ResourceRespecify (Client/WireTables.cpp:425-433) writes the carrier from
+        // the pointer through MGPipeSetRespecifiedLevel, and the server codec
+        // (Wire/PipeWireCodec.cpp:1677-1683) rebuilds the pointer from the carrier. So under a
+        // split transport EVERY per-level glTexImage*D arrives here with the carrier set, and
+        // the old pin made verify x split unmeasurable - it fired on the server's apply thread
+        // during bring-up, before a single verify case could arm:
+        //
+        //   Fatal{PipeRespecifyScope} resource_respecify {slot=12, gen=0}: the descriptor
+        //   carries a per-level respecify scope (target=258, level=0), and no path in this
+        //   phase may set one
+        //
+        // WHAT SURVIVES, AND IT IS THE WHOLE INVARIANT. The pin never cared that the carrier
+        // was set; it cared that THE TWO HALVES OF THE SCOPE COULD DISAGREE - "the first thing
+        // that can go wrong is exactly one of the two moving". That hazard did not go away when
+        // the producer landed, it became LIVE, and it is silent: the applier below drops pending
+        // uploads by the POINTER, so a descriptor that declares (target, level) while this call
+        // hands over a null pointer takes the WHOLE-RESOURCE arm and eats every other level's
+        // texels, and one that hands over a different pair erases the wrong key and keeps the
+        // one the client stopped owing. Neither shows up as anything but missing pixels, a
+        // frame later, on whichever level the wire dropped.
+        //
+        // So the rule becomes CONTRACT-P7 §6's: A PRODUCER OF A PER-LEVEL SCOPE MUST COVER THE
+        // RANGE IT DECLARES. Carrier set => the call passes a pointer, and that pointer names
+        // exactly the declared (uploadTarget, level).
+        //
+        // ONE-DIRECTIONAL ON PURPOSE. A whole-resource descriptor says NOTHING about the
+        // pointer, and must not: that is the monolith shape and it is still the majority of the
+        // calls in the tree. MG_Impl/Pipe/TextureEmit.h builds a value-initialized descriptor
+        // (carrier clear, by MGPipeClearRespecifiedLevel's own "the safe default") and states
+        // the scope in the trailing pointer alone, which is legal, load-bearing and untouched
+        // here. Checking that direction too would red every monolith glTexImage*D in the tree
+        // and would be asserting a convention, not an invariant - the pointer is the caller's
+        // statement, and a caller that has not been converted to the carrier has not lied.
+        void PinRespecifyScopeCoversItsDeclaration(const MGPResourceDesc& desc,
+                                                   const MGPRespecifiedLevel* level, MGPipeHandle res,
+                                                   const char* call) {
             if (MGPipeRespecifyIsWholeResource(desc)) return;
+            const Uint16 declaredTarget = MGPipeRespecifiedUploadTargetOf(desc);
+            const Uint16 declaredLevel = MGPipeRespecifiedLevelOf(desc);
+            if (level != nullptr && level->UploadTarget == declaredTarget &&
+                level->Level == declaredLevel) {
+                return;
+            }
             MGP_TRIP_WIRE_REPORT("MGPipe: " MGP_TRIP_WIRE_TAG("PipeRespecifyScope")
-                                 " %s {slot=%u, gen=%u}: the descriptor carries a per-level respecify "
-                                 "scope (target=%u, level=%u), and no path in this phase may set one",
-                                 call, res.Slot, res.Gen,
-                                 static_cast<unsigned>(MGPipeRespecifiedUploadTargetOf(desc)),
-                                 static_cast<unsigned>(MGPipeRespecifiedLevelOf(desc)));
+                                 " %s {slot=%u, gen=%u}: the descriptor declares a per-level respecify "
+                                 "scope (target=%u, level=%u) and this call covers %s(target=%u, "
+                                 "level=%u), so a per-level producer is not covering the range it "
+                                 "declares",
+                                 call, res.Slot, res.Gen, static_cast<unsigned>(declaredTarget),
+                                 static_cast<unsigned>(declaredLevel),
+                                 level == nullptr ? "NOTHING " : "",
+                                 level == nullptr ? 0u : static_cast<unsigned>(level->UploadTarget),
+                                 level == nullptr ? 0u : static_cast<unsigned>(level->Level));
         }
 #else
-        void PinWholeResourceRespecifyScope(const MGPResourceDesc&, MGPipeHandle, const char*) {}
+        void PinRespecifyScopeCoversItsDeclaration(const MGPResourceDesc&, const MGPRespecifiedLevel*,
+                                                   MGPipeHandle, const char*) {}
 #endif
 
 #if MOBILEGL_PIPE_VERIFY
@@ -1010,6 +1108,74 @@ namespace MobileGL::MG_Pipe {
             return true;
         }
 
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // Texture records can have a server consumer without the buffer ops table (Magma).
+        // Their staged bytes still belong to the server before SEG_STAGE retires. Keep the
+        // existing backend hooks authoritative when present, and use this fallback otherwise.
+        void AdoptTextureWithoutBackendHook(const MGPipeResourceRecord& stored, const MGPSubData& upload,
+                                           const void* bytes, const MGPSubRegion* regions) {
+            if (MG_Config::Transport == MG_Config::TransportMode::Monolith || !bytes || upload.Blob.Size == 0) return;
+            auto& store = MG_Remote::Server::ServerStagedTexture();
+            const auto& desc = stored.Desc;
+            const Uint64 key = MG_Remote::Server::StagedTextureStore::KeyForHandle(upload.Res);
+            const Uint16 target = MGPipeSubDataUploadTargetOf(upload.Target);
+            const IntVec3 extent = MG_Remote::Server::StagedTextureUploadExtent(desc, upload);
+            // RegionCount == 0 IS the whole-level spelling - "the run is the level shadow" - so it
+            // is adopted with the spelling that replaces the level; every other record names a RUN
+            // of the level by its own box (fix A2: a level too large to stage whole crosses as
+            // slabs, one record each, and the first of them is at the level's first byte).
+            if (upload.RegionCount == 0) {
+                store.Adopt(key, target, upload.Level, extent, bytes,
+                            static_cast<SizeT>(upload.Blob.Size));
+                return;
+            }
+            store.AdoptRun(key, target, upload.Level, extent,
+                           MG_Remote::Server::StagedTextureRunImageOffset(upload, regions), bytes,
+                           static_cast<SizeT>(upload.Blob.Size));
+        }
+
+        void DefineTextureWithoutBackendHook(const MGPResourceDesc& desc, const MGPRespecifiedLevel* level) {
+            if (MG_Config::Transport == MG_Config::TransportMode::Monolith) return;
+            auto& store = MG_Remote::Server::ServerStagedTexture();
+            const Uint64 key = MG_Remote::Server::StagedTextureStore::KeyForHandle(desc.Resource);
+            const auto define = [&](Uint16 target, Uint16 mip, const IntVec3& extent) {
+                store.NoteLevelDefined(key, target, mip, extent, desc.Target, desc.InternalFormat);
+            };
+            if (level) {
+                define(MGPipeSubDataUploadTargetOf(level->UploadTarget), level->Level,
+                       IntVec3{static_cast<Int>(level->Width), static_cast<Int>(level->Height),
+                               static_cast<Int>(level->Depth)});
+                return;
+            }
+            store.ResetLevels(key);
+            if (!desc.Immutable || !desc.Levels) return;
+            const auto defineChain = [&](TextureUploadTarget target) {
+                for (Uint32 mip = 0; mip < desc.Levels; ++mip)
+                    define(static_cast<Uint16>(target), static_cast<Uint16>(mip),
+                           MG_Remote::Server::StagedTextureMipExtent(desc.Target, desc.Width,
+                                                                    desc.Height, desc.Depth, mip));
+            };
+            switch (static_cast<MGPipeResourceTarget>(desc.Target)) {
+            case MGPipeResourceTarget::Tex1D: defineChain(TextureUploadTarget::Texture1D); break;
+            case MGPipeResourceTarget::Tex2D: defineChain(TextureUploadTarget::Texture2D); break;
+            case MGPipeResourceTarget::Tex3D: defineChain(TextureUploadTarget::Texture3D); break;
+            case MGPipeResourceTarget::Tex1DArray: defineChain(TextureUploadTarget::Texture1DArray); break;
+            case MGPipeResourceTarget::Tex2DArray: defineChain(TextureUploadTarget::Texture2DArray); break;
+            case MGPipeResourceTarget::TexCube:
+                for (Uint32 face = static_cast<Uint32>(TextureUploadTarget::CubeMapPositiveX);
+                     face <= static_cast<Uint32>(TextureUploadTarget::CubeMapNegativeZ); ++face)
+                    defineChain(static_cast<TextureUploadTarget>(face));
+                break;
+            case MGPipeResourceTarget::TexCubeArray: defineChain(TextureUploadTarget::CubeMapArray); break;
+            case MGPipeResourceTarget::Tex2DMS: defineChain(TextureUploadTarget::Texture2DMultisample); break;
+            case MGPipeResourceTarget::Tex2DMSArray: defineChain(TextureUploadTarget::Texture2DMultisampleArray); break;
+            case MGPipeResourceTarget::TexRect: defineChain(TextureUploadTarget::TextureRectangle); break;
+            case MGPipeResourceTarget::TexBuffer: defineChain(TextureUploadTarget::TextureBuffer); break;
+            default: break;
+            }
+        }
+#endif
+
         // The texture half of resource_subdata, and it DISPATCHES TO NOBODY at GL-call time:
         // a texture write marks a level dirty and Espryt uploads it at its own sync point, out
         // of the accumulated set below. So the whole of this function is the gate, the
@@ -1064,8 +1230,13 @@ namespace MobileGL::MG_Pipe {
             // deliberately holds no byte pointer). The hook copies the run into the server's
             // staged-texture store keyed by this record's own handle; it is a no-op in
             // monolith, so the monolith shape keeps P5's pointer-dropping expression exactly.
+            // The REGIONS travel with it because a record may carry a RUN of its level rather
+            // than the whole of it (fix A2): they are what places that run in the level image,
+            // and the applier's pending set - which already has them - is not the store's.
             if (g_resourceOps != nullptr && g_resourceOps->TextureSubData != nullptr) {
                 g_resourceOps->TextureSubData(record.Res, record, bytes, regions);
+            } else {
+                AdoptTextureWithoutBackendHook(*stored, record, bytes, regions);
             }
 #endif
             return true;
@@ -1235,9 +1406,32 @@ namespace MobileGL::MG_Pipe {
         // site: ApplyUnitWindow validates and writes in one step, so the question has to be
         // asked in front of it.
         Bool NoP4aConsumer() {
+#if MOBILEGL_BUILD_DISAGGREGATED
+            if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+                const auto* session = MG_Remote::Server::ServerSession::Active();
+                if (session && session->CallMaskIsSet() && MG_Remote::MGCapsServerConsumes(
+                        session->CallMask(), kMGPipeSubsystemTextureResources)) return false;
+            }
+#endif
             if (g_resourceOps != nullptr) return false;
             ++g_applier.RefusedNoConsumer;
             return true;
+        }
+
+        // P5e (sb, CONTRACT-P5E.md §5.6): the three binding-point windows, cleared in one
+        // place because BOTH resets clear them and the two used to drift on exactly this kind
+        // of member (the framebuffer family's four). The SERIAL is deliberately NOT touched
+        // here - each caller advances it beside its own siblings, where the "advance, never
+        // zero" rule is written out.
+        void ClearShaderBufferWindows() {
+            for (Uint32 cls = 0; cls < kMGPipeShaderBufferClassCount; ++cls) {
+                g_applier.BoundShaderBuffers[cls] = {};
+                g_applier.ShaderBufferStart[cls] = 0;
+                g_applier.ShaderBufferCount[cls] = 0;
+                for (Uint32 w = 0; w < kMGPipeShaderBufferWritableMaskWords; ++w) {
+                    g_applier.ShaderBufferWritableMask[cls][w] = 0;
+                }
+            }
         }
     } // namespace
 
@@ -1255,9 +1449,18 @@ namespace MobileGL::MG_Pipe {
         // documented bring-up exception), and a ServerLoop fixture with no client at all has
         // none either - there this call is the only reset that exists. Monolith keeps the
         // direct call, byte for byte (G1); in a pull build none of this is compiled at all.
+        // D10: THE MIDDLE CONJUNCT WAS ClientSession::Active() != nullptr ALONE, WHICH IS
+        // PERMANENTLY NULL IN A SERVER PROCESS - so this guard could not arm at all under
+        // spawn, in the shape where calling the reset off the apply thread is most likely and
+        // least recoverable. MGPipeSessionLive() is the same question asked in a way both roles
+        // can answer, and MGPipeServerArm() is the process-scoped half of "am I the server".
+        //
+        // BOTH ARE ADDED AS DISJUNCTS, not substituted. The originals are the only facts a
+        // fixture without a full session has, and swapping them out silently disarms every such
+        // test - measured.
         if (MG_Config::Transport != MG_Config::TransportMode::Monolith &&
-            MG_Remote::Client::ClientSession::Active() != nullptr &&
-            !MG_Remote::Server::ServerLoop::OnApplyThread()) {
+            (MG_Remote::Client::ClientSession::Active() != nullptr || MG_Pipe::MGPipeSessionLive()) &&
+            !MG_Remote::Server::ServerLoop::OnApplyThread() && !MG_Pipe::MGPipeServerArm()) {
             MGLOG_F("MGPipe: Fatal{RoleViolation, \"g_applier\"} - MGPipeApplierReset() called "
                     "off the apply thread with an active transport; under split the reset "
                     "crosses as the applier_reset record (CONTRACT-P5C.md §5.1)");
@@ -1363,14 +1566,37 @@ namespace MobileGL::MG_Pipe {
         g_applier.DrawProgram = kMGPipeNullHandle;
         g_applier.DispatchProgram = kMGPipeNullHandle;
         g_applier.BoundShaderCso = kMGPipeNullHandle;
+#if MOBILEGL_BUILD_DISAGGREGATED
+        g_applier.BoundStreamOutputLifetimeId = 0;
+        // Begin is emitted once per span, not on make-current. Its immutable object
+        // snapshot survives with the resource/program records until End or release;
+        // set_context_values restores the returning context's bound lifetime id.
+#endif
+        // P5e (sb, CONTRACT-P5E.md §5.6): the three binding-point windows are per-context
+        // WORKING state and go with the rest of it - a returning context has its own
+        // glBindBufferBase history and may not inherit the one this applier was left holding.
+        // The SERIAL advances rather than restarting, for the reason written out above: the
+        // clearing is itself a change every backend memo has to hear about, and a counter that
+        // restarts walks back through values already stamped into a memo that outlived the
+        // switch. The EMITTER's latch resets with it (PipeFill.cpp's FreshlyPrimed arm
+        // invalidates the three suppressor slots), or the first emission after a make-current
+        // would be suppressed as unchanged and the server would draw with a cleared window.
+        ClearShaderBufferWindows();
         ++g_applier.FramebufferSerial;
         ++g_applier.SamplerViewsSerial;
         ++g_applier.SamplerStatesSerial;
         ++g_applier.ShaderImagesSerial;
         ++g_applier.ProgramBindingSerial;
+        ++g_applier.ShaderBuffersSerial;
     }
 
     void MGPipeApplierReleaseObjectRecords() {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith &&
+            (g_resourceOps == nullptr || g_resourceOps->TextureDestroy == nullptr)) {
+            MG_Remote::Server::ServerStagedTexture().DropAll();
+        }
+#endif
         // The served context is going away and this applier with it. Under split that is one
         // applier per served context; in the monolith there is one applier behind every
         // context, so nothing wires this - see PipeApply.h. The two serials advance here for
@@ -1404,6 +1630,10 @@ namespace MobileGL::MG_Pipe {
         g_applier.DrawProgram = kMGPipeNullHandle;
         g_applier.DispatchProgram = kMGPipeNullHandle;
         g_applier.BoundShaderCso = kMGPipeNullHandle;
+#if MOBILEGL_BUILD_DISAGGREGATED
+        g_applier.BoundStreamOutputLifetimeId = 0;
+        g_applier.StreamOutputSpans.clear();
+#endif
         // AND "THE WORKING HANDLES THEY COULD NAME" IS ALL OF THEM, NOT JUST THE THREE ABOVE.
         // Every framebuffer record holds eleven MGPSurface::Res naming texture and renderbuffer
         // records this function has just dropped - which is why the table itself goes above -
@@ -1424,20 +1654,39 @@ namespace MobileGL::MG_Pipe {
         g_applier.BoundShaderImages = {};
         g_applier.ShaderImageStart = 0;
         g_applier.ShaderImageCount = 0;
+        // P5e (sb): and the three binding-point windows, for the paragraph above's reason in
+        // its own words - every MGPBufferRange::Res names a resource record this function has
+        // just dropped, so a window left populated here is a set of handles into an empty
+        // table, which the next resolve either refuses or answers with somebody else's record
+        // on a slot the next context re-mints.
+        ClearShaderBufferWindows();
         ++g_applier.FramebufferSerial;
         ++g_applier.SamplerViewsSerial;
         ++g_applier.SamplerStatesSerial;
         ++g_applier.ShaderImagesSerial;
         ++g_applier.ProgramBindingSerial;
+        ++g_applier.ShaderBuffersSerial;
     }
 
     void MGPipeApplyCreateRenderState(const MGPRenderStateDesc& desc, const void* chunkBytes) {
         MOBILEGL_ASSERT(desc.Cso.Slot >= kMGPipeFirstAllocatableSlot,
                         "create_render_state named the reserved slot 0");
-        if (desc.Cso.Slot >= g_applier.RenderStateCsos.size()) {
-            g_applier.RenderStateCsos.resize(desc.Cso.Slot + 1);
+        MGPipeRenderStateCsoRecord* recordAt =
+            RecordAt(g_applier.RenderStateCsos, desc.Cso.Slot, kMGPipeMaxRenderStateCsoSlots);
+        if (recordAt == nullptr) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+            MGPipeSessionFail(MGPipeFatalFamily::ProtocolCorruption,
+                              "MGPipe: Fatal{ProtocolCorruption, \"CreateRenderState.Cso.Slot\"} - "
+                              "create_render_state {slot=%u, gen=%u} is outside the record table bound (%u)",
+                              desc.Cso.Slot, desc.Cso.Gen, kMGPipeMaxRenderStateCsoSlots);
+#else
+            MGP_TRIP_WIRE_REPORT("MGPipe: " MGP_TRIP_WIRE_TAG("ProtocolCorruption")
+                                 " create_render_state {slot=%u, gen=%u} is outside the record table bound (%u)",
+                                 desc.Cso.Slot, desc.Cso.Gen, kMGPipeMaxRenderStateCsoSlots);
+#endif
+            return;
         }
-        MGPipeRenderStateCsoRecord& record = g_applier.RenderStateCsos[desc.Cso.Slot];
+        MGPipeRenderStateCsoRecord& record = *recordAt;
 
         // NEITHER BRANCH MAY LEAVE ITS BAD CASE TO MOBILEGL_ASSERT. The slot the client is
         // naming may be a RECYCLED one whose record still holds the previous occupant's 396
@@ -1544,6 +1793,9 @@ namespace MobileGL::MG_Pipe {
         // memory the rule exists to stop it reading. One store, inert until the caps bit is
         // published, and it is what makes the two roles' third clause the same clause.
         g_applier.IsTransformFeedbackActive = values.IsTransformFeedbackActive != 0;
+#if MOBILEGL_BUILD_DISAGGREGATED
+        g_applier.BoundStreamOutputLifetimeId = values.BoundTransformFeedbackLifetimeId;
+#endif
     }
 
     void MGPipeApplySetPatchState(const MGPPatchState& patch) {
@@ -1727,6 +1979,17 @@ namespace MobileGL::MG_Pipe {
     // ================================================================================
 
     Bool MGPipeApplyResourceCreate(const MGPResourceDesc& desc) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (!MGPipeRespecifyIsWholeResource(desc)) {
+            MGP_TRIP_WIRE_REPORT("MGPipe: Fatal{ProtocolCorruption, \"ResourceCreate.RespecifyScope\"} - "
+                                 "resource_create cannot carry a per-level respecify extent");
+        }
+        if (desc.Target != static_cast<Uint8>(MGPipeResourceTarget::TexBuffer) &&
+            (desc.BufOffset != 0 || desc.BufSize != 0)) {
+            MGP_TRIP_WIRE_REPORT("MGPipe: Fatal{ProtocolCorruption, \"ResourceCreate.BufferRange\"} - "
+                                 "only a texture-buffer resource may carry BufOffset/BufSize");
+        }
+#endif
         MOBILEGL_ASSERT(desc.Resource.Slot >= kMGPipeFirstAllocatableSlot,
                         "resource_create named the reserved slot 0");
         if (desc.Resource.Slot < kMGPipeFirstAllocatableSlot) return false;
@@ -1806,7 +2069,26 @@ namespace MobileGL::MG_Pipe {
         MGPipeResourceRecord* record = ResolveResourceIn(*table, "resource_respecify", desc.Resource);
         if (record == nullptr) return false;
         PinNoLiveHostWrites(*record, desc.Resource, "resource_respecify");
-        PinWholeResourceRespecifyScope(desc, desc.Resource, "resource_respecify");
+        PinRespecifyScopeCoversItsDeclaration(desc, level, desc.Resource, "resource_respecify");
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (level != nullptr &&
+            (desc.Target == kMGPipeResourceTargetBuffer ||
+             desc.Target == static_cast<Uint8>(MGPipeResourceTarget::Renderbuffer) ||
+             desc.Target == static_cast<Uint8>(MGPipeResourceTarget::TexBuffer))) {
+            MGP_TRIP_WIRE_REPORT("MGPipe: Fatal{ProtocolCorruption, \"ResourceRespecify.Target\"} - "
+                                 "this resource target cannot name a texture mip level");
+        }
+        if (!MGPipeRespecifyIsWholeResource(desc) &&
+            !MGPipeRespecifiedExtentCarrierIsCanonical(desc)) {
+            MGP_TRIP_WIRE_REPORT("MGPipe: Fatal{ProtocolCorruption, \"ResourceRespecify.ExtentCarrier\"} - "
+                                 "a named image level's depth word must fit in 32 bits (no high BufSize bits)");
+        }
+        if (level == nullptr && desc.Target != static_cast<Uint8>(MGPipeResourceTarget::TexBuffer) &&
+            (desc.BufOffset != 0 || desc.BufSize != 0)) {
+            MGP_TRIP_WIRE_REPORT("MGPipe: Fatal{ProtocolCorruption, \"ResourceRespecify.BufferRange\"} - "
+                                 "a whole non-buffer resource may not carry BufOffset/BufSize");
+        }
+#endif
 
         // IS THIS A REDEFINITION AT ALL? Asked BEFORE the descriptor is replaced, because the
         // stored one is the only thing there is to compare against (ID-18 M4). See
@@ -1821,6 +2103,14 @@ namespace MobileGL::MG_Pipe {
         // asking a frontend object for them. A metadata update replaces it too - that is how
         // the mask arrives - and by construction only the non-storage fields differ.
         record->Desc = desc;
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (level != nullptr && desc.Target != static_cast<Uint8>(MGPipeResourceTarget::TexBuffer)) {
+            // Scope and BufOffset/BufSize are transient respecify carriers, not resource state.
+            MGPipeClearRespecifiedLevel(record->Desc);
+            record->Desc.BufOffset = 0;
+            record->Desc.BufSize = 0;
+        }
+#endif
         // THE SERIAL MOVES EITHER WAY, and for a metadata update it is the entire publication:
         // the twin re-derives its storage flags from the new mask at its next sync and decides
         // for itself whether the backend needs a recreate.
@@ -1859,14 +2149,11 @@ namespace MobileGL::MG_Pipe {
         //     glTexSubImage2D and the sync that consumes it; eating those texels there would be
         //     C1's bug with a different trigger, and just as silent.
         //
-        //   - A NAMED LEVEL IS DROPPED WHETHER OR NOT THE DESCRIPTOR MOVED (P4a final review
-        //     C-1, refining wire's W11 clause). The level pointer is the CALLER's statement that
-        //     it reallocated that level, and the descriptor cannot contradict it: a non-base
-        //     level redefined at a new size moves no descriptor field at all (the descriptor
-        //     carries the base extent and the level count), so "identical storage fields" says
-        //     nothing about that level's coordinate system, and a box kept against the old
-        //     level would be uploaded past the end of the new one. The client's mask republish
-        //     passes null, so this arm can never eat a standing upload on its behalf.
+        //   - A NAMED LEVEL IS DROPPED WHETHER OR NOT THE base descriptor moved (P4a final
+        //     review C-1). The companion scope now carries that level's exact W/H/D as well as
+        //     its (uploadTarget, level) key, so the texture twin and staged-byte store update the
+        //     same coordinate system. A metadata-only mask republish passes null and therefore
+        //     cannot consume a standing upload on its behalf.
         //
         // A buffer never has a pending upload at all, so all three arms are inert for P3a's
         // half - which is also why a buffer is never classified as metadata-only (below).
@@ -1894,9 +2181,12 @@ namespace MobileGL::MG_Pipe {
         // system. Textures only: a buffer's storage is the ops table's own Respecify hook, and
         // a renderbuffer has no levels.
         if (desc.Target != kMGPipeResourceTargetBuffer &&
-            desc.Target != static_cast<Uint8>(MGPipeResourceTarget::Renderbuffer) && !metadataOnly &&
-            g_resourceOps != nullptr && g_resourceOps->TextureRespecify != nullptr) {
-            g_resourceOps->TextureRespecify(desc.Resource, desc, level);
+            desc.Target != static_cast<Uint8>(MGPipeResourceTarget::Renderbuffer) &&
+            (level != nullptr || !metadataOnly)) {
+            if (g_resourceOps != nullptr && g_resourceOps->TextureRespecify != nullptr)
+                g_resourceOps->TextureRespecify(desc.Resource, desc, level);
+            else
+                DefineTextureWithoutBackendHook(desc, level);
         }
 #endif
 
@@ -2104,9 +2394,12 @@ namespace MobileGL::MG_Pipe {
         // P5c (tx): with ONE exception - the staged-texture store is keyed by the handle, so
         // the death must reach it or a recycled slot's stale levels would answer for the
         // successor. This does not hand the texture to the buffer family's Destroy.
-        if (static_cast<MGPipeKind>(handle.Kind) == MGPipeKind::Texture &&
-            g_resourceOps != nullptr && g_resourceOps->TextureDestroy != nullptr) {
-            g_resourceOps->TextureDestroy(handle.Handle);
+        if (static_cast<MGPipeKind>(handle.Kind) == MGPipeKind::Texture) {
+            if (g_resourceOps != nullptr && g_resourceOps->TextureDestroy != nullptr)
+                g_resourceOps->TextureDestroy(handle.Handle);
+            else if (MG_Config::Transport != MG_Config::TransportMode::Monolith)
+                MG_Remote::Server::ServerStagedTexture().Drop(
+                    MG_Remote::Server::StagedTextureStore::KeyForHandle(handle.Handle));
         }
 #endif
         if (static_cast<MGPipeKind>(handle.Kind) != MGPipeKind::Buffer) return;
@@ -2830,42 +3123,134 @@ namespace MobileGL::MG_Pipe {
     }
 
     // ---------------------------------------------------------------------------------
-    // P5e's two entry points, DECLARED AND REFUSED HERE (MG_Remote/CONTRACT-P5E.md §1)
+    // P5e's two entry points, DECLARED BY c0e (MG_Remote/CONTRACT-P5E.md §1)
     // ---------------------------------------------------------------------------------
     //
-    // Package sb writes the first body and package pg the second. Until then a record that
-    // reached either one would be a binding set the server accepted and dropped, so the answer
-    // is a named abort rather than a quiet return: the picture would be wrong and the lane
-    // would be green, which is the one failure mode this campaign spends its refusals on.
+    // set_shader_buffers HAS ITS BODY (package sb); set_program_bindings still refuses by name
+    // until package pg writes its own. A record that reached an unbodied one would be a binding
+    // set the server accepted and dropped, so the answer there is a named abort rather than a
+    // quiet return: the picture would be wrong and the lane would be green, which is the one
+    // failure mode this campaign spends its refusals on.
+
+    // set_shader_buffers, ONE RECORD PER CLASS (CONTRACT-P5E.md §5.6, rulings 10/11). The whole
+    // body is "validate the window, copy the tail into that class's array, take the mask, move
+    // the serial" - the binding points are WORKING STATE and the objects they name are resolved
+    // by the backend at its own sync point, from the handle each range carries.
     //
-    // Neither is reachable today - no route row installs the table slot and the wire decoder's
-    // arms for both opcodes validate and decline (PipeCatalogueTest pins both slots null) - so
-    // this is a link-time seam, not a runtime one.
+    // IT DOES NOT GO THROUGH ApplyUnitWindow, and the reason is worth a line rather than a
+    // diff: that helper's refusal message names "the merged texture-unit space" and the three
+    // unit sets share one capacity, while this row has THREE windows keyed by Class and two
+    // refusals of its own that the contract names by string ("SetShaderBuffers.Class" /
+    // ".Count"). A shared helper that had to grow a class parameter and a message parameter
+    // would be the same code with more ways to pass the wrong one.
+    //
+    // AND THERE IS NO NoP4aConsumer BELT HERE, deliberately. P4a's belt exists because a client
+    // clears a per-level dirty flag on ACCEPTANCE, so accepting on a backend that consumes
+    // nothing loses uploads (ID-39). This family's liveness gate is the client's own
+    // P5eFamilyIsLive (PipeFill.cpp), which asks R-8 for bit 13 in particular - a server that
+    // does not publish bit 13 never receives one of these records at all - and storing a window
+    // no backend reads costs nothing and loses nothing, because the emitter's only latch is the
+    // set-hash suppressor and the record it latched did cross.
     void MGPipeApplySetShaderBuffers(const MGPShaderBuffers& hdr, const MGPBufferRange* tail) {
-        (void)tail;
-        MGLOG_F("MGPipe: Fatal{UnmigratedVerb, \"set_shader_buffers\"} - the applier entry point "
-                "is declared by P5e package c0e and bodied by package sb; a record for class %u "
-                "with %u range(s) reached it, which means a route was installed ahead of its "
-                "consumer",
-                hdr.Class, hdr.Count);
-        std::abort();
+        if (hdr.Class >= kMGPipeShaderBufferClassCount) {
+            MGP_TRIP_WIRE_REPORT("MGPipe: " MGP_TRIP_WIRE_TAG("ProtocolCorruption")
+                                 " SetShaderBuffers.Class - class %u names no binding-point "
+                                 "array; the three are Uniform=0, ShaderStorage=1, "
+                                 "AtomicCounter=2",
+                                 hdr.Class);
+            return;
+        }
+        const Uint64 end = Uint64{hdr.Start} + Uint64{hdr.Count};
+        if (end > kMGPipeMaxBufferBindingPoints || (hdr.Count != 0 && tail == nullptr)) {
+            MGP_TRIP_WIRE_REPORT("MGPipe: " MGP_TRIP_WIRE_TAG("ProtocolCorruption")
+                                 " SetShaderBuffers.Count {class=%u, start=%u, count=%u}: the "
+                                 "window runs past the %u binding points the wire carries, or a "
+                                 "non-empty set carries no ranges",
+                                 hdr.Class, hdr.Start, hdr.Count,
+                                 static_cast<unsigned>(kMGPipeMaxBufferBindingPoints));
+            return;
+        }
+        // THE WINDOW IS THE BOUND AND ENTRIES OUTSIDE IT ARE NOT CLEARED, exactly as the three
+        // unit sets and set_vertex_buffers work: the record is "the last set as received", and
+        // a binding at or above Count means "nothing bound" to every reader (the frontend
+        // array's default says the same thing, which is what makes the two pictures agree).
+        auto& destination = g_applier.BoundShaderBuffers[hdr.Class];
+        for (Uint32 i = 0; i < hdr.Count; ++i) destination[hdr.Start + i] = tail[i];
+        g_applier.ShaderBufferStart[hdr.Class] = hdr.Start;
+        g_applier.ShaderBufferCount[hdr.Class] = hdr.Count;
+        for (Uint32 w = 0; w < kMGPipeShaderBufferWritableMaskWords; ++w) {
+            g_applier.ShaderBufferWritableMask[hdr.Class][w] = hdr.WritableMask[w];
+        }
+        // ONE SERIAL FOR ALL THREE CLASSES, and it moves on EVERY applied record - a backend
+        // memo that asks "have the binding points moved since I last bound them" must hear
+        // about a uniform set exactly as it hears about a storage set, and splitting the serial
+        // per class would make each of the four consumers pick which one to read.
+        ++g_applier.ShaderBuffersSerial;
     }
 
+    // P5e (pg) WRITES THE SECOND BODY. The three post-link mutable reflection fields -
+    // glUniformBlockBinding's block-to-point map, glUniform1i's sampler unit per uniform
+    // LOCATION, and glShaderStorageBlockBinding's name-keyed override set - all live INSIDE
+    // the frontend's LinkArtifacts and all move after the link that produced it. An archive
+    // snapshot alone therefore answers the wrong question: a twin built from it would bind the
+    // uniform blocks the program was LINKED with rather than the ones it is BOUND with.
     void MGPipeApplySetProgramBindings(const MGPProgramBindings& hdr, const Int32* blockBindings,
                                        const MGPProgramSamplerUnit* samplerUnits,
                                        const MGPProgramStorageOverride* storageOverrides,
                                        const char* const* storageOverrideNames) {
-        (void)blockBindings;
-        (void)samplerUnits;
-        (void)storageOverrides;
-        (void)storageOverrideNames;
-        MGLOG_F("MGPipe: Fatal{UnmigratedVerb, \"set_program_bindings\"} - the applier entry point "
-                "is declared by P5e package c0e and bodied by package pg; a record for shader CSO "
-                "{%u, %u} with %u/%u/%u tail entries reached it, which means a route was installed "
-                "ahead of its consumer",
-                hdr.Cso.Slot, hdr.Cso.Gen, hdr.BlockBindingCount, hdr.SamplerUnitCount,
-                hdr.StorageOverrideCount);
-        std::abort();
+        // THE BOUNDS ARE THE DECODER'S AND ARE RE-ASSERTED HERE, because the monolith adapter
+        // reaches this entry point without passing the decoder at all: under monolith the only
+        // validation a record ever gets is the one the applier does itself, which is the rule
+        // every sibling in this file already keeps.
+        const char* fault = nullptr;
+        if (hdr.BlockBindingCount > kMGPipeMaxProgramBlockBindings) fault = "BlockBindingCount";
+        else if (hdr.SamplerUnitCount > kMGPipeMaxProgramSamplerUnits) fault = "SamplerUnitCount";
+        else if (hdr.StorageOverrideCount > kMGPipeMaxProgramStorageOverrides) fault = "StorageOverrideCount";
+        else if (hdr.BlockBindingCount != 0 && blockBindings == nullptr) fault = "BlockBindings";
+        else if (hdr.SamplerUnitCount != 0 && samplerUnits == nullptr) fault = "SamplerUnits";
+        else if (hdr.StorageOverrideCount != 0 &&
+                 (storageOverrides == nullptr || storageOverrideNames == nullptr)) {
+            fault = "StorageOverrides";
+        }
+        if (fault != nullptr) {
+            MGP_TRIP_WIRE_REPORT("MGPipe: " MGP_TRIP_WIRE_TAG("ProtocolCorruption")
+                                 " set_program_bindings {slot=%u, gen=%u}: %s is out of range or "
+                                 "its tail is absent (%u/%u/%u declared)",
+                                 hdr.Cso.Slot, hdr.Cso.Gen, fault, hdr.BlockBindingCount,
+                                 hdr.SamplerUnitCount, hdr.StorageOverrideCount);
+            return;
+        }
+        // P4a's belt, for MGPipeApplyBindShaderState's reason: with no consumer this applier
+        // holds no shader CSO record at all, so the resolution below would report the designed
+        // state as RefusedObjectCalls.
+        if (NoP4aConsumer()) return;
+
+        MGPipeShaderCsoRecord* record = ResolveShaderCso("set_program_bindings", hdr.Cso);
+        if (record == nullptr) return;
+
+        // WHOLE-SET REPLACEMENT, NOT A MERGE, in all three tails. Each one describes the
+        // program's complete state for its index space as the client observed it at emit; a
+        // merge would leave a block binding the application has since reset to its declared
+        // default sitting on top of the archive's value for ever, and there is no per-entry
+        // "cleared" token on the wire that could say otherwise.
+        record->BlockBindings.assign(blockBindings, blockBindings + hdr.BlockBindingCount);
+        record->SamplerUnits.assign(samplerUnits, samplerUnits + hdr.SamplerUnitCount);
+        record->StorageOverrides.clear();
+        record->StorageOverrides.reserve(hdr.StorageOverrideCount);
+        for (Uint32 i = 0; i < hdr.StorageOverrideCount; ++i) {
+            MGPipeProgramStorageOverride entry;
+            // COPIED, NOT POINTED AT (rule C). The name rides SEG_STAGE and the staged run
+            // retires with the record that named it; the rebuild that reads this may be a
+            // frame later, and by then those bytes are somebody else's.
+            entry.Name = storageOverrideNames[i] != nullptr ? String(storageOverrideNames[i]) : String();
+            entry.Binding = storageOverrides[i].Binding;
+            record->StorageOverrides.push_back(Move(entry));
+        }
+        record->Signature = hdr.Signature;
+        // ADVANCED, NEVER RETURNED TO A VALUE IT HAS HANDED OUT - VertexBuffersSerial's rule.
+        // Both texture-unit memos and the program twin's clean condition key on it (ruling 6),
+        // so a serial that went backwards would make a memo match state it has never seen.
+        ++record->BindingsSerial;
     }
 
     // ---------------------------------------------------------------------------------
@@ -2889,6 +3274,27 @@ namespace MobileGL::MG_Pipe {
         if (op == MGPWireOp::DrawVbo && payload != nullptr) {
             const auto& draw = *static_cast<const MGPDrawInfo*>(payload);
             if ((draw.Flags & static_cast<Uint8>(kDrawClientArrays)) != 0) return true;
+            // ---- ESCALATION (iii) WAS HERE AND IS WITHDRAWN (P5e ra2, ID-133 then ID-136) ---
+            //
+            // ID-133 escalated a PLAIN multi-draw (`NumDraws > 1 && !kDrawIsIndirect`) so that
+            // MultiDrawImpl::RunIndirect's read of the client's GL_DRAW_INDIRECT_BUFFER binding
+            // became a legal barriered pull instead of an unbarriered Fatal. It worked, and it
+            // cost a rendezvous on EVERY plain glMultiDraw* on the DEFAULT tier: there is one
+            // draw opcode - all twenty entry points collapse onto draw_vbo - and the tier is
+            // chosen on the server per batch (MultiDraw.cpp's ResolveTierForBatch), so no
+            // predicate both roles can compute names the arm that actually needed it.
+            //
+            // THE CHECK ON AN ESCALATION IS "WHICH ARM PAYS FOR IT", NOT "WHICH LANE GOES
+            // GREEN", and that is the rule this pair of rulings exists to record. The read was
+            // a save/restore of a GL binding NAME around the tier's own scratch buffer, not a
+            // data dependency, so the answer was to ask the side that did the binding:
+            // BoundDrawIndirectBufferId now takes the handle arm its neighbour
+            // ResolveBoundIndexBuffer already had, and the pull is GONE rather than legalised.
+            //
+            // Both halves landed in ONE commit on purpose: the pull retired without this clause
+            // withdrawn is a cost with no reason, and this clause withdrawn without the pull
+            // retired puts 18 lane entries back on the unbarriered arm. Neither is a state to
+            // gate or to measure, so neither was ever a head.
         }
         return false;
     }
@@ -2905,12 +3311,25 @@ namespace MobileGL::MG_Pipe {
     // MGPipeBarriered in the sink's ApplyOne.
     namespace {
         thread_local Bool g_currentRecordBarriered = true;
+        // P5e (gl), ID-128. FALSE IS THE DEFAULT AND IT IS THE STRICT ANSWER: "this record was
+        // barriered by escalation" admits a pull that neither the wait class nor the retiring
+        // phase admits, so a reader that runs before any writer must say no. The stamp above
+        // defaults the other way because ITS safe answer is "the client is parked".
+        thread_local Bool g_currentRecordBarrieredByEscalation = false;
     } // namespace
 
     Bool MGPipeApplierCurrentRecordIsBarriered() { return g_currentRecordBarriered; }
 
     void MGPipeApplierSetCurrentRecordBarriered(Bool barriered) {
         g_currentRecordBarriered = barriered;
+    }
+
+    Bool MGPipeApplierCurrentRecordIsBarrieredByEscalation() {
+        return g_currentRecordBarrieredByEscalation;
+    }
+
+    void MGPipeApplierSetCurrentRecordBarrieredByEscalation(Bool escalated) {
+        g_currentRecordBarrieredByEscalation = escalated;
     }
 
     // ================================================================================
@@ -2932,7 +3351,8 @@ namespace MobileGL::MG_Pipe {
 
     void MGPipeApplyCreateShaderState(const MGPProgramDesc& desc,
                                       const MG_State::GLState::LinkArtifacts* link,
-                                      const MG_State::GLState::SpirvArtifacts* spirv) {
+                                      const MG_State::GLState::SpirvArtifacts* spirv,
+                                      SharedPtr<const MG_State::GLState::ProgramArchive> archive) {
         MOBILEGL_ASSERT(desc.Cso.Slot >= kMGPipeFirstAllocatableSlot,
                         "create_shader_state named the reserved slot 0");
         if (desc.Cso.Slot < kMGPipeFirstAllocatableSlot) return;
@@ -3005,6 +3425,31 @@ namespace MobileGL::MG_Pipe {
         // deserialised archive is attached to. Either way the applier owns identity, extent and
         // order, and never content.
         record.Desc = desc;
+        // P5e (pg), gap G-A: "under split the descriptor is what the deserialised archive is
+        // attached to" is now literally true, and this is the attachment. ADOPTED
+        // UNCONDITIONALLY, INCLUDING A NULL: a monolith create must CLEAR an archive a
+        // previous split-arm create left behind, because the record outlives a transport
+        // change (MGPipeApplierReset keeps the CSO table - a program lives in a share group)
+        // and a stale archive is worse than none.
+        //
+        // AFTER Desc, so a reader that sees the new descriptor sees the artefacts it describes;
+        // the apply thread is the only writer and the only reader, so ordering here is about
+        // reading this function rather than about memory visibility.
+        record.Archive = Move(archive);
+        // THE RE-ISSUE CLEARS THE THREE BINDING TAILS for the reason it clears GlobalConstants
+        // one branch up: they are indices INTO the archive that has just been replaced, so a
+        // surviving tail would name block indices and uniform locations of a program that no
+        // longer exists. Unconditional rather than inside the else-branch above, because a
+        // recycled slot must not inherit its predecessor's bindings either - and a fresh record
+        // has empty tails, so the clear costs a live program nothing. The client re-emits
+        // set_program_bindings immediately after this create (ProgramEmit.h), which is the
+        // ordering the applier relies on: emitting them BEFORE would put them where this line
+        // wipes them.
+        record.BlockBindings.clear();
+        record.SamplerUnits.clear();
+        record.StorageOverrides.clear();
+        record.Signature = 0;
+        ++record.BindingsSerial;
     }
 
     void MGPipeApplyBindShaderState(const MGPHandleOnly& handle) {

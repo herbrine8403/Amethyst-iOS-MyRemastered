@@ -10,38 +10,68 @@
 // reply read that sits inside it are package c1's (EmitAndWait below is still c0's stub).
 
 #include "ClientSession.h"
+#include <MG_Remote/FatalFunnel.h>
+#include <MG_Remote/Handshake.h>
+#include <MG_Remote/Transport/LinkMetrics.h>
 
 #include "../CapsCodec.h"
 #include "../Protocol/generated/protocol_generated.h"
 #include "../Server/ServerLoop.h"
 #include "../Server/ServerSession.h"
+#include "../Protocol/SurfaceOpCodec.h"
+#include "../Transport/FdPassing.h"
 #include "../Transport/InProcessTransport.h"
 #include "WireTables.h"
 
 #include <MGGitHash.h>
+#include <MG_Backend/MGPipe/PipeInputs.h>
 #include <MG_Impl/GLImpl/Framebuffer/GL_Framebuffer.h>
 #include <MG_Impl/Pipe/ResourceTracker.h>
 #include <MG_Pipe/MGPipeCallbacks.h>
+#include <MG_State/EGLState/Core.h>
 #include <MG_State/GLState/Core.h>
 #include <MG_State/GLState/ErrorState/ErrorInfo.h>
 #include <MG_State/GLState/TextureState/TextureObject2D.h>
 #include <MG_Util/Debug/Log.h>
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <thread>
 #include <utility>
 #include <vector>
 
+// CONTRACT-P6 4.3: the handshake now carries real process ids.
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
 namespace MobileGL::MG_Remote::Client {
 
+    namespace {
+        // CONTRACT-P6 4.3. Hello::pid was hard-coded 0 and Welcome::serverPid ECHOED it, so both
+        // were always 0 and neither named anything. Under spawn the pair is the cheapest arm
+        // proof there is: two different values mean two processes, and a same-process session
+        // cannot produce them.
+        std::uint32_t SelfProcessId() {
+#if defined(_WIN32)
+            return static_cast<std::uint32_t>(::_getpid());
+#else
+            return static_cast<std::uint32_t>(::getpid());
+#endif
+        }
+    } // namespace
+
 #define MGP5_C0_STUB(what)                                                                                             \
-    do {                                                                                                               \
-        MGLOG_F("MGPipe: Fatal{UnimplementedClientSession, \"%s\"} - P5 packages s1/c1 have not "                      \
+    SessionFail(MGFatalFamily::UnimplementedClientSession,                                                             \
+                "MGPipe: Fatal{UnimplementedClientSession, \"%s\"} - P5 packages s1/c1 have not "                      \
                 "landed this yet; c0 shipped the signature only",                                                      \
-                what);                                                                                                 \
-        std::abort();                                                                                                  \
-    } while (0)
+                what)
 
     namespace {
 
@@ -50,10 +80,75 @@ namespace MobileGL::MG_Remote::Client {
         // The same bounded handshake deadline the server uses. Bounded, not kWaitForever: a
         // bring-up that never answers has to be a red lane rather than a wedged CI job.
         constexpr Uint32 kHandshakeTimeoutMs = 5000;
+        // cp (CONTRACT-P6 D5b): bounded, and its expiry is NOT fatal. A peer that
+        // is gone is a different fact from a peer that is slow, and only the
+        // doorbell death latch may say which. The surface-control reply wait itself reads
+        // MOBILEGL_IPC_CONTROL_TIMEOUT_MS / MOBILEGL_IPC_COLD_START_MS (ControlReplyBudgetMs
+        // below); this constant bounds the log-flush round trip, which is not a control op.
+        constexpr Uint32 kRemoteControlTimeoutMs = 5000;
+        // The server has to create a backend before it binds, and a cold
+        // software rasteriser is not fast. Bounded, and a NAMED refusal at the end.
+        constexpr Uint32 kSpawnConnectTimeoutMs = 20000;
         // Teardown's drain. Also bounded, and for the same reason - table 3's order is
         // "publish and wait for the server to drain and acknowledge", and a wait with no
         // deadline there turns a lost record into a hung process exit.
         constexpr Uint32 kDrainTimeoutMs = 5000;
+
+        // ---- F1 (P7 wave 2): WHO IS FETCHING THE FIRST SNAPSHOT --------------------------
+        //
+        // CapsMirror::RequireFirstSnapshot needs one fact this file owns and no other does:
+        // is a bring-up in flight, and is it on THIS thread. The counter answers the first;
+        // the thread-local answers the second, and it is the one that matters, because the
+        // defect F1 closes had the emitter and the handshake on the same thread in sequence -
+        // a wait there would burn its whole budget and change nothing.
+        //
+        // Not guarded by a mutex: the counter is only ever compared against zero and the
+        // thread-local is private to its thread by construction.
+        ::std::atomic<int> g_bringUpsInFlight{0};
+        thread_local Bool tl_bringingUpHere = false;
+
+        // ---- P7 CI: THE COLD-START BUDGET OF A SURFACE-CONTROL REPLY -----------------------
+        //
+        // A spawned (or tcp) server brings its NATIVE backend up lazily, INSIDE the first
+        // surface creation (Espryt: eglInitialize under CreatePbufferSurface/CreateWindowSurface)
+        // or the first MakeCurrent (Magma: the Vulkan instance and device) - ServerLoop.cpp's
+        // ApplySurfaceControlFrame. On a workstation that is ~100 ms; on a loaded CI runner it
+        // took longer than the 5 s steady-state bound, and the retrace-split spawn legs died on
+        // "no SurfaceReply for CreatePbufferSurface seq 2" / "for MakeCurrent seq 3" with the
+        // server still alive and about to answer (11 of 77 legs in run 35671704873, 17 of 77 in
+        // 35706183230, a different set each run). The server was never wedged; the client simply
+        // asked a cold software rasteriser for a warm one's latency.
+        //
+        // So until the session's first MakeCurrent is answered ok, those three ops wait the
+        // cold-start budget; every other op, and all three once the backend is warm, keep the
+        // steady bound. The budget is never shorter than the steady bound, and its expiry is
+        // the same non-fatal, NAMED answer (D5b) - a longer wait, not a different contract.
+        Bool MayBringTheBackendUp(Server::SurfaceControlOp kind) {
+            return kind == Server::SurfaceControlOp::CreatePbufferSurface ||
+                   kind == Server::SurfaceControlOp::CreateWindowSurface ||
+                   kind == Server::SurfaceControlOp::MakeCurrent;
+        }
+
+        Uint32 ControlReplyBudgetMs(Server::SurfaceControlOp kind, Bool backendWarm, Bool* coldStart) {
+            const Uint32 steady = MG_Config::Ipc.ControlTimeoutMs;
+            *coldStart = !backendWarm && MayBringTheBackendUp(kind);
+            return *coldStart ? std::max(steady, MG_Config::Ipc.ColdStartMs) : steady;
+        }
+
+        struct BringUpScope {
+            BringUpScope() {
+                g_bringUpsInFlight.fetch_add(1, ::std::memory_order_acq_rel);
+                m_outer = tl_bringingUpHere;
+                tl_bringingUpHere = true;
+            }
+            ~BringUpScope() {
+                tl_bringingUpHere = m_outer;
+                g_bringUpsInFlight.fetch_sub(1, ::std::memory_order_acq_rel);
+            }
+            BringUpScope(const BringUpScope&) = delete;
+            BringUpScope& operator=(const BringUpScope&) = delete;
+            Bool m_outer = false;
+        };
 
         MobileGLResult ReceiveEnvelope(Transport::ITransport& transport, std::vector<Uint8>& out,
                                        Uint32 timeoutMs) {
@@ -77,17 +172,6 @@ namespace MobileGL::MG_Remote::Client {
                 return nullptr;
             }
             return ::MobileGL::Wire::GetCtrlEnvelope(bytes.data());
-        }
-
-        [[noreturn]] void FatalAbiMismatch(const char* what, Uint64 ours, Uint64 theirs,
-                                           const char* theirStamp) {
-            MGLOG_F("MGPipe: Fatal{AbiMismatch, \"%s\"} ours=%llu theirs=%llu ourBuild=%s "
-                    "theirBuild=%s - never a downgrade: the caps block's size is ABI-dependent "
-                    "and every field past the first difference would be read at the wrong offset",
-                    what, static_cast<unsigned long long>(ours),
-                    static_cast<unsigned long long>(theirs), GIT_COMMIT_HASH_SHORT,
-                    theirStamp == nullptr ? "?" : theirStamp);
-            std::abort();
         }
 
         // Guarded the same way ServerSession's helpers are: MG_Config::Ipc only exists
@@ -116,6 +200,10 @@ namespace MobileGL::MG_Remote::Client {
         // thread inside the applier" - see ClientSession::InBarrierWait's note.
         thread_local Bool g_inBarrierWait = false;
         std::atomic<Bool> g_applyThreadInsideApplier{false};
+        // A split client cannot observe a server's process-local diagnostic. The
+        // role-local value remains useful to the applier itself; ordering between
+        // roles is carried by the ring watermarks, not by this instrumentation.
+        thread_local Bool g_roleInsideApplier = false;
 
         struct BarrierWaitScope {
             BarrierWaitScope() { g_inBarrierWait = true; }
@@ -124,11 +212,20 @@ namespace MobileGL::MG_Remote::Client {
             BarrierWaitScope& operator=(const BarrierWaitScope&) = delete;
         };
 
-        // BOUNDED, AND THE BOUND IS GENEROUS RATHER THAN TIGHT. The barrier is a correctness
-        // device, not a watchdog: a slow readback on a software rasterizer is a legitimate
-        // second-scale wait, while a lost record never completes at all. 30 s separates the two
-        // without turning a loaded CI machine into a red lane, and the Fatal names the seq.
-        constexpr Uint32 kBarrierTimeoutMs = 30000;
+        // A DEADLOCK DETECTOR, NOT A PERFORMANCE GATE. The barrier exists so that a record the
+        // applier never retires is reported instead of hanging: a lost record never completes at
+        // all, while a slow apply completes late. The bound only has to sit far above the slowest
+        // legitimate apply.
+        //
+        // lavapipe/llvmpipe have legitimate apply-thread stalls that reach the tens of seconds:
+        // texture-handle registration (vkCreateImageView -> lvp_CreateImageView ->
+        // llvmpipe_register_texture) blocks the apply thread on a JIT/futex path, measured at
+        // 29.3-39.7 s in a single stall, ~44.6 s cumulatively over one inproc retrace run. A 30 s
+        // bound therefore red-lanes those runs intermittently while the same stall on a monolith
+        // run is simply slow - the monolith has no equivalent cap on this path. 120 s is >3x the
+        // largest observed stall and keeps the watchdog's job: a record that is truly lost still
+        // terminates the run, and the Fatal names the seq.
+        constexpr Uint32 kBarrierTimeoutMs = 120000;
 
         Uint64 AppliedWaitBudgetMs(MG_Pipe::MGPWireOp op, const void* payload) {
             if (op != MG_Pipe::MGPWireOp::FenceWait) return kBarrierTimeoutMs;
@@ -139,7 +236,12 @@ namespace MobileGL::MG_Remote::Client {
             return timeoutNs / 1000000 + (timeoutNs % 1000000 != 0) + kBarrierTimeoutMs;
         }
 
+        // Defined below; declared here because the applied wait has to be able to drain
+        // SEG_EVENT while it is parked (P5e §2.6).
+        Uint32 DrainEventRing(Transport::EventRingConsumer& events);
+
         Transport::SessionWait WaitForAppliedBudget(Transport::SessionProducer& producer,
+                                                    Transport::EventRingConsumer& events,
                                                     Uint64 seq, Uint64 remainingMs) {
             // The transport takes Uint32 milliseconds with UINT32_MAX meaning forever.
             // Keep even the largest GL timeout finite, using bounded chunks and preserving
@@ -148,7 +250,23 @@ namespace MobileGL::MG_Remote::Client {
             for (;;) {
                 const Uint32 chunkMs = remainingMs > kMaxFiniteWaitMs
                                            ? kMaxFiniteWaitMs : static_cast<Uint32>(remainingMs);
-                const auto wait = producer.WaitForApplied(seq, chunkMs);
+                // P5e (ra, CONTRACT-P5E §2.6): THE PARK BREAKS ON TWO THINGS. A server that
+                // ran out of SEG_EVENT stops producing and therefore stops applying, so a
+                // waiter that could only be woken by appliedSeq would wait for a watermark
+                // nothing is going to move - and it is holding the only drain there is. The
+                // second exit is that case: drain, clear the latch, ring the server, park
+                // again. `remainingMs` is deliberately NOT charged for it; a wake that did
+                // the queue's work is not the caller's budget being spent.
+                const auto wait = producer.WaitForAppliedOrEventBacklog(seq, chunkMs);
+                if (wait == Transport::SessionWait::Reached) {
+                    const auto* progress = producer.Progress();
+                    if (progress == nullptr ||
+                        Transport::Watermark::Reached(progress->appliedSeq, seq)) {
+                        return wait;
+                    }
+                    DrainEventRing(events);
+                    continue;
+                }
                 if (wait != Transport::SessionWait::TimedOut || remainingMs <= chunkMs) return wait;
                 remainingMs -= chunkMs;
             }
@@ -230,6 +348,29 @@ namespace MobileGL::MG_Remote::Client {
             }
         }
 
+        // P12 (on-screen server window), D1: the session's server-owned window surfaces - the
+        // client's EGL handles for them. Written by the surface RPCs (NoteServerOwnedWindowSurface /
+        // ForgetServerOwnedWindowSurface) and read by the drain; a mutex because an app may create
+        // and release surfaces from more than one thread. REVIEW FIX: a SET, not one slot - with one
+        // slot a second surface took the geometry updates from the first, and releasing the second
+        // left the first with none. Every one of them is on the server's one window, so an extent
+        // applies to all of them.
+        std::mutex g_serverOwnedSurfacesMutex;
+        std::vector<EGLSurface> g_serverOwnedSurfaces;
+
+        // An event's extent is the SERVER's surface size. For the server-owned window that is the
+        // size the client renders at, so the EGL state's record of the surface follows it:
+        // eglQuerySurface(EGL_WIDTH/EGL_HEIGHT) is what a headless client sizes its viewport from.
+        // A format-only event (Width/Height 0) says nothing about the size and changes nothing.
+        void ApplyServerOwnedSurfaceExtent(Uint32 width, Uint32 height) {
+            if (width == 0 || height == 0 || !MG_State::pEGLContext) return;
+            const std::lock_guard<std::mutex> lock(g_serverOwnedSurfacesMutex);
+            for (const EGLSurface surface : g_serverOwnedSurfaces) {
+                (void)MG_State::pEGLContext->SetSurfaceExtent(surface, static_cast<EGLint>(width),
+                                                              static_cast<EGLint>(height));
+            }
+        }
+
         Uint32 DrainEventRing(Transport::EventRingConsumer& events) {
             if (!events.Valid()) return 0;
             Uint32 delivered = 0;
@@ -237,9 +378,8 @@ namespace MobileGL::MG_Remote::Client {
             Bool corrupt = false;
             while (events.Pop(view, &corrupt)) {
                 if (corrupt) {
-                    MGLOG_F("MGPipe: Fatal{ProtocolCorruption, \"event-ring\"} - the reverse "
+                    SessionFail(MGFatalFamily::ProtocolCorruption, "MGPipe: Fatal{ProtocolCorruption, \"event-ring\"} - the reverse "
                             "channel's record stream is corrupt");
-                    std::abort();
                 }
                 switch (view.kind) {
                 case Transport::kEventBufferWriteback: {
@@ -248,11 +388,10 @@ namespace MobileGL::MG_Remote::Client {
                         static_cast<const Transport::EventBufferWritebackHead*>(view.payload);
                     const void* bytes = static_cast<const Uint8*>(view.payload) + sizeof(*head);
                     if (view.payloadSize - sizeof(*head) < head->Size) {
-                        MGLOG_F("MGPipe: Fatal{ProtocolCorruption, \"buffer-writeback\"} - the "
+                        SessionFail(MGFatalFamily::ProtocolCorruption, "MGPipe: Fatal{ProtocolCorruption, \"buffer-writeback\"} - the "
                                 "head declares %llu inline bytes and the record carries %llu",
                                 static_cast<unsigned long long>(head->Size),
                                 static_cast<unsigned long long>(view.payloadSize - sizeof(*head)));
-                        std::abort();
                     }
                     // The blobref names SEG_EVENT and the IN-SEGMENT offset of those inline
                     // bytes - never a host address (R-2's rule B), which is the whole reason
@@ -274,11 +413,10 @@ namespace MobileGL::MG_Remote::Client {
                         static_cast<const Transport::EventGpuWrittenHead*>(view.payload);
                     const Uint64 tail = view.payloadSize - sizeof(*head);
                     if (tail / sizeof(Transport::EventRange) < head->RangeCount) {
-                        MGLOG_F("MGPipe: Fatal{ProtocolCorruption, \"gpu-written\"} - RangeCount "
+                        SessionFail(MGFatalFamily::ProtocolCorruption, "MGPipe: Fatal{ProtocolCorruption, \"gpu-written\"} - RangeCount "
                                 "%u does not fit the record's %llu tail bytes",
                                 static_cast<unsigned>(head->RangeCount),
                                 static_cast<unsigned long long>(tail));
-                        std::abort();
                     }
                     // EventRange and MGPRange are the same two Uint64s (EventRing.h:61-66
                     // asserts it), so the tail is handed over as-is rather than copied into
@@ -303,6 +441,9 @@ namespace MobileGL::MG_Remote::Client {
                     info.Layers = head->Layers;
                     info.IsDefault = head->IsDefault;
                     ApplySurfaceChangedToClient(info);
+                    // P12 (D1): and the server-owned window's EGL-state size, beside the
+                    // default framebuffer's reallocation above.
+                    ApplyServerOwnedSurfaceExtent(info.Width, info.Height);
                     ++delivered;
                     break;
                 }
@@ -319,12 +460,11 @@ namespace MobileGL::MG_Remote::Client {
                     // least one byte and that byte terminates the string.
                     if (head->MessageBytes == 0 || tail < head->MessageBytes ||
                         message[head->MessageBytes - 1] != '\0') {
-                        MGLOG_F("MGPipe: Fatal{ProtocolCorruption, \"kEventGlError\"} - "
+                        SessionFail(MGFatalFamily::ProtocolCorruption, "MGPipe: Fatal{ProtocolCorruption, \"kEventGlError\"} - "
                                 "MessageBytes %u against a %llu-byte tail, or the terminating "
                                 "NUL is missing",
                                 static_cast<unsigned>(head->MessageBytes),
                                 static_cast<unsigned long long>(tail));
-                        std::abort();
                     }
                     // The error queue is CLIENT state, written here on the GL thread. The
                     // observation point is the next drain after the post - P9 owns the
@@ -422,10 +562,71 @@ namespace MobileGL::MG_Remote::Client {
     // monolith answer. Every call that PRESUMES a session aborts instead.
     ClientSession* ClientSession::Active() { return g_active; }
 
+    Bool ClientSession::DeviceLost() {
+        const ClientSession* session = Active();
+        return session != nullptr && session->m_deviceLost.load(std::memory_order_acquire);
+    }
+
+    void ClientSession::LatchDeviceLost(const char* why) {
+        // exchange, so the log line is written EXACTLY once however many waits notice the same
+        // hangup at the same moment - and there will be several: the barrier, the control wait
+        // and the event pump can all be in flight when the server goes.
+        if (m_deviceLost.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        MGLOG_E("MGPipe: DEVICE LOST - %s. The server process is gone; every verb from here is "
+                "DECLINED and glGetGraphicsResetStatus reports GL_UNKNOWN_CONTEXT_RESET. This is "
+                "latched from the peer's HANGUP and not from any deadline (CONTRACT-P6 5.4): a "
+                "server one frame behind is P5e's intended steady state and must never read as a "
+                "dead one. There is no recovery - MOBILEGL_IPC_RESPAWN is the stage that would "
+                "add one and it is refused by name until then.",
+                why == nullptr ? "the peer hung up" : why);
+    }
+
     ClientSession& ClientSessionInstance() {
         // Leak at exit, deliberately and per ID-8, exactly as ServerSessionInstance does.
         static ClientSession* instance = new ClientSession{};
         return *instance;
+    }
+
+    namespace {
+        // F1 (P7 wave 2). The wait CapsMirror::RequireFirstSnapshot calls. Its whole job is to
+        // distinguish "the snapshot is on its way and somebody else is fetching it" from "no
+        // snapshot can arrive while you block", and to answer the second immediately.
+        //
+        // IT DOES NOT PUMP. Pumping a half-built session from a thread that does not own it is
+        // how two readers end up splitting one control frame; the thread that IS bringing the
+        // session up already pumps, in FinishStartup step 7, and this one only has to see the
+        // generation it publishes.
+        Bool AwaitFirstCapsSnapshot(Uint32 timeoutMs) {
+            if (PublishedCapsGeneration() != 0) return true;
+            // The two immediate falses. Nothing is fetching, or the fetcher is the caller -
+            // which is the exact shape MobileGL::Initialize produced before F1 moved the
+            // split bring-up above MG_State::Init().
+            if (tl_bringingUpHere) return false;
+            if (g_bringUpsInFlight.load(::std::memory_order_acquire) == 0) return false;
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (PublishedCapsGeneration() != 0) return true;
+                if (g_bringUpsInFlight.load(::std::memory_order_acquire) == 0) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            return PublishedCapsGeneration() != 0;
+        }
+    } // namespace
+
+    Bool BringUpInFlight() {
+        return g_bringUpsInFlight.load(::std::memory_order_acquire) != 0;
+    }
+
+    ClientSession::ClientSession() {
+        m_link = Transport::CreateSharedLink(Transport::TransportRoleTag::ClientProducer);
+        m_cmd = &m_link->CommandsOut(); m_events = &m_link->EventsIn();
+        // F1: installed from the constructor rather than from Start, because the question it
+        // answers is asked by frontend object births that may precede any Start at all - and
+        // the honest answer to those is the Fatal, not a silent false.
+        SetCapsFirstSnapshotWait(&AwaitFirstCapsSnapshot);
     }
 
     ClientSession::~ClientSession() {
@@ -437,6 +638,12 @@ namespace MobileGL::MG_Remote::Client {
     Bool ClientSession::Started() const { return m_started; }
 
     MobileGLResult ClientSession::Start(MG_Config::TransportMode mode, const String& endpoint) {
+        // F1: the bring-up window opens HERE and not at FinishStartup, because under inproc the
+        // server's first CapsSnapshot is produced inside ServerSession::Accept - step 3 below -
+        // and a window that started after it would not contain the one moment a reader on
+        // another thread has to be able to wait through. Re-entrant: StartOverTransportPair
+        // opens a nested scope and BringUpScope nests.
+        const BringUpScope bringUp;
         if (m_started) {
             return MOBILEGL_ERR_INVALID_ARGUMENT;
         }
@@ -463,6 +670,7 @@ namespace MobileGL::MG_Remote::Client {
     MobileGLResult ClientSession::StartOverTransportPair(
         std::unique_ptr<Transport::InProcessTransport> clientEnd,
         std::unique_ptr<Transport::InProcessTransport> serverEnd) {
+        const BringUpScope bringUp; // F1, and see Start() for why it opens this early.
         if (m_started) {
             return MOBILEGL_ERR_INVALID_ARGUMENT;
         }
@@ -477,13 +685,19 @@ namespace MobileGL::MG_Remote::Client {
 
         // ---- 2. Hello. Sent before the server accepts: InProcessTransport queues whole
         // messages, so one thread can drive both halves of the handshake in order.
-        const Uint64 fingerprint = CapsAbiFingerprint();
+        const auto dial = ::MobileGL::Wire::DialMode::No;
+        const auto dataPlane = ::MobileGL::Wire::DataPlane::SharedSegments;
+        const Uint64 fingerprint = WireFingerprint();
         {
             ::flatbuffers::FlatBufferBuilder builder(512);
-            auto stamp = builder.CreateString(GIT_COMMIT_HASH_SHORT);
+            auto stamp = builder.CreateString(BuildFingerprint());
+            auto terms = ::MobileGL::Wire::CreateLinkTerms(builder, dataPlane);
+            const char* tokenText = std::getenv("MOBILEGL_IPC_TOKEN");
+            auto token = builder.CreateString(tokenText == nullptr ? "" : tokenText);
             auto hello = ::MobileGL::Wire::CreateHello(
                 builder, MOBILEGL_PROTOCOL_ABI_MAJOR, MOBILEGL_PROTOCOL_ABI_MINOR, stamp,
-                /*backendType=*/0u, /*pid=*/0u, /*configBlob=*/0, fingerprint);
+                static_cast<Uint32>(MG_Config::ActiveBackendType), SelfProcessId(), 0,
+                fingerprint, fingerprint, terms, token, dial);
             auto root = ::MobileGL::Wire::CreateCtrlEnvelope(
                 builder, ::MobileGL::Wire::CtrlMsg::Hello, hello.Union());
             ::MobileGL::Wire::FinishCtrlEnvelopeBuffer(builder, root);
@@ -514,6 +728,10 @@ namespace MobileGL::MG_Remote::Client {
                 return received;
             }
             const ::MobileGL::Wire::CtrlEnvelope* envelope = ParseEnvelope(frame);
+            if (LogPeerRefusal(envelope)) {
+                Stop();
+                return MOBILEGL_ERR_PROTOCOL_MISMATCH;
+            }
             // msg_as_Welcome() IS PART OF THE GUARD - flatbuffers' Verifier::VerifyTable is
             // `return !table || table->Verify(*this)`, so a NULL union member verifies while
             // msg_type() still reports Welcome. See ServerSession::Accept for the same guard.
@@ -528,9 +746,35 @@ namespace MobileGL::MG_Remote::Client {
             const char* theirStamp = welcome->buildFingerprint() == nullptr
                                          ? nullptr
                                          : welcome->buildFingerprint()->c_str();
-            if (welcome->abiFingerprint() != fingerprint) {
-                FatalAbiMismatch("struct shapes", fingerprint, welcome->abiFingerprint(),
-                                 theirStamp);
+            // 4.3: the pid the SERVER stated, taken before any check can abort, so a Fatal line
+            // can name it too.
+            m_peerServerPid = static_cast<std::uint32_t>(welcome->serverPid());
+            const MobileGLResult compatible = ValidatePeerHandshake(*m_transport,
+                welcome->abiMajor(), welcome->abiMinor(), welcome->wireFingerprint(), theirStamp, dial);
+            if (compatible != MOBILEGL_OK) {
+                Stop();
+                return compatible;
+            }
+            const auto* terms = welcome->linkTerms();
+            if (terms == nullptr || terms->dataPlane() != dataPlane ||
+                terms->wireForm() != ::MobileGL::Wire::WireForm::StructImage ||
+                terms->cmdWindowBytes() < Transport::kMinRingCapacity ||
+                (terms->cmdWindowBytes() & (terms->cmdWindowBytes() - 1)) != 0 ||
+                terms->stageWindowBytes() == 0 || terms->maxReplyBytes() == 0 ||
+                terms->maxReplyBytes() > 0xFFFFFFFFull - sizeof(Transport::ReplySlotHeader) ||
+                terms->eventWindowBytes() < Transport::kMinRingCapacity ||
+                (terms->eventWindowBytes() & (terms->eventWindowBytes() - 1)) != 0) {
+                const auto result = RefuseHandshake(*m_transport, ::MobileGL::Wire::RefuseCode::LinkTerms,
+                                                    "invalid server link terms");
+                Stop();
+                return result;
+            }
+            if (welcome->backendType() != static_cast<Uint32>(MG_Config::ActiveBackendType)) {
+                const auto result = RefuseHandshake(*m_transport, ::MobileGL::Wire::RefuseCode::Backend,
+                    "server backend differs from request", static_cast<Uint32>(MG_Config::ActiveBackendType),
+                    welcome->backendType());
+                Stop();
+                return result;
             }
             // The four SegmentRefs are what a spawn client MAPS (P6). Under inproc the mapping
             // already exists, so what they are good for here is the cross-check that the two
@@ -562,15 +806,660 @@ namespace MobileGL::MG_Remote::Client {
         // under the client role; under `spawn` it becomes ShmSegment::Adopt of the fds the
         // server passed by SCM_RIGHTS, which is why nothing below this line knows which it was.
         const MobileGLResult attached =
-            m_shm.AttachInProcess(server.Shm(), Transport::MemoryRole::Client);
+            m_link->Memory().AttachInProcess(server.Shm(), Transport::MemoryRole::Client);
         if (attached != MOBILEGL_OK) {
             Stop();
             return attached;
         }
 
-        Transport::RingControl* control = m_shm.CmdControl();
-        m_cmd = Transport::RingProducer(control, m_shm.CmdRingBase(), m_shm.CmdRingCapacity(),
-                                        Transport::RingCursorSet::Cmd);
+        return FinishStartup(&m_clientTransport->PeerDoorbell(),
+                             &m_clientTransport->SelfDoorbell(),
+                             /*startApplyThreadHere=*/true);
+    }
+
+    MobileGLResult ClientSession::StartSpawned() {
+        const BringUpScope bringUp; // F1, and see Start() for why it opens this early.
+        if (m_started) {
+            return MOBILEGL_ERR_INVALID_ARGUMENT;
+        }
+        const std::string configured(MG_Config::Ipc.Control.c_str());
+        if (configured != "fork") {
+            const bool tcp = configured.compare(0, 6, "tcp://") == 0;
+            const bool unixSocket = configured.compare(0, 5, "unix:") == 0;
+            const std::string data(MG_Config::Ipc.Data.c_str());
+            if ((!tcp && !unixSocket) ||
+                (data != "auto" && data != (tcp ? "stream" : "shm"))) {
+                MGLOG_E("MG_Remote: Refuse{ProtocolMismatch} unsupported control/data pair %s/%s",
+                        configured.c_str(), data.c_str());
+                return MOBILEGL_ERR_UNSUPPORTED;
+            }
+            m_connectDial = true;
+            const auto endpoint = tcp ? configured : configured.substr(5);
+            std::unique_ptr<Transport::SocketTransport> socket;
+            // PH-7 (4): on TCP, the control connection only. The data connection is opened after
+            // Welcome, with the nonce Welcome carries - never paired by arrival order.
+            const auto connected = Transport::SocketTransport::ConnectControl(endpoint, kSpawnConnectTimeoutMs, socket);
+            if (connected != MOBILEGL_OK) return connected;
+            m_dataEndpoint = tcp ? endpoint : std::string();
+            const auto started = StartOverSocket(std::move(socket));
+            if (started == MOBILEGL_OK) {
+                MGLOG_I("MG_Remote client: control=%s data=%s server=%s pid=%u dial=connect",
+                        tcp ? "tcp" : "unix", tcp ? "stream" : "shm",
+                        tcp ? endpoint.c_str() + 6 : endpoint.c_str(), m_peerServerPid);
+            }
+            return started;
+        }
+        if (MG_Config::Ipc.Data != "auto" && MG_Config::Ipc.Data != "shm") {
+            MGLOG_E("MG_Remote: Refuse{ProtocolMismatch} fork requires shm data in P6.5 wave one");
+            return MOBILEGL_ERR_UNSUPPORTED;
+        }
+        m_connectDial = false;
+        // A rendezvous nobody else can collide with. Independent processes need
+        // a NAME; making it per-process-per-instant is what stops two runs on
+        // one machine - which `ctest -j` produces by construction - finding each
+        // other's server.
+        // AN ABSTRACT NAME ('@'), not a path under /tmp. An Android app has no
+        // writable /tmp and the first device run proved it the blunt way: the
+        // server launched, bind() had nowhere to put the node, and the client
+        // refused by name 20 s later. The abstract namespace needs no directory,
+        // no mode bits and no cleanup after a crash, and its reach - the network
+        // namespace - is exactly one app's processes.
+        const std::string endpoint = std::string("@mgl-") +
+                                     std::to_string(static_cast<long long>(::getpid())) + "-" +
+                                     std::to_string(reinterpret_cast<std::uintptr_t>(this));
+
+        const MobileGLResult launched =
+            Server::LaunchServer(std::string(MG_Config::Ipc.ServerPath.c_str()), endpoint,
+                                 &m_spawned);
+        if (launched != MOBILEGL_OK) {
+            return launched;
+        }
+
+        std::unique_ptr<Transport::SocketTransport> socket;
+        // The bounded connect retry is what tolerates the server still binding -
+        // and it is the CLIENT's, not the launcher's. An exhausted budget is a
+        // NAMED refusal; there is no monolith fallback from here.
+        const MobileGLResult connected =
+            Transport::SocketTransport::ConnectTo(endpoint, kSpawnConnectTimeoutMs, socket);
+        if (connected != MOBILEGL_OK) {
+            int exitCode = 0;
+            Server::ReapServer(m_spawned, 2000, &exitCode);
+            MGLOG_E("MG_Remote client: could not reach the server we launched at \"%s\" "
+                    "(rc=%d, server exit=%d)",
+                    endpoint.c_str(), static_cast<int>(connected), exitCode);
+            return connected;
+        }
+        // THE ONE FACT A MONOLITH OR inproc RUN CANNOT PRODUCE: a pid that is
+        // not ours. The ConfigLoader marker proves the VALUE resolved; this
+        // proves the SERVER ROLE LEFT THIS PROCESS, which is the whole claim the
+        // SPAWN arm of the retrace matrix makes. run_trace_case.cmake requires
+        // BOTH, so a spawn arm cannot go green on a transport that resolved and
+        // then quietly ran the server role locally.
+        const MobileGLResult started = StartOverSocket(std::move(socket));
+        if (started == MOBILEGL_OK) {
+            MGLOG_I("MG_Remote client: spawn ARMED - the server role runs in pid %d, reached at "
+                    "\"%s\"",
+                    m_spawned.pid, endpoint.c_str());
+        }
+        return started;
+    }
+
+    MobileGLResult ClientSession::StartOverSocket(
+        std::unique_ptr<Transport::SocketTransport> transport) {
+        const BringUpScope bringUp; // F1, and see Start() for why it opens this early.
+        if (m_started) {
+            return MOBILEGL_ERR_INVALID_ARGUMENT;
+        }
+        if (transport == nullptr) {
+            MGLOG_E("MG_Remote client: StartOverSocket needs a connected transport");
+            return MOBILEGL_ERR_INVALID_ARGUMENT;
+        }
+        m_socketTransport = Move(transport);
+        m_transport = m_socketTransport.get();
+
+        // ---- Hello. The same bytes as inproc; the fingerprint is still compared
+        // for equality, because under Dial == Fork the child IS the same binary and
+        // comparing it catches a stale MOBILEGL_IPC_SERVER_PATH (CONTRACT-P6 4.1).
+        const auto dial = m_connectDial ? ::MobileGL::Wire::DialMode::Connect : ::MobileGL::Wire::DialMode::Fork;
+        const auto dataPlane = m_socketTransport->IsTcp() ? ::MobileGL::Wire::DataPlane::Stream
+                                                        : ::MobileGL::Wire::DataPlane::SharedSegments;
+        const Uint64 fingerprint = WireFingerprint();
+        {
+            ::flatbuffers::FlatBufferBuilder builder(512);
+            auto stamp = builder.CreateString(BuildFingerprint());
+            auto terms = ::MobileGL::Wire::CreateLinkTerms(builder, dataPlane);
+            const char* tokenText = std::getenv("MOBILEGL_IPC_TOKEN");
+            auto token = builder.CreateString(tokenText == nullptr ? "" : tokenText);
+            auto hello = ::MobileGL::Wire::CreateHello(
+                builder, MOBILEGL_PROTOCOL_ABI_MAJOR, MOBILEGL_PROTOCOL_ABI_MINOR, stamp,
+                static_cast<Uint32>(MG_Config::ActiveBackendType), SelfProcessId(), 0,
+                fingerprint, fingerprint, terms, token, dial);
+            auto root = ::MobileGL::Wire::CreateCtrlEnvelope(
+                builder, ::MobileGL::Wire::CtrlMsg::Hello, hello.Union());
+            ::MobileGL::Wire::FinishCtrlEnvelopeBuffer(builder, root);
+            const MobileGLResult sent = m_transport->SendFrame(
+                MobileGLByteSpan{builder.GetBufferPointer(), builder.GetSize()});
+            if (sent != MOBILEGL_OK) {
+                Stop();
+                return sent;
+            }
+        }
+
+        // ---- Welcome, and the four announced sizes. THERE IS NO LOCAL SERVER TO
+        // ASK: the inproc path cross-checks Welcome against ServerSessionInstance()'s
+        // own mapping, which a6 showed is vacuous against a real peer. Here the wire
+        // values are the only values, which is what that check has to become on
+        // every lane (CONTRACT-P6 4.4).
+        Transport::SessionSegmentSizes negotiatedSizes;
+        bool stream = false;
+        std::vector<Uint8> dataBind;
+        Uint64 announced[4] = {0, 0, 0, 0};
+        const Uint32 replySlotCount = Transport::kDefaultReplySlotCount;
+        {
+            std::vector<Uint8> frame;
+            const MobileGLResult received =
+                ReceiveEnvelope(*m_transport, frame, kHandshakeTimeoutMs);
+            if (received != MOBILEGL_OK) {
+                MGLOG_E("MG_Remote client: no Welcome from the spawned server within %u ms (rc=%d)",
+                        kHandshakeTimeoutMs, static_cast<int>(received));
+                Stop();
+                return received;
+            }
+            const ::MobileGL::Wire::CtrlEnvelope* envelope = ParseEnvelope(frame);
+            if (LogPeerRefusal(envelope)) {
+                Stop();
+                return MOBILEGL_ERR_PROTOCOL_MISMATCH;
+            }
+            if (envelope == nullptr || envelope->msg_type() != ::MobileGL::Wire::CtrlMsg::Welcome ||
+                envelope->msg_as_Welcome() == nullptr) {
+                MGLOG_E("MG_Remote client: the spawned server first frame is not a verifiable "
+                        "Welcome");
+                Stop();
+                return MOBILEGL_ERR_PROTOCOL_MISMATCH;
+            }
+            const ::MobileGL::Wire::Welcome* welcome = envelope->msg_as_Welcome();
+            const char* theirStamp = welcome->buildFingerprint() == nullptr
+                                         ? nullptr
+                                         : welcome->buildFingerprint()->c_str();
+            // 4.3: the pid the SERVER stated, taken before any check can abort, so a Fatal line
+            // can name it too.
+            m_peerServerPid = static_cast<std::uint32_t>(welcome->serverPid());
+            const MobileGLResult compatible = ValidatePeerHandshake(*m_transport,
+                welcome->abiMajor(), welcome->abiMinor(), welcome->wireFingerprint(), theirStamp, dial);
+            if (compatible != MOBILEGL_OK) {
+                Stop();
+                return compatible;
+            }
+            const auto* terms = welcome->linkTerms();
+            if (terms == nullptr || terms->dataPlane() != dataPlane ||
+                terms->wireForm() != ::MobileGL::Wire::WireForm::StructImage ||
+                terms->cmdWindowBytes() < Transport::kMinRingCapacity ||
+                (terms->cmdWindowBytes() & (terms->cmdWindowBytes() - 1)) != 0 ||
+                terms->stageWindowBytes() == 0 || terms->maxReplyBytes() == 0 ||
+                terms->maxReplyBytes() > 0xFFFFFFFFull - sizeof(Transport::ReplySlotHeader) ||
+                terms->eventWindowBytes() < Transport::kMinRingCapacity ||
+                (terms->eventWindowBytes() & (terms->eventWindowBytes() - 1)) != 0) {
+                const auto result = RefuseHandshake(*m_transport, ::MobileGL::Wire::RefuseCode::LinkTerms,
+                                                    "invalid server link terms");
+                Stop();
+                return result;
+            }
+            if (welcome->backendType() != static_cast<Uint32>(MG_Config::ActiveBackendType)) {
+                const auto result = RefuseHandshake(*m_transport, ::MobileGL::Wire::RefuseCode::Backend,
+                    "server backend differs from request", static_cast<Uint32>(MG_Config::ActiveBackendType),
+                    welcome->backendType());
+                Stop();
+                return result;
+            }
+            stream = terms->dataPlane() == ::MobileGL::Wire::DataPlane::Stream;
+            if (stream) {
+                // PH-7 (4). A Stream Welcome without a nonce of exactly the minted width names no
+                // data connection this client could open; refused rather than guessed at.
+                const auto* nonce = welcome->dataNonce();
+                if (nonce == nullptr || nonce->size() != Transport::kDataNonceBytes || m_dataEndpoint.empty()) {
+                    const auto result = RefuseHandshake(*m_transport, ::MobileGL::Wire::RefuseCode::LinkTerms,
+                                                        "stream Welcome carries no data nonce", Transport::kDataNonceBytes,
+                                                        nonce == nullptr ? 0 : nonce->size());
+                    Stop();
+                    return result;
+                }
+                dataBind = EncodeDataBind(nonce->data(), nonce->size());
+            }
+            negotiatedSizes.CmdRingBytes = terms->cmdWindowBytes();
+            negotiatedSizes.StageBytes = terms->stageWindowBytes();
+            negotiatedSizes.EventRingBytes = terms->eventWindowBytes();
+            negotiatedSizes.ReplyBytes = (terms->maxReplyBytes() + sizeof(Transport::ReplySlotHeader)) *
+                                        negotiatedSizes.ReplySlotCount;
+            const ::MobileGL::Wire::SegmentRef* refs[4] = {welcome->cmdRing(), welcome->stageRing(),
+                                                           welcome->replyPool(),
+                                                           welcome->eventRing()};
+            for (int index = 0; index < 4; ++index) {
+                if (refs[index] == nullptr || refs[index]->sizeBytes() == 0) {
+                    MGLOG_E("MG_Remote client: Welcome SegmentRef %d is missing or zero-sized",
+                            index);
+                    Stop();
+                    return MOBILEGL_ERR_PROTOCOL_MISMATCH;
+                }
+                announced[index] = refs[index]->sizeBytes();
+            }
+        }
+
+        if (stream) {
+            int dataFd = -1;
+            const auto opened = Transport::SocketTransport::ConnectDataConnection(
+                m_dataEndpoint, kSpawnConnectTimeoutMs, MobileGLByteSpan{dataBind.data(), dataBind.size()}, &dataFd);
+            if (opened != MOBILEGL_OK) {
+                MGLOG_E("MG_Remote client: could not open the data connection to %s (rc=%d)",
+                        m_dataEndpoint.c_str(), static_cast<int>(opened));
+                Stop();
+                return opened;
+            }
+            const auto attached = AttachStreamLink(dataFd, negotiatedSizes);
+            if (attached != MOBILEGL_OK) { Stop(); return attached; }
+            m_controlInbox = std::make_unique<Transport::ControlInbox>(*m_transport);
+            Server::ServerLoopInstance().SetRemoteControlSink(&RemoteControlSinkThunk, this);
+            return FinishStartup(&m_link->ConsumerBell(), &m_link->ProducerBell(), false);
+        }
+
+        // ---- the four descriptors. THIS is the step inproc does not have, and the
+        // reason SCM_RIGHTS is in this design at all: the segments are anonymous -
+        // ASharedMemory_create has no filesystem name and memfd / shm_open+unlink
+        // are not openable either - so the descriptor IS the only key.
+        //
+        // The slot travels in the sideband rather than being inferred from arrival
+        // order, so a reordered or dropped offer is a NAMED mismatch instead of two
+        // segments quietly swapped.
+        // Seven offers: four segments, then THREE bell descriptors (slots 4..6).
+        // Three because each side parks on one and rings another; see ServerMain.
+        int fds[7] = {-1, -1, -1, -1, -1, -1, -1};
+        {
+            struct Sideband {
+                Uint32 slot;
+                Uint64 bytes;
+            };
+            const auto closeAll = [&fds]() {
+                for (int& open : fds) {
+                    if (open >= 0) {
+                        ::close(open);
+                        open = -1;
+                    }
+                }
+            };
+            for (int received = 0; received < 7; ++received) {
+                Sideband sideband{};
+                Uint64 sidebandSize = 0;
+                int fd = -1;
+                std::vector<Uint8> scratch(Transport::FdPassing::kMaxSidebandBytes);
+                MobileGLMutableByteSpan span{scratch.data(), scratch.size()};
+                const MobileGLResult got =
+                    m_transport->ReceiveFd(&fd, span, &sidebandSize, kHandshakeTimeoutMs);
+                if (got != MOBILEGL_OK || fd < 0) {
+                    MGLOG_E("MG_Remote client: segment descriptor %d did not arrive (rc=%d)",
+                            received, static_cast<int>(got));
+                    closeAll();
+                    Stop();
+                    return got == MOBILEGL_OK ? MOBILEGL_ERR_PROTOCOL_MISMATCH : got;
+                }
+                if (sidebandSize != sizeof(Sideband)) {
+                    MGLOG_E("MG_Remote client: segment offer %d carried %llu sideband bytes",
+                            received, static_cast<unsigned long long>(sidebandSize));
+                    ::close(fd);
+                    closeAll();
+                    Stop();
+                    return MOBILEGL_ERR_PROTOCOL_MISMATCH;
+                }
+                std::memcpy(&sideband, scratch.data(), sizeof(Sideband));
+                const bool isSegment = sideband.slot < 4;
+                if (sideband.slot >= 7 || fds[sideband.slot] >= 0 ||
+                    (isSegment && sideband.bytes != announced[sideband.slot])) {
+                    MGLOG_E("MG_Remote client: segment offer names slot %u with %llu bytes; "
+                            "Welcome announced a different size or the slot is already filled",
+                            sideband.slot, static_cast<unsigned long long>(sideband.bytes));
+                    ::close(fd);
+                    closeAll();
+                    Stop();
+                    return MOBILEGL_ERR_PROTOCOL_MISMATCH;
+                }
+                fds[sideband.slot] = fd;
+            }
+
+            // ---- adopt and map. The same Adopt + Map every inproc run has
+            // exercised since P5; only the origin of the descriptor is new.
+            const MobileGLResult adopted = m_link->Memory().AdoptFromDescriptors(
+                fds, announced, replySlotCount, Transport::MemoryRole::Client);
+            if (adopted != MOBILEGL_OK) {
+                closeAll();
+                Stop();
+                return adopted;
+            }
+            // The four segment descriptors now belong to m_link->Memory(). The two bells
+            // belong to the doorbells, which own and close them.
+            //
+            // WHICH BELL IS WHICH IS THE SESSION'S KNOWLEDGE, exactly as under
+            // inproc: slot 4 is the pair end whose WRITE wakes the server, slot 5
+            // is the one this side POLLS.
+            // PARK ON ONE END, RING THE OTHER - the same split the server makes,
+            // and for the same reason: a single-fd bell rings the PEER, so it
+            // cannot wake its own waiter.
+            //   fds[4] ring the SERVER      (ring-only, we never park on it)
+            //   fds[5] our park end
+            //   fds[6] ring OURSELVES
+            m_socketPeerBell = MakeUnique<Transport::SocketDoorbell>(-1, fds[4], 1, true);
+            // Built into a TYPED pointer first: the witness is SocketDoorbell's, and the member
+            // is a Doorbell so that the inproc path can put a CondVarDoorbell in it.
+            auto selfBell = MakeUnique<Transport::SocketDoorbell>(fds[5], fds[6], 1, true);
+
+            // `dl`: THE DEATH WITNESS, and it has to be a descriptor this side does not also
+            // write to. Our own bell is a socketpair we hold BOTH ends of - slot 5 to park on,
+            // slot 6 to ring ourselves - so it can never hang up however dead the server is. The
+            // control socket's far end is held only by the server, so its hangup IS the death.
+            //
+            // Passing the fd rather than the transport keeps the ownership honest: the bell polls
+            // it for hangup alone and never reads it, and SocketTransport goes on owning and
+            // closing it. CONTRACT-P6 D5c.
+            selfBell->SetDeathWitness(m_socketTransport->StreamFd());
+            m_socketSelfBell = Move(selfBell);
+        }
+
+        // `cp`: from here the twelve EGL forwarders cross the socket instead of
+        // being posted into a mailbox this process does not own. Installed BEFORE
+        // FinishStartup, because FinishStartup's caps pump can already trigger
+        // one.
+        Server::ServerLoopInstance().SetRemoteControlSink(&RemoteControlSinkThunk, this);
+
+        // The apply thread IS ALREADY RUNNING, in the other process: ServerMain
+        // started it before it sent the first descriptor. Starting one here would
+        // put a second applier on a ring that already has one.
+        return FinishStartup(m_socketPeerBell.get(), m_socketSelfBell.get(), false);
+    }
+
+    MobileGLResult ClientSession::RemoteControlSinkThunk(void* user,
+                                                        Server::SurfaceControlFrame& frame) {
+        return static_cast<ClientSession*>(user)->RunRemoteSurfaceControlFrame(frame);
+    }
+
+    MobileGLResult ClientSession::ReceiveControlFrame(std::vector<Uint8>& frame, Uint32 timeoutMs) {
+        return m_controlInbox ? m_controlInbox->Receive(frame, timeoutMs)
+                              : ReceiveEnvelope(*m_transport, frame, timeoutMs);
+    }
+
+    void ClientSession::SyncPeerLog() {
+        if (!m_started || !m_socketTransport || !m_transport || DeviceLost()) return;
+        const auto submitted = m_producer.LastPublishedSeq();
+        m_producer.PublishAndNotify(submitted);
+        const auto wait = WaitForAppliedBudget(m_producer, *m_events, submitted, kRemoteControlTimeoutMs);
+        if (wait == Transport::SessionWait::ShutDown) {
+            if (const auto* bell = m_producer.SelfDoorbell(); bell && bell->PeerHungUp())
+                LatchDeviceLost("log synchronization woke on a peer that had hung up");
+            return;
+        }
+        if (wait != Transport::SessionWait::Reached) {
+            SessionFail(MGFatalFamily::BarrierTimeout,
+                        "MGPipe: Fatal{BarrierTimeout, LogFlush} apply prefix was not completed");
+        }
+        DrainEventRing(*m_events);
+        const std::lock_guard<std::mutex> lock(m_remoteControlMutex);
+        const auto seq = ++m_logFlushSeq;
+        flatbuffers::FlatBufferBuilder builder(64);
+        auto flush = ::MobileGL::Wire::CreateLogFlush(builder, seq, false);
+        auto envelope = ::MobileGL::Wire::CreateCtrlEnvelope(builder, ::MobileGL::Wire::CtrlMsg::LogFlush, flush.Union());
+        ::MobileGL::Wire::FinishCtrlEnvelopeBuffer(builder, envelope);
+        if (m_transport->SendFrame({builder.GetBufferPointer(), builder.GetSize()}) != MOBILEGL_OK) {
+            LatchDeviceLost("control stream closed during LogFlush");
+            return;
+        }
+        for (;;) {
+            std::vector<Uint8> bytes;
+            const auto received = ReceiveControlFrame(bytes, kRemoteControlTimeoutMs);
+            if (received == MOBILEGL_ERR_TRANSPORT_CLOSED) {
+                LatchDeviceLost("control stream closed during LogFlush");
+                return;
+            }
+            if (received != MOBILEGL_OK)
+                SessionFail(MGFatalFamily::ProtocolCorruption, "MGPipe: Fatal{ProtocolCorruption, LogFlush} no acknowledgement rc=%d", received);
+            const auto* reply = ParseEnvelope(bytes);
+            if (!reply)
+                SessionFail(MGFatalFamily::ProtocolCorruption, "MGPipe: Fatal{ProtocolCorruption, LogFlush} malformed acknowledgement");
+            if (const auto* ack = reply->msg_as_LogFlush()) {
+                if (!ack->ack() || ack->seq() != seq) {
+                    SessionFail(MGFatalFamily::ProtocolCorruption, "MGPipe: Fatal{ProtocolCorruption, LogFlush} reply sequence mismatch");
+                }
+                return;
+            }
+            if (const auto* caps = reply->msg_as_CapsSnapshot()) AdoptCapsSnapshot(caps);
+        }
+    }
+
+    MobileGLResult ClientSession::RunRemoteSurfaceControlFrame(Server::SurfaceControlFrame& frame) {
+        if (m_transport == nullptr) {
+            return MOBILEGL_ERR_NOT_INITIALIZED;
+        }
+        // THE CLIENT MINTS, always, dense from 1 (CONTRACT-P6 §6.3). The server's
+        // local mint exists for unnumbered LOCAL posts; a wire request that let
+        // the server renumber it would get back a reply it cannot correlate.
+        if (frame.seq == 0) {
+            frame.seq = ++m_remoteControlSeq;
+        }
+
+        ::flatbuffers::FlatBufferBuilder builder(512);
+        const MG_Remote::SurfaceWireError encoded = MG_Remote::EncodeSurfaceOpFrame(frame, &builder);
+        if (encoded != MG_Remote::SurfaceWireError::None) {
+            // A NAMED refusal, not a dropped op. InprocOnlyOpOnTheWire is the
+            // live one: three of the twelve forwarders ride the frame channel
+            // without a wire kind (CONTRACT-P6 §2), and a spawn client that
+            // reaches one has found a gap rather than a transport error.
+            MGLOG_E("MG_Remote client: surface op kind %d cannot cross the wire (%s)",
+                    static_cast<int>(frame.kind), MG_Remote::SurfaceWireErrorName(encoded));
+            return MOBILEGL_ERR_UNSUPPORTED;
+        }
+
+        // ONE CONTROL OP AT A TIME. The twelve forwarders are already
+        // caller-serialised on the server's m_callerMutex under inproc; the same
+        // discipline has to hold here or two replies race for one correlation.
+        const std::lock_guard<std::mutex> lock(m_remoteControlMutex);
+        // The whole op - prefix drain, reply, event delivery - runs on one budget: the cold-start
+        // one while the server may still be bringing its backend up (see ControlReplyBudgetMs).
+        Bool coldStart = false;
+        const Uint32 budgetMs = ControlReplyBudgetMs(frame.kind, m_serverBackendWarm, &coldStart);
+        // Control and data are independent ordered streams. Finish the old
+        // command prefix before a surface operation can change its EGL tuple.
+        if (m_started && m_link && !m_link->Capabilities().PublishIsDelivery) {
+            const auto submitted = m_producer.LastPublishedSeq();
+            m_producer.PublishAndNotify(submitted);
+            if (WaitForAppliedBudget(m_producer, *m_events, submitted, budgetMs) !=
+                Transport::SessionWait::Reached) return MOBILEGL_ERR_TRANSPORT_CLOSED;
+            DrainEventRing(*m_events);
+        }
+        const MobileGLResult sent = m_transport->SendFrame(
+            MobileGLByteSpan{builder.GetBufferPointer(), builder.GetSize()});
+        if (sent != MOBILEGL_OK) {
+            return sent;
+        }
+
+        // The reply. A BOUNDED wait whose expiry is NOT fatal (CONTRACT-P6 §5.4
+        // D5b): a peer that is gone is a different fact from a peer that is slow,
+        // and only the doorbell's death latch may say which.
+        //
+        // P7 (p7/spawnhang): THE BUDGET BOUNDS SILENCE, NOT THE OP. It used to be one deadline
+        // for the whole reply, so a server that was still running the op - a cold native
+        // bring-up, eglInitialize loading a software rasteriser off a runner's cold disk for
+        // ~20 s (retrace-split run 35912252677) - was reported ALIVE BUT SILENT and its surface
+        // creation failed, although it was about to answer. The server now says so while it runs
+        // an op it has taken (Wire::SurfaceProgress, every ServerLoop::kControlProgressIntervalMs),
+        // and each report restarts this budget. What still times out, named as before: a server
+        // that never took the op or is frozen (no report arrives), and one that reports progress
+        // past kBarrierTimeoutMs - the bound the verb barrier gives one record's apply, which is
+        // what a surface op that is being run IS.
+        const auto sentAt = std::chrono::steady_clock::now();
+        const Uint32 ceilingMs = std::max<Uint32>(budgetMs, kBarrierTimeoutMs);
+        Uint32 progressReports = 0;
+        Uint32 lastProgressMs = 0;
+        for (;;) {
+            std::vector<Uint8> reply;
+            Uint32 waitMs = budgetMs;
+            if (progressReports != 0) {
+                const auto spentMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - sentAt).count();
+                waitMs = spentMs >= ceilingMs ? 0u : std::min<Uint32>(budgetMs, ceilingMs - static_cast<Uint32>(spentMs));
+            }
+            // A zero wait is the ceiling, reached: answered exactly as an expired budget is.
+            const MobileGLResult received =
+                waitMs == 0 ? MOBILEGL_ERR_TIMEOUT : ReceiveControlFrame(reply, waitMs);
+            if (received != MOBILEGL_OK) {
+                // `dl` (D5b): THE EXPIRY IS NOT FATAL AND IT IS NOT ONE ANSWER. The transport
+                // already distinguishes the two states this wait can end in, and the contract
+                // says they must stay distinguished without a threshold:
+                //
+                //   TRANSPORT_CLOSED - the control socket returned EOF. Only the server held the
+                //     far end, so it is gone. That is the device-loss fact, taken from a
+                //     descriptor.
+                //   TIMEOUT - nothing arrived in the budget, and the socket is still open. The
+                //     peer is ALIVE AND SILENT: wedged, frozen, SIGSTOP'd, or merely slower than
+                //     the budget. 5.4 forbids calling that a death, so it gets a NAME instead.
+                //     The bell is asked anyway, because a hangup noticed by the ring side counts
+                //     here too.
+                if (received == MOBILEGL_ERR_TRANSPORT_CLOSED) {
+                    LatchDeviceLost("the control stream reached EOF while a reply was owed");
+                } else if (const Transport::Doorbell* bell = m_producer.SelfDoorbell();
+                           bell != nullptr && bell->PeerHungUp()) {
+                    LatchDeviceLost("a control reply timed out and the peer had hung up");
+                } else if (progressReports != 0 && waitMs == 0) {
+                    MGLOG_E("MG_Remote client: the server is ALIVE AND BUSY past the ceiling - it "
+                            "reported %u time(s) that it was still running %s seq %llu (the last "
+                            "at %u ms) and has not answered within %u ms, the bound the verb "
+                            "barrier gives one apply. This is NOT device loss (CONTRACT-P6 5.4); "
+                            "the op itself is not returning on the server's apply thread.",
+                            progressReports, Server::SurfaceControlOpName(frame.kind),
+                            static_cast<unsigned long long>(frame.seq), lastProgressMs, ceilingMs);
+                } else {
+                    MGLOG_E("MG_Remote client: the server is ALIVE BUT SILENT - no SurfaceReply "
+                            "for %s seq %llu within %u ms (%s) and the control stream is still "
+                            "open. This is NOT device loss (CONTRACT-P6 5.4): a frozen or merely "
+                            "slow peer produces no hangup, and only a hangup may arm the latch. "
+                            "If this repeats, the server is wedged rather than gone.",
+                            Server::SurfaceControlOpName(frame.kind),
+                            static_cast<unsigned long long>(frame.seq), budgetMs,
+                            coldStart ? "the cold-start budget, MOBILEGL_IPC_COLD_START_MS: the "
+                                        "server may still have been bringing its backend up"
+                                      : "the steady bound, MOBILEGL_IPC_CONTROL_TIMEOUT_MS");
+                    // WHICH SILENCE (p7/spawnhang). A server running the op reports progress, so
+                    // none at all means it never started it (or froze before it could say so);
+                    // reports that stopped mean it froze mid-op.
+                    if (progressReports == 0)
+                        MGLOG_E("MG_Remote client: no SurfaceProgress arrived for seq %llu either (a "
+                                "server reports every %u ms while it runs an op): it did not start "
+                                "the op, or it is frozen",
+                                static_cast<unsigned long long>(frame.seq),
+                                Server::ServerLoop::kControlProgressIntervalMs);
+                    else
+                        MGLOG_E("MG_Remote client: the server had reported progress on seq %llu "
+                                "%u time(s), the last at %u ms, and then stopped",
+                                static_cast<unsigned long long>(frame.seq), progressReports,
+                                lastProgressMs);
+                }
+                MGLOG_E("MG_Remote client: no SurfaceReply for seq %llu within %u ms (rc=%d)",
+                        static_cast<unsigned long long>(frame.seq), waitMs == 0 ? ceilingMs : budgetMs,
+                        static_cast<int>(received));
+                return received;
+            }
+            const ::MobileGL::Wire::CtrlEnvelope* envelope = ParseEnvelope(reply);
+            if (envelope == nullptr) {
+                return MOBILEGL_ERR_PROTOCOL_MISMATCH;
+            }
+            if (envelope->msg_type() == ::MobileGL::Wire::CtrlMsg::CapsSnapshot) {
+                // The server republishes caps from inside its MakeCurrent
+                // dispatch (a6 row A4-30), so a snapshot can arrive BEFORE the
+                // reply to the very op that produced it. Adopting it here rather
+                // than dropping it is what keeps R-12's "a second arrival IS the
+                // invalidation" true on this path too.
+                if (const auto* snapshot = envelope->msg_as_CapsSnapshot()) {
+                    AdoptCapsSnapshot(snapshot);
+                }
+                continue;
+            }
+            if (envelope->msg_type() == ::MobileGL::Wire::CtrlMsg::SurfaceProgress) {
+                // THE SERVER IS STILL RUNNING THIS OP (p7/spawnhang, above): the budget restarts.
+                // One op is outstanding at a time (m_remoteControlMutex), so a report naming any
+                // other seq is a server that has lost track of which op it is running.
+                const auto* progress = envelope->msg_as_SurfaceProgress();
+                if (progress == nullptr || progress->seq() != frame.seq) {
+                    MGLOG_E("MG_Remote client: a SurfaceProgress names seq %llu while seq %llu is "
+                            "the op outstanding",
+                            static_cast<unsigned long long>(progress == nullptr ? 0 : progress->seq()),
+                            static_cast<unsigned long long>(frame.seq));
+                    return MOBILEGL_ERR_PROTOCOL_MISMATCH;
+                }
+                if (progressReports == 0) {
+                    MGLOG_I("MG_Remote client: the server is still running %s seq %llu (%u ms after "
+                            "it was posted to its apply thread); the reply budget of %u ms restarts "
+                            "on each progress report, up to %u ms",
+                            Server::SurfaceControlOpName(frame.kind),
+                            static_cast<unsigned long long>(frame.seq), progress->elapsedMs(), budgetMs,
+                            ceilingMs);
+                }
+                ++progressReports;
+                lastProgressMs = progress->elapsedMs();
+                continue;
+            }
+            if (envelope->msg_type() == ::MobileGL::Wire::CtrlMsg::Fatal) {
+                // `dl` step three: the server published a SessionFault before it aborted, so this
+                // is a death that NAMES ITSELF instead of arriving as a bare EOF. Log the family
+                // and detail, latch device-lost from it, and report the op declined - the same
+                // answer a hangup gives, now with a cause the guest's log can read.
+                if (const auto* fatal = envelope->msg_as_Fatal()) {
+                    const char* fam = fatal->family() ? fatal->family()->c_str() : "<none>";
+                    const char* msg = fatal->message() ? fatal->message()->c_str() : "";
+                    MGLOG_E("MG_Remote client: the server published a SessionFault before dying - "
+                            "Fatal family %s: %s", fam, msg);
+                }
+                LatchDeviceLost("the server published a SessionFault and then aborted");
+                frame.ok = false;
+                return MOBILEGL_ERR_TRANSPORT_CLOSED;
+            }
+            if (envelope->msg_type() != ::MobileGL::Wire::CtrlMsg::SurfaceReply ||
+                envelope->msg_as_SurfaceReply() == nullptr) {
+                MGLOG_E("MG_Remote client: expected a SurfaceReply, got message type %d",
+                        static_cast<int>(envelope->msg_type()));
+                return MOBILEGL_ERR_PROTOCOL_MISMATCH;
+            }
+            const ::MobileGL::Wire::SurfaceReply* wire = envelope->msg_as_SurfaceReply();
+            if (wire->seq() != frame.seq) {
+                MGLOG_E("MG_Remote client: SurfaceReply names seq %llu, we asked for %llu",
+                        static_cast<unsigned long long>(wire->seq()),
+                        static_cast<unsigned long long>(frame.seq));
+                return MOBILEGL_ERR_PROTOCOL_MISMATCH;
+            }
+            MG_Remote::DecodeWireSurfaceReply(*wire, &frame);
+            if (m_link) {
+                const auto delivered = m_link->WaitForEventDelivery(frame.eventHead, budgetMs);
+                if (delivered != MOBILEGL_OK) return delivered;
+            }
+            // A MakeCurrent the server answered ok has brought its backend up: from here on
+            // every op keeps the steady bound.
+            if (frame.kind == Server::SurfaceControlOp::MakeCurrent && frame.ok) m_serverBackendWarm = true;
+            return MOBILEGL_OK;
+        }
+    }
+
+    // The half of startup that is IDENTICAL for inproc and spawn: the ring
+    // producer, the reply pool, the event ring, the segment table, the encoder,
+    // the first CapsSnapshot and the emitter tables. Extracted by `sm` so the
+    // spawn path cannot drift from the shape P5 spent five packages settling -
+    // everything here is below the line where "which transport" stopped
+    // mattering.
+    //
+    // `startApplyThreadHere` is the one policy difference, and it is not a
+    // transport question: under inproc the client is what starts the server
+    // role, because there is no server-side main to do it. Under spawn there
+    // IS one, and it started the apply thread before it ever sent Welcome.
+    MobileGLResult ClientSession::FinishStartup(Transport::Doorbell* peerBell,
+                                                Transport::Doorbell* selfBell,
+                                                bool startApplyThreadHere) {
+        // F1: every startup path - inproc, spawn, unix, tcp - reaches step 7 through here, so
+        // this is the one place that has to declare "a first snapshot is being fetched, on
+        // this thread". CapsMirror reads both halves of that (see AwaitFirstCapsSnapshot).
+        const BringUpScope bringUp;
+        m_link->InitializeEndpoints();
         // NO STAGE RING. SEG_STAGE is package w1's encoder-local LINEAR ALLOCATOR:
         // a staged byte run carries no RingRecordHeader, nothing consumes SEG_STAGE,
         // and the allocator reclaims on retiredSeq. A RingProducer over
@@ -578,21 +1467,22 @@ namespace MobileGL::MG_Remote::Client {
         // two tails, so FreeBytes() would fall to zero the first time the head
         // lapped the capacity and never recover - a guaranteed hang. See
         // RingControl's stage triple in Ring.h.
-        if (!m_cmd.Valid()) {
+        if (!m_cmd->Valid()) {
             Stop();
             return MOBILEGL_ERR_INVALID_ARGUMENT;
         }
         // PeerDoorbell() is the bell the SERVER parks on and this side rings; SelfDoorbell() is
         // this side's own. Which is which is the session's knowledge, not the transport's.
-        m_producer.Attach(control, &m_cmd, &m_clientTransport->PeerDoorbell(),
-                          &m_clientTransport->SelfDoorbell(), SpinUsFromConfig());
+        m_link->BindDoorbells(peerBell, selfBell);
+        peerBell = &m_link->ConsumerBell(); selfBell = &m_link->ProducerBell();
+        m_producer.Attach(*m_link, SpinUsFromConfig());
 
-        m_replies = Transport::ReplySlotPool(m_shm.ReplyBase(), m_shm.ReplyBytes(),
-                                             m_shm.ReplySlotCount());
-        m_events = Transport::EventRingConsumer(m_shm.EventControl(), control,
-                                                m_shm.EventRingBase(), m_shm.EventRingCapacity(),
-                                                m_shm.EventSegmentBase());
-        if (!m_replies.Valid() || !m_events.Valid()) {
+
+        // P5e (ra, §2.6): the drain's other half. A server parked on a full SEG_EVENT is woken
+        // by the drain that emptied it, not by the next thing this client happens to publish.
+        m_events->SetServerDoorbell(peerBell);
+        m_events->SetLink(m_link->Capabilities().PublishIsDelivery ? nullptr : m_link.get());
+        if (MaxReplyBytes() == 0 || !m_events->Valid()) {
             Stop();
             return MOBILEGL_ERR_INVALID_ARGUMENT;
         }
@@ -613,33 +1503,52 @@ namespace MobileGL::MG_Remote::Client {
         //
         // The Install calls themselves are package w1's and are named-Fatal stubs until w1
         // lands; see ServerSession::Accept for why they are called anyway.
-        m_segments.Install(Wire::kSegCmd,
-                           Wire::SegmentView{m_shm.CmdRingBase(), m_shm.CmdRingCapacity()});
-        m_segments.Install(Wire::kSegStage,
-                           Wire::SegmentView{m_shm.StageBase(), m_shm.StageBytes()});
-        m_segments.Install(Wire::kSegReply,
-                           Wire::SegmentView{m_shm.ReplyBase(), m_shm.ReplyBytes()});
-        m_segments.Install(Wire::kSegEvent,
-                           Wire::SegmentView{m_shm.EventSegmentBase(),
-                                             m_shm.AnnouncedSize(Transport::SessionSegmentSlot::Event)});
-        // nullptr for the stage producer, and that is the honest value: c0's
-        // signature predates w1's ruling that SEG_STAGE is a linear allocator, and
-        // the encoder reaches its bytes through the SegmentTable above. Handing it
-        // a live RingProducer over a cursor triple nobody consumes would be the
-        // half-wired shape this session exists not to have.
-        m_encoder = Wire::PipeWireEncoder(control, &m_cmd, nullptr, &m_segments);
+        m_segments.AttachLink(m_link.get());
+        m_encoder = Wire::PipeWireEncoder(m_link.get(), &m_segments);
+        m_encoder.SetLink(m_link->Capabilities().PublishIsDelivery ? nullptr : m_link.get());
         m_encoder.SetStageRetirementDoorbell(m_producer.SelfDoorbell());
+        m_encoder.SetStageWaitTimeoutMs(kBarrierTimeoutMs);
+        m_encoder.SetCancellationState(&m_deviceLost, +[](void* self) {
+            auto& session = *static_cast<ClientSession*>(self);
+            auto* bell = session.m_producer.SelfDoorbell();
+            if (bell && bell->PeerHungUp()) {
+                session.LatchDeviceLost("staging observed a peer that had hung up");
+            }
+            return session.m_deviceLost.load(std::memory_order_acquire) || (bell && bell->Dead());
+        }, this);
 
-        // ---- 7. the first CapsSnapshot, if the server had a backend to publish one from.
-        // ONE DRAIN, ONE ADOPTER (c1): PumpControlPlane below is the only thing in the client
-        // that turns a CapsSnapshot into a CapsMirror generation, so R-12's "a second arrival
-        // IS the invalidation" lives in exactly one place. s1's step here used to stop at
-        // "the snapshot arrived and is verifiable"; it now goes all the way, through the same
-        // function every later arrival goes through.
-        if (PumpControlPlane() == 0) {
-            MGLOG_W("MG_Remote client: the handshake carried no CapsSnapshot - the caps mirror is "
-                    "a PLACEHOLDER until one arrives. Every caps read until then answers a "
-                    "default and says so");
+        // P5e (ra, §2.6): the stage bell is a client wait and every client wait drains. The
+        // encoder owns the park; the session owns SEG_EVENT, so the session lends it a drain.
+        m_encoder.SetStageWaitHook(
+            +[](void* self) { DrainEventRing(static_cast<ClientSession*>(self)->Events()); }, this);
+
+        // ---- 7. A real first snapshot belongs to startup, not to a later GL call.
+        // Inproc already queued it; an independent control reader may still be
+        // receiving it. Do not latch run-ahead against a placeholder: promotion
+        // after this first decision is deliberately forbidden.
+        {
+            std::vector<Uint8> initialCaps;
+            const auto received = ReceiveControlFrame(initialCaps, kHandshakeTimeoutMs);
+            if (received != MOBILEGL_OK) {
+                MGLOG_E("MG_Remote client: Refuse{InitialCapsSnapshot} no initial capabilities "
+                        "within %u ms (rc=%d); the session was not started",
+                        kHandshakeTimeoutMs, static_cast<int>(received));
+                Stop();
+                return received;
+            }
+            const auto* envelope = ParseEnvelope(initialCaps);
+            if (envelope == nullptr || envelope->msg_type() != ::MobileGL::Wire::CtrlMsg::CapsSnapshot ||
+                envelope->msg_as_CapsSnapshot() == nullptr ||
+                !AdoptCapsSnapshot(envelope->msg_as_CapsSnapshot())) {
+                MGLOG_E("MG_Remote client: Refuse{InitialCapsSnapshot} first post-Welcome control "
+                        "frame is not a valid capabilities snapshot; the session was not started");
+                Stop();
+                return MOBILEGL_ERR_PROTOCOL_MISMATCH;
+            }
+            LatchRunAheadFromCaps();
+            // A newer snapshot already queued may demote the initial decision.
+            // LogLine frames on TCP were filtered by ControlInbox before this read.
+            PumpControlPlane();
         }
 
         // BOTH, AND m_started FIRST. `Active()` is what the integration lane's skip reads and
@@ -652,17 +1561,36 @@ namespace MobileGL::MG_Remote::Client {
         // to be true before the pointer that grants access to it is published. `Stop()` takes
         // them down in the mirror order (m_started = false, then g_active = nullptr).
         m_started = true;
+        Transport::LinkMetricsBegin();
         g_active = this;
+        // D1c: THE SESSION-LIVE AND APPLY-THREAD FACTS, stated where they become true.
+        //
+        // MGPipeApplierReset's layer-2 guard used to ask ClientSession::Active() != nullptr,
+        // which no SERVER process can ever answer yes to - so the guard was compiled in and
+        // permanently disarmed there. MGPipeSessionLive() is the same question asked in a way
+        // both roles can answer, and the probe hands MG_Backend the one thread fact it cannot
+        // derive: whether the CALLING thread is inside the applier.
+        MG_Pipe::MGPipeSetSessionLive(true);
+        // ServerLoop::OnApplyThread, NOT ApplyThreadIsInsideApplier - two different questions,
+        // and installing the wrong one turned every GL-thread call into a role violation while
+        // the applier happened to be busy. Measured: the inproc retrace died on
+        // Fatal{RoleViolation, "MGPipeSlots"} raised from the GL thread. "Am I the apply
+        // thread" is what the guards ask; "is the apply thread inside the applier" is R-1's
+        // mutual-exclusion probe and is about a DIFFERENT thread.
+        MG_Pipe::MGPipeSetApplyThreadProbe(&Server::ServerLoop::OnApplyThread);
         LogMemory("handshake");
 
         // ---- 8. and only now the apply thread. It is package v1's ServerLoop: it names the
         // thread mgl-srv-apply, applies MOBILEGL_IPC_SERVER_AFFINITY and logs the RESOLVED
         // mask. Under `inproc` the client is what starts the server role, which is why this
         // call is here rather than in some server-side main.
-        const MobileGLResult running = Server::ServerLoopInstance().Start(server);
-        if (running != MOBILEGL_OK) {
-            Stop();
-            return running;
+        if (startApplyThreadHere) {
+            Server::ServerSession& server = Server::ServerSessionInstance();
+            const MobileGLResult running = Server::ServerLoopInstance().Start(server);
+            if (running != MOBILEGL_OK) {
+                Stop();
+                return running;
+            }
         }
 
         // ---- 9. AND ONLY NOW THE THIRTY-SEVEN WIRE EMITTERS (R-17). This is the line that
@@ -678,7 +1606,7 @@ namespace MobileGL::MG_Remote::Client {
         //     would go to a server this client has not been told consumes that family;
         //   - after ServerLoop::Start (step 8), because EmitAndWait BLOCKS on appliedSeq and
         //     with no apply thread nothing advances it: the first resource_create would spend
-        //     30 seconds in the barrier and then Fatal{BarrierTimeout};
+        //     the whole kBarrierTimeoutMs in the barrier and then Fatal{BarrierTimeout};
         //   - on THIS thread, the one that called MG_Backend::Init(), because it is the GL
         //     thread and table 3 makes gPipeInputs its to touch while the barrier holds.
         // The publication is safe without a fence because the apply thread never reads these
@@ -702,6 +1630,8 @@ namespace MobileGL::MG_Remote::Client {
         // monolith adapter runs is a defined no-op rather than a use-after-free.
         UninstallClientWireTables();
         if (!m_started) {
+            m_controlInbox.reset();
+            if (m_socketTransport) m_socketTransport->Shutdown();
             // Start's own failure paths land here with a half-built session. FIVE of them are
             // reached AFTER ServerSession::Accept has already returned OK, so tearing down
             // only the client half is not enough and gets three things wrong at once: the
@@ -712,7 +1642,8 @@ namespace MobileGL::MG_Remote::Client {
             // still point at. The server closes FIRST, in the same order the started path
             // gets right, and only then do the transports go.
             m_producer.Detach();
-            m_shm.Close();
+            m_link = Transport::CreateSharedLink(Transport::TransportRoleTag::ClientProducer);
+            m_cmd = &m_link->CommandsOut(); m_events = &m_link->EventsIn();
             Server::ServerSessionInstance().Close();
             m_clientTransport.reset();
             m_serverTransport.reset();
@@ -727,8 +1658,7 @@ namespace MobileGL::MG_Remote::Client {
         //
         // 1. publish and let the server drain. Bounded: a lost record must be a red lane, not
         //    a hung exit.
-        Transport::RingControl* control = m_shm.CmdControl();
-        if (control != nullptr) {
+        if (m_link->Attached()) {
             // The PRODUCER's own last-published seq, not RingControl::submittedSeq. Ring.h:72-77
             // permits submittedSeq to be published lazily and Ring.h:243 encourages batching
             // the publish, so the shared watermark is allowed to lag the emitter - and a drain
@@ -751,9 +1681,30 @@ namespace MobileGL::MG_Remote::Client {
         //    kWaitForever (CondVarDoorbell::Kill): a Notify is consumed by one Park, after which
         //    Doorbell::Wait re-tests a condition nothing published, finds the bell alive and
         //    parks again, forever. InProcessChannel::Close kills both bells.
+        // Request EOF starts remote backend destruction. Keep receiving until
+        // peer EOF, so the next client cannot overtake that session's cleanup.
+        if (m_socketTransport && !m_deviceLost.load(std::memory_order_acquire) &&
+            m_socketTransport->ShutdownSend() == MOBILEGL_OK) {
+            bool closed = false;
+            if (m_controlInbox) closed = m_controlInbox->WaitClosed(kDrainTimeoutMs);
+            else {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kDrainTimeoutMs);
+                for (;;) {
+                    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        deadline - std::chrono::steady_clock::now()).count();
+                    if (left <= 0) break;
+                    std::vector<Uint8> finalFrame;
+                    const auto result = ReceiveControlFrame(finalFrame, static_cast<Uint32>(left));
+                    if (result == MOBILEGL_ERR_TRANSPORT_CLOSED) { closed = true; break; }
+                    if (result != MOBILEGL_OK) break;
+                }
+            }
+            if (!closed) MGLOG_W("MG_Remote client: remote teardown did not reach EOF within %u ms", kDrainTimeoutMs);
+        }
         if (m_transport != nullptr) {
             m_transport->Shutdown();
         }
+        m_controlInbox.reset();
 
         // 3. JOIN, bounded - package v1's ServerLoop::Stop, which also destroys the server's
         //    private BackendObject on that thread before it exits.
@@ -763,19 +1714,35 @@ namespace MobileGL::MG_Remote::Client {
         //    referenced by an unapplied record is a use-after-free the join is what prevents.
         LogMemory("teardown");
         LogWireLedger();
+        Transport::LinkMetricsEnd();
         m_producer.Detach();
         m_encoder = Wire::PipeWireEncoder();
-        m_events = Transport::EventRingConsumer();
-        m_replies = Transport::ReplySlotPool();
-        m_cmd = Transport::RingProducer();
-        m_shm.Close();
+        *m_events = Transport::EventRingConsumer();
+        *m_cmd = Transport::RingProducer();
+        m_link = Transport::CreateSharedLink(Transport::TransportRoleTag::ClientProducer);
+        m_cmd = &m_link->CommandsOut(); m_events = &m_link->EventsIn();
+        m_link->Memory().Close();
         Server::ServerSessionInstance().Close();
         m_clientTransport.reset();
         m_serverTransport.reset();
         m_transport = nullptr;
         m_started = false;
+        // P5e (ra, §1): the LATCH GOES DOWN WITH THE SESSION. It is "what the first caps
+        // adoption of THIS session said", and a session that starts again - the same singleton,
+        // a second Start - must take it again from that session's own first snapshot rather
+        // than inherit a verdict about a server that is gone. The present serial goes with it
+        // for the same reason: the credit's id space belongs to the session that paces on it.
+        m_runAheadArmed = false;
+        m_runAheadLatched = false;
+        // The cold-start window is the next server's, not this one's (RunRemoteSurfaceControlFrame).
+        m_serverBackendWarm = false;
+        m_presentsSent = 0;
         if (g_active == this) {
             g_active = nullptr;
+            // Mirror order, and the probe goes with it: a dangling function pointer into a
+            // torn-down session is a worse answer than "there is no applier".
+            MG_Pipe::MGPipeSetSessionLive(false);
+            MG_Pipe::MGPipeSetApplyThreadProbe(nullptr);
         }
         // AND ONLY NOW the monolith adapters go back (codex 4): every ring an emitter would have
         // used is freed above, so from here a routed call - an at-exit ~BufferObject delete - runs
@@ -783,6 +1750,25 @@ namespace MobileGL::MG_Remote::Client {
         // process that no longer has a session. During the whole span above, the raised flag made
         // any routed call abort by name instead.
         ReinstallMonolithAfterTeardown();
+        // P6: the server we launched. Closing the transport is what it sees as
+        // EOF and EOF is its whole exit condition, so the order is transport
+        // first, reap second - and the reap is BOUNDED, because a server that
+        // will not go is a different fact from one that is slow and only the
+        // exit code can say which.
+        if (m_spawned.pid >= 0) {
+            if (m_socketTransport) {
+                m_socketTransport->Shutdown();
+            }
+            int exitCode = 0;
+            if (Server::ReapServer(m_spawned, 3000, &exitCode) != MOBILEGL_OK) {
+                MGLOG_W("MG_Remote client: the spawned server (pid %d) did not exit within 3 s",
+                        m_spawned.pid);
+            } else if (exitCode != 0) {
+                MGLOG_W("MG_Remote client: the spawned server exited %d", exitCode);
+            }
+        }
+        Server::ServerLoopInstance().SetRemoteControlSink(nullptr, nullptr);
+
     }
 
     Wire::PipeWireEncoder& ClientSession::Encoder() { return m_encoder; }
@@ -814,17 +1800,17 @@ namespace MobileGL::MG_Remote::Client {
     Uint64 ClientSession::EmitAndWaitTails(MG_Pipe::MGPWireOp op, const void* payload,
                                            Uint64 payloadBytes, const Wire::WireTail* tails,
                                            Uint32 tailCount, void* replyOut, Uint64 replyBytes,
-                                           Int32* statusOut, Uint64* replySizeOut) {
+                                           Int32* statusOut, Uint64* replySizeOut,
+                                           Bool wantReply) {
         Uint64 varTailBytes = 0;
         for (Uint32 i = 0; i < tailCount; ++i) varTailBytes += tails[i].Size;
         if (statusOut != nullptr) *statusOut = Wire::ReplySink::kStatusError;
         if (replySizeOut != nullptr) *replySizeOut = 0;
         if (!m_started) {
-            MGLOG_F("MGPipe: Fatal{NoClientSession, \"%s\"} - EmitAndWait on a session that has "
+            SessionFail(MGFatalFamily::NoClientSession, "MGPipe: Fatal{NoClientSession, \"%s\"} - EmitAndWait on a session that has "
                     "not started. There is no fall-through: a record that could not be emitted "
                     "is a verb that did not happen",
                     Wire::WireOpName(op));
-            std::abort();
         }
 
         // R-1's INVARIANT, AS A RUNTIME CHECK RATHER THAN A SENTENCE - but only while the
@@ -838,50 +1824,127 @@ namespace MobileGL::MG_Remote::Client {
         // the fill quiescent during that apply). With the batch off, the original check
         // stands as written.
         if (MG_Config::Ipc.BatchWaits == 0 && ApplyThreadIsInsideApplier()) {
-            MGLOG_F("MGPipe: Fatal{BarrierViolation, \"%s\"} - the apply thread is inside the "
+            SessionFail(MGFatalFamily::BarrierViolation, "MGPipe: Fatal{BarrierViolation, \"%s\"} - the apply thread is inside the "
                     "applier while the GL thread is emitting. R-1 makes at most one of them "
                     "runnable, which is what keeps one process-wide gPipeInputs legal",
                     Wire::WireOpName(op));
-            std::abort();
         }
 
+        const auto declineCancelled = [&] {
+            if (statusOut) *statusOut = Wire::ReplySink::kStatusDeclined;
+            return Wire::kInvalidSeq;
+        };
+        if (DeviceLost() || m_encoder.Cancelled()) return declineCancelled();
+        const Bool rowCarriesReplySlot =
+            (MG_Pipe::MGPipeCallFlagsFor(op) & static_cast<Uint32>(MG_Pipe::kReplySlot)) != 0;
+        const Bool ownsReplySlot = rowCarriesReplySlot && wantReply;
         Uint64 seq = m_encoder.EncodeRecord(op, payload, payloadBytes, tails, tailCount);
         if (seq == Wire::kInvalidSeq) {
+            if (DeviceLost() || m_encoder.Cancelled()) return declineCancelled();
             // EncodeRecord already refused individually oversized records. This one fits,
             // but appliedSeq may be ahead of retiredTail: wait for actual reclaimable space,
             // including the wrap pad. Prior EmitAndWait calls have published every record.
             Wire::WireRecordLayout layout{};
             Wire::MGPipeWireRecordLayout(op, payload, layout);
-            const Uint64 toEnd = m_cmd.Capacity() - m_cmd.LocalHead() % m_cmd.Capacity();
+            const Uint64 toEnd = m_cmd->Capacity() - m_cmd->LocalHead() % m_cmd->Capacity();
             const Uint64 needed = layout.TotalBytes + (toEnd < layout.TotalBytes ? toEnd : 0);
             const BarrierWaitScope waiting;
             const auto wait = m_producer.WaitForCmdSpace(needed, kBarrierTimeoutMs);
+            if (wait == Transport::SessionWait::ShutDown) {
+                (void)m_encoder.CheckCancellation();
+                return declineCancelled();
+            }
             if (wait != Transport::SessionWait::Reached) {
-                MGLOG_F("MGPipe: Fatal{RetirementWaitFailed, \"SEG_CMD\"} - %s needs %llu "
+                SessionFail(MGFatalFamily::RetirementWaitFailed, "MGPipe: Fatal{RetirementWaitFailed, \"SEG_CMD\"} - %s needs %llu "
                         "reclaimable bytes; the retirement wait ended on %s",
                         Wire::WireOpName(op), static_cast<unsigned long long>(needed),
                         wait == Transport::SessionWait::ShutDown ? "shutdown" : "timeout");
-                std::abort();
             }
+            // P5e (ra, §2.6): EVERY WAIT EXIT DRAINS. The cmd-space wait is one of the two
+            // safety nets under run-ahead (the stage bell is the other), and a client parked
+            // here without draining is the other half of the flow-control deadlock: the server
+            // stops applying on a full event ring, so retiredSeq stops moving, so this wait
+            // never completes. One drain on the way out closes it.
+            DrainEventRing(*m_events);
             seq = m_encoder.EncodeRecord(op, payload, payloadBytes, tails, tailCount);
             if (seq == Wire::kInvalidSeq) {
-                MGLOG_F("MGPipe: Fatal{RingOverrun, \"SEG_CMD\"} - %s refused after sufficient "
+                if (DeviceLost() || m_encoder.Cancelled()) return declineCancelled();
+                SessionFail(MGFatalFamily::RingOverrun, "MGPipe: Fatal{RingOverrun, \"SEG_CMD\"} - %s refused after sufficient "
                         "space retired", Wire::WireOpName(op));
-                std::abort();
             }
         }
 
         // Publish the head, record submittedSeq, THEN ring - in that order, which is
         // SessionProducer's one job and RingTest.cpp:446's pin. Notify-then-publish loses the
         // wakeup.
+        const auto replyMetricStart = Transport::LinkMetricsBeginReply(ownsReplySlot);
         m_producer.PublishAndNotify(seq);
+        if (op == MG_Pipe::MGPWireOp::Present) {
+            // A credit is permission to run ahead, not permission to retain the
+            // last frame locally until another frame or a wait happens to arrive.
+            Flush();
+            Transport::LinkMetricsPresent();
+        }
 
         // Does this row own a reply slot? kMGPipeCallFlags IS THE SINGLE SOURCE OF TRUTH
         // (R-16 / ID-31) - fourteen rows now, because the four Bool acceptance entry points
         // gained the flag. Asking the catalogue rather than the caller is what stops a caller
         // that forgot to pass a buffer from silently turning an answer into a guess.
-        const Bool ownsReplySlot =
-            (MG_Pipe::MGPipeCallFlagsFor(op) & static_cast<Uint32>(MG_Pipe::kReplySlot)) != 0;
+        //
+        // P5e (ra) ADDS ONE CALLER-SIDE CONJUNCT AND NO SECOND SOURCE OF TRUTH: `wantReply`.
+        // The catalogue still says which rows CARRY a slot; a caller that passes false says it
+        // will not read this one (resource_subdata's buffer half, §2.5 - the only such caller).
+        // The server posts either way, so the wire is unchanged and the row keeps its flag.
+
+
+        // ---- THE P5e WAIT RULE (CONTRACT-P5E §2.3) ---------------------------------------
+        //
+        // IT STANDS BEFORE THE BATCH SKIP AND REPLACES IT WHOLE, rather than adding a clause to
+        // it. The batch skip is a rule about CALL CLASSES ("a set/CSO/object record carries its
+        // whole value in the payload"); the wait class is a rule about WHAT AN APPLY READS, and
+        // it is generated from the same PipeCalls.def row the class comes from
+        // (MGPipeWaitClassFor, c0e). Two rules layered would mean a row could be skipped by the
+        // class rule and waited by the column, and the column is the one the SERVER's
+        // MGPipeBarriered reads - so the two halves of the wire would disagree about whether
+        // the client is parked behind this record, which is the single fact §4.4's exemptions
+        // and §3.3's detector both rest on.
+        //
+        // WITH RUN-AHEAD DISARMED NOTHING BELOW RUNS and the file's original shape continues -
+        // Magma, a monolith transport, MOBILEGL_IPC_RUN_AHEAD=0 and every build before the
+        // integration commit take the old path byte for byte, which is what makes RUN_AHEAD=0
+        // a pure wait-rule A/B on identical server code (§5.8).
+        if (RunAheadArmed() && !ownsReplySlot) {
+            MG_Pipe::MGPipeWaitClass waitClass = MG_Pipe::MGPipeWaitClassFor(op);
+            // §2.5's named relaxation, and the ONLY place a static column answer is overridden:
+            // a kWaitReply row whose caller does not want the answer has nothing to wait FOR.
+            // It is spelled here rather than in the column because the column is per-op and
+            // this is per-call - the texture half of the same row still waits.
+            if (!wantReply && waitClass == MG_Pipe::kWaitReply) waitClass = MG_Pipe::kWaitNone;
+            switch (waitClass) {
+            case MG_Pipe::kWaitNone:
+                // Published and gone. Rule F is what makes this legal: the apply of an
+                // unbarriered record names no client memory at all (§3, §4, §5).
+                return seq;
+            case MG_Pipe::kWaitPresent:
+                // The credit wait already ran, in EmitPresent, BEFORE the encode (§2.4). There
+                // is nothing left to do here and waiting would turn the credit into a barrier.
+                return seq;
+            case MG_Pipe::kWaitApplied:
+                // §2.2's barriered rows: applier_reset, generate_mipmap (until tx2 lands its
+                // VerbMipRes arm), set_storage_block_binding, the five XFB span verbs and the
+                // CopyTex endpoint. Each still pulls a row or probes a registry, and the
+                // client's wait is exactly what keeps P5C's semantics legal for it (ruling 4).
+                // Falls through to the wait below.
+                break;
+            case MG_Pipe::kWaitReply:
+            case MG_Pipe::kWaitClassCount:
+                // Unreachable: `ownsReplySlot` is false here, and gen_pipe refuses a kWaitReply
+                // row without a slot and a kReplySlot row that does not wait (c0e's three
+                // negative controls). Treated as a wait rather than as a skip, because the
+                // wrong answer to "does this hang" is the recoverable one.
+                break;
+            }
+        }
 
         // MOBILEGL_IPC_BATCH_WAITS (default 1): a value-class record is published WITHOUT
         // waiting for its own apply. The barrier's one load-bearing reader is the backend
@@ -912,7 +1975,13 @@ namespace MobileGL::MG_Remote::Client {
         // (set_texture_params, resource_subdata, resource_readback and get_texture_image
         // own reply slots and wait anyway; the resource_* transfers and object_death resolve
         // by handle).
-        if (!ownsReplySlot && MG_Config::Ipc.BatchWaits != 0 &&
+        //
+        // AND IT IS DISARMED WHOLE UNDER RUN-AHEAD (P5e §2.3): the wait class above is the
+        // rule there, and a second skip rule reading a different column is how the two halves
+        // of the wire end up disagreeing about whether the client is parked. Written as a
+        // conjunct here rather than left to "the classes happen not to overlap", because the
+        // classes overlapping is one PipeCalls.def row away at any time.
+        if (!ownsReplySlot && !RunAheadArmed() && MG_Config::Ipc.BatchWaits != 0 &&
             op != MG_Pipe::MGPWireOp::GenerateMipmap) {
             const MG_Pipe::MGPipeCallClass callClass = MG_Pipe::MGPipeCallClassFor(op);
             if (callClass == MG_Pipe::kCtxState || callClass == MG_Pipe::kCtxCso ||
@@ -931,8 +2000,18 @@ namespace MobileGL::MG_Remote::Client {
 
         const BarrierWaitScope waiting;
         const Uint64 waitBudgetMs = AppliedWaitBudgetMs(op, payload);
-        const Transport::SessionWait wait = WaitForAppliedBudget(m_producer, seq, waitBudgetMs);
+        const Transport::SessionWait wait =
+            WaitForAppliedBudget(m_producer, *m_events, seq, waitBudgetMs);
         if (wait == Transport::SessionWait::ShutDown) {
+            // `dl`: SHUTDOWN IS TWO DIFFERENT EVENTS AND ONLY ONE IS A DEVICE LOSS. Stop() kills
+            // this same bell to wake a parked applier, so an orderly exit arrives here too - and
+            // latching on Dead() alone would arm the device-lost flag on every clean teardown.
+            // PeerHungUp() is true only when a descriptor whose far end ONLY THE SERVER held
+            // reported hangup, which nothing this side can cause.
+            if (const Transport::Doorbell* bell = m_producer.SelfDoorbell();
+                bell != nullptr && bell->PeerHungUp()) {
+                LatchDeviceLost("the barrier woke on a peer that had hung up");
+            }
             // The doorbell died: the server went away. The only thing that returns from a
             // kWaitForever park, and therefore the only way a client blocked in the barrier
             // survives a server that is gone. It is teardown, not a server fault - so the answer
@@ -950,33 +2029,43 @@ namespace MobileGL::MG_Remote::Client {
             return seq;
         }
         if (wait != Transport::SessionWait::Reached) {
-            MGLOG_F("MGPipe: Fatal{BarrierTimeout, \"%s\"} - appliedSeq did not reach %llu within "
+            SessionFail(MGFatalFamily::BarrierTimeout, "MGPipe: Fatal{BarrierTimeout, \"%s\"} - appliedSeq did not reach %llu within "
                     "%llu ms. A bounded wait is deliberate: a wedged CI job and a lost record look "
                     "identical from outside, and only one of them is a bug worth finding",
                     Wire::WireOpName(op), static_cast<unsigned long long>(seq),
                     static_cast<unsigned long long>(waitBudgetMs));
-            std::abort();
         }
+
+        Transport::LinkMetricsReplyApplied(replyMetricStart);
 
         // THE REVERSE CHANNEL IS DRAINED HERE, and here is the only place it can be: under the
         // barrier this is the one instant at which the apply thread is known not to be inside
         // the applier, and MGPipeClientOnGpuWritten / OnBufferWriteback write frontend objects.
         // It is what gives AwaitBufferWriteback something to have waited FOR: b1's third state
         // clears when the writeback lands, and the writeback lands on this ring.
-        DrainEventRing(m_events);
+        DrainEventRing(*m_events);
 
-        if (!ownsReplySlot) return seq;
+        if (!ownsReplySlot) {
+            // P5e (ra, §2.3). A barriered record's apply has returned and this thread is the
+            // only runnable one, so the four O-class SharedPtr rows the last fill left in
+            // gPipeInputs can go. Under lockstep they were harmless - the next verb's fill
+            // overwrote them - but under run-ahead the next fill may be a frame away, and a
+            // frontend VAO or program whose LAST owner is that block is one the apply thread
+            // can end up destroying (§2.7's deferred-destroy hazard). Released here rather
+            // than at the fill, because here is where the applier is provably idle.
+            if (RunAheadArmed()) ReleaseFillPins();
+            return seq;
+        }
 
         // THE SAME WAIT, NOT A SECOND ONE. appliedSeq >= seq already means the server wrote
         // this record's answer, because it writes the slot before it advances the watermark.
         Uint64 replySize = 0;
         Int32 status = Wire::ReplySink::kStatusError;
         if (!ReadReply(seq, replyOut, replyBytes, &status, &replySize)) {
-            MGLOG_F("MGPipe: Fatal{ReplyMissing, \"%s\"} - seq %llu carries kReplySlot and the "
+            SessionFail(MGFatalFamily::ReplyMissing, "MGPipe: Fatal{ReplyMissing, \"%s\"} - seq %llu carries kReplySlot and the "
                     "server applied it, but its slot does not stamp that seq. The stamp is what "
                     "makes a wrong-slot read detectable rather than plausible (R-3)",
                     Wire::WireOpName(op), static_cast<unsigned long long>(seq));
-            std::abort();
         }
         if (statusOut != nullptr) *statusOut = status;
         if (replySizeOut != nullptr) *replySizeOut = replySize;
@@ -989,30 +2078,206 @@ namespace MobileGL::MG_Remote::Client {
         // (R-5). A client that treated it as a failure would re-create ID-39 from the other
         // side.
         if (replyOut != nullptr && replySize > replyBytes) {
-            MGLOG_F("MGPipe: Fatal{ReplyTooLarge, \"%s\"} - the answer is %llu bytes and the "
+            SessionFail(MGFatalFamily::ReplyTooLarge, "MGPipe: Fatal{ReplyTooLarge, \"%s\"} - the answer is %llu bytes and the "
                     "caller offered %llu. P5 does not chunk a reply",
                     Wire::WireOpName(op), static_cast<unsigned long long>(replySize),
                     static_cast<unsigned long long>(replyBytes));
-            std::abort();
         }
         return seq;
     }
 
     Bool ClientSession::BarrierArmed() const { return m_barrierArmed; }
 
+    // ---- P5e (ra): the run-ahead latch and the waits it leaves behind ---------------------
+
+    Bool ClientSession::RunAheadArmed() const { return m_runAheadArmed; }
+    // THE PRODUCER'S NUMBER, NOT A SECOND ONE. SessionProducer records it inside
+    // PublishAndNotify, which is the only place a record becomes published at all; a copy kept
+    // here would be a second thing to forget to write on a path that publishes without waiting
+    // - which, after P5e, is most of them.
+    Uint64 ClientSession::LastPublishedSeq() const { return m_producer.LastPublishedSeq(); }
+    Uint64 ClientSession::PresentCreditWaits() const { return m_presentCreditWaits; }
+
+    void ClientSession::LatchRunAheadFromCaps() {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // THE CONJUNCTION, IN THE CONTRACT'S OWN ORDER (§1). The caps read is last because it
+        // is the only one that costs a mirror load, and because it is the only one whose answer
+        // can change: the other two are process configuration.
+        const Bool armed = m_barrierArmed && MG_Config::Ipc.RunAhead != 0 &&
+                           Caps().HasCap(MG_Pipe::kCapRunAheadApply);
+        if (!m_runAheadLatched) {
+            m_runAheadLatched = true;
+            m_runAheadArmed = armed;
+            if (armed) {
+                MGLOG_I("MG_Remote client: run-ahead ARMED - the server publishes "
+                        "kCapRunAheadApply, so an unbarriered record is published and not "
+                        "waited for (CONTRACT-P5E §2.3), paced by a present credit of %u",
+                        MG_Config::Ipc.PresentCredit);
+            } else if (MG_Config::Ipc.RunAhead != 0 && m_barrierArmed) {
+                // THE KNOB IS NOT A SWITCH ON ITS OWN, and an operator who set it has to be
+                // told that, or an A/B arm that measured nothing looks like an A/B arm that
+                // measured no difference (Config.h's own argument for parsing it everywhere).
+                MGLOG_W_ONCE("MG_Remote client: run-ahead requested, server does not publish "
+                             "kCapRunAheadApply - running lockstep. The selected backend has "
+                             "not enabled its implementation-readiness gate");
+            }
+            return;
+        }
+        // A LATER SNAPSHOT MAY ONLY TURN IT OFF. Promotion would mean the records already
+        // published without a wait were published against a rule this server never agreed to,
+        // and nothing can un-publish them; demotion only adds waits, so it is safe and is
+        // exactly what a server that lost its run-ahead backend needs.
+        if (!armed && m_runAheadArmed) {
+            m_runAheadArmed = false;
+            MGLOG_W("MG_Remote client: run-ahead DISARMED by a later caps snapshot - every "
+                    "record from here waits as it did before P5e");
+        }
+#endif
+    }
+
+    void ClientSession::ReleaseFillPins() {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // The block's own door: PipeInputs' O-class rows are private and MG_Remote has no
+        // business knowing which four they are. MG_Impl owns the fill, so MG_Impl owns the
+        // un-fill (PipeFill.cpp), and this side only says WHEN.
+        MG_Pipe::MGPipeReleaseResidualFillPins();
+#endif
+    }
+
+    void ClientSession::WaitForApplyToCatchUp(const char* why) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // A NO-OP WITHOUT RUN-AHEAD, and that is not an optimisation: under lockstep the
+        // client already waited for every record it published, so appliedSeq is at
+        // LastPublishedSeq by construction and a second wait would only add a park on a
+        // watermark that is already reached.
+        if (!m_runAheadArmed || !m_started) return;
+        const Uint64 target = m_producer.LastPublishedSeq();
+        if (target == 0) return;
+        const BarrierWaitScope waiting;
+        const Transport::SessionWait wait =
+            WaitForAppliedBudget(m_producer, *m_events, target, kBarrierTimeoutMs);
+        if (wait == Transport::SessionWait::ShutDown) {
+            // `dl`: the same two-events distinction the verb barrier makes. Only a peer that
+            // HUNG UP is a device loss; Stop() reaches this path too.
+            if (const Transport::Doorbell* bell = m_producer.SelfDoorbell();
+                bell != nullptr && bell->PeerHungUp()) {
+                LatchDeviceLost("a forced run-ahead wait woke on a peer that had hung up");
+            }
+            // The doorbell died: teardown, not a fault - the same answer EmitAndWaitTails
+            // gives, and for the same reason.
+            MGLOG_E("MG_Remote client: the forced wait for %s woke on a dead doorbell; the "
+                    "server is gone", why);
+            return;
+        }
+        if (wait != Transport::SessionWait::Reached) {
+            SessionFail(MGFatalFamily::BarrierTimeout, "MGPipe: Fatal{BarrierTimeout, \"%s\"} - a forced run-ahead wait did not "
+                    "reach appliedSeq %llu within %u ms. The forced waits of CONTRACT-P5E §2.5 "
+                    "are the points at which the client must be in step again, so a wedge here "
+                    "is a wedge in the queue and not a slow frame",
+                    why, static_cast<unsigned long long>(target), kBarrierTimeoutMs);
+        }
+        // EVERY WAIT EXIT DRAINS (§2.6). It is what the flow-control deadlock argument rests
+        // on: the server blocks only on a full event ring, the client blocks only on
+        // watermarks the server advances, and every client wait drains - so at most one side
+        // is parked at any instant.
+        DrainEventRing(*m_events);
+        ReleaseFillPins();
+#else
+        (void)why;
+#endif
+    }
+
+    void ClientSession::Flush() {
+        if (!m_started || !m_link) return;
+        const auto result = m_link->Flush();
+        if (result == MOBILEGL_ERR_TRANSPORT_CLOSED) {
+            if (m_link->PeerHungUp()) LatchDeviceLost("published commands could not reach the disconnected peer");
+        } else if (result != MOBILEGL_OK) {
+            SessionFail(MGFatalFamily::ProtocolCorruption,
+                        "MGPipe: Fatal{ProtocolCorruption, link flush} published commands were not delivered (rc=%d)",
+                        static_cast<int>(result));
+        }
+    }
+
+    void ClientSession::Finish() {
+        // glFinish. Nothing goes on the wire - Flush and Finish have no record (ARCHITECTURE
+        // §11) - and under lockstep there was nothing to do, because the client had already
+        // waited out every command it issued. Under run-ahead "the commands issued so far have
+        // completed" is a promise the queue can break, so this is where it is kept.
+        WaitForApplyToCatchUp("glFinish");
+    }
+
+    Uint64 ClientSession::AcquirePresentCredit() {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // MINTED CLIENT-SIDE AND 1-BASED (§1). Before P5e the client sent 0 and the server
+        // stamped its own frame count, which was honest while nothing paced on it; a credit
+        // needs an id space only the payer can advance, and that is this one.
+        const Uint64 serial = m_presentsSent + 1;
+        if (!m_runAheadArmed) {
+            // Lockstep: the present record's own barrier IS the pacing, one frame deep by
+            // construction. The serial is still minted so that both arms carry the same field
+            // and the server's ReturnPresentCredit is fed on both - an A/B whose two arms
+            // disagree about a wire field is not an A/B (Config.h's rule for the knobs).
+            m_presentsSent = serial;
+            return serial;
+        }
+        const Uint32 credit = MG_Config::Ipc.PresentCredit;
+        if (m_presentsSent >= credit) {
+            // Wait for swap number (serial - credit) to have come back. With credit 1 that is
+            // the previous frame: the client publishes frame N+1's records while the server
+            // applies and swaps frame N, and blocks here until swap N returned - one frame of
+            // overlap and at most one frame of added latency (ruling 4 / ID-92).
+            const Uint64 awaited = serial - credit;
+            ++m_presentCreditWaits;
+            const BarrierWaitScope waiting;
+            Transport::SessionWait wait = Transport::SessionWait::TimedOut;
+            for (;;) {
+                // §2.6 again: the credit park breaks on a full SEG_EVENT too, for the same
+                // reason the applied park does - a server that stopped producing stopped
+                // swapping, and this waiter holds the only drain.
+                wait = m_producer.WaitForPresentAckOrEventBacklog(awaited, kBarrierTimeoutMs);
+                if (wait != Transport::SessionWait::Reached) break;
+                const auto* progress = m_producer.Progress();
+                if (progress == nullptr ||
+                    Transport::Watermark::Reached(progress->presentAckSerial, awaited)) {
+                    break;
+                }
+                DrainEventRing(*m_events);
+            }
+            if (wait == Transport::SessionWait::TimedOut) {
+                SessionFail(MGFatalFamily::PresentCreditTimeout, "MGPipe: Fatal{PresentCreditTimeout} - present %llu waited %u ms for "
+                        "swap %llu to come back with a credit of %u. The credit, never the "
+                        "ring's bytes, is what paces a run-ahead client (CONTRACT-P5E §2.4), "
+                        "so a credit that never returns is a server that stopped swapping",
+                        static_cast<unsigned long long>(serial), kBarrierTimeoutMs,
+                        static_cast<unsigned long long>(awaited), credit);
+            }
+            // ShutDown is teardown and returns: the present did not happen, the same answer
+            // the barrier gives on a dead doorbell.
+            if (wait == Transport::SessionWait::Reached) DrainEventRing(*m_events);
+        }
+        m_presentsSent = serial;
+        return serial;
+#else
+        return ++m_presentsSent;
+#endif
+    }
+
     // R-1's mutual-exclusion invariant, as two probes that answer honestly.
     //
     // THE CLIENT'S FLAG IS THREAD-LOCAL AND THE SERVER'S IS NOT, and the asymmetry is the
     // point: "am I inside a barrier wait" is a question about the calling thread, while "is the
     // apply thread inside the applier" is a question the GL thread asks about a DIFFERENT
-    // thread - so the second has to be a shared atomic and the first must not be, or a second
-    // GL thread would see the first one's wait as its own.
+    // thread in the shared-block control. Under role split each thread instead observes only
+    // its own diagnostic; the client writes a different block and waits through appliedSeq.
     Bool ClientSession::InBarrierWait() { return g_inBarrierWait; }
     Bool ClientSession::ApplyThreadIsInsideApplier() {
+        if (MG_Pipe::MGPipeRoleSplitRehearsalActive()) return g_roleInsideApplier;
         return g_applyThreadInsideApplier.load(std::memory_order_acquire);
     }
 
-    void ClientSession::RefusePipeInputsTouchWhileApplierOwnsIt(const char* surface) {
+    void ClientSession::RefusePipeInputsTouchWhileApplierOwnsIt(const char* surface,
+                                                                Bool isBarrieredFill) {
         // THE CHAIN IS A CONJUNCTION, SO ITS ORDER IS FREE - AND IT IS ORDERED CHEAPEST-FIRST
         // (P5d round 3, package D). Every line below is a pure predicate whose only effect is
         // "no violation, go home"; the Fatal fires on the AND of all of them, so reordering
@@ -1028,6 +2293,53 @@ namespace MobileGL::MG_Remote::Client {
         // both miss do we pay for a role probe, two singleton reads, a shared atomic and the
         // thread_local at the end.
         if (MG_Config::Transport == MG_Config::TransportMode::Monolith) return;
+        // ---- P5e (ra), CONTRACT-P5E §3.5: THE RUN-AHEAD RULE IS A DIFFERENT RULE -----------
+        //
+        // It is first, before the BatchWaits return, because BatchWaits' argument does not
+        // survive run-ahead: "the pull-verbs' own wait keeps their pulled reads fenced" is a
+        // statement about a client that waits at every verb, and this one does not. Under
+        // run-ahead the block is SERVER-ROLE memory (§3) and the single legal GL-thread write
+        // is the residual fill of a BARRIERED record - the one the client is about to park
+        // behind. Every other touch races the applier by construction, so there is no
+        // in-applier flag to consult and no "count it" arm: the value would be torn.
+        //
+        // This is where a fill left standing for an unbarriered record lands, by name.
+        if (ClientSessionInstance().RunAheadArmed()) {
+            // ---- P5e (ra2): THE EXEMPTION IS A FACT NOW, NOT A CLAIM ------------------------
+            //
+            // This arm used to read `if (isBarrieredFill) return;`, i.e. the caller's own
+            // sentence "this touch is the residual fill of a record this thread is about to park
+            // behind" was accepted as the whole argument. It is an argument about the FUTURE.
+            // The order at the validate point is fill, then emit, then park, so at the instant
+            // of the write the apply thread is still draining the unbarriered records the client
+            // ran ahead of - and the measured consequence was the GL thread bumping
+            // CurrentVerbSerial, withdrawing MGPipeServerClearVerbBoundary's flag and renaming
+            // m_currentVerb underneath a record the applier was inside, which surfaced as
+            // Fatal{UnmigratedPipeInput, "<field>@<the client's verb>"} on the apply thread.
+            // Because the exemption was unconditional, this guard could not fire on any of it:
+            // that is the answer to "does RefusePipeInputsTouchWhileApplierOwnsIt fire, and if
+            // not, why not".
+            //
+            // So the sentence still exempts the fill, but only once it is TRUE of this instant.
+            // The fill sites establish it by taking §2.5's forced wait first
+            // (QuiesceApplierBeforeFill, PipeFill.cpp); removing that wait is the red-once and
+            // lands here, by name, on the first barriered verb behind a run-ahead backlog.
+            //
+            // ApplyThreadIsInsideApplier() is an acquire load of the flag PipeApplier raises for
+            // the whole of ApplyOne - stamp, decode and LeaveApplier included - so "not inside"
+            // is exactly "no record is being applied" and not merely "not decoding".
+            if (isBarrieredFill && !ApplyThreadIsInsideApplier()) return;
+            if (Server::ServerLoop::OnApplyThread()) return; // the applier owns the block
+            SessionFail(MGFatalFamily::RoleViolation, "MGPipe: Fatal{RoleViolation, \"gPipeInputs\"} - the GL thread touched "
+                    "gPipeInputs (%s) on a RUN-AHEAD session %s. With the client running ahead "
+                    "the block is the server's to read for as long as ANY record is in flight "
+                    "(CONTRACT-P5E §3), so the only legal GL-thread write is a barriered fill "
+                    "that has first taken §2.5's forced wait (QuiesceApplierBeforeFill)",
+                    surface,
+                    isBarrieredFill ? "in a barriered fill that did not first wait for the "
+                                      "applier to catch up"
+                                    : "outside a barriered fill");
+        }
         // MOBILEGL_IPC_BATCH_WAITS=1 makes "the fill runs while the apply thread applies an
         // earlier value record" the INTENDED shape: the fill writes only fields no record
         // supplies (the wire-live skips are the same answer the emitters use), the applier
@@ -1046,19 +2358,22 @@ namespace MobileGL::MG_Remote::Client {
         // access in a shared library, and it must stay thread-local (see InBarrierWait's note
         // above - a second GL thread would otherwise read the first one's wait as its own).
         if (InBarrierWait()) return;
-        MGLOG_F("MGPipe: Fatal{RoleViolation, \"gPipeInputs\"} - the GL thread touched gPipeInputs "
+        SessionFail(MGFatalFamily::RoleViolation, "MGPipe: Fatal{RoleViolation, \"gPipeInputs\"} - the GL thread touched gPipeInputs "
                 "(%s) while the apply thread was inside the applier and this thread was not in a "
                 "barrier wait. R-1's barrier is the only thing that makes one process-wide "
                 "gPipeInputs legal (CONTRACT-P5 table 3); a touch in this window races the "
                 "applier's own reads of it",
                 surface);
-        std::abort();
     }
     void ClientSession::NoteApplyThreadEnteredApplier() {
-        g_applyThreadInsideApplier.store(true, std::memory_order_release);
+        g_roleInsideApplier = true;
+        if (!MG_Pipe::MGPipeRoleSplitRehearsalActive())
+            g_applyThreadInsideApplier.store(true, std::memory_order_release);
     }
     void ClientSession::NoteApplyThreadLeftApplier() {
-        g_applyThreadInsideApplier.store(false, std::memory_order_release);
+        g_roleInsideApplier = false;
+        if (!MG_Pipe::MGPipeRoleSplitRehearsalActive())
+            g_applyThreadInsideApplier.store(false, std::memory_order_release);
     }
 
     Uint32 ClientSession::PumpControlPlane() {
@@ -1071,9 +2386,9 @@ namespace MobileGL::MG_Remote::Client {
         // drains them would otherwise hold the GL thread here for ever, and a frame backlog
         // deeper than this is a finding rather than a steady state.
         for (Uint32 guard = 0; guard < kMaxControlFramesPerPump; ++guard) {
-            if (m_transport->PeekFrameSize() == 0) break;
+            if ((m_controlInbox ? m_controlInbox->Peek() : m_transport->PeekFrameSize()) == 0) break;
             std::vector<Uint8> frame;
-            if (ReceiveEnvelope(*m_transport, frame, 0) != MOBILEGL_OK) break;
+            if (ReceiveControlFrame(frame, 0) != MOBILEGL_OK) break;
             const ::MobileGL::Wire::CtrlEnvelope* envelope = ParseEnvelope(frame);
             if (envelope == nullptr) {
                 MGLOG_E("MG_Remote client: an unverifiable control frame (%llu bytes) was dropped",
@@ -1090,7 +2405,31 @@ namespace MobileGL::MG_Remote::Client {
             }
             if (AdoptCapsSnapshot(envelope->msg_as_CapsSnapshot())) ++adopted;
         }
+        // P5e (ra, §1): the run-ahead latch rides R-12's invalidation edge, because "the first
+        // caps adoption after Start" and "the one place a CapsSnapshot becomes a mirror
+        // generation" are the same instant, and a latch taken anywhere else would be reading a
+        // mirror whose generation nobody had adopted yet. Called even when `adopted` is 0: the
+        // first call in Start() is what takes the latch, and a pump that adopted nothing still
+        // has to leave it taken (a handshake with no snapshot latches "not armed", which is
+        // the honest answer for a server that never said what it consumes).
+        if (adopted != 0 || !m_runAheadLatched) LatchRunAheadFromCaps();
         return adopted;
+    }
+
+    MobileGLResult ClientSession::AttachStreamLink(int fd, const Transport::SessionSegmentSizes& sizes) {
+        std::unique_ptr<Transport::ILink> link;
+        const auto attached = Transport::CreateStreamLink(fd, sizes, Transport::TransportRoleTag::ClientProducer, link);
+        if (attached != MOBILEGL_OK) return attached;
+        AttachDataLink(std::move(link));
+        return MOBILEGL_OK;
+    }
+
+    void ClientSession::AttachDataLink(std::unique_ptr<Transport::ILink> link) {
+        m_link = std::move(link);
+        m_cmd = &m_link->CommandsOut(); m_events = &m_link->EventsIn();
+        m_producer.SetLink(m_link->Capabilities().PublishIsDelivery ? nullptr : m_link.get());
+        m_encoder.SetLink(m_link->Capabilities().PublishIsDelivery ? nullptr : m_link.get());
+        m_events->SetLink(m_link->Capabilities().PublishIsDelivery ? nullptr : m_link.get());
     }
 
     Transport::SessionProducer& ClientSession::Producer() { return m_producer; }
@@ -1101,36 +2440,70 @@ namespace MobileGL::MG_Remote::Client {
 
     Bool ClientSession::ReadReply(Uint64 seq, void* outBytes, Uint64 outCapacity, Int32* outStatus,
                                   Uint64* outSize) {
-        return m_replies.Read(seq, outBytes, outCapacity, outStatus, outSize);
+        const void* bytes = nullptr; Uint64 size = 0; Int32 status = 0;
+        if (m_link->ReadReply(seq, &status, &bytes, &size) != MOBILEGL_OK) return false;
+        if (outStatus) *outStatus = status;
+        if (outSize) *outSize = size;
+        if (size > outCapacity || (size && !outBytes)) return false;
+        if (size) std::memcpy(outBytes, bytes, static_cast<SizeT>(size));
+        return true;
     }
 
-    Uint32 ClientSession::MaxReplyBytes() const { return m_replies.MaxReplyBytes(); }
+    Uint32 ClientSession::MaxReplyBytes() const { return static_cast<Uint32>(m_link->Capabilities().MaxReplyBytes); }
 
-    Bool ClientSession::ReplyCanHold(Uint64 bytes) const { return m_replies.CanHold(bytes); }
+    Bool ClientSession::ReplyCanHold(Uint64 bytes) const { return bytes <= MaxReplyBytes(); }
 
     // ID-47. Forwarded verbatim so that the message, the boundary and the abort are the pool's
     // and are pinned once, in SessionTest, rather than re-derived per caller.
     void ClientSession::RequireReadPixelsReplyFits(Uint32 width, Uint32 height, Uint32 format,
                                                    Uint32 type, Uint64 bytes) const {
-        m_replies.RequireReadPixelsFits(width, height, format, type, bytes);
+        if (!ReplyCanHold(bytes)) {
+            SessionFail(MGFatalFamily::ReplyTooLarge,
+                "MGPipe: Fatal{ReplyTooLarge, \"ReadPixels %ux%u 0x%04X/0x%04X %llu > %u\"}",
+                width, height, format, type, static_cast<unsigned long long>(bytes), MaxReplyBytes());
+        }
     }
 
-    Transport::EventRingConsumer& ClientSession::Events() { return m_events; }
+    Transport::EventRingConsumer& ClientSession::Events() { return *m_events; }
 
     Uint32 ClientSession::DrainPublishedEvents() {
         // Not gated on m_started on purpose: PumpControlPlane's own pre-start call during
         // Start() has its ring-consumer twin here, and DrainEventRing's Valid() check is
         // the whole guard either case needs.
-        return DrainEventRing(m_events);
+        return DrainEventRing(*m_events);
     }
 
-    Uint64 ClientSession::EventRingCapacityBytes() const { return m_shm.EventRingCapacity(); }
+    void ClientSession::NoteServerOwnedWindowSurface(EGLSurface surface, Uint32 width, Uint32 height) {
+        {
+            const std::lock_guard<std::mutex> lock(g_serverOwnedSurfacesMutex);
+            if (std::find(g_serverOwnedSurfaces.begin(), g_serverOwnedSurfaces.end(), surface) ==
+                g_serverOwnedSurfaces.end())
+                g_serverOwnedSurfaces.push_back(surface);
+        }
+        ApplyServerOwnedSurfaceExtent(width, height);
+    }
+
+    void ClientSession::ForgetServerOwnedWindowSurface(EGLSurface surface) {
+        const std::lock_guard<std::mutex> lock(g_serverOwnedSurfacesMutex);
+        g_serverOwnedSurfaces.erase(std::remove(g_serverOwnedSurfaces.begin(), g_serverOwnedSurfaces.end(), surface),
+                                    g_serverOwnedSurfaces.end());
+    }
+
+    Bool ClientSession::IsServerOwnedWindowSurface(EGLSurface surface) {
+        const std::lock_guard<std::mutex> lock(g_serverOwnedSurfacesMutex);
+        return std::find(g_serverOwnedSurfaces.begin(), g_serverOwnedSurfaces.end(), surface) !=
+               g_serverOwnedSurfaces.end();
+    }
+
+    Uint64 ClientSession::EventRingCapacityBytes() const { return m_link->Memory().EventRingCapacity(); }
+
+    Uint64 ClientSession::StageCapacityBytes() const { return m_link->Memory().StageBytes(); }
 
     Wire::SegmentTable& ClientSession::Segments() { return m_segments; }
 
-    Transport::RingControl* ClientSession::Control() { return m_shm.CmdControl(); }
+    Transport::RingControl* ClientSession::Control() { return m_link->Memory().CmdControl(); }
 
-    Transport::SessionSegments& ClientSession::Shm() { return m_shm; }
+    Transport::SessionSegments& ClientSession::Shm() { return m_link->Memory(); }
 
     Transport::ITransport* ClientSession::Control_Plane() { return m_transport; }
 
@@ -1167,9 +2540,9 @@ namespace MobileGL::MG_Remote::Client {
         MGLOG_I("MG_Remote client: wire ledger: maxrec=%llu maxrecop=%s cap=%llu (%llu.%llu%% of "
                 "RingProducer::MaxRecordBytes, half of a %llu byte SEG_CMD) cmdbytes=%llu "
                 "ringwraps=%llu ringpads=%llu "
-                "ringwaits=%llu emitseq=%llu cliwait=%llu clipark=%llu - R-10's proof obligation, "
-                "R-9's producer readings and P5d round 3's client wait pair, published from the "
-                "session that produced them",
+                "ringwaits=%llu emitseq=%llu cliwait=%llu clipark=%llu credit-waits=%llu - "
+                "R-10's proof obligation, R-9's producer readings, P5d round 3's client wait "
+                "pair and P5e's present credit, published from the session that produced them",
                 static_cast<unsigned long long>(maxRecord), m_encoder.MaxRecordOpName(),
                 static_cast<unsigned long long>(cap),
                 static_cast<unsigned long long>(permille / 10),
@@ -1185,9 +2558,19 @@ namespace MobileGL::MG_Remote::Client {
                 // profile runs did not set MOBILEGL_PIPE_STATS either, and "did the barrier spin
                 // or did it park" is the question their logs have to be able to answer.
                 static_cast<unsigned long long>(m_producer.Waits()),
-                static_cast<unsigned long long>(m_producer.Parks()));
+                static_cast<unsigned long long>(m_producer.Parks()),
+                // P5e (ra, §2.4). The number the device exit reads to say whether the present
+                // credit is what paces this workload: 0 with credit 1 means the server is
+                // never the frame's critical path, and a count near the frame count means it
+                // always is. It is on this line rather than only on the stats line for
+                // LogWireLedger's own reason - a trace replay never reaches a stats summary.
+                static_cast<unsigned long long>(m_presentCreditWaits));
     }
 
 #undef MGP5_C0_STUB
 
 } // namespace MobileGL::MG_Remote::Client
+
+extern "C" __attribute__((visibility("default"))) void MGPipeSyncPeerLog() {
+    if (auto* session = MobileGL::MG_Remote::Client::ClientSession::Active()) session->SyncPeerLog();
+}

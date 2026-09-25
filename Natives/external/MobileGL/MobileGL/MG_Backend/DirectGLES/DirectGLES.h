@@ -23,6 +23,16 @@ namespace MobileGL::MG_Backend::DirectGLES {
     // Content uploads use scratch bindings, so draws and dispatches call this after
     // texture synchronization.
     void BindCurrentTextures();
+#if MOBILEGL_BUILD_DISAGGREGATED
+    Bool ReadTextureImageWire(const MG_Pipe::MGPReadbackInfo& info, Vector<Uint8>& bytes);
+    // Native/server-only color level readback. Returns tightly packed, owned
+    // bytes in the requested pair; never consults a frontend texture or PACK/PBO.
+    // The caller resolves identity/extent from its resource record and supplies
+    // whether the SOURCE allocation already uses an image carrier.
+    Bool ReadTextureLevelTight(GLuint texture, TextureTarget target, TextureUploadTarget uploadTarget,
+                               TextureInternalFormat logicalFormat, GLint level, const IntVec3& logicalExtent,
+                               Bool sourceUsesImageCarrier, GLenum format, GLenum type, Vector<Uint8>& bytes);
+#endif
     void ClearBufferfi(GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil);
     void ClearBufferfv(GLenum buffer, GLint drawbuffer, const GLfloat* value);
     void ClearBufferuiv(GLenum buffer, GLint drawbuffer, const GLuint* value);
@@ -178,6 +188,13 @@ namespace MobileGL::MG_Backend::DirectGLES {
     // Applies (or defers until the window surface exists) the app-requested
     // eglSwapInterval on the native EGL surface.
     void SetSwapInterval(Int interval);
+#if MOBILEGL_BUILD_DISAGGREGATED
+    // P12 review fix: the swap interval an ended server session asked for is not the next one's.
+    // The request outlives the context on purpose (a surface re-created mid-session re-applies it),
+    // so the in-process display server's session end forgets it: the next session starts at the
+    // driver's default until it asks (BackendObject_DirectGLES's destructor under a transport).
+    void ForgetRequestedSwapInterval();
+#endif
     void SetEGLFuncsTable(const MG_External::EGLFunctionsTable& eglFuncs);
     void SetGLESFuncsTable(const MG_External::GLESFunctionsTable& glesFuncs);
     void SetGLESCapabilities(const MG_External::GLESCapabilities& capabilities);

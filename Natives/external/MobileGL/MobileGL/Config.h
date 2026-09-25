@@ -456,6 +456,20 @@ namespace MobileGL::MG_Config {
     // The <path> of `unix:` / the <name> of `pipe:`. Empty for the other three modes.
     extern String TransportEndpoint;
 
+    // P7 F1. DID **THIS PROCESS'S OWN CONFIGURATION** ASK FOR A SPLIT TRANSPORT.
+    //
+    // `Transport` alone cannot answer that, and the difference is exactly the one the F1 gate
+    // turns on. A unit fixture assigns `Transport` by hand to put the code under test on its
+    // split arm (ServerLoopTest's main does, and says why) while building no client at all; a
+    // real run gets it from MG_ConfigLoader::Init(), and that run WILL bring a client half up.
+    // Only the second may be held to "never decide a record family's fate from a placeholder
+    // caps mirror" - in the first there is no handshake, no mirror to adopt and nothing the
+    // rule could mean.
+    //
+    // Written once, by InitTransport(), and never cleared: a process does not stop having been
+    // configured. Read by MG_Remote::Client::CapsMirror::RequireFirstSnapshot.
+    extern Bool SplitTransportRequestedByConfig;
+
     // The MOBILEGL_IPC_* family. A separate table rather than more FeaturesTable members,
     // for the G1 reason above and because every field here is meaningless without the
     // transport: a build that cannot reach the MG_Remote code cannot honour one of them.
@@ -465,21 +479,61 @@ namespace MobileGL::MG_Config {
     // the full planned inventory (PRESENT_CREDIT, POLL_ESCALATE, SHADOW_SHM,
     // INLINE_PAYLOADS, TRACE, ATTACH, RESPAWN, IDLE_EXIT_S), and every one of those belongs
     // to P6 or later.
+    //
+    // P12 (on-screen server window): MOBILEGL_IPC_SURFACE's two values. See IpcTable::Surface.
+    enum class IpcSurface : Uint8 {
+        Offscreen = 0, // a window surface is the client's own window, as before (the default)
+        Server = 1,    // a window surface is the SERVER's window: WindowKind::ServerOwned
+    };
     struct IpcTable {
         // MOBILEGL_IPC_SERVER_PATH: where to find libMobileGLServer. P6 consumes it; P5
         // lands the parse because t1's ctest ENVIRONMENT blocks and add_trace_replay_test's
         // SPLIT variant already carry it, and an environment variable that nothing parses is
         // indistinguishable from one that is parsed and ignored.
         String ServerPath;
+        // Control endpoint and data-plane selection are independent of topology.
+        String Control = "fork"; // fork | unix:<path> | tcp://host:port
+        String Data = "auto";    // auto | shm | stream
         // MOBILEGL_IPC_RING_MB: SEG_CMD size. A RECORD MAY BE AT MOST HALF OF THIS
         // (RingProducer::MaxRecordBytes), so 8 MiB caps one record at 4 MiB; R-10 makes the
         // codec publish a max-record-bytes counter rather than assume that is enough.
         Uint32 RingMb = 8;
         // MOBILEGL_IPC_STAGE_MB: SEG_STAGE size. Every blob and every var-tail's bytes live
-        // here (R-10: no chunking in P5, so nothing may exceed it).
+        // here ONE BLOB AT A TIME: a row whose content can outgrow the segment cuts it at the
+        // stage chunk budget (MGPipeStageChunkBytes, a quarter of this), and a record type with
+        // no cut is Fatal{RingOverrun, "SEG_STAGE"} rather than allowed to exceed it.
         Uint32 StageMb = 32;
+        // MOBILEGL_IPC_WIRE_DEFERRED_MB (P7 wave 4 M2, ID-P7-32): the SERVER's budget, in MiB,
+        // for orphaned wire buffer stores - the old VkBuffer every glBufferData that crosses the
+        // wire leaves behind - that a GPU command recorded but not yet retired may still name.
+        // Stores no command names are destroyed at once and stores whose last submission has
+        // retired are destroyed at the next park; this bounds the REST. When the parked bytes
+        // exceed it after a sweep, the server flushes what it has recorded and waits for it
+        // (WaitForWireBufferHostAccess's sync point, mid-frame), which retires every one. It is
+        // not a frame count because a frame is not bounded: a snapshot-exiting pbuffer replay
+        // delivers one present for 1.3 M calls. The same sync point also fires above a fixed
+        // 1024 parked stores (VkBufferManager::kWireDeferredCountCeiling), because small
+        // orphans never reach a byte budget. 0 IS THE NEGATIVE CONTROL for both, not "unlimited
+        // by design": no forced sync, so a one-frame respecify-and-draw loop grows without bound
+        // and MagmaWireReclaimScenario's watermark cases must go red.
+        Uint32 WireDeferredMb = 64;
         // MOBILEGL_IPC_SPIN_US: spin before parking on a doorbell, either direction.
         Uint32 SpinUs = 50;
+        // MOBILEGL_IPC_EVENT_WAIT_MS (PH-6, ID-P7-2): the SERVER's patience, in ms, for ONE
+        // reverse-channel event that finds SEG_EVENT full under run-ahead. The apply thread
+        // publishes, rings the client and parks until the client drains enough room; a client
+        // that has not made room when this runs out - it stopped draining (NotDraining) or it
+        // drains a slot at a time (TooSlow) - FORFEITS the reverse channel: that event and every
+        // later one is dropped and counted (eventDropped), and the session stops by the ordinary
+        // stop path rather than by Fatal{EventRingOverflow}. A peer that goes away (PeerGone) or
+        // a session that is stopped (Stopped) ends the wait at once instead, so the knob may
+        // exceed ServerLoop::Stop()'s 5000 ms join. It bounds the whole reservation, not one
+        // park, so a trickling peer cannot stretch it - nor can a shm peer that writes the
+        // (peer-writable) eventRingFull latch to 0 itself, though that one keeps the apply
+        // thread spinning rather than parked until the budget runs out. Was a 30000 ms constant
+        // spent twice. Read by the server only (ServerSpawn.cpp passes it to a spawned child);
+        // the lockstep arm (no kCapRunAheadApply, i.e. Magma) never waits and keeps P5C's Fatal.
+        Uint32 EventWaitMs = 2000;
         // MOBILEGL_IPC_PERSISTENT_BLOCK_KB: block granularity of the persistent-map push.
         // 0 IS A NEGATIVE CONTROL, NOT "unlimited": it disables the push, and
         // PersistentCoherentMapScenario must go RED under it (exit gate E3(a)).
@@ -531,10 +585,36 @@ namespace MobileGL::MG_Config {
         // client that is already CPU-bound and costs a frame of latency, which is why the
         // default is 1 and not "as deep as the ring".
         Uint32 PresentCredit = 1;
+        // MOBILEGL_IPC_CONTROL_TIMEOUT_MS (CONTRACT-P6 §5.4 D5b): how long a spawn/tcp client
+        // waits for the SurfaceReply to one surface-control op (eglCreate*Surface, MakeCurrent,
+        // ...) once the server's backend is up. Its expiry is NOT fatal: the doorbell's death
+        // latch decides dead (device lost) from alive-but-silent (a named diagnostic). The
+        // contract named this knob from P6 on; the client hard-coded its default until P7.
+        Uint32 ControlTimeoutMs = 5000;
+        // MOBILEGL_IPC_COLD_START_MS (P7): the same wait for the three ops a server may bring its
+        // NATIVE backend up inside - CreatePbufferSurface, CreateWindowSurface, MakeCurrent -
+        // until the session's first MakeCurrent is answered ok. The bring-up is lazy (Espryt's
+        // eglInitialize, Magma's Vulkan instance and device), ~100 ms on a workstation and more
+        // than the steady 5 s on a loaded CI runner (retrace-split spawn legs, runs 35671704873
+        // and 35706183230). Never shorter than CONTROL_TIMEOUT_MS; its expiry is the same
+        // non-fatal named answer. The default is the spawn connect budget, for the same reason:
+        // "the server has to create a backend, and a cold software rasteriser is not fast".
+        Uint32 ColdStartMs = 20000;
         // MOBILEGL_IPC_STRICT_ERRORS: promote a BARRIER-PULLED field read - and, in a split
         // build, the seven sticky forwards that are otherwise exempt - from "count it in
         // rsp" to Fatal (R-7.3).
         Bool StrictErrors = false;
+        // MOBILEGL_IPC_ROLE_SPLIT_STATE (P5f f1, P5F-WIRE-COMPLETENESS.md §4): the dual-block
+        // rehearsal. 1 = the client's residual fill writes a CLIENT-ROLE PipeInputs block and
+        // the backend/applier keep reading the SERVER-ROLE one, so every path that today works
+        // only because the two roles share one object turns into a named
+        // Fatal{UnmigratedPipeInput, "<field>@<verb>"} instead of a silent cross-role read.
+        // Meaningless under monolith transport (the two roles are one thread there, so the
+        // selection folds to the single shared block) and forced off by MOBILEGL_PIPE_VERIFY
+        // (the comparator owns the one fill block it compares against). 0 is not merely the
+        // default, it is the negative control: the lane's distinctness case must go red
+        // without it (P5F §6).
+        Bool RoleSplitState = false;
         // MOBILEGL_IPC_AUDIT: after a record retires, the server fills the SEG_STAGE bytes
         // it referenced with 0xDD (R-2.5). This is the ONLY mechanical control that an
         // inproc implementation did not quietly keep using a pointer past its lifetime.
@@ -544,8 +624,24 @@ namespace MobileGL::MG_Config {
         // because the resolved mask is logged by whoever starts the apply thread, and the
         // string is what an operator typed.
         String ServerAffinity = "auto";
+        // MOBILEGL_IPC_SURFACE (P12, on-screen server window) = offscreen | server. `server` makes
+        // the client a HEADLESS one: eglCreateWindowSurface / eglCreatePlatformWindowSurface accept
+        // any native window including NULL, send ONE CreateWindowSurface naming
+        // WindowKind::ServerOwned (token 0, the size from EGL_WIDTH/EGL_HEIGHT, 0/0 = the server's
+        // own) and no SetWindowHandle, and take the surface's real geometry back from the server.
+        // Meaningful only when this client talks to a remote server (MOBILEGL_TRANSPORT=spawn, the
+        // fork or tcp:// control); under monolith / inproc it is parsed, logged as ignored, and
+        // changes nothing. `offscreen` (the default) is today's behaviour byte for byte.
+        // Pbuffers stay pbuffers in both modes (D4: one mode per session, decided by the first).
+        IpcSurface Surface = IpcSurface::Offscreen;
     };
     extern IpcTable Ipc;
+
+    // P12: the one predicate every client-side consumer of MOBILEGL_IPC_SURFACE asks - a window
+    // surface is the server's when the knob says so AND there is a remote server to own it.
+    inline Bool ServerOwnedWindowSurfaces() {
+        return Transport == TransportMode::Spawn && Ipc.Surface == IpcSurface::Server;
+    }
 #else
     // The whole point: in a build without MG_Remote this folds at compile time, so
     // `if (MG_Config::Transport != MG_Config::TransportMode::Monolith)` in Init.cpp is a

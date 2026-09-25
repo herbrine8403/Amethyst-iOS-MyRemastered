@@ -152,17 +152,12 @@ namespace MobileGL::MG_Pipe {
         kCapRunAheadApply = 1ull << 10,
     };
 
-    // THE RUN-AHEAD ARM, AS A PURE FUNCTION, so that "Magma never" is something a unit case can
-    // hold rather than a line inside MG_Backend/Init.cpp's InitSplitRoles that only a live
-    // split session reaches. `ready` is Init.cpp's kMGPipeP5eRunAheadReady - false until the
-    // P5e integration commit - and the BACKEND TYPE is the half that must not depend on it:
-    // whatever `ready` says, a DirectVulkan server publishes no bit 10, because Magma keeps the
-    // lockstep for the whole of P5e (CONTRACT-P5E.md §6) and its apply thread really does read
-    // client memory inside MagmaP7AllocatorDebtScope. MG_Test/Pipe/MagmaPipeIdentityTest.cpp
-    // pins both halves; reverting the type test there is the phase's named red.
+    // Readiness is supplied independently by each backend's integration gate.
+    // The capability names client-memory independence, not merely a config knob.
+    // See CONTRACT-MAGMA-RUNAHEAD.md for the Vulkan resource/submission contract.
     inline constexpr Uint64 MGPipeRunAheadCapBitsFor(BackendType type, Bool ready) {
-        return (ready && type == BackendType::DirectGLES) ? static_cast<Uint64>(kCapRunAheadApply)
-                                                          : static_cast<Uint64>(kCapNone);
+        return (ready && (type == BackendType::DirectGLES || type == BackendType::DirectVulkan))
+            ? static_cast<Uint64>(kCapRunAheadApply) : static_cast<Uint64>(kCapNone);
     }
 
     struct MGPCaps {
@@ -180,10 +175,8 @@ namespace MobileGL::MG_Pipe {
         MGPBlobRef RendererInfo;
     };
     static_assert(std::is_trivially_copyable_v<MGPCaps>, "MGPCaps must be trivially copyable");
-    // Stated as a COMPOSITION rather than a literal: DynamicBackendParameters still carries
-    // SizeT fields, so its literal size is ABI-dependent until P0.5 moves the caps block
-    // into MGPipeValueTypes.h with fixed-width members. The assertion still fires on any
-    // padding introduced between the members below.
+    // Stated as a composition to catch padding between the wire members.
+    // P6.5: all dynamic scalar widths are explicit; member offsets are in the wire digest.
     static_assert(sizeof(MGPCaps) == sizeof(DynamicBackendParameters) + 8 + 24 + 24,
                   "MGPCaps gained padding or a member; update the wire format");
 
@@ -349,16 +342,19 @@ namespace MobileGL::MG_Pipe {
         // It exists because the applier ALREADY takes that scope - as a trailing
         // const MGPRespecifiedLevel* (PipeApply.h:792-795) - and MGPResourceDesc could not
         // express it, so it was the second of resource_respecify's two companions with no wire
-        // carrier. The difference is not cosmetic: a null scope drops EVERY pending upload,
+        // carrier. PH-4 extends that carrier with exact W/H/D for the named level, which the
+        // server validates before staging bytes. The difference is not cosmetic: a null scope drops EVERY pending upload,
         // because every level's coordinate system has just been replaced, while a per-level
         // one drops only that key. Crossing without the scope would make every mutable
         // per-level glTexImage*D on the far side look like a whole-resource redefinition and
         // silently eat the texels of every other level - exactly the loss the server-side
         // pending-upload set exists to prevent.
         //
-        // READ IT THROUGH THE THREE HELPERS BELOW, never by touching the fields: the
-        // presence byte and the pair are one value in three pieces, and an open-coded reader
-        // that forgets the presence byte reads level 0 of upload target 0 as a real scope.
+        // READ IT THROUGH THE HELPERS BELOW, never by touching the fields: the presence byte,
+        // target/level pair and exact per-level extent form one value. For a named image level,
+        // BufOffset/BufSize temporarily carry W/H/D; the target makes this safe because a
+        // texture-buffer range cannot legally name a mip level. The applier clears that carrier
+        // before storing the descriptor.
         //
         // NOT STORAGE-DEFINING, and not metadata either: it does not describe the resource at
         // all, it describes what this CALL replaces. MGPipeResourceRespecifyNeedsAck and the
@@ -385,7 +381,9 @@ namespace MobileGL::MG_Pipe {
         Uint16 RespecifiedLevel;
         MGPipeHandle ViewOf;             // storage owner for a texture view
         MGPipeHandle BufferForTexBuffer; // texture-buffer backing store
-        Uint64 BufOffset, BufSize;       // kWholeBuffer == ~0, resolved live
+        // TexBuffer's backing range; on a named non-buffer mip respecify the same words carry
+        // exact width/height/depth until the applier accepts and normalizes the descriptor.
+        Uint64 BufOffset, BufSize;
     };
     MGP_ASSERT_POD(MGPResourceDesc, 88);
     // The scope fields went into the two existing pads, so the descriptor did not grow and this
@@ -408,9 +406,9 @@ namespace MobileGL::MG_Pipe {
         return desc.HasRespecifiedLevel == 0;
     }
 
-    // The single (uploadTarget, level) a per-level respecify replaces. Reading either half of a
-    // whole-resource descriptor is a caller error; both answer 0 so that a misuse is at least
-    // deterministic rather than whatever the pad happened to hold.
+    // The single (uploadTarget, level, width, height, depth) a per-level respecify replaces.
+    // Reading any component of a whole-resource descriptor is a caller error; helpers answer
+    // zero so a misuse is deterministic rather than whatever the pad/range held.
     inline constexpr Uint16 MGPipeRespecifiedUploadTargetOf(const MGPResourceDesc& desc) {
         return MGPipeRespecifyIsWholeResource(desc) ? Uint16(0) : desc.RespecifiedUploadTarget;
     }
@@ -418,16 +416,54 @@ namespace MobileGL::MG_Pipe {
         return MGPipeRespecifyIsWholeResource(desc) ? Uint16(0) : desc.RespecifiedLevel;
     }
 
-    // The two writers. A producer sets the scope with one call so the presence byte cannot be
-    // left behind, and clears it with the other; a descriptor built by value-initialization is
-    // already whole-resource, which is the safe default and the only one P5 produces.
+    // A producer sets the scope and its exact mutable-level extent with one call so the
+    // presence byte cannot be left behind, and clears scope with the other. A descriptor built
+    // by value-initialization is already whole-resource, which is the safe default.
+    inline constexpr Uint32 MGPipeRespecifiedWidthOf(const MGPResourceDesc& desc) {
+        return MGPipeRespecifyIsWholeResource(desc) ? 0u : static_cast<Uint32>(desc.BufOffset >> 32);
+    }
+    inline constexpr Uint32 MGPipeRespecifiedHeightOf(const MGPResourceDesc& desc) {
+        return MGPipeRespecifyIsWholeResource(desc) ? 0u : static_cast<Uint32>(desc.BufOffset);
+    }
+    inline constexpr Uint32 MGPipeRespecifiedDepthOf(const MGPResourceDesc& desc) {
+        return MGPipeRespecifyIsWholeResource(desc) ? 0u : static_cast<Uint32>(desc.BufSize);
+    }
+    // A ZERO COMPONENT IS CANONICAL. glTexImage1D(width 0), glTexImage2D(0 x 0) and friends are
+    // legal GL that define an EMPTY level - dEQP's resetStateGLCore issues exactly that for every
+    // texture target after every case - and the frontend reports the level's exact extent as
+    // e.g. {0, 1, 1}. Requiring nonzero components made that legal call a session Fatal on every
+    // split arm. The carrier's only noncanonical shape is a depth word past 32 bits; whether an
+    // extent is USABLE is the staged store's question (an empty level has no byte bound, so any
+    // resource_subdata against it is refused there).
+    inline constexpr Bool MGPipeRespecifiedExtentCarrierIsCanonical(const MGPResourceDesc& desc) {
+        return MGPipeRespecifyIsWholeResource(desc) || (desc.BufSize >> 32) == 0;
+    }
+
     inline constexpr void MGPipeSetRespecifiedLevel(MGPResourceDesc& desc, Uint16 uploadTarget,
-                                                   Uint16 level) {
+                                                   Uint16 level, Uint32 width = 0, Uint32 height = 0,
+                                                   Uint32 depth = 0) {
         desc.HasRespecifiedLevel = 1;
         desc.RespecifiedUploadTarget = uploadTarget;
         desc.RespecifiedLevel = level;
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // Non-buffer texture targets leave this descriptor range unused. A named-level
+        // respecify repurposes it as exact W/H/D; TexBuffer cannot legally name a mip level.
+        desc.BufOffset = (static_cast<Uint64>(width) << 32) | static_cast<Uint64>(height);
+        desc.BufSize = depth;
+#else
+        (void)width;
+        (void)height;
+        (void)depth;
+#endif
     }
     inline constexpr void MGPipeClearRespecifiedLevel(MGPResourceDesc& desc) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (desc.HasRespecifiedLevel != 0 &&
+            desc.Target != static_cast<Uint8>(MGPipeResourceTarget::TexBuffer)) {
+            desc.BufOffset = 0;
+            desc.BufSize = 0;
+        }
+#endif
         desc.HasRespecifiedLevel = 0;
         desc.RespecifiedUploadTarget = 0;
         desc.RespecifiedLevel = 0;
@@ -978,17 +1014,57 @@ namespace MobileGL::MG_Pipe {
     inline constexpr Uint32 kMGPipeShaderBufferClassAtomicCounter = 2;
     inline constexpr Uint32 kMGPipeShaderBufferClassCount = 3;
 
+    // P5e, ID-104. HOW MANY Uint32 WORDS THE WRITABLE MASK NEEDS TO COVER THE WINDOW IT IS
+    // ATTACHED TO, and it is a derived number rather than a literal because the two used to
+    // disagree: WritableMask was ONE Uint32 while the window has been 84 points since P4a, so
+    // the mask could only ever describe the first 32 of them and a shader-storage buffer bound
+    // at point 32 or above was silently unwritable as far as the record was concerned.
+    //
+    // THE RULING WIDENS THE FIELD RATHER THAN NARROWING THE WINDOW (ID-104): narrowing to 32
+    // would change what an application can bind, which is an observable, while the POD growing
+    // 32 -> 40 bytes is paid by a record that fires at most once per class per change and is
+    // confined to the push build. THREE Uint32 WORDS AND NOT A Uint64+Uint32 PAIR: 96 >= 84
+    // either way, but one word type means one shift width, so the set and the test below are a
+    // single expression each instead of a low half and a high half that have to agree.
+    inline constexpr Uint32 kMGPipeShaderBufferWritableMaskWords = 3;
+
     struct MGPShaderBuffers {
         Uint32 Class; // MGPipeTypes.h's kMGPipeShaderBufferClass* - Uniform | ShaderStorage |
                       // AtomicCounter
         Uint32 Start;
         Uint32 Count;
-        Uint32 WritableMask;
+        // Bit i (LSB-first within word i/32) = "the shader may WRITE through binding point i",
+        // for classes 1 and 2. Always read and written through the two helpers below, never by
+        // hand: an open-coded shift is how the emitter and the four consumers come to disagree
+        // about which word a point lives in.
+        Uint32 WritableMask[kMGPipeShaderBufferWritableMaskWords];
         Uint32 HostSpanCount; // 0, or Count when the kHostSpan tail is present (D-B8)
         Uint32 Pad0;
         Uint64 ContentHash;
     };
-    MGP_ASSERT_POD(MGPShaderBuffers, 32);
+    MGP_ASSERT_POD(MGPShaderBuffers, 40);
+
+    // THE ONE SPELLING OF THE MASK, for the reason kMGPipeShaderBufferClass* is the one
+    // spelling of the class: the emitter sets these bits on the client and four backend sites
+    // read them on the server, and a mask indexed by hand in five places is five chances to
+    // pick the wrong word. Both take the words rather than the record so the APPLIER's copy of
+    // the mask - which is per class and lives in MGPipeApplierState, not in a payload - goes
+    // through exactly the same arithmetic.
+    //
+    // OUT OF RANGE IS "NOT WRITABLE" AND "WRITE NOTHING", never an out-of-bounds word: the
+    // capacity is the wire's bound and the codec refuses a record past it, so this is the
+    // second belt rather than the first.
+    inline constexpr Bool MGPipeShaderBufferMaskHas(const Uint32* words, Uint32 index) {
+        if (index >= kMGPipeMaxBufferBindingPoints) return false;
+        return (words[index >> 5] & (Uint32{1} << (index & 31u))) != 0;
+    }
+    inline constexpr void MGPipeShaderBufferMaskSet(Uint32* words, Uint32 index) {
+        if (index >= kMGPipeMaxBufferBindingPoints) return;
+        words[index >> 5] |= Uint32{1} << (index & 31u);
+    }
+    static_assert(kMGPipeShaderBufferWritableMaskWords * 32u >= kMGPipeMaxBufferBindingPoints,
+                  "the writable mask no longer covers the binding-point window it describes "
+                  "(ID-104: widen the mask, never narrow the window)");
 
     // Var-tail header: MGPBufferRange[Count] then Uint32 offsets[Count].
     struct MGPStreamOutputTargets {
@@ -1105,6 +1181,31 @@ namespace MobileGL::MG_Pipe {
     // notice the value struct changing width under the wire format.
     static_assert(sizeof(MGPPixelPackState) == 28,
                   "MGPPixelPackState changed size; update the wire format and this assertion");
+
+    // ID-49's NEUTRAL PACK, in one place. The server's read_pixels reads the backend with this
+    // state and scatters the tight reply through the application's own pack on the client side
+    // (MG_Remote/Server/PipeApplier.cpp), so the pack state never shapes the wire answer.
+    //
+    // ONE SPELLING, because there are two readers of the same constant and they are in different
+    // libraries: the applier that installs it, and (in a verify build) the compare-at-read hook in
+    // MG_Impl/Pipe/PipeFill.cpp, whose oracle for the pack half inside that window IS this value.
+    // Two hand-typed copies would drift silently in the ONE direction that matters - the hook
+    // would stop recognising the window and start reporting a divergence that is not one - so
+    // MG_Pipe, which owns MGPPixelPackState, owns the constant as well.
+    //
+    // Value-initialised and then the five fields the applier sets: RowLength / SkipRows /
+    // SkipPixels / SkipImages are already 0 by PixelStoreParameters' own defaults and are spelled
+    // out anyway, because "neutral" is a statement about every member rather than about the ones
+    // whose default happens to be right.
+    inline MGPPixelPackState MGPipeNeutralReadPixelsPack() {
+        MGPPixelPackState neutral{};
+        neutral.Pack.RowLength = 0;
+        neutral.Pack.SkipRows = 0;
+        neutral.Pack.SkipPixels = 0;
+        neutral.Pack.SkipImages = 0;
+        neutral.Pack.Alignment = 1;
+        return neutral;
+    }
 
     // Also a shader-variant input: both backends bake these into the synthesized
     // pass-through control stage.
@@ -1231,7 +1332,7 @@ namespace MobileGL::MG_Pipe {
         // bytes an untransformed level shadow?
         Uint8 SourceIsVerbatimLevelShadow;
         // P5 (b1): DOES THIS RESOURCE HAVE A LIVE HOST WRITER RIGHT NOW? One byte out of the
-        // pad, so MGP_ASSERT_POD(MGPSubData, 72) below does not move.
+        // original pad; the complete mip extent below is a separate payload extension.
         //
         // It is here rather than on MGPResourceDesc, and that is a ruling with a reason. The
         // fact is CONTENT-shaped - "someone may be writing these bytes without telling you" -
@@ -1255,8 +1356,11 @@ namespace MobileGL::MG_Pipe {
         Uint32 RegionCount; // MGPSubRegion[] in the variable tail
         Uint32 Pad1;
         MGPBlobRef Blob;
+        // Mutable GL images may define a lone mip or a noncanonical mip size.
+        // The dirty box describes changed texels, not the full staged image.
+        Uint32 LevelWidth, LevelHeight, LevelDepth, LevelPad;
     };
-    MGP_ASSERT_POD(MGPSubData, 72);
+    MGP_ASSERT_POD(MGPSubData, 88);
 
     // The one spelling of MGPSubData::Target's encoding, stated above the struct.
     //
@@ -1629,11 +1733,18 @@ namespace MobileGL::MG_Pipe {
     struct MGPStreamOutputBegin {
         Uint32 PrimitiveMode;
         Uint32 Pad0;
+        // P5f: immutable span snapshot; no frontend pointers survive Begin.
+        MGPipeHandle CaptureProgram;
+        Uint64 LifetimeId;
+        MGPBufferRange Targets[4];
     };
-    MGP_ASSERT_POD(MGPStreamOutputBegin, 8);
+    MGP_ASSERT_POD(MGPStreamOutputBegin, 120);
 
-    // end_stream_output carries the accounting the client owns; the scatter itself is a
-    // read-modify-write of the client's shadow and lives there (section 7.2.1).
+    // end_stream_output carries the accounting the client owns. THE SCATTER ITSELF IS THE
+    // SERVER'S, and this sentence used to say the opposite: plan B section 7.2.1 put the
+    // read-modify-write on the client's shadow, P5c/P5f put it on the server's own staged
+    // shadow, and the reconciled range comes back as an ordinary OnBufferWriteback. Nothing
+    // about the scatter crosses in this record.
     struct MGPXfbAccounting {
         Uint64 CapturedVertices;
         Uint64 PrimitivesWritten;

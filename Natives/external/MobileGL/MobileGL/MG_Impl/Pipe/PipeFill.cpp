@@ -31,6 +31,7 @@
 #include <MG_Impl/Pipe/ResourceTracker.h>
 #include <MG_Impl/Pipe/SamplerEmit.h>
 #include <MG_Impl/Pipe/SetHashSuppressor.h>
+#include <MG_Impl/Pipe/ShaderBufferEmit.h>
 #include <MG_Impl/Pipe/TextureEmit.h>
 #include <MG_Impl/Pipe/Tracker.h>
 #include <MG_Impl/Pipe/VertexInputEmit.h>
@@ -47,13 +48,15 @@
 // build-split runs MOBILEGL_TRANSPORT=monolith in every unit and integration-gpu lane and those
 // lanes must keep answering exactly what they answered before.
 #include <MG_Remote/Client/CapsMirror.h>
+// MGPipeStageChunkBytes: the resource emitters' content cap (see MGPipeContentChunkCap below).
+#include <MG_Remote/Client/GpuWritePending.h>
 #include <MG_Remote/Client/WireTables.h>
 // P5c gt (CONTRACT-P5C §6 layer 2, audit A1): the client-side gPipeInputs check consults
 // InBarrierWait() and ApplyThreadIsInsideApplier() - both live here.
 #include <MG_Remote/Client/ClientSession.h>
-// P5c ev (CONTRACT-P5C §4.2): RecordError's transport arm posts kEventGlError through the
-// server session, and InvalidateCompileEnv's forward is deleted with an active transport.
-#include <MG_Remote/Server/ServerSession.h>
+// P5f fv: backend errors use the same owned reverse callback table as other events.
+// The producer, rather than this client-side translation unit, knows the server session.
+#include <MG_Pipe/MGPipeCallbacks.h>
 #endif
 
 #include <atomic>
@@ -84,6 +87,20 @@ namespace MobileGL::MG_Pipe {
         static const PipeInputs::CurrentVertexAttributeValue* VertexAttribDefaultsOf(const PipeInputs& inputs) {
             return inputs.m_currentVertexAttribute;
         }
+
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // P5e (ra, CONTRACT-P5E §2.3). THE FOUR O-CLASS ROWS, AND ONLY THEY: these are the only
+        // members of this block that own a frontend object rather than point into one, so they
+        // are the only ones through which the apply thread can become a last owner. The raw
+        // pointer rows (the binding-slot bases) are borrowed from a live GLContext and own
+        // nothing, so releasing them would buy no lifetime and lose the monolith's arms.
+        static void ReleaseObjectPins(PipeInputs& inputs) {
+            inputs.m_boundVertexArray.reset();
+            inputs.m_programForDispatch.reset();
+            inputs.m_programForDraw.reset();
+            inputs.m_transformFeedbackProgram.reset();
+        }
+#endif
 
         static void CopyField(PipeInputs& dst, GLContext& ctx, MGPipeInputField field) {
             using F = MGPipeInputField;
@@ -330,6 +347,147 @@ namespace MobileGL::MG_Pipe {
     namespace {
         GLContext* LiveContext() { return MG_State::pGLContext.get(); }
 
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // ---- P5e (ra): the fill decision (CONTRACT-P5E §3.1) -----------------------------
+        //
+        // Is this process a run-ahead CLIENT right now? Three questions, cheapest first, and
+        // the last one is the latch ClientSession took at its first caps adoption - so this is
+        // one pointer test and one bool load on the verb path once the first two are constant.
+        Bool ClientRunsAhead() {
+            if (MG_Config::Transport == MG_Config::TransportMode::Monolith) return false;
+            if (MG_Remote::Client::RunsAsTheServerRole()) return false;
+            const MG_Remote::Client::ClientSession* session = MG_Remote::Client::ClientSession::Active();
+            return session != nullptr && session->RunAheadArmed();
+        }
+
+        // THE WIRE OP A VERB BOUNDARY BECOMES, which is the join MGPipeVerbForWireOp draws in
+        // the other direction. Built by walking the op space once at compile time rather than
+        // written out, because a second hand-written table is a second thing to forget a row
+        // in - and the generator already refuses a verb-shaped op with no row.
+        constexpr MGPWireOp WireOpForVerb(MGPipeVerb verb) {
+            for (SizeT i = 0; i < static_cast<SizeT>(MGPWireOp::kOpCount); ++i) {
+                const auto op = static_cast<MGPWireOp>(i);
+                if (MGPipeVerbForWireOp(op) == verb) return op;
+            }
+            return MGPWireOp::kOpCount;
+        }
+
+        // CONTRACT-P5E §2.1's predicate, ASKED AT THE VALIDATE POINT - which is before the
+        // record exists, so it is asked of the verb and the live context rather than of the
+        // payload. The two halves must agree with MGPipeBarriered(op, payload, applierState),
+        // which is what the server computes, so each clause is the same clause:
+        //
+        //   1. the static WaitClass column          - the same generated table, same op;
+        //   2. kCtxVerb inside an open XFB span     - ctx.IsTransformFeedbackActive() here,
+        //      the applied MGPContextValues mirror there, and set_context_values precedes the
+        //      verb on the ring, so the two read the same value (§2.1);
+        //   3. a draw carrying kDrawClientArrays    - NOT asked here, because under run-ahead
+        //      such a draw never reaches a record at all: vi refuses it on this very thread in
+        //      EmitDrawRecord's array arm (§5.1, ruling 2). Asking it here would be a second
+        //      spelling of vi's "does any enabled attribute lack a buffer" walk, and two
+        //      spellings of an escalation is precisely what ruling 3 replaced.
+        //
+        // AN OP WITH NO VERB ROW ANSWERS BARRIERED. A verb the join does not know is one this
+        // file cannot reason about, and the safe answer - fill it, wait for it - is also the
+        // pre-P5e answer.
+        // `ctx` MAY BE NULL, and that is not a convenience: the validate point asks this
+        // question BEFORE it has decided whether there is anything to fill, so that the answer
+        // is about the RECORD and not about the state of the block. A null context has no open
+        // transform-feedback span, so clause 2 is false for it - and the verb is a no-op below
+        // either way.
+        Bool ClientVerbIsBarriered(MGPipeVerb verb, GLContext* ctx) {
+            MGPWireOp op = WireOpForVerb(verb);
+            // ---- P5e (ra2): THE JOIN IS MANY-TO-ONE ON THE DRAW FAMILY, SO THE INVERSE IS NOT
+            // A FUNCTION, AND THE DEFAULT BELOW WAS ANSWERING FOR NINETEEN VERBS -----------------
+            //
+            // MGP_VERB_OP_LIST carries ONE row for the whole draw family - `DrawVbo ->
+            // DrawArrays` - because that is the direction the SERVER needs: a draw_vbo record
+            // stamps a verb boundary and DrawArrays is the name it prints. Inverting it
+            // verb-first therefore answers kOpCount for DrawElements, DrawElementsBaseVertex,
+            // DrawElementsIndirect, MultiDrawElementsBaseVertex and every other indexed /
+            // instanced / multi / indirect verb - all of which emit exactly that same draw_vbo.
+            //
+            // The conservative default below reads "a verb the join does not know answers
+            // BARRIERED: fill it, wait for it". THE FILL HAPPENS AND THE WAIT DOES NOT. The wait
+            // is not decided here - it is decided per RECORD, by MGPipeBarriered(op, payload,
+            // st) at the publish (§2.1) - and the record is a draw_vbo, whose wait class is
+            // kWaitNone. So every indexed draw filled gPipeInputs while telling
+            // RefusePipeInputsTouchWhileApplierOwnsIt, through isBarrieredFill, that this thread
+            // was about to park behind it, and then ran on without parking. The apply thread was
+            // measured inside a record at that instant, and the abort it produced named the
+            // CLIENT's verb - a verb the applier cannot stamp, which is what identifies the
+            // writer (report §2).
+            //
+            // So the family's one row is applied to the family. Every other unknown verb keeps
+            // the conservative answer, which is now honest rather than hoped for: the fill site
+            // establishes quiescence before it writes (MGPipeValidateForVerb below), so a
+            // barriered fill no longer rests on a park that may never come.
+            static_assert(MGPipeVerbForWireOp(MGPWireOp::DrawVbo) == MGPipeVerb::DrawArrays,
+                          "the draw family's representative row moved; the fallback below names "
+                          "draw_vbo because that is the record every kDraw verb emits");
+            // P5e (ra2): THE CLIENT'S HALF OF ESCALATION (iii) WAS HERE AND WENT WITH IT
+            // (ID-133, withdrawn by ID-136). It named MultiDrawArrays / MultiDrawElements /
+            // MultiDrawElementsBaseVertex so the client would FILL for the records the server
+            // was escalating - a fill the server then read as a barriered pull. Retiring that
+            // pull outright (MultiDraw.cpp's BoundDrawIndirectBufferId takes a handle arm) left
+            // nothing for the fill to serve, so a plain multi-draw is an ordinary kDraw verb
+            // again and takes the draw_vbo answer below. The pair is the phase's own lesson
+            // written twice: a wait added to make a lane green is paid by an arm, and here the
+            // arm was the default tier the phone ships.
+            if (op == MGPWireOp::kOpCount &&
+                kMGPipeVerbClass[static_cast<SizeT>(verb)] == MGPipeVerbClass::kDraw) {
+                op = MGPWireOp::DrawVbo;
+            }
+            if (op == MGPWireOp::kOpCount) return true;
+            if (MGPipeWaitClassFor(op) != kWaitNone) return true;
+            if (MGPipeCallClassFor(op) == kCtxVerb && ctx != nullptr &&
+                ctx->IsTransformFeedbackActive()) {
+                return true;
+            }
+            return false;
+        }
+
+        // ---- P5e (ra2), CONTRACT-P5E §3.5 AMENDED: A BARRIERED FILL MAKES ITSELF QUIESCENT ----
+        //
+        // §3.5 exempted the residual fill of a BARRIERED record from the single-writer rule on
+        // the ground that "this thread is about to park behind it". That is a claim about the
+        // FUTURE, and the write is in the PRESENT: the order at the validate point is fill,
+        // then emit, then park, and between the fill and the park the apply thread is still
+        // draining the UNBARRIERED records the client ran ahead of. The claim was therefore
+        // never an argument about this instant, and the guard that took it - the
+        // `if (isBarrieredFill) return;` arm of RefusePipeInputsTouchWhileApplierOwnsIt - could
+        // not fire however wrong the fill was.
+        //
+        // This makes the claim TRUE instead of asserting it. §2.5's forced wait is exactly
+        // "publish nothing, wait for the applier to reach LastPublishedSeq, drain the reverse
+        // channel", which is the definition of the window the fill needs, and it already exists
+        // for glFinish and for BackendObject_Remote's forwarders.
+        //
+        // IT IS CALLED AT EVERY GL-THREAD WRITE INTO THE BLOCK, not once per verb, because the
+        // validate point writes the block in TWO phases that straddle record publication: the
+        // serial bump / stamp withdrawal / verb rename run BEFORE the emitters, and the 63-field
+        // walk of step 4 runs AFTER them - and the records the emitters published are records
+        // whose apply READS the block. One wait cannot cover both halves.
+        //
+        // THE ARM IS STATED, NOT INFERRED (ID-81): WaitForApplyToCatchUp's own first test is
+        // `m_runAheadArmed && m_started`, and m_runAheadArmed is the latch of
+        // `Transport != Monolith && Ipc.RunAhead && kMGPipeP5eRunAheadReady && the caps bit`. So
+        // on the monolith arm, on the pull build and under MOBILEGL_IPC_RUN_AHEAD=0 this is a
+        // call that returns, and the lockstep client's behaviour is unchanged byte for byte
+        // (G1) - under lockstep appliedSeq is already at LastPublishedSeq by construction.
+        void QuiesceApplierBeforeFill(const char* surface) {
+            MG_Remote::Client::ClientSession* session = MG_Remote::Client::ClientSession::Active();
+            if (session == nullptr) return; // no session: this process has no applier to outrun
+            session->WaitForApplyToCatchUp(surface);
+        }
+
+        // Whether the LAST fill actually happened, i.e. whether the rows in the block describe
+        // the verb in flight. Read by MGPipeNoteFrontendMutation, which refreshes one field of
+        // that fill: with no fill behind it there is nothing to refresh and the write would be
+        // the role violation §3.5 names.
+        Bool g_lastFillWasBarriered = true;
+#endif
+
         template <class T>
         const SharedPtr<T>& NullShared() {
             static const SharedPtr<T> null;
@@ -424,12 +582,25 @@ namespace MobileGL::MG_Pipe {
             Optional<MGPipeInputField> Corrupt;
             String CorruptKnob; // the MOBILEGL_PIPE_VERIFY_CORRUPT value the last arm saw
             std::atomic<Uint64> Divergences{0};
-            ~VerifyState() {
+            Uint64 Summarised = 0; // how many of them the summary line has reported so far
+            // THE SUMMARY IS WRITTEN FROM MobileGL::Destroy, NOT FROM HERE (V1 fix round 2). This
+            // is a namespace-scope static, so this destructor runs from __run_exit_handlers, AFTER
+            // DestroyImpl has called MG_Util::Debug::Close(). Close nulls the role's sink; Log.cpp's
+            // WriteToFile then re-runs InitFile() for the next line, and InitFile opens the role's
+            // file with "w". So the one line this destructor wrote was the only line the client half
+            // of every FATAL=0 run kept - 121 bytes, the summary itself, with the entry compare's
+            // own reports, the arming line and the config dump gone (and the monolith arm's
+            // VerifyCorrupted. log wiped the same way). MGPipeVerifyFlushSummary runs before Close,
+            // so by the time this destructor runs there is nothing new to say and it says nothing;
+            // the arm is kept for a process that never called Destroy, where no Close ran and the
+            // line lands in the still-open file as it always did.
+            ~VerifyState() { FlushSummary(); }
+            void FlushSummary() {
                 const Uint64 count = Divergences.load(std::memory_order_relaxed);
-                if (count != 0) {
-                    MGLOG_E("MGPipe: verify summary - %llu divergence(s) survived MOBILEGL_PIPE_VERIFY_FATAL=0",
-                            static_cast<unsigned long long>(count));
-                }
+                if (count == 0 || count == Summarised) return;
+                Summarised = count;
+                MGLOG_E("MGPipe: verify summary - %llu divergence(s) survived MOBILEGL_PIPE_VERIFY_FATAL=0",
+                        static_cast<unsigned long long>(count));
             }
         };
         VerifyState g_verify;
@@ -468,9 +639,9 @@ namespace MobileGL::MG_Pipe {
         }
 
         void ReportDivergence(MGPipeInputField field, const char* where) {
-            const Uint64 serial = MGPipeFillAccess::Filled(gPipeInputs).CurrentVerbSerial;
+            const Uint64 serial = MGPipeFillAccess::Filled(MGPipeClientInputs()).CurrentVerbSerial;
             MGLOG_F("MGPipe: Fatal{PipeVerifyDiffer, \"%s@%s\", verb=%llu, where=%s}",
-                    kMGPipeInputFieldNames[static_cast<SizeT>(field)], MGPipeVerbName(gPipeInputs.CurrentVerb()),
+                    kMGPipeInputFieldNames[static_cast<SizeT>(field)], MGPipeVerbName(MGPipeClientInputs().CurrentVerb()),
                     static_cast<unsigned long long>(serial), where);
             if (g_verify.Fatal) std::abort();
             g_verify.Divergences.fetch_add(1, std::memory_order_relaxed);
@@ -487,6 +658,57 @@ namespace MobileGL::MG_Pipe {
             MGPipeInputField differing = MGPipeInputField::kFieldCount;
             if (!MGPipeVerifyInputs(inputs, g_snapshot, mask, &differing)) ReportDivergence(differing, "entry");
         }
+
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // ---- P7 wave 3 (V1): the compare-at-read oracle inside the server's read_pixels ----
+        //
+        // WHAT THE SPLIT ARM FOUND THE FIRST TIME VERIFY AND SPLIT SHARED A BUILD. Every
+        // glReadPixels on the inproc arm - 8530 reads over 220 of the lane's 1068 entries, and the
+        // VerifySplitArming. entries on both backends - aborted with
+        //
+        //   MGPipe: verify read of GetPixelStoreParameters (index 0, 0) differs from the live context
+        //   MGPipe: Fatal{PipeVerifyDiffer, "GetPixelStoreParameters@ReadPixels", verb=6, where=read}
+        //
+        // on the server's apply thread, and it was the ONLY field that diverged anywhere in the
+        // lane. The mechanism is ID-49 and is deliberate: the pack state never shapes the wire
+        // answer, so MG_Remote/Server/PipeApplier.cpp's read_pixels body writes a NEUTRAL pack
+        // into the applier's copy of the field (MGPipeApplySetPixelPackState), makes the backend
+        // read, and restores the pushed one; the client then scatters the tight reply through the
+        // application's own pack state. The frontend context - this comparator's oracle - still
+        // holds the application's pack (Alignment 4 by default), so the backend's read of the
+        // pack half answers {Alignment 1} where the live context says {Alignment 4}. On the
+        // monolith arm the same neutral window is opened on the frontend context itself
+        // (GL_Texture.cpp's ScopedNeutralPackState), which is why the monolith lane never saw it.
+        //
+        // SO THE ORACLE, NOT THE RULE, IS WHAT CHANGES, AND ONLY IN THAT WINDOW: under a server
+        // stamp, on the ReadPixels verb, the pack half's expected value is the neutral pack the
+        // applier reads with, and the UNPACK half and every other field keep the live context as
+        // their oracle. A server read of the pack half that is neither the application's value
+        // nor exactly the neutral one is still a divergence and still Fatal.
+        //
+        // WHAT THIS GIVES UP IS ONE VALUE, NOT THE FIELD (corrected in P7 wave 3's V1 fix round;
+        // the first statement of it here said the comparator could no longer see a client that
+        // pushed a WRONG pack state at all, which is too broad). PipeApplier.cpp's read_pixels
+        // reads `savedPack` THROUGH THE ACCESSOR - and therefore through this hook - BEFORE it
+        // installs the neutral value, so the pushed pack has already been compared against the
+        // live one by then: a correct push is equal and returns, and a wrong push that is not
+        // exactly the neutral pack fails both compares and is still Fatal. The blind spot is the
+        // single value {SwapBytes 0, LSBFirst 0, RowLength 0, ImageHeight 0, Skip* 0, Alignment 1},
+        // and only while the application's own pack differs from it. The client-side scatter that
+        // consumes the real pack is covered by the readback matrix cases, which compare bytes,
+        // not fields.
+        Bool ServerReadsInsideTheNeutralPackWindow(const PipeInputs& self, MGPipeInputField field) {
+            return field == MGPipeInputField::GetPixelStoreParameters && self.ServerStampedVerb() &&
+                   self.CurrentVerb() == MGPipeVerb::ReadPixels;
+        }
+
+        // The constant itself is MG_Pipe's (MGPipeTypes.h's MGPipeNeutralReadPixelsPack), which is
+        // the same function MG_Remote/Server/PipeApplier.cpp's read_pixels installs. It used to be
+        // re-typed here, field for field, to avoid reaching into MG_Remote/Server from MG_Impl -
+        // but the owner of MGPPixelPackState is MG_Pipe, both sites already include it, and a
+        // drift between the two spellings would have cost a false divergence rather than a build
+        // break.
+#endif // MOBILEGL_BUILD_DISAGGREGATED
 #endif // MOBILEGL_PIPE_VERIFY
     } // namespace
 
@@ -494,7 +716,7 @@ namespace MobileGL::MG_Pipe {
     void SnapshotFromGLContext(PipeInputs& snapshot, const MGPipeFieldMask& mask) {
         auto* ctx = LiveContext();
         MGPipeFillAccess::SetIdentity(snapshot, ctx);
-        MGPipeFillAccess::SetVerb(snapshot, gPipeInputs.CurrentVerb());
+        MGPipeFillAccess::SetVerb(snapshot, MGPipeClientInputs().CurrentVerb());
         if (ctx == nullptr) return;
         for (SizeT i = 0; i < kMGPipeInputFieldCount; ++i) {
             const auto field = static_cast<MGPipeInputField>(i);
@@ -521,13 +743,77 @@ namespace MobileGL::MG_Pipe {
         // never recurses (and never reports the inner read against a half-copied scratch).
         g_verify.InHook = true;
         MGPipeFillAccess::CopyField(g_readScratch, *ctx, field);
+        // P7 wave 3 (V1): NEGATIVE CONTROL A REACHES THIS ARM TOO. Until this line the knob only
+        // ever perturbed EntryCompare's snapshot, so every red it could produce said `where=entry`
+        // and was produced on the CLIENT thread - which left the compare-at-read hook, the arm
+        // that runs on the server's apply thread and does the whole of the split lane's per-read
+        // work, with no falsifier at all: a hook that had stopped comparing would have looked
+        // exactly like a hook with nothing to report. The perturbation goes on the ORACLE, for
+        // EntryCompare's reason: the arm under test is the stored value, so corrupting THAT would
+        // be testing the corruption.
+        //
+        // WHICH READ THIS BLOCK TURNS RED (V1 fix round 2). The server reads the pack field TWICE
+        // inside the ReadPixels verb window, and both reads sit inside
+        // ServerReadsInsideTheNeutralPackWindow below (the verb stamp is up for the whole apply):
+        // PipeApplier::read_pixels saves the application's pack through the accessor BEFORE it
+        // installs the neutral one, and the backend's ReadPixels reads the field AFTER. This block
+        // is what turns the FIRST of them red: at that read `self` still holds the application's
+        // pack, so the first compare only reaches the window if this perturbation made it differ,
+        // and inside the window the application's pack against the neutral oracle differs on its
+        // own. It does nothing for the second read - `self` IS the neutral pack there - which is
+        // what the re-application inside the window is for.
+        if (g_verify.Corrupt && *g_verify.Corrupt == field) {
+            MGPipeApplyVerifyCorruption(g_readScratch, field);
+        }
         const Bool equal = MGPipeInputsFieldEqual(field, self, g_readScratch);
         g_verify.InHook = false;
         if (equal) return;
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (ServerReadsInsideTheNeutralPackWindow(self, field)) {
+            // The live context is the application's pack state and the server is, by ID-49,
+            // reading with the neutral one; the oracle for THAT HALF is the neutral pack, and
+            // every other byte of the field still has to match the live context.
+            g_verify.InHook = true;
+            PipeInputs::VisitStorage(field, g_readScratch, g_readScratch, [](auto& live, auto&) {
+                if constexpr (std::is_same_v<std::remove_reference_t<decltype(live)>, PixelStoreParameters[2]>) {
+                    live[0] = MGPipeNeutralReadPixelsPack().Pack;
+                }
+                return true;
+            });
+            // AND THE CONTROL IS RE-APPLIED, because the overwrite above replaces the pack half
+            // WHOLESALE - the corruption included, since CorruptStorage perturbs an array's FIRST
+            // ELEMENT and the pack half is element 0. This is the block for the POST-INSTALL read
+            // (the backend's ReadPixels, after PipeApplier::read_pixels installed the neutral pack
+            // into gPipeInputs): there `self` is the neutral pack, the overwrite just made the
+            // oracle equal to it, and only a perturbation applied AFTER the overwrite can make
+            // that compare differ - the block above cannot reach it. Without this line the one
+            // window in which this arm is most load-bearing (the server's read_pixels, 8530 reads
+            // over 220 of the lane's entries) would be the one window MOBILEGL_PIPE_VERIFY_CORRUPT=
+            // GetPixelStoreParameters cannot turn red - and a control that accepted ONE report
+            // would never notice, because the saved-pack read still reports through the block
+            // above. The VerifySplitReadCorrupted. entries and the CI step therefore require at
+            // least TWO `where=read` reports in the server half (V1 fix round 2). Measured: 3 on
+            // DirectGLES (its backend reads the field twice after the install) / 2 on
+            // DirectVulkan; without this block both drop to 1, without the block above
+            // DirectVulkan drops to 1 while DirectGLES's two post-install reports keep it at 2 -
+            // so this block is falsified on both backends and the one above on DirectVulkan.
+            if (g_verify.Corrupt && *g_verify.Corrupt == field) {
+                MGPipeApplyVerifyCorruption(g_readScratch, field);
+            }
+            const Bool equalToTheNeutralPack = MGPipeInputsFieldEqual(field, self, g_readScratch);
+            g_verify.InHook = false;
+            if (equalToTheNeutralPack) return;
+        }
+#endif
         MGLOG_E("MGPipe: verify read of %s (index %u, %u) differs from the live context", kMGPipeInputFieldNames[index],
                 index0, index1);
         ReportDivergence(field, "read");
     }
+
+    // PipeInputs.h. The FATAL=0 summary, written while the role's log is still open:
+    // MobileGL::Destroy calls this right before MG_Util::Debug::Close() - see VerifyState for why
+    // the static destructor cannot be the writer.
+    void MGPipeVerifyFlushSummary() { g_verify.FlushSummary(); }
 #endif // MOBILEGL_PIPE_VERIFY
 
     // ---- push on mutation (P1 lane finding F2) ----
@@ -544,12 +830,28 @@ namespace MobileGL::MG_Pipe {
     // filled must stay Fatal{UnmigratedPipeInput} on the next read rather than be healed by
     // an unrelated frontend write.
     void MGPipeNoteFrontendMutation(MGPipeInputField field) {
-        PipeInputs& inputs = gPipeInputs;
+        PipeInputs& inputs = MGPipeClientInputs();
 #if MOBILEGL_BUILD_DISAGGREGATED
+        // P5e (ra, CONTRACT-P5E §3.1): THIS REFRESHES ONE FIELD OF THE LAST FILL, so with no
+        // fill behind it there is nothing to refresh. Under run-ahead the last verb may have
+        // been unbarriered, in which case the block describes an older verb the server is no
+        // longer being asked about and a write here would be a GL-thread touch of server-role
+        // memory. It returns instead - the same answer, one line earlier, as the class-mask
+        // test below gives for a field the verb never pushed.
+        if (!g_lastFillWasBarriered) return;
         // P5c (gt, layer 2): the single-field refresh is a client write into gPipeInputs too -
-        // same gate as the fill.
+        // same gate as the fill, and it makes the same claim the fill made: the rows it is
+        // touching belong to a record this thread is parked behind (or will park behind).
+        //
+        // P5e (ra2): SO IT TAKES THE SAME WAIT. This one runs at a frontend mutation point, not
+        // at a verb, so "will park behind" is even weaker here than it is at the fill - the
+        // mutation can land anywhere between two verbs, with the whole run-ahead backlog in
+        // flight. The wait is a no-op unless run-ahead is armed, and at a mutation point after a
+        // barriered verb the applier is usually already caught up, so this is a watermark test
+        // rather than a park in the common case.
+        QuiesceApplierBeforeFill("MGPipeNoteFrontendMutation");
         MG_Remote::Client::ClientSession::RefusePipeInputsTouchWhileApplierOwnsIt(
-            "MGPipeNoteFrontendMutation");
+            "MGPipeNoteFrontendMutation", /*isBarrieredFill=*/true);
 #endif
         auto* ctx = LiveContext();
         if (ctx == nullptr) return;
@@ -752,7 +1054,19 @@ namespace MobileGL::MG_Pipe {
         // initialBytes is the client's own shadow base - zero copy, and null is a real answer
         // for the orphaning idiom (a NULL-data respecify leaves the store undefined and the
         // backend must not upload the stale bytes).
-        const void* initialBytes = desc.HasDefinedContent != 0 ? buffer.MappedData() : nullptr;
+        //
+        // THE SIZE TEST IS NOT REDUNDANT. A zero-byte store is DEFINED content - glBufferData's
+        // `size == 0` arm sets HasDefinedContent (BufferObject.cpp:242) because the store exists
+        // and is empty - and MappedData() answers a NON-NULL pointer for it, since the shadow
+        // reserves one byte whatever the size (PipeResource.h:140-143). Reading MappedData()
+        // alone therefore answered "bytes to carry" for a store that has none, which sent the
+        // split branch below down the respecify(nullptr)-plus-follow-up shape; the follow-up
+        // walk emits nothing for a zero-length range (ResourceTracker.h:253), so the
+        // InitialBytesNotCarried self-check aborted by name on the first
+        // glBufferData(target, 0, NULL, usage) of the bsl-esc-menu trace. `GetSize() > 0` is
+        // what makes the answer mean "there are bytes here" rather than "the store is defined".
+        const void* initialBytes =
+            (desc.HasDefinedContent != 0 && buffer.GetSize() > 0) ? buffer.MappedData() : nullptr;
         // kNeedsAck rides on the CALL and MGPipeResourceRespecifyNeedsAck(desc) decides per
         // record: only an immutable store (a glBufferStorage*) is a real synchronous
         // allocation and only it is allowed one. In monolith the acknowledgement is
@@ -799,7 +1113,11 @@ namespace MobileGL::MG_Pipe {
             const Uint64 before = MG_Remote::Client::ClientWireRecordsEmitted();
             MGPipeEmitResourceSubData(buffer, 0, static_cast<SizeT>(buffer.GetSize()));
             if (MG_Remote::Client::ClientWireRecordsEmitted() == before) {
-                MGLOG_F("MGPipe: Fatal{InitialBytesNotCarried, \"resource_respecify\"} - the "
+                // UncarriedInitialBytes, not a second word for the same family: WireTables.cpp:418
+                // already dies of exactly this - a respecify that crossed with no initial bytes -
+                // under that name, and two words for one family is the vocabulary drift a6
+                // censused and 5.2's .def exists to bound (P7 wave 0).
+                MGLOG_F("MGPipe: Fatal{UncarriedInitialBytes, \"resource_respecify\"} - the "
                         "respecify crossed with initialBytes = nullptr (R-13.3) and the "
                         "resource_subdata records that were supposed to follow it emitted "
                         "NOTHING, so %llu bytes of initial content exist on no side of the wire",
@@ -811,6 +1129,25 @@ namespace MobileGL::MG_Pipe {
 #endif
         MGPipeRouteResourceRespecify(desc, initialBytes);
     }
+
+    // THE CAP THE TWO CONTENT WALKS BELOW CUT A RANGE AT. The record's own bound (2^32-1) is not
+    // the one a real upload meets first: one piece's bytes are staged WHOLE in SEG_STAGE, a
+    // linear arena, and a blob larger than that arena is Fatal{RingOverrun, "SEG_STAGE"} at the
+    // encoder rather than a split (PipeWireCodec.cpp:856-864). Measured on the CI traces: a
+    // 128 MiB arena's whole-buffer follow-up against a 32 MiB segment aborted there, which is
+    // the RingOverrun this walk exists to prevent.
+    //
+    // 0 from the helper means "nothing to fit" - monolith, the server role's own uploads (which
+    // run the monolith adapter), or a process with no session - and the record's own bound is
+    // then the answer, exactly as it was before the cap existed.
+#if MOBILEGL_BUILD_DISAGGREGATED
+    Uint64 MGPipeContentChunkCap() {
+        const SizeT stageChunk = MG_Remote::Client::MGPipeStageChunkBytes();
+        return stageChunk == 0 ? kMGPipeSubDataMaxRecordSize : static_cast<Uint64>(stageChunk);
+    }
+#else
+    constexpr Uint64 MGPipeContentChunkCap() { return kMGPipeSubDataMaxRecordSize; }
+#endif
 
     void MGPipeEmitResourceSubData(BufferObject& buffer, SizeT offset, SizeT size) {
         const MGPipeHandle handle = ContentHandleFor(buffer, "resource_subdata");
@@ -837,7 +1174,7 @@ namespace MobileGL::MG_Pipe {
                 // rather than re-read so the staged run and the record's own claim come from
                 // one number.
                 MGPipeRouteResourceSubData(record, base + at, length);
-            });
+            }, MGPipeContentChunkCap());
         if (!encodable) {
             MGLOG_E_ONCE("MGPipe: resource_subdata range [%llu, +%llu) on buffer %u cannot be encoded - "
                          "one record's destination box caps the offset at 2^31-1",
@@ -868,7 +1205,15 @@ namespace MobileGL::MG_Pipe {
 #endif
                 // The application's STAGING store, valid for the duration of the call only.
                 MGPipeRouteBufferSubDataResident(record, base + (at - offset), length);
-            });
+                // P7 wave 2 package C, OQ-10: `rsd=`, counted HERE rather than at the call
+                // above so that one glBufferSubData cut into N chunk records counts N. See
+                // PipeStats.h's CallClass::ResidentSubDataEmissions for why the count is the
+                // only thing that can tell this arm from the in-place memcpy beside it.
+                if (MG_Util::PipeStats::Enabled()) {
+                    MG_Util::PipeStats::AddCalls(
+                        MG_Util::PipeStats::CallClass::ResidentSubDataEmissions, 1);
+                }
+            }, MGPipeContentChunkCap());
         if (!encodable) {
             MGLOG_E_ONCE("MGPipe: buffer_subdata_resident range [%llu, +%llu) on buffer %u cannot be encoded",
                          static_cast<unsigned long long>(offset), static_cast<unsigned long long>(size),
@@ -999,12 +1344,67 @@ namespace MobileGL::MG_Pipe {
     Bool MGPipeDeferDestroyAndFreeIfOnApplyThread(MGPipeKind kind, Uint64 lifetimeId) {
         if (MG_Config::Transport == MG_Config::TransportMode::Monolith) return false;
         if (!MG_Remote::Client::RunsAsTheServerRole()) return false;
+        // P5e (ra), CONTRACT-P5E §2.7 / ruling 13. The queue stays - a BARRIERED record's apply
+        // may still pin a frontend object (its fill's O-class rows, XFB's targets), so the
+        // apply thread can still be a last owner and this is still the belt that keeps that
+        // death off the client's allocator. But an enqueue from an UNBARRIERED record is a
+        // FINDING, not a service: rule F says such an apply names no client memory at all, so
+        // a SharedPtr it could be the last owner of means some site is still pinning a
+        // frontend object across a record and the migration this phase believes it finished is
+        // not finished. Named once with the kind so the site is findable, and Fatal under
+        // strict so the lane owns the red rather than a log nobody reads.
+        if (!MG_Pipe::MGPipeApplierCurrentRecordIsBarriered()) {
+            if (MG_Config::Ipc.StrictErrors) {
+                MGLOG_F("MGPipe: Fatal{RoleViolation, \"deferred-destroy\"} - an UNBARRIERED "
+                        "apply was the last owner of a frontend object of kind %u (lifetime "
+                        "%llu). CONTRACT-P5E rule F says an unbarriered apply reads no client "
+                        "memory, so nothing it touched should have been a SharedPtr at all",
+                        static_cast<unsigned>(kind), static_cast<unsigned long long>(lifetimeId));
+                std::abort();
+            }
+            MGLOG_E_ONCE("MGPipe: an UNBARRIERED apply deferred the destruction of a frontend "
+                         "object of kind %u - CONTRACT-P5E §2.7's finding: some apply-thread "
+                         "site still holds a frontend SharedPtr across a record",
+                         static_cast<unsigned>(kind));
+        }
         {
             std::lock_guard<std::mutex> lock(g_deferredDestroyMutex);
             g_deferredDestroys.push_back(MGPipeDeferredDestroy{kind, lifetimeId});
         }
         g_deferredDestroyCount.fetch_add(1, std::memory_order_release);
         return true;
+    }
+
+    // P5e (ra), CONTRACT-P5E §2.3. Declared in PipeMutation.h, where its WHY is argued.
+    //
+    // NO GUARD ON THE CALLER'S BEHALF: ClientSession calls this only after a barriered apply
+    // has returned on a run-ahead session, and adding a second "is run-ahead armed" test here
+    // would be a copy of a decision that belongs on the other side. What this side owns is
+    // WHICH rows go, and that answer is ReleaseObjectPins' four.
+    //
+    // THE STAMPS ARE LEFT ALONE, deliberately. A released row reads back as null, and a
+    // BARRIERED verb's fill re-copies it before that verb's apply can pull it (§3.1 skips the
+    // fill only for UNBARRIERED records); an unbarriered apply may not read it at all, and
+    // §3.3's detector is what says so by name. Clearing the stamps as well would trade that
+    // named abort for the poison Fatal, which names the field but not the rule it broke.
+    void MGPipeReleaseResidualFillPins() { MGPipeFillAccess::ReleaseObjectPins(MGPipeClientInputs()); }
+
+    // P5e (ra), CONTRACT-P5E §2.5. Declared in PipeMutation.h; see there for why it is not a
+    // ClientSession call at the GL entry point.
+    void MGPipeClientFlush() {
+        if (MG_Config::Transport == MG_Config::TransportMode::Monolith) return;
+        if (MG_Remote::Client::RunsAsTheServerRole()) return;
+        if (MG_Remote::Client::ClientSession* session = MG_Remote::Client::ClientSession::Active()) {
+            session->Flush();
+        }
+    }
+
+    void MGPipeClientFinish() {
+        if (MG_Config::Transport == MG_Config::TransportMode::Monolith) return;
+        if (MG_Remote::Client::RunsAsTheServerRole()) return;
+        if (MG_Remote::Client::ClientSession* session = MG_Remote::Client::ClientSession::Active()) {
+            session->Finish();
+        }
     }
 
     void MGPipeDrainDeferredDestroys() {
@@ -1173,8 +1573,10 @@ namespace MobileGL::MG_Pipe {
             // family here would be a NEW rule, and a client that withheld more than the server
             // refuses leaves the server's handle arm live with no records to read.
             if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+                // P5f fm: texture/framebuffer records have their own server consumers;
+                // Magma consumes them without claiming the still-unmigrated buffer family.
                 return MG_Remote::Client::CapsMirrorInstance().ServerConsumes(
-                    kMGPipeSubsystemResources);
+                    subsystem & kMGPipeP4aFamilySubsystems);
             }
 #endif
             return MGPipeGetResourceOps() != nullptr;
@@ -1200,79 +1602,44 @@ namespace MobileGL::MG_Pipe {
         // above: with a dependency unmet the client emits NOTHING for that family and the legacy
         // pull path runs untouched, on both sides of the boundary.
         //
-        // THE TABLE IS WRITTEN ONCE, HERE, and every one of its rows is the client mirror of the
-        // refusal Espryt already implements, bit for bit and non-transitively - the two must say
-        // the SAME thing, because a client that withheld more than the server refuses would
-        // leave the server's handle arm live with no records to read, and a client that withheld
-        // less is the defect above.
-        struct P4aFamilyDependencyRow {
-            Uint64 Family;   // exactly one bit, and it is one of kMGPipeP4aFamilySubsystems
-            Uint64 Requires; // the bits MOBILEGL_PIPE_PUSH must ALSO carry for it to be live
-        };
-
-        inline constexpr P4aFamilyDependencyRow kMGPipeP4aFamilyDependencies[] = {
-            // BIT 9 REQUIRES BIT 10. Every MGPSurface::Res in a set_framebuffer_state record
-            // names a Texture or a Renderbuffer handle, and only bit 10 populates those two slot
-            // tables (Managers.cpp ResolveFramebufferSubsystemArm).
-            {kMGPipeSubsystemFramebuffer, kMGPipeSubsystemTextureResources},
-
-            // BIT 10 REQUIRES BIT 7 - a buffer texture's MGPResourceDesc::BufferForTexBuffer
-            // names a Buffer handle and only bit 7 puts twins in the resource slot table (D-D1,
-            // ResolveTextureResourceSubsystemArm's first row) - AND BIT 11, which is D-K2's
-            // FOURTH row (ID-14/ID-15): MGPTextureParams::BuiltinSampler is a SamplerCso HANDLE,
-            // only bit 11 mints sampler CSOs (c0b's four unconditional mints deliberately
-            // exclude it), and the applier's verdict for a null one is Fatal{ProtocolCorruption}
-            // rather than a decline. The brief's original "bit 10 without 11 is fine" is
-            // WITHDRAWN for P4a as built.
-            {kMGPipeSubsystemTextureResources,
-             kMGPipeSubsystemResources | kMGPipeSubsystemSamplers},
-
-            // BIT 11 REQUIRES BIT 10. Every MGPBoundView::Texture and every MGPImageView::Res
-            // names a Texture handle and only bit 10 populates that slot table; without it every
-            // per-unit lookup would miss and the walk would `continue` WITHOUT unbinding
-            // (ResolveSamplerSubsystemArm). With the row above this is SYMMETRIC: bits 10 and 11
-            // are one arm with two switches, and the only two masks that reach either handle arm
-            // are "both set" and "neither set".
-            {kMGPipeSubsystemSamplers, kMGPipeSubsystemTextureResources},
-
-            // BIT 12 DEPENDS ON NOTHING, and that is a ROW rather than an absence so the table
-            // covers the four families exhaustively (the static_assert below): a ShaderCso handle
-            // names no texture and no buffer, the archive rides beside the record as a companion
-            // pointer, and the extra inputs the server specialises on are read from state the
-            // backend already holds (ResolveProgramSubsystemArm).
-            {kMGPipeSubsystemPrograms, 0},
-        };
-
-        // THE MIRROR PAIRS THAT STAY FINE, said out loud rather than left as an absence, because
-        // an unreachable branch that says something different is how the reachable one drifts
-        // (Managers.cpp's own words at :2377-2381) - and because the table is only trustworthy if
-        // what it does NOT contain was decided rather than forgotten:
-        //   - bit 10 set, bit 9 clear: FINE. The legacy FBO sync reaches the texture twin through
-        //     SyncTextureObjectToBackend, which dispatches to the handle arm by itself.
-        //   - bit 11 set, bit 9 clear: FINE, for the same reason - a sampler view names a texture,
-        //     never a framebuffer.
-        //   - bit 7 set, bit 10 clear: FINE, and it is P3a's shipped configuration.
-        //   - bit 12 set with any or none of 9/10/11: FINE, per the last row.
-        //   - bit 10 set, bit 11 clear (and its mirror) is NOT fine and is the row above; this is
-        //     the one sentence in the brief that P4a as built withdrew.
+        // THE TABLE IS WRITTEN ONCE, IN MG_Pipe/SubsystemDeps.def, and every one of its rows is
+        // the client mirror of the refusal Espryt already implements, bit for bit and
+        // non-transitively - the two must say the SAME thing, because a client that withheld more
+        // than the server refuses would leave the server's handle arm live with no records to
+        // read, and a client that withheld less is the defect above.
+        //
+        // THIS FILE USED TO HOLD ITS OWN COPY of the four P4a rows (P3b/P4b R-5 found six
+        // statements of one rule and two of them drifted). The rows moved to the .def with R-5
+        // and this reader was left pointing at the copy deliberately, because PipeFill.cpp is the
+        // contract package's file for the phase; wave 2-D package D3 switches it over.
+        //
+        // THE ARGUMENT IS MASKED TO kMGPipeP4aFamilySubsystems, AND THAT IS THE WHOLE DIFFERENCE
+        // BETWEEN A REWRITE AND A BEHAVIOUR CHANGE. The .def carries SIX rows; the table deleted
+        // from here carried FOUR, and this predicate is `wants()`'s fourth conjunct for P4a's
+        // families only. Reading all six unmasked would make the CLIENT withhold bit 8's
+        // vertex-input emissions at a mask with bit 7 clear - P3a's own rule, which this gate has
+        // never narrowed and which TextureEmitTest's
+        // EveryDKTwoDependencyRowGatesItsOwnFamilyAndTheMirrorPairsStayLive pins by name ("bit 8
+        // alone, with bit 7 clear: P3a's own rule, which this table must not touch"). Bit 13 is
+        // not narrowed here either; it asks the table for itself in P5eFamilyIsLive below,
+        // because bit 13's conjunct is bit 13's own. So the ROWS now come from one place and WHO
+        // each gate speaks for is still each gate's.
+        //
+        // The P4a-specific COVERAGE assertion stays for the same reason: a fifth P4a family
+        // without a row in the .def has to be a compile error, not a silent "depends on nothing".
         constexpr Uint64 P4aFamilyDependencyBits(Uint64 subsystem) {
-            Uint64 required = 0;
-            for (const P4aFamilyDependencyRow& row : kMGPipeP4aFamilyDependencies) {
-                if ((subsystem & row.Family) != 0) required |= row.Requires;
-            }
-            return required;
+            return MGPipeSubsystemRequires(subsystem & kMGPipeP4aFamilySubsystems);
         }
 
-        // The table covers the four families this phase migrates and nothing else, so a fifth
-        // family added to kMGPipeP4aFamilySubsystems without a row here does not silently inherit
-        // "depends on nothing".
         constexpr Uint64 P4aFamilyDependencyTableCoverage() {
             Uint64 covered = 0;
-            for (const P4aFamilyDependencyRow& row : kMGPipeP4aFamilyDependencies) covered |= row.Family;
+            for (const MGPipeSubsystemDependencyRow& row : kMGPipeSubsystemDependencies) covered |= row.Family;
             return covered;
         }
-        static_assert(P4aFamilyDependencyTableCoverage() == kMGPipeP4aFamilySubsystems,
-                      "every P4a family needs a D-K2 dependency row, even an empty one");
+        static_assert((P4aFamilyDependencyTableCoverage() & kMGPipeP4aFamilySubsystems) ==
+                          kMGPipeP4aFamilySubsystems,
+                      "every P4a family needs a D-K2 dependency row in MG_Pipe/SubsystemDeps.def, "
+                      "even an empty one");
         static_assert(P4aFamilyDependencyBits(kMGPipeSubsystemFramebuffer) ==
                           kMGPipeSubsystemTextureResources,
                       "bit 9 requires bit 10");
@@ -1319,11 +1686,45 @@ namespace MobileGL::MG_Pipe {
         // the commit that gives the emitter its body - so a client path that lands before its
         // emitter does is inert by construction rather than by everyone remembering to check; the
         // third is P4aFamilyHasItsConsumer above and the fourth is P4aFamilyDependenciesAreSet.
+        // P5e (sb, ID-106 and CONTRACT-P5E.md §1). THE BINDING-POINT FAMILY's TWO EXTRA
+        // CONJUNCTS, kept beside P4a's rather than folded into them, because it asks a
+        // DIFFERENT consumer question. P4a's four families all ride the resource family's one
+        // signal (P4aFamilyHasItsConsumer says why); bit 13's consumer question is bit 13's
+        // own - MG_Backend/Init.cpp publishes it in the same commit that sets
+        // ShaderBufferEmit.h's wired constant, and a server that does not publish it is a
+        // server whose four binding-point walks still read the frontend, so a record sent to it
+        // would be stored and never looked at while the client latched its suppressor.
+        //
+        // AND BIT 13'S OWN DEPENDENCY ROW IS READ FROM MG_Pipe/SubsystemDeps.def, exactly as
+        // P4a's four are (P3b/P4b R-5, switched over by wave 2-D package D3). It used to be the
+        // hand-coded `(pushMask & kMGPipeSubsystemResources) == 0` below - the sixth statement of
+        // the rule, and the one that sat fifteen lines from the block stating the other three,
+        // which is how "THREE OF THEM" survived two phases. Its reason is the table's: every
+        // MGPBufferRange::Res names a Buffer handle and only bit 7 puts one in the resource slot
+        // table, so without it every EnsureBufferResourceForHandle on the server would mint a
+        // twin with no record behind it. Withholding the whole family is the safe direction - the
+        // legacy frontend walk runs untouched on both sides.
+        Bool P5eFamilyIsLive(Uint64 subsystem, Uint64 pushMask) {
+            if ((subsystem & kMGPipeSubsystemBufferBindings) == 0) return true;
+            if (!MGPipeSubsystemDependenciesAreSet(kMGPipeSubsystemBufferBindings, pushMask)) return false;
+#if MOBILEGL_BUILD_DISAGGREGATED
+            if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+                return MG_Remote::Client::CapsMirrorInstance().ServerConsumes(
+                    kMGPipeSubsystemBufferBindings);
+            }
+#endif
+            // Under monolith the "consumer" is the backend that registered the resource op
+            // table, exactly as it is for P4a's four: there is no caps snapshot to ask and the
+            // binding-point walks live in the same DirectGLES that registers it.
+            return MGPipeGetResourceOps() != nullptr;
+        }
+
         Bool FamilyIsLive(Uint64 subsystem, Uint64 wired) {
             const Uint64 pushMask = MG_Config::Features.PipePush;
             return (pushMask & subsystem) != 0 && (wired & subsystem) != 0 &&
                    P4aFamilyHasItsConsumer(subsystem) &&
-                   P4aFamilyDependenciesAreSet(subsystem, pushMask);
+                   P4aFamilyDependenciesAreSet(subsystem, pushMask) &&
+                   P5eFamilyIsLive(subsystem, pushMask);
         }
 
         // ---- THE FAMILY SEAM ----
@@ -1587,8 +1988,11 @@ namespace MobileGL::MG_Pipe {
     //
     // BACKEND-NEUTRAL FROM THE FIRST COMMIT, which is the whole point: before P3a's C-1 fix
     // the only thing that ever returned a VertexElementsCso slot was DirectGLES'
-    // StateObjectDeathOps table, so under a backend that installs none every VAO leaked a slot
-    // and a ~1.3 KB applier record for the life of the process. P4a mints SIX kinds and there
+    // StateObjectDeathOps table, so under a backend that installed none every VAO leaked a slot
+    // and a ~1.3 KB applier record for the life of the process. It stays the point now that
+    // BOTH backends install one (P7 wave 2 package C gives Magma its own, CONTRACT-P7 §5.5):
+    // Magma's table EMITS the death record and frees nothing, so the slot still comes back
+    // from here and from nowhere else. P4a mints SIX kinds and there
     // is no intermediate state in which a backend table is the only path for any of them.
     //
     // THE THREE-STEP ORDER IS FIXED and each position is load-bearing (see PipeMutation.h):
@@ -1848,7 +2252,13 @@ namespace MobileGL::MG_Pipe {
     }
 
     // ---- liveness ----
-    Bool PipeInputs::IsLive() const { return LiveContext() != nullptr; }
+    Bool PipeInputs::IsLive() const {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith)
+            return MGPipeServerContextIsLive();
+#endif
+        return LiveContext() != nullptr;
+    }
 
     // ---- the seven F-class forwarders ----
     //
@@ -1868,6 +2278,18 @@ namespace MobileGL::MG_Pipe {
 #endif
 
     SizeT PipeInputs::GetBufferBindingPointCount(BufferTarget target) const {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+            switch (target) {
+            case BufferTarget::Uniform:
+            case BufferTarget::ShaderStorage:
+            case BufferTarget::AtomicCounter:
+            case BufferTarget::TransformFeedback:
+                return kMGPipeMaxBufferBindingPoints;
+            default: return 0;
+            }
+        }
+#endif
         MGP_STICKY_FORWARD_PULL(GetBufferBindingPointCount);
         const auto* ctx = LiveContext();
         return ctx != nullptr ? ctx->GetBufferBindingPointCount(target) : 0;
@@ -1886,6 +2308,12 @@ namespace MobileGL::MG_Pipe {
     }
 
     Bool PipeInputs::HasOpenTransformFeedbackSpan(Uint64 lifetimeId) const {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+            return lifetimeId != 0 && MGPipeApplier().StreamOutputSpans.count(lifetimeId) != 0;
+        }
+#endif
+
         MGP_STICKY_FORWARD_PULL(HasOpenTransformFeedbackSpan);
         const auto* ctx = LiveContext();
         return ctx != nullptr && ctx->HasOpenTransformFeedbackSpan(lifetimeId);
@@ -1913,7 +2341,6 @@ namespace MobileGL::MG_Pipe {
     }
 
     void PipeInputs::RecordError(ErrorCode code, UniquePtr<ErrorInfo> info) {
-        MGP_STICKY_FORWARD_PULL(RecordError);
 #if MOBILEGL_BUILD_DISAGGREGATED
         if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
             // The error queue is CLIENT state and the apply thread may not write it (R4).
@@ -1923,11 +2350,16 @@ namespace MobileGL::MG_Pipe {
             // program order of error-then-read but not cross-verb interleaving - the
             // accepted P5c shape, stated in the contract rather than discovered in P6.
             const String message = info != nullptr ? info->toString() : String{};
-            MG_Remote::Server::ServerSessionInstance().PostGlError(static_cast<Uint32>(code),
-                                                                   message.c_str());
+            if (gMGPipeCallbacks.OnGlError == nullptr) {
+                MGLOG_F("MGPipe: Fatal{RoleViolation, \"OnGlError.callback-missing\"} - "
+                        "a transport backend error has no reverse-channel owner");
+                std::abort();
+            }
+            gMGPipeCallbacks.OnGlError(static_cast<Uint32>(code), message.c_str());
             return;
         }
 #endif
+        MGP_STICKY_FORWARD_PULL(RecordError);
         auto* ctx = LiveContext();
         if (ctx == nullptr) {
             MGLOG_E_ONCE("PipeInputs::RecordError: no live context, dropping error %d", static_cast<int>(code));
@@ -1953,11 +2385,22 @@ namespace MobileGL::MG_Pipe {
     Uint32 MGPipePendingBaseInstance() { return MGPipeTrackerInstance().PendingBaseInstance(); }
 
     void MGPipeLeaveVerb() {
-        PipeInputs& inputs = gPipeInputs;
+        PipeInputs& inputs = MGPipeClientInputs();
 #if MOBILEGL_BUILD_DISAGGREGATED
-        // Same layer-2 gate as the fill: the serial bump and the verb reset below are writes
-        // into gPipeInputs (gt).
-        MG_Remote::Client::ClientSession::RefusePipeInputsTouchWhileApplierOwnsIt("MGPipeLeaveVerb");
+        // P5e (ra, §3.1): a verb whose fill was skipped has no stamps of this thread's to
+        // retire, and the bump below would move a serial the SERVER's stamp owns. Leave
+        // returns, and the tracker's base-instance clear - which is frontend state, not block
+        // state - still runs at the bottom.
+        if (g_lastFillWasBarriered) {
+            // Same layer-2 gate as the fill: the serial bump and the verb reset below are
+            // writes into gPipeInputs (gt).
+            MG_Remote::Client::ClientSession::RefusePipeInputsTouchWhileApplierOwnsIt(
+                "MGPipeLeaveVerb", /*isBarrieredFill=*/true);
+        }
+        if (!g_lastFillWasBarriered) {
+            MGPipeTrackerInstance().ClearPendingBaseInstance();
+            return;
+        }
 #endif
 #if MOBILEGL_PIPE_POISON
         // Same bump the next fill would make, without a verb to fill from: no field is
@@ -1965,7 +2408,7 @@ namespace MobileGL::MG_Pipe {
         ++MGPipeFillAccess::Filled(inputs).CurrentVerbSerial;
 #endif
 #if MOBILEGL_BUILD_DISAGGREGATED
-        MGPipeServerClearVerbBoundary();
+        MGPipeClientClearVerbBoundary();
 #endif
         MGPipeFillAccess::SetVerb(inputs, MGPipeVerb::kVerbCount);
         // The pending base instance belongs to the verb that was about to run, so leaving
@@ -2248,7 +2691,14 @@ namespace MobileGL::MG_Pipe {
                                                   kMGPipeWiredFramebufferSubsystem |
                                                   kMGPipeWiredTextureSubsystem |
                                                   kMGPipeWiredSamplerSubsystem |
-                                                  kMGPipeWiredProgramSubsystem;
+                                                  kMGPipeWiredProgramSubsystem |
+                                                  // P5e (sb): the indexed buffer binding
+                                                  // points, by the same rule and from the same
+                                                  // kind of header. ID-106 pins the other half
+                                                  // of the switch: MG_Backend/Init.cpp's
+                                                  // consumer mask gains bit 13 in the same
+                                                  // commit, or R-8 withholds the whole family.
+                                                  kMGPipeWiredBufferBindingSubsystem;
         // Each family constant is either 0 or its own subsystem bit and nothing else. Without
         // this a header that set the wrong constant - the sampler bit in the program header,
         // say - would switch the wrong family on and every gate would still pass.
@@ -2264,51 +2714,16 @@ namespace MobileGL::MG_Pipe {
         static_assert(kMGPipeWiredProgramSubsystem == 0 ||
                           kMGPipeWiredProgramSubsystem == kMGPipeSubsystemPrograms,
                       "ProgramEmit.h's wired constant must be 0 or the program bit");
+        static_assert(kMGPipeWiredBufferBindingSubsystem == 0 ||
+                          kMGPipeWiredBufferBindingSubsystem == kMGPipeSubsystemBufferBindings,
+                      "ShaderBufferEmit.h's wired constant must be 0 or the binding-point bit");
 
-        // A field an emitted call supplies COMPLETELY, so the residual fill may stop pulling
-        // it. Two rows of Coverage.def's emitted list do not qualify and each has its reason
-        // recorded here rather than a silent absence:
-        //
-        //   GetPixelStoreParameters is BOTH halves of the pixel store (m_pixelStore[0] pack
-        //     and [1] unpack) and set_pixel_pack_state deliberately carries only PACK
-        //     (ARCHITECTURE.md 4.6 D5, MGPipeTypes.h). The unpack half has no carrier at all,
-        //     so the field keeps being pulled and the verify comparator keeps proving it.
-        //
-        //   GetBoundVertexArray is P3a's row, and Coverage.def asks for the decision to be
-        //     taken HERE, deliberately, rather than inherited from the row's presence. THE
-        //     ANSWER IS NO, and it is not a matter of degree: the field's storage is a
-        //     SharedPtr<VertexArrayObject> - a frontend heap reference - and the call that
-        //     supplies it, bind_vertex_elements, carries an eight-byte {slot, gen} handle
-        //     and nothing else. The applier stores that handle in
-        //     MGPipeApplierState::BoundVertexElements; it has no way to produce the pointer,
-        //     and P3a deliberately does not give it one (a payload never contains a pointer,
-        //     and the whole point of the conversion is that the server stops holding
-        //     frontend references). Skipping the pull would leave m_boundVertexArray null on
-        //     every draw of every push build - which is not a subtle staleness, it is every
-        //     backend read of the bound VAO reading nothing.
-        //
-        //     So the row is EMITTED-AND-STILL-PULLED, exactly like GetPixelStoreParameters:
-        //     the call goes out because the server needs the format, and the field keeps
-        //     coming through the residual fill because the mirror is a pointer only the
-        //     client can hold. What retires the pull is not a better applier - it is P8,
-        //     where the backend stops reading a frontend VAO at all.
-        //   P4a's SIX ROWS ARE ALL FALSE, and five of them for GetBoundVertexArray's exact
-        //     reason: the field's storage is a frontend heap reference - a
-        //     BindingSlot<FramebufferObject>, an ImageTextureBinding, a TextureUnit, two
-        //     SharedPtr<ProgramObject> - and the calls that supply them carry eight-byte
-        //     {slot, gen} handles and fully resolved descriptors. The applier has no way to
-        //     produce a pointer and P4a deliberately does not give it one: a payload never
-        //     contains a pointer, and the whole point of the conversion is that the server
-        //     stops holding frontend references. Skipping the pull would leave those mirrors
-        //     null on every draw of every push build. What retires them is not a better
-        //     applier, it is the phase where the backend stops reading a frontend object.
-        //
-        //     GetMaxTouchedTextureUnit was the sixth and its argument was different - a plain
-        //     Int whose carrier (set_sampler_views' Count) is hash-suppressed while the
-        //     high-water mark still moves on a redundant re-bind. P5c rv RETIRED it from this
-        //     list (CONTRACT-P5C.md §5.3): set_context_values carries the mark as a VALUE of
-        //     its own, whole-record suppressed, so the lag the suppressor could introduce is
-        //     gone and the derivation's RECORD_SUPPLIED answer is honest.
+        // Does the record supply this exact getter's representation? P5f consumers now
+        // read handle/range records directly, while the old pointer getters are FATAL on
+        // the server. A handle is still not a SharedPtr/client table base, so these false
+        // arms remain: otherwise the ownership generator would misclassify the retired
+        // getters as RECORD_SUPPLIED. Monolith still fills its original pointer mirrors.
+        // PixelStoreParameters has two halves and only PACK is supplied.
         constexpr Bool EmittedCallSuppliesTheWholeField(MGPipeInputField field) {
             switch (field) {
             case MGPipeInputField::GetPixelStoreParameters:
@@ -2318,12 +2733,8 @@ namespace MobileGL::MG_Pipe {
             case MGPipeInputField::GetTextureUnitObject:
             case MGPipeInputField::GetProgramForDraw:
             case MGPipeInputField::GetProgramForDispatch:
-            // P5e (CONTRACT-P5E.md §5.6): the same answer for the same reason. The field is
-            // four raw bases into the frontend's binding-point table and set_shader_buffers
-            // carries resolved {handle, offset, size} ranges; the applier cannot produce a
-            // pointer, so skipping the pull would leave the mirror null on every draw of every
-            // push build. What retires it is the four Espryt consumers reading the applier's
-            // BoundShaderBuffers, not this row.
+            // Indexed binding points also have a different representation: ranges on
+            // the server, raw client table bases in the legacy getter.
             case MGPipeInputField::GetBufferBindingPoint:
                 return false;
             default:
@@ -2493,12 +2904,60 @@ namespace MobileGL::MG_Pipe {
                       "memo can now answer differently for the consumer signal, so that key input "
                       "needs the unit case the paragraph above names");
 
+        // ---- P5e (gl), ID-112: THE SAME TRIP WIRE FOR THE TWO ROWS THAT ONE CANNOT SEE ------
+        //
+        // The assertion above is keyed on the EMITTER'S SUBSYSTEM, so it covers exactly the five
+        // P4a-family rows. GetBoundVertexArray (P3a's, emitted by BindVertexElements) and
+        // GetBufferBindingPoint (P5e sb's, emitted by SetShaderBuffers) sit outside
+        // kMGPipeP4aFamilySubsystems and had therefore no compile-time protection at all.
+        //
+        // WHY THAT IS A DEVICE CRASH AND NOT A STYLE POINT. This residual fill is MAGMA'S ONLY
+        // SOURCE for all seven pointer-backed rows, and Magma dereferences them on its first
+        // draw: it is in lockstep for the whole of P5e (ID-90) and reads them through
+        // MagmaP7AllocatorDebtScope. A package retiring a DirectGLES consumer that "tidied up"
+        // by deleting one of these two rows from EmittedCallSuppliesTheWholeField would not
+        // break the build - it would SIGSEGV Magma on a phone, which is the exact shape that
+        // cost this phase 38 scenarios once already (ID-107). So the seven are NAMED, and the
+        // naming is the deliverable: it converts the most likely mistake of every remaining
+        // package from a device crash into a build break.
+        //
+        // IF THIS ASSERTION FIRED ON YOU: the answer for each row is argued above
+        // EmittedCallSuppliesTheWholeField and it is the same argument every time - the field's
+        // storage is a frontend heap reference and no payload may carry a pointer. What retires
+        // a row is the phase where the BACKEND stops reading a frontend object (P7 for the
+        // texture/framebuffer/program mirrors, P8 for the VAO), never a consumer-side cleanup
+        // in the package you are writing.
+        constexpr MGPipeInputField kMGPipePointerBackedResidualRows[] = {
+            MGPipeInputField::GetBoundVertexArray,       MGPipeInputField::GetBufferBindingPoint,
+            MGPipeInputField::GetFramebufferBindingSlot, MGPipeInputField::GetImageTextureBinding,
+            MGPipeInputField::GetTextureUnitObject,      MGPipeInputField::GetProgramForDraw,
+            MGPipeInputField::GetProgramForDispatch,
+        };
+        static_assert(sizeof(kMGPipePointerBackedResidualRows) / sizeof(MGPipeInputField) == 7,
+                      "ID-112 names SEVEN pointer-backed residual rows; this list is the whole of "
+                      "them and a row removed from it is a row with no trip wire");
+        constexpr Bool NoPointerBackedRowIsWhollySupplied() {
+            for (const MGPipeInputField field : kMGPipePointerBackedResidualRows) {
+                if (EmittedCallSuppliesTheWholeField(field)) return false;
+            }
+            return true;
+        }
+        static_assert(NoPointerBackedRowIsWhollySupplied(),
+                      "a pointer-backed residual row stopped being pulled (ID-112). This fill is "
+                      "Magma's ONLY source for GetBoundVertexArray, GetBufferBindingPoint and the "
+                      "five P4a-family mirrors, and Magma dereferences them on its first draw - so "
+                      "this is a build break standing in for a device SIGSEGV. Retire the row in "
+                      "the phase that stops the backend reading a frontend object (P7/P8)");
+
         struct ResidualFillPlan {
             Bool Valid = false;
             Uint64 PushMask = 0;
             Bool ApplierDerives = false;
             Bool ContextValuesWireLive = false;
             Bool P4aConsumer = false;
+#if MOBILEGL_BUILD_DISAGGREGATED
+            Uint64 CapsGeneration = 0;
+#endif
             // One bit per FIELD - not per verb class. The class mask is applied at the walk
             // exactly as it always was, so "does this verb read this field" stays the walk's
             // business and this stays a statement about EMISSION alone.
@@ -2524,7 +2983,12 @@ namespace MobileGL::MG_Pipe {
             if (g_fillPlan.Valid && g_fillPlan.PushMask == pushMask &&
                 g_fillPlan.ApplierDerives == applierDerives &&
                 g_fillPlan.ContextValuesWireLive == contextValuesWireLive &&
-                g_fillPlan.P4aConsumer == p4aConsumer) {
+                g_fillPlan.P4aConsumer == p4aConsumer
+#if MOBILEGL_BUILD_DISAGGREGATED
+                && g_fillPlan.CapsGeneration == (MG_Config::Transport != MG_Config::TransportMode::Monolith ?
+                    MG_Remote::Client::CapsMirrorInstance().Generation() : 0)
+#endif
+                ) {
                 return g_fillPlan.Supplied;
             }
             MGPipeFieldMask built{};
@@ -2565,6 +3029,10 @@ namespace MobileGL::MG_Pipe {
             g_fillPlan.ApplierDerives = applierDerives;
             g_fillPlan.ContextValuesWireLive = contextValuesWireLive;
             g_fillPlan.P4aConsumer = p4aConsumer;
+#if MOBILEGL_BUILD_DISAGGREGATED
+            g_fillPlan.CapsGeneration = MG_Config::Transport != MG_Config::TransportMode::Monolith ?
+                MG_Remote::Client::CapsMirrorInstance().Generation() : 0;
+#endif
             g_fillPlan.Supplied = built;
             return built;
         }
@@ -2686,7 +3154,19 @@ namespace MobileGL::MG_Pipe {
             // Did the applier reproduce it? Byte for byte, over the attributes this call
             // named - anything less would be a mirror that disagrees with the frontend in a
             // window no gate looks at.
-            const auto* mirror = MGPipeFillAccess::VertexAttribDefaultsOf(gPipeInputs);
+            //
+            // P5e (ra, CONTRACT-P5E §3.4): NOT UNDER RUN-AHEAD. The mirror is the APPLIER's
+            // copy of this record, and set_vertex_attrib_defaults is a kWaitNone row - so
+            // under run-ahead this thread has not waited for the apply and the read races it,
+            // and the repair below (a CopyField straight into the block) is precisely the
+            // GL-thread write §3.5 refuses. The client's own authority is `resolved` and
+            // `g_attribDefaultLastHeader`, which is what it just published; there is nothing
+            // the mirror could add that the wire does not already carry. A build that ever
+            // needs the repair arm again has to earn it with a barriered row.
+#if MOBILEGL_BUILD_DISAGGREGATED
+            if (ClientRunsAhead()) return sizeof(MGPVertexAttribDefaults) + header.Count * sizeof(MGPAttribValue);
+#endif
+            const auto* mirror = MGPipeFillAccess::VertexAttribDefaultsOf(MGPipeClientInputs());
             Bool reproduced = true;
             for (SizeT i = 0; i < kAttribs && reproduced; ++i) {
                 if ((header.Mask & (Uint32{1} << static_cast<Uint32>(i))) == 0) continue;
@@ -2697,7 +3177,7 @@ namespace MobileGL::MG_Pipe {
                 MGLOG_W_ONCE("MGPipe: MGPipeApplySetVertexAttribDefaults did not reproduce the "
                              "carried three views on this build - the client is keeping "
                              "m_currentVertexAttribute authoritative");
-                MGPipeFillAccess::CopyField(gPipeInputs, ctx, MGPipeInputField::GetCurrentVertexAttribute);
+                MGPipeFillAccess::CopyField(MGPipeClientInputs(), ctx, MGPipeInputField::GetCurrentVertexAttribute);
             }
             return sizeof(MGPVertexAttribDefaults) + header.Count * sizeof(MGPAttribValue);
         }
@@ -2985,6 +3465,22 @@ namespace MobileGL::MG_Pipe {
         Uint64 DrainTextureSubData(GLContext& ctx) {
             return MGPipeTextureEmitterInstance().DrainTextureSubData(ctx);
         }
+
+        // ---- P5e's two, and they are TWO adapters over THREE records (sb, §5.6) ----
+        //
+        // The split is the DIRTY BITS' and not the classes': bit 15 is the uniform binding
+        // points and bit 16 is the two writable classes, which share a shutter because a
+        // storage bind and a counter bind are the same event to every reader of the record.
+        // Bit 17's family (set_stream_output_targets) has no adapter at all - XFB stays
+        // lockstep for the whole of P5e (§5.7) - and that absence is the catalogue's split,
+        // not an omission.
+        Uint64 EmitConstBuffers(GLContext& ctx) {
+            return MGPipeShaderBufferEmitterInstance().EmitConstBuffers(ctx);
+        }
+
+        Uint64 EmitShaderBuffers(GLContext& ctx) {
+            return MGPipeShaderBufferEmitterInstance().EmitShaderBuffers(ctx);
+        }
     } // namespace
 
     Uint64 MGPipeVertexAttribDefaultRepairCount() { return g_attribDefaultRepairs; }
@@ -3002,15 +3498,25 @@ namespace MobileGL::MG_Pipe {
 
     // ---- the validate point (P2 brief D1) ----
     void MGPipeValidateForVerb(MGPipeVerb verb) {
-        PipeInputs& inputs = gPipeInputs;
+        // P5f (f1): the fill side's one new spelling. With MOBILEGL_IPC_ROLE_SPLIT_STATE=1 this
+        // is the CLIENT-role block and gPipeInputs is the server's alone; off, or under
+        // monolith transport, it folds back onto gPipeInputs and nothing below changes.
+        PipeInputs& inputs = MGPipeClientInputs();
 #if MOBILEGL_BUILD_DISAGGREGATED
-        // P5c (gt, CONTRACT-P5C §6 layer 2): the residual fill is THE client-side write into
-        // gPipeInputs, and it is legal only because it runs before the record is published -
-        // under an armed barrier the apply thread's in-applier flag is provably down here. If
-        // that ever stops being true this is the check that says so, rather than the applier
-        // reading a half-written fill.
-        MG_Remote::Client::ClientSession::RefusePipeInputsTouchWhileApplierOwnsIt(
-            "MGPipeValidateForVerb");
+        // ---- P5e (ra), CONTRACT-P5E §3: WHO OWNS gPipeInputs FOR THIS VERB ----------------
+        //
+        // Under run-ahead the block is SERVER-ROLE MEMORY for an unbarriered record: the
+        // client does not fill it, does not stamp it and does not withdraw the server's stamp,
+        // because it will not be parked while the apply runs and every one of those writes
+        // would race the applier's own reads. What still runs, unchanged, is the tracker walk
+        // and the emitters (steps 2 and 3): those PRODUCE RECORDS, which is the whole of what
+        // an unbarriered verb is allowed to hand the server.
+        //
+        // `fillOwed` is deliberately a separate name from `barriered`, and that is what makes
+        // the red-once one line: setting it to `true` restores the old behaviour (a fill for
+        // every verb) and the guard below then fires Fatal{RoleViolation, "gPipeInputs"} on
+        // the first unbarriered verb, by name.
+        const Bool runAhead = ClientRunsAhead();
 #endif
         ParsePoisonOmissionKnob();
 #if MOBILEGL_PIPE_VERIFY
@@ -3023,24 +3529,81 @@ namespace MobileGL::MG_Pipe {
                          "(configure with -DMOBILEGL_PIPE_VERIFY=ON)");
         }
 #endif
+        auto* ctx = LiveContext();
+        // THE IDENTITY / LIVENESS PAIR IS WRITTEN ON EVERY VERB, run-ahead or not, and that is
+        // a NAMED DEVIATION from CONTRACT-P5E §3.1's list (see the report): `m_live` and
+        // `m_contextIdentity` are not FIELDS of the residual model - no FieldOwnership.def row
+        // owns them, no applier record carries them, and no server stamp can answer them -
+        // they are "does this process still have a GL context", which every null-context guard
+        // in the backend reads and which only this thread can know. Two stores, no freshness
+        // and no stamp, so an unbarriered apply reading them reads a fact about the client's
+        // process rather than a value the wire owes it.
+        MGPipeFillAccess::SetIdentity(inputs, ctx);
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // §2.1's predicate, client-side (see ClientVerbIsBarriered).
+        const Bool barriered = !runAhead || ClientVerbIsBarriered(verb, ctx);
+        // THE ONE LINE THE RED-ONCE FLIPS: `= true` here is "fill for every verb", the
+        // pre-P5e behaviour, and it turns the guard below into the abort §3.5 names.
+        const Bool fillOwed = barriered;
+        g_lastFillWasBarriered = fillOwed;
+        if (fillOwed) {
+            // P5c (gt, CONTRACT-P5C §6 layer 2) / P5e §3.5: the residual fill is THE
+            // client-side write into gPipeInputs. Under lockstep it is legal because it runs
+            // before the record is published - the apply thread's in-applier flag is provably
+            // down here. Under run-ahead it is legal because this record is BARRIERED: this
+            // thread is about to park behind it. The second argument is which of the two
+            // claims the caller is making, and a fill that made the second one falsely is the
+            // named abort.
+            //
+            // P5e (ra2): AND IT IS MADE TRUE FIRST. Phase 1 of the block write is three lines
+            // below - the serial bump, MGPipeServerClearVerbBoundary() and SetVerb - and every
+            // one of them is a scalar the apply thread reads at each field access inside the
+            // record it is currently applying. Withdrawing the server's own stamp from under it
+            // is what produced `Fatal{UnmigratedPipeInput, "<RECORD-SUPPLIED field>@<this
+            // thread's verb>"}` on the apply thread (report §2). THE RED-ONCE IS THIS LINE:
+            // delete it and the guard below aborts with Fatal{RoleViolation, "gPipeInputs"}
+            // naming MGPipeValidateForVerb, because the guard now tests the fact rather than
+            // taking the claim.
+            QuiesceApplierBeforeFill("MGPipeValidateForVerb");
+            MG_Remote::Client::ClientSession::RefusePipeInputsTouchWhileApplierOwnsIt(
+                "MGPipeValidateForVerb", /*isBarrieredFill=*/barriered);
+        }
+#else
+        constexpr Bool fillOwed = true;
+#endif
+        if (fillOwed) {
 #if MOBILEGL_PIPE_POISON
-        MGPipeFilledState& filled = MGPipeFillAccess::Filled(inputs);
-        // Starts at 1: FilledGen == 0 is "never filled", and MGPipeInputFieldIsFresh refuses
-        // it on both branches, so a read before this first bump is
-        // Fatal{UnmigratedPipeInput, "<Field>@<none>"} rather than default storage.
-        ++filled.CurrentVerbSerial;
+            // Starts at 1: FilledGen == 0 is "never filled", and MGPipeInputFieldIsFresh
+            // refuses it on both branches, so a read before this first bump is
+            // Fatal{UnmigratedPipeInput, "<Field>@<none>"} rather than default storage.
+            ++MGPipeFillAccess::Filled(inputs).CurrentVerbSerial;
 #endif
 #if MOBILEGL_BUILD_DISAGGREGATED
-        // The client is filling, so whatever the server stamped at its last verb boundary is
-        // withdrawn: the stamps below are the CLIENT's again and a stale read is a defect, not
-        // a residual pull. Disarming here rather than at the end of the applier's work is what
-        // makes the arming flag say "the current stamps are the server's" no matter which of
-        // the two roles ran last.
-        MGPipeServerClearVerbBoundary();
+            // The client is filling, so whatever the server stamped at its last verb boundary
+            // is withdrawn: the stamps below are the CLIENT's again and a stale read is a
+            // defect, not a residual pull. Disarming here rather than at the end of the
+            // applier's work is what makes the arming flag say "the current stamps are the
+            // server's" no matter which of the two roles ran last.
+            //
+            // P5e (§3.2): under run-ahead this runs only inside a barriered fill, which is the
+            // whole of the E note's hazard (b.4) - a GL thread withdrawing the SERVER's stamp
+            // while the apply thread is inside a record that depends on it. For an unbarriered
+            // verb the stamp is not touched at all, and the applier's own LeaveApplier is then
+            // its only writer.
+            //
+            // P5f (f1): this is now the CLIENT block's flag (MGPipeClientClearVerbBoundary).
+            // With the rehearsal off both names denote the one shared block and the semantics
+            // above are unchanged; with it on the client block's flag is never raised and the
+            // clear is a no-op, and withdrawing the SERVER's stamp is the applier's job alone
+            // (PipeApplier::LeaveApplier) - which is CONTRACT-P5E §3.2's per-role stamp
+            // ownership, landed as the dual block rather than as moved fields.
+            MGPipeClientClearVerbBoundary();
 #endif
-        MGPipeFillAccess::SetVerb(inputs, verb);
-        auto* ctx = LiveContext();
-        MGPipeFillAccess::SetIdentity(inputs, ctx);
+            MGPipeFillAccess::SetVerb(inputs, verb);
+        }
+#if MOBILEGL_PIPE_POISON
+        MGPipeFilledState& filled = MGPipeFillAccess::Filled(inputs);
+#endif
         if (ctx == nullptr) {
             // The pending base instance belongs to THIS verb, and this exit skips step 3's
             // clear, so it has to make the same promise here: a base-instanced draw with no
@@ -3105,12 +3668,17 @@ namespace MobileGL::MG_Pipe {
 #else
         constexpr Bool contextValuesWireLive = false;
 #endif
+        // AND THE SEVENTH IS P5eFamilyIsLive (ID-106), which is the same sentence for the
+        // binding-point family and asks bit 13's OWN consumer bit rather than the resource
+        // family's. It answers true for every subsystem but bit 13, so nothing that emitted
+        // before P5e changes.
         const auto wants = [&](MGPipeDirty bit) {
             const Uint64 subsystem = MGPipeSubsystemForDirty(bit);
             return subsystem != 0 && (pushMask & subsystem) != 0 &&
                    (kMGPipeWiredSubsystems & subsystem) != 0 &&
                    P4aFamilyHasItsConsumer(subsystem) &&
                    P4aFamilyDependenciesAreSet(subsystem, pushMask) &&
+                   P5eFamilyIsLive(subsystem, pushMask) &&
                    (dirty & MGPipeDirtyBit(bit)) != 0;
         };
         Uint64 payloadBytes = 0;
@@ -3182,6 +3750,13 @@ namespace MobileGL::MG_Pipe {
             MGPipeSamplerEmitterInstance().Reset();
             MGPipeImageEmitterInstance().Reset();
             MGPipeProgramEmitterInstance().Reset();
+            // P5e (sb): and the binding-point emitter's mirrors. MGPipeApplierReset clears all
+            // three of the applier's windows and ADVANCES ShaderBuffersSerial, so the emitter's
+            // latch has to reset with it - the three suppressor slots are already cleared by
+            // InvalidateAll() above, and without that the first emission after a make-current
+            // would be suppressed as unchanged and the server would draw against a window it
+            // had just been told to empty.
+            MGPipeShaderBufferEmitterInstance().Reset();
             g_residualDue = true;
         }
 
@@ -3229,6 +3804,24 @@ namespace MobileGL::MG_Pipe {
         }
         if (wants(MGPipeDirty::NewGlobalConstants)) {
             payloadBytes += EmitGlobalConstants(*ctx);
+        }
+
+        // P5e's segment (sb, §5.6): the indexed buffer binding points, AFTER the program
+        // segment for the same "code organisation, not a contract" reason ARCHITECTURE.md 5.4
+        // gives for P4a's order - all of a verb's set_*/bind_* complete before the verb, and
+        // the server resolves a point against its own descriptor at its sync point. It reads
+        // better here because the uniform window is what the program's block bindings INDEX
+        // (DirectGLES.cpp's UBO loop), so the two records that describe a draw's uniform
+        // buffers stand together.
+        //
+        // NOTHING FOR BIT 17: set_stream_output_targets stays unemitted for the whole of P5e
+        // (§5.7). The bit is still computed, counted and mapped onto this subsystem, so an
+        // operator clearing bit 13 gets the whole family's frontend walk back.
+        if (wants(MGPipeDirty::NewConstBuffers)) {
+            payloadBytes += EmitConstBuffers(*ctx);
+        }
+        if (wants(MGPipeDirty::NewShaderBuffers)) {
+            payloadBytes += EmitShaderBuffers(*ctx);
         }
 
         if (wants(MGPipeDirty::NewPipelineState) || wants(MGPipeDirty::NewRenderState)) {
@@ -3286,12 +3879,34 @@ namespace MobileGL::MG_Pipe {
         // does read. The two halves of P5c rv's gate still read the ONE `contextValuesWireLive`
         // computed at the top of this function - it is the memo's key AND its argument - so they
         // cannot disagree about who supplies the eight value-class fields.
+        //
+        // P5e (ra, §3.1): AND IT DOES NOT RUN AT ALL FOR AN UNBARRIERED RECORD. Every write
+        // below - the CopyField and the FilledGen stamp alike - is a GL-thread write into a
+        // block the apply thread is about to read without this thread being parked, which is
+        // exactly what rule F forbids. The server does not go without an answer: it stamps its
+        // own boundary and §3.3's detector turns any field it still needs from here into
+        // Fatal{UnmigratedPipeInput, "<field>@<verb>"} by name, which is what makes the strict
+        // lane a gate rather than a count.
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // P5e (ra2): PHASE 2 OF THE BLOCK WRITE, AND IT NEEDS ITS OWN WAIT. Everything between
+        // the phase-1 wait and here PUBLISHED RECORDS - the fourteen emitters above - and the
+        // apply thread reads gPipeInputs while it applies them. So the window the fill opened at
+        // the top of this function was closed again by this function's own emissions, and the
+        // 63-field walk below would run straight into it. Same call, same arm, same no-op
+        // everywhere run-ahead is not armed; the guard beside it is what turns a missing one
+        // into a named abort rather than a torn read.
+        if (fillOwed) {
+            QuiesceApplierBeforeFill("MGPipeValidateForVerb/residual");
+            MG_Remote::Client::ClientSession::RefusePipeInputsTouchWhileApplierOwnsIt(
+                "MGPipeValidateForVerb/residual", /*isBarrieredFill=*/true);
+        }
+#endif
         const Bool applierDerives = ApplierDerivesRenderStateFields();
         // BY VALUE, NOT BY REFERENCE: the memo's storage is rebuilt in place when the key moves,
         // and the walk below holds this across 63 iterations.
         const MGPipeFieldMask supplied =
             SuppliedFieldMask(pushMask, applierDerives, contextValuesWireLive);
-        for (SizeT i = 0; i < kMGPipeInputFieldCount; ++i) {
+        for (SizeT i = 0; fillOwed && i < kMGPipeInputFieldCount; ++i) {
             const auto field = static_cast<MGPipeInputField>(i);
             if (!MGPipeFieldMaskHas(mask, field)) continue;
 #if MOBILEGL_PIPE_POISON

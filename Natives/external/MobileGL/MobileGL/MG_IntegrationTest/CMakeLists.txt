@@ -58,6 +58,11 @@ add_executable(MobileGLIntegrationTest
     Harness/P4aFinalFixPeek.cpp
     Harness/PersistentMapPeek.cpp
     Harness/SplitRuntimePeek.cpp
+    # ---- P3b/P4b wave 2-D package D2 (own block; D1 edits this file elsewhere) --------------
+    # The client texture emitter's own counters, for TextureViewAliasScenario's half of the
+    # owner-keyed emission cursor gate: a drain that ran and emitted nothing is invisible in
+    # pixels and is exactly the two-cursor regression's signature.
+    Harness/TextureEmitPeek.cpp
     Scenarios/OrientationScenario.cpp
     Scenarios/CrossFrameBufferScenario.cpp
     Scenarios/ResidentIndexScenario.cpp
@@ -72,11 +77,16 @@ add_executable(MobileGLIntegrationTest
     Scenarios/SampledSetStalenessScenario.cpp
     Scenarios/ThreeChannelAttachmentScenario.cpp
     Scenarios/SnormAttachmentScenario.cpp
+    Scenarios/MonolithAttachmentClearScenario.cpp
     Scenarios/PipelineFailureScenario.cpp
     Scenarios/AdvertisedLimitsScenario.cpp
     Scenarios/PixelStoreSweepScenario.cpp
+    # P7 gate 5 (g5-readback): readbacks larger than one reply slot. Ordinary GL cases, so the
+    # monolith arms run them too - that is the parity half of the split registrations below.
+    Scenarios/BandedReadbackScenario.cpp
     Scenarios/PrimitiveRestartScenario.cpp
     Scenarios/FragCoordOriginScenario.cpp
+    Scenarios/ClientVertexArrayScenario.cpp
     Scenarios/ClearThenReadPixelsScenario.cpp
     Scenarios/SampleVariablesScenario.cpp
     Scenarios/DepthStencilReadbackScenario.cpp
@@ -97,6 +107,7 @@ add_executable(MobileGLIntegrationTest
     Scenarios/ImageFormatQualifierScenario.cpp
     Scenarios/NonCoreImageFormatScenario.cpp
     Scenarios/ImageSizeAfterRespecScenario.cpp
+    Scenarios/EmptyTextureLevelScenario.cpp
     Scenarios/SsboDeclarationFormScenario.cpp
     Scenarios/Glsl420DeclarationScenario.cpp
     Scenarios/IoBlockNameCollisionScenario.cpp
@@ -119,6 +130,8 @@ add_executable(MobileGLIntegrationTest
     Scenarios/CopyImageLayeredScenario.cpp
     Scenarios/CopyImagePacked16Scenario.cpp
     Scenarios/TextureViewScenario.cpp
+    # P3b/P4b wave 2-D package D2: the verification half of the owner-keyed emission cursor.
+    Scenarios/TextureViewAliasScenario.cpp
     Scenarios/PackedWordReadbackScenario.cpp
     Scenarios/LayeredAttachmentBarrierScenario.cpp
     Scenarios/LayeredAttachmentShapeScenario.cpp
@@ -131,6 +144,8 @@ add_executable(MobileGLIntegrationTest
     Scenarios/RelinkStageSetScenario.cpp
     Scenarios/GuiBatchScenario.cpp
     Scenarios/UnboundImageDescriptorScenario.cpp
+    # P7 gate 5: an image unit naming a (level, layer) its texture lacks (GL 4.6 core 8.26).
+    Scenarios/InvalidImageUnitScenario.cpp
     Scenarios/IntegerBorderColorScenario.cpp
     Scenarios/ClearTexImageUndefinedLevelZeroScenario.cpp
     Scenarios/RenderbufferBlendFormatScenario.cpp
@@ -150,6 +165,7 @@ add_executable(MobileGLIntegrationTest
     # run the same cases with MOBILEGL_TRANSPORT=inproc.
     Scenarios/TriangleScenario.cpp
     Scenarios/PersistentCoherentMapScenario.cpp
+    Scenarios/DefaultFramebufferAcrossSwapScenario.cpp
 )
 
 target_include_directories(MobileGLIntegrationTest PRIVATE
@@ -630,9 +646,16 @@ if (MOBILEGL_PIPE_PUSH)
     # question with a different owner's file behind it (review F-m7). ctu= is emitted by PipeStats
     # in EVERY push build whether or not anything increments it, so "the counter read zero" and
     # "no client emitter exists" are the same number and TextureUploadShape cannot tell them apart
-    # from the summary line alone. Once package B's texture emitter lands, an emitter that stopped
-    # emitting would read exactly like no emitter at all and the two-sided assertion the scenario
-    # exists for would pass while comparing nothing. This probe is what separates them.
+    # from the summary line alone. An emitter that STOPPED emitting reads exactly like no emitter
+    # at all in that field, and the two-sided assertion the scenario exists for would pass while
+    # comparing nothing. This probe is what separates them.
+    #
+    # THAT EMITTER HAS LANDED (P3b/P4b wave 2-D corrects this comment's tense):
+    # MG_Impl/Pipe/TextureEmit.h's EmitOneLevel increments
+    # CallClass::ClientTextureUploadEmissions on every piece it emits, so the probe hits and the
+    # else() arm below is unreachable on this tree. It is KEPT rather than deleted because it is
+    # what makes the arming decision falsifiable in both directions - a probe that cannot report
+    # "absent" cannot be shown to be looking for the right symbol.
     mgl_itest_probe_for_symbol(MGL_ITEST_CLIENT_TEXTURE_UPLOAD_EMITTER
         "${MGL_ITEST_ROOT}/MobileGL/MG_Impl/Pipe" "ClientTextureUploadEmissions")
     if (MGL_ITEST_CLIENT_TEXTURE_UPLOAD_EMITTER)
@@ -744,8 +767,24 @@ include(GoogleTest)
 # Discovery runs `--gtest_list_tests`, which does not construct the harness and
 # so needs no GPU. One registration per backend; TEST_PREFIX keeps the two sets
 # of ctest names apart.
+# The original ambient names remain present, but mechanism oracles must not
+# inherit an inproc environment: they deliberately toggle process-local push
+# masks, pointer-key ABA, direct persistent adoption or synchronous stats slots.
+# Keep ordinary pixel/byte cases (including the other arena/regrow cases) on the
+# caller's transport. A separate label makes every exception inspectable.
+set(MGL_ITEST_MONOLITH_MECHANISM_FILTER
+    "HandleRecycleScenario.*:CsoContentAddressingScenario.*:ResourceSubsystemControlScenario.*:ObjectSubsystemControlScenario.*:PipeVerifyArmingScenario.*:PoisonOmissionScenario.*:StorageBufferRegrowScenario.NStorageDefinitionsCostNMapPersistentRoundtripsNotOnePerDraw:LargeArenaAdoptionScenario.AnAdoptionCostsExactlyOneMapPersistentRoundtrip")
+# P3b/P4b wave 2-D package D2: TextureViewAliasScenario joins this list rather than the ambient
+# one for the same reason TextureViewScenario is in it - every case it carries constructs a
+# glTextureView, which DirectGLES withholds unless MOBILEGL_ESPRYT_ENABLE_TEXTURE_VIEW=1
+# (ConfigLoader.cpp:213). In the ambient entry it would green-skip on every run and the gate
+# would be a name in a list.
+set(MGL_ITEST_GLES_VIEW_FILTER
+    "TextureViewScenario.*:TextureViewAliasScenario.*:F1WireScenario.ComputeImageStoreThroughViewPreservesOtherRootLayer:F1WireScenario.TextureViewClearTargetsItsRootMipAndLayer:F1WireScenario.GenerateMipmapThroughViewKeepsOwnerLevelsAndLayersOutsideItsWindow:InvalidImageUnitScenario.ALevelPastATextureViewsWindowReadsZero")
+
 gtest_discover_tests(MobileGLIntegrationTest
     TEST_PREFIX "DirectGLES."
+    TEST_FILTER "-${MGL_ITEST_MONOLITH_MECHANISM_FILTER}:${MGL_ITEST_GLES_VIEW_FILTER}"
     DISCOVERY_TIMEOUT 30
     PROPERTIES
         LABELS integration-gpu
@@ -755,12 +794,37 @@ gtest_discover_tests(MobileGLIntegrationTest
 
 gtest_discover_tests(MobileGLIntegrationTest
     TEST_PREFIX "DirectVulkan."
+    TEST_FILTER "-${MGL_ITEST_MONOLITH_MECHANISM_FILTER}"
     DISCOVERY_TIMEOUT 30
     PROPERTIES
         LABELS integration-gpu
         TIMEOUT ${MGL_ITEST_TIMEOUT}
         ENVIRONMENT "${MGL_ITEST_VULKAN_ENVIRONMENT}"
 )
+
+foreach(backend DirectGLES DirectVulkan)
+    if (backend STREQUAL "DirectGLES")
+        set(mechanism_environment "${MGL_ITEST_GLES_ENVIRONMENT}")
+    else()
+        set(mechanism_environment "${MGL_ITEST_VULKAN_ENVIRONMENT}")
+    endif()
+    gtest_discover_tests(MobileGLIntegrationTest
+        TEST_PREFIX "${backend}."
+        TEST_FILTER "${MGL_ITEST_MONOLITH_MECHANISM_FILTER}"
+        DISCOVERY_TIMEOUT 30
+        PROPERTIES LABELS "integration-gpu\;integration-monolith-control"
+            TIMEOUT ${MGL_ITEST_TIMEOUT}
+            ENVIRONMENT "${mechanism_environment}\;MOBILEGL_TRANSPORT=monolith")
+endforeach()
+
+# This is Espryt's existing feature opt-in, independent of transport. Exercise
+# the actual view implementation instead of inheriting its default-off skip.
+gtest_discover_tests(MobileGLIntegrationTest
+    TEST_PREFIX "DirectGLES."
+    TEST_FILTER "${MGL_ITEST_GLES_VIEW_FILTER}"
+    DISCOVERY_TIMEOUT 30
+    PROPERTIES LABELS integration-gpu TIMEOUT ${MGL_ITEST_TIMEOUT}
+        ENVIRONMENT "${MGL_ITEST_GLES_ENVIRONMENT}\;MOBILEGL_ESPRYT_ENABLE_TEXTURE_VIEW=1")
 
 # A third registration, of ONE scenario, with asynchronous shader compilation
 # pinned on. Not a second code path in the renderer: a second ALLOCATION pattern.
@@ -1142,22 +1206,28 @@ else()
 endif()
 
 mgl_itest_join_environment(MGL_ITEST_GLES_HANDLE_HANDLES_ENVIRONMENT
+    "MOBILEGL_TRANSPORT=monolith"
     "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_HANDLE_ARM=handles" ${MGL_ITEST_HANDLES_ARM_KNOBS}
     ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
 mgl_itest_join_environment(MGL_ITEST_VULKAN_HANDLE_HANDLES_ENVIRONMENT
+    "MOBILEGL_TRANSPORT=monolith"
     "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MGITEST_HANDLE_ARM=handles" ${MGL_ITEST_HANDLES_ARM_KNOBS}
     ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_VULKAN_ENV})
 mgl_itest_join_environment(MGL_ITEST_GLES_HANDLE_LEGACY_ENVIRONMENT
+    "MOBILEGL_TRANSPORT=monolith"
     "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_HANDLE_ARM=legacy" "MOBILEGL_PIPE_PUSH=0"
     ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
 mgl_itest_join_environment(MGL_ITEST_VULKAN_HANDLE_LEGACY_ENVIRONMENT
+    "MOBILEGL_TRANSPORT=monolith"
     "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MGITEST_HANDLE_ARM=legacy" "MOBILEGL_PIPE_PUSH=0"
     ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_VULKAN_ENV})
 mgl_itest_join_environment(MGL_ITEST_VULKAN_HANDLE_ABA_ENVIRONMENT
+    "MOBILEGL_TRANSPORT=monolith"
     "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MGITEST_HANDLE_ARM=aba" "MOBILEGL_PIPE_PUSH=0"
     ${MGL_ITEST_ABA_ARM_KNOBS}
     ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_VULKAN_ENV})
 mgl_itest_join_environment(MGL_ITEST_VULKAN_HANDLE_ABA_HANDLES_ENVIRONMENT
+    "MOBILEGL_TRANSPORT=monolith"
     "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MGITEST_HANDLE_ARM=aba"
     ${MGL_ITEST_HANDLES_ARM_KNOBS} ${MGL_ITEST_ABA_ARM_KNOBS}
     ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_VULKAN_ENV})
@@ -1167,7 +1237,7 @@ gtest_discover_tests(MobileGLIntegrationTest
     TEST_FILTER "HandleRecycleScenario.*"
     DISCOVERY_TIMEOUT 30
     PROPERTIES
-        LABELS integration-gpu
+        LABELS "integration-gpu\;integration-monolith-control"
         TIMEOUT ${MGL_ITEST_TIMEOUT}
         ENVIRONMENT "${MGL_ITEST_GLES_HANDLE_HANDLES_ENVIRONMENT}"
 )
@@ -1176,7 +1246,7 @@ gtest_discover_tests(MobileGLIntegrationTest
     TEST_FILTER "HandleRecycleScenario.*"
     DISCOVERY_TIMEOUT 30
     PROPERTIES
-        LABELS integration-gpu
+        LABELS "integration-gpu\;integration-monolith-control"
         TIMEOUT ${MGL_ITEST_TIMEOUT}
         ENVIRONMENT "${MGL_ITEST_VULKAN_HANDLE_HANDLES_ENVIRONMENT}"
 )
@@ -1185,7 +1255,7 @@ gtest_discover_tests(MobileGLIntegrationTest
     TEST_FILTER "HandleRecycleScenario.*"
     DISCOVERY_TIMEOUT 30
     PROPERTIES
-        LABELS integration-gpu
+        LABELS "integration-gpu\;integration-monolith-control"
         TIMEOUT ${MGL_ITEST_TIMEOUT}
         ENVIRONMENT "${MGL_ITEST_GLES_HANDLE_LEGACY_ENVIRONMENT}"
 )
@@ -1194,7 +1264,7 @@ gtest_discover_tests(MobileGLIntegrationTest
     TEST_FILTER "HandleRecycleScenario.*"
     DISCOVERY_TIMEOUT 30
     PROPERTIES
-        LABELS integration-gpu
+        LABELS "integration-gpu\;integration-monolith-control"
         TIMEOUT ${MGL_ITEST_TIMEOUT}
         ENVIRONMENT "${MGL_ITEST_VULKAN_HANDLE_LEGACY_ENVIRONMENT}"
 )
@@ -1203,7 +1273,7 @@ gtest_discover_tests(MobileGLIntegrationTest
     TEST_FILTER "HandleRecycleScenario.*"
     DISCOVERY_TIMEOUT 30
     PROPERTIES
-        LABELS integration-gpu
+        LABELS "integration-gpu\;integration-monolith-control"
         TIMEOUT ${MGL_ITEST_TIMEOUT}
         ENVIRONMENT "${MGL_ITEST_VULKAN_HANDLE_ABA_ENVIRONMENT}"
 )
@@ -1212,7 +1282,7 @@ gtest_discover_tests(MobileGLIntegrationTest
     TEST_FILTER "HandleRecycleScenario.*"
     DISCOVERY_TIMEOUT 30
     PROPERTIES
-        LABELS integration-gpu
+        LABELS "integration-gpu\;integration-monolith-control"
         TIMEOUT ${MGL_ITEST_TIMEOUT}
         ENVIRONMENT "${MGL_ITEST_VULKAN_HANDLE_ABA_HANDLES_ENVIRONMENT}"
 )
@@ -1252,21 +1322,25 @@ gtest_discover_tests(MobileGLIntegrationTest
 # what it buys is that a CSO regression that only shows up with the P3a subsystems on can reach
 # them. (contract-review-v1.md item 11, closed here for all three lane families.)
 mgl_itest_join_environment(MGL_ITEST_GLES_CSO_ON_ENVIRONMENT
+    "MOBILEGL_TRANSPORT=monolith"
     "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_CSO_LANE=content-addressed"
     "MOBILEGL_PIPE_PUSH=0x1fff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
     "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/cso-content-addressed-DirectGLES.log"
     ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
 mgl_itest_join_environment(MGL_ITEST_GLES_CSO_OFF_ENVIRONMENT
+    "MOBILEGL_TRANSPORT=monolith"
     "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_CSO_LANE=no-content-addressing"
     "MOBILEGL_PIPE_PUSH=0x8000000000001fff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
     "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/cso-no-content-addressing-DirectGLES.log"
     ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
 mgl_itest_join_environment(MGL_ITEST_VULKAN_CSO_ON_ENVIRONMENT
+    "MOBILEGL_TRANSPORT=monolith"
     "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MGITEST_CSO_LANE=content-addressed"
     "MOBILEGL_PIPE_PUSH=0x1fff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
     "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/cso-content-addressed-DirectVulkan.log"
     ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_VULKAN_ENV})
 mgl_itest_join_environment(MGL_ITEST_VULKAN_CSO_OFF_ENVIRONMENT
+    "MOBILEGL_TRANSPORT=monolith"
     "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MGITEST_CSO_LANE=no-content-addressing"
     "MOBILEGL_PIPE_PUSH=0x8000000000001fff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
     "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/cso-no-content-addressing-DirectVulkan.log"
@@ -1277,7 +1351,7 @@ gtest_discover_tests(MobileGLIntegrationTest
     TEST_FILTER "CsoContentAddressingScenario.*"
     DISCOVERY_TIMEOUT 30
     PROPERTIES
-        LABELS integration-gpu
+        LABELS "integration-gpu\;integration-monolith-control"
         TIMEOUT ${MGL_ITEST_TIMEOUT}
         ENVIRONMENT "${MGL_ITEST_GLES_CSO_ON_ENVIRONMENT}"
 )
@@ -1286,7 +1360,7 @@ gtest_discover_tests(MobileGLIntegrationTest
     TEST_FILTER "CsoContentAddressingScenario.*"
     DISCOVERY_TIMEOUT 30
     PROPERTIES
-        LABELS integration-gpu
+        LABELS "integration-gpu\;integration-monolith-control"
         TIMEOUT ${MGL_ITEST_TIMEOUT}
         ENVIRONMENT "${MGL_ITEST_GLES_CSO_OFF_ENVIRONMENT}"
 )
@@ -1295,7 +1369,7 @@ gtest_discover_tests(MobileGLIntegrationTest
     TEST_FILTER "CsoContentAddressingScenario.*"
     DISCOVERY_TIMEOUT 30
     PROPERTIES
-        LABELS integration-gpu
+        LABELS "integration-gpu\;integration-monolith-control"
         TIMEOUT ${MGL_ITEST_TIMEOUT}
         ENVIRONMENT "${MGL_ITEST_VULKAN_CSO_ON_ENVIRONMENT}"
 )
@@ -1304,7 +1378,7 @@ gtest_discover_tests(MobileGLIntegrationTest
     TEST_FILTER "CsoContentAddressingScenario.*"
     DISCOVERY_TIMEOUT 30
     PROPERTIES
-        LABELS integration-gpu
+        LABELS "integration-gpu\;integration-monolith-control"
         TIMEOUT ${MGL_ITEST_TIMEOUT}
         ENVIRONMENT "${MGL_ITEST_VULKAN_CSO_OFF_ENVIRONMENT}"
 )
@@ -1339,11 +1413,13 @@ gtest_discover_tests(MobileGLIntegrationTest
 # MOBILEGL_PIPE_PUSH value in the environment of a pull library steers nothing (Config.h declares
 # the field inside the push guard), exactly as the HandleRecycle Legacy lanes already rely on.
 mgl_itest_join_environment(MGL_ITEST_GLES_RESOURCE_SUBSYSTEM_ON_ENVIRONMENT
+    "MOBILEGL_TRANSPORT=monolith"
     "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_RESOURCE_SUBSYSTEM_LANE=on"
     "MOBILEGL_PIPE_PUSH=0x1fff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
     "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/resource-subsystem-on-DirectGLES.log"
     ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
 mgl_itest_join_environment(MGL_ITEST_GLES_RESOURCE_SUBSYSTEM_OFF_ENVIRONMENT
+    "MOBILEGL_TRANSPORT=monolith"
     "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_RESOURCE_SUBSYSTEM_LANE=off"
     "MOBILEGL_PIPE_PUSH=0x7f" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
     "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/resource-subsystem-off-DirectGLES.log"
@@ -1354,7 +1430,7 @@ gtest_discover_tests(MobileGLIntegrationTest
     TEST_FILTER "ResourceSubsystemControlScenario.*"
     DISCOVERY_TIMEOUT 30
     PROPERTIES
-        LABELS integration-gpu
+        LABELS "integration-gpu\;integration-monolith-control"
         TIMEOUT ${MGL_ITEST_TIMEOUT}
         ENVIRONMENT "${MGL_ITEST_GLES_RESOURCE_SUBSYSTEM_ON_ENVIRONMENT}"
 )
@@ -1363,7 +1439,7 @@ gtest_discover_tests(MobileGLIntegrationTest
     TEST_FILTER "ResourceSubsystemControlScenario.*"
     DISCOVERY_TIMEOUT 30
     PROPERTIES
-        LABELS integration-gpu
+        LABELS "integration-gpu\;integration-monolith-control"
         TIMEOUT ${MGL_ITEST_TIMEOUT}
         ENVIRONMENT "${MGL_ITEST_GLES_RESOURCE_SUBSYSTEM_OFF_ENVIRONMENT}"
 )
@@ -1373,11 +1449,13 @@ gtest_discover_tests(MobileGLIntegrationTest
 # LargeArenaAdoption asserts one adoption costs exactly one. Each names a single case in its
 # TEST_FILTER, for the private-log reason above.
 mgl_itest_join_environment(MGL_ITEST_GLES_MPR_REGROW_ENVIRONMENT
+    "MOBILEGL_TRANSPORT=monolith"
     "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_MPR_LANE=storage-buffer-regrow"
     "MOBILEGL_PIPE_PUSH=0x1fff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
     "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/mpr-storage-buffer-regrow-DirectGLES.log"
     ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
 mgl_itest_join_environment(MGL_ITEST_GLES_MPR_ARENA_ENVIRONMENT
+    "MOBILEGL_TRANSPORT=monolith"
     "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_MPR_LANE=large-arena-adoption"
     "MOBILEGL_PIPE_PUSH=0x1fff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
     "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/mpr-large-arena-adoption-DirectGLES.log"
@@ -1388,7 +1466,7 @@ gtest_discover_tests(MobileGLIntegrationTest
     TEST_FILTER "StorageBufferRegrowScenario.NStorageDefinitionsCostNMapPersistentRoundtripsNotOnePerDraw"
     DISCOVERY_TIMEOUT 30
     PROPERTIES
-        LABELS integration-gpu
+        LABELS "integration-gpu\;integration-monolith-control"
         TIMEOUT ${MGL_ITEST_TIMEOUT}
         ENVIRONMENT "${MGL_ITEST_GLES_MPR_REGROW_ENVIRONMENT}"
 )
@@ -1397,7 +1475,7 @@ gtest_discover_tests(MobileGLIntegrationTest
     TEST_FILTER "LargeArenaAdoptionScenario.AnAdoptionCostsExactlyOneMapPersistentRoundtrip"
     DISCOVERY_TIMEOUT 30
     PROPERTIES
-        LABELS integration-gpu
+        LABELS "integration-gpu\;integration-monolith-control"
         TIMEOUT ${MGL_ITEST_TIMEOUT}
         ENVIRONMENT "${MGL_ITEST_GLES_MPR_ARENA_ENVIRONMENT}"
 )
@@ -1410,9 +1488,11 @@ gtest_discover_tests(MobileGLIntegrationTest
 # four processes to truncate. The fourth case skips in both lanes for exactly that reason, saying
 # so.
 mgl_itest_join_environment(MGL_ITEST_GLES_ARENA_SUBSYSTEM_ON_ENVIRONMENT
+    "MOBILEGL_TRANSPORT=monolith"
     "MOBILEGL_BACKEND_TYPE=DirectGLES" "MOBILEGL_PIPE_PUSH=0x1fff"
     ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
 mgl_itest_join_environment(MGL_ITEST_GLES_ARENA_SUBSYSTEM_OFF_ENVIRONMENT
+    "MOBILEGL_TRANSPORT=monolith"
     "MOBILEGL_BACKEND_TYPE=DirectGLES" "MOBILEGL_PIPE_PUSH=0x7f"
     ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
 
@@ -1421,7 +1501,7 @@ gtest_discover_tests(MobileGLIntegrationTest
     TEST_FILTER "LargeArenaAdoptionScenario.*"
     DISCOVERY_TIMEOUT 30
     PROPERTIES
-        LABELS integration-gpu
+        LABELS "integration-gpu\;integration-monolith-control"
         TIMEOUT ${MGL_ITEST_TIMEOUT}
         ENVIRONMENT "${MGL_ITEST_GLES_ARENA_SUBSYSTEM_ON_ENVIRONMENT}"
 )
@@ -1430,7 +1510,7 @@ gtest_discover_tests(MobileGLIntegrationTest
     TEST_FILTER "LargeArenaAdoptionScenario.*"
     DISCOVERY_TIMEOUT 30
     PROPERTIES
-        LABELS integration-gpu
+        LABELS "integration-gpu\;integration-monolith-control"
         TIMEOUT ${MGL_ITEST_TIMEOUT}
         ENVIRONMENT "${MGL_ITEST_GLES_ARENA_SUBSYSTEM_OFF_ENVIRONMENT}"
 )
@@ -1488,31 +1568,37 @@ gtest_discover_tests(MobileGLIntegrationTest
 # `ctest -L integration-gpu` stays name-for-name identical between pull and push (gate G2). In a
 # pull build MGITEST_PIPE_PUSH_BUILD is absent and every one of these cases skips saying so.
 mgl_itest_join_environment(MGL_ITEST_GLES_OBJECT_SUBSYSTEM_ON_ENVIRONMENT
+    "MOBILEGL_TRANSPORT=monolith"
     "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_OBJECT_SUBSYSTEM_LANE=on"
     "MOBILEGL_PIPE_PUSH=0x1fff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
     "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/object-subsystem-on-DirectGLES.log"
     ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
 mgl_itest_join_environment(MGL_ITEST_GLES_OBJECT_SUBSYSTEM_OFF_ENVIRONMENT
+    "MOBILEGL_TRANSPORT=monolith"
     "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_OBJECT_SUBSYSTEM_LANE=off"
     "MOBILEGL_PIPE_PUSH=0x1ff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
     "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/object-subsystem-off-DirectGLES.log"
     ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
 mgl_itest_join_environment(MGL_ITEST_GLES_OBJECT_SUBSYSTEM_REFUSED_ENVIRONMENT
+    "MOBILEGL_TRANSPORT=monolith"
     "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_OBJECT_SUBSYSTEM_LANE=refused"
     "MOBILEGL_PIPE_PUSH=0x9ff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
     "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/object-subsystem-refused-DirectGLES.log"
     ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
 mgl_itest_join_environment(MGL_ITEST_GLES_OBJECT_SUBSYSTEM_REFUSED_TEXTURE_ENVIRONMENT
+    "MOBILEGL_TRANSPORT=monolith"
     "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_OBJECT_SUBSYSTEM_LANE=refused-texture"
     "MOBILEGL_PIPE_PUSH=0x5ff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
     "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/object-subsystem-refused-texture-DirectGLES.log"
     ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
 mgl_itest_join_environment(MGL_ITEST_GLES_OBJECT_SUBSYSTEM_CONSUMER_ENVIRONMENT
+    "MOBILEGL_TRANSPORT=monolith"
     "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_OBJECT_SUBSYSTEM_LANE=consumer"
     "MOBILEGL_PIPE_PUSH=0x1fff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
     "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/object-subsystem-consumer-DirectGLES.log"
     ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
 mgl_itest_join_environment(MGL_ITEST_VULKAN_OBJECT_SUBSYSTEM_NO_CONSUMER_ENVIRONMENT
+    "MOBILEGL_TRANSPORT=monolith"
     "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MGITEST_OBJECT_SUBSYSTEM_LANE=no-consumer"
     "MOBILEGL_PIPE_PUSH=0x1fff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
     "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/object-subsystem-no-consumer-DirectVulkan.log"
@@ -1523,7 +1609,7 @@ gtest_discover_tests(MobileGLIntegrationTest
     TEST_FILTER "ObjectSubsystemControlScenario.ClearingTheP4aBitsStopsTheEmissionsAndNotThePixels"
     DISCOVERY_TIMEOUT 30
     PROPERTIES
-        LABELS integration-gpu
+        LABELS "integration-gpu\;integration-monolith-control"
         TIMEOUT ${MGL_ITEST_TIMEOUT}
         ENVIRONMENT "${MGL_ITEST_GLES_OBJECT_SUBSYSTEM_ON_ENVIRONMENT}"
 )
@@ -1532,7 +1618,7 @@ gtest_discover_tests(MobileGLIntegrationTest
     TEST_FILTER "ObjectSubsystemControlScenario.ClearingTheP4aBitsStopsTheEmissionsAndNotThePixels"
     DISCOVERY_TIMEOUT 30
     PROPERTIES
-        LABELS integration-gpu
+        LABELS "integration-gpu\;integration-monolith-control"
         TIMEOUT ${MGL_ITEST_TIMEOUT}
         ENVIRONMENT "${MGL_ITEST_GLES_OBJECT_SUBSYSTEM_OFF_ENVIRONMENT}"
 )
@@ -1541,7 +1627,7 @@ gtest_discover_tests(MobileGLIntegrationTest
     TEST_FILTER "ObjectSubsystemControlScenario.ASamplerBitWithoutTheTextureBitIsRefusedAndNamed"
     DISCOVERY_TIMEOUT 30
     PROPERTIES
-        LABELS integration-gpu
+        LABELS "integration-gpu\;integration-monolith-control"
         TIMEOUT ${MGL_ITEST_TIMEOUT}
         ENVIRONMENT "${MGL_ITEST_GLES_OBJECT_SUBSYSTEM_REFUSED_ENVIRONMENT}"
 )
@@ -1550,7 +1636,7 @@ gtest_discover_tests(MobileGLIntegrationTest
     TEST_FILTER "ObjectSubsystemControlScenario.ATextureBitWithoutTheSamplerBitIsRefusedAndNamed"
     DISCOVERY_TIMEOUT 30
     PROPERTIES
-        LABELS integration-gpu
+        LABELS "integration-gpu\;integration-monolith-control"
         TIMEOUT ${MGL_ITEST_TIMEOUT}
         ENVIRONMENT "${MGL_ITEST_GLES_OBJECT_SUBSYSTEM_REFUSED_TEXTURE_ENVIRONMENT}"
 )
@@ -1559,7 +1645,7 @@ gtest_discover_tests(MobileGLIntegrationTest
     TEST_FILTER "ObjectSubsystemControlScenario.TheAppliersNoConsumerBeltNeverFiresBehindTheClientsGate"
     DISCOVERY_TIMEOUT 30
     PROPERTIES
-        LABELS integration-gpu
+        LABELS "integration-gpu\;integration-monolith-control"
         TIMEOUT ${MGL_ITEST_TIMEOUT}
         ENVIRONMENT "${MGL_ITEST_GLES_OBJECT_SUBSYSTEM_CONSUMER_ENVIRONMENT}"
 )
@@ -1568,26 +1654,37 @@ gtest_discover_tests(MobileGLIntegrationTest
     TEST_FILTER "ObjectSubsystemControlScenario.TheAppliersNoConsumerBeltNeverFiresBehindTheClientsGate"
     DISCOVERY_TIMEOUT 30
     PROPERTIES
-        LABELS integration-gpu
+        LABELS "integration-gpu\;integration-monolith-control"
         TIMEOUT ${MGL_ITEST_TIMEOUT}
         ENVIRONMENT "${MGL_ITEST_VULKAN_OBJECT_SUBSYSTEM_NO_CONSUMER_ENVIRONMENT}"
 )
 
-# --- The texture upload shape: RECORDED, NOT GATED in P4a (D-D4) ----------------------
+# --- The texture upload shape: A GATE as of P3b/P4b R-11 (D-D4) -----------------------
 #
 # SSIM is blind to the box-versus-rect upload shape and the Mali cliff it hides is ~+6 ms/frame, so
 # the shape needs a number - two numbers, in fact, the server's tex[emit= box= rect= jobs=] and the
-# client's emit[ctu=], which agreeing is the whole reason both are published (D-L). What this lane
-# asserts is that the numbers could be READ, that the server bracket's own arithmetic holds and that
-# the two sides agree when both are non-zero; WHICH shape each texture took is RecordProperty'd and
-# printed for MEASUREMENTS.md. P3b/P4b turns it into a gate against a gold standard, with the Mali
-# frame-time delta published beside it - gating a shape this phase has not finished deciding would
-# either pin today's shape as the answer or fail on the change that is the next phase's point.
+# client's emit[ctu=], which agreeing is the whole reason both are published (D-L).
+#
+# P4a RECORDED those numbers rather than gating them, because the per-storage-owner emission cursor
+# with view/owner index remapping - what actually decides the shape for a texture uploaded through a
+# VIEW - was the next phase's and gating an unfinished shape pins a non-answer. THAT WORK LANDED
+# (MG_Impl/Pipe/TextureEmit.h's owner-keyed drain list; TextureObjectView::ToOwner*), so this lane's
+# RecordProperty block is now EXPECT_EQ against a gold row measured on this cursor, and the workload
+# carries a third texture written through a glTextureView so the remap is inside the counted window.
+#
+# MOBILEGL_ESPRYT_ENABLE_TEXTURE_VIEW=1 IS THEREFORE MANDATORY HERE, not decorative: without it the
+# case SKIPS rather than dropping the third texture, because a conditional workload behind a fixed
+# gold row is a gate that passes by shrinking.
+#
+# THE MALI FRAME-TIME DELTA D-D4 asks for beside the gold is NOT SCHEDULABLE in this phase - one
+# Redmi, an Adreno, no Mali part - and is recorded as a declared deviation in the scenario header
+# and in docs/Disaggregated/MEASUREMENTS.md rather than modelled.
 #
 # Its own log path and its own single-case filter, for the per-lane-log reason above.
 mgl_itest_join_environment(MGL_ITEST_GLES_TEXTURE_UPLOAD_SHAPE_ENVIRONMENT
     "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_TEXTURE_UPLOAD_SHAPE_LANE=1"
     "MOBILEGL_PIPE_PUSH=0x1fff" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
+    "MOBILEGL_ESPRYT_ENABLE_TEXTURE_VIEW=1"
     "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/texture-upload-shape-DirectGLES.log"
     ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
 
@@ -1598,6 +1695,7 @@ gtest_discover_tests(MobileGLIntegrationTest
     PROPERTIES
         LABELS integration-gpu
         TIMEOUT ${MGL_ITEST_TIMEOUT}
+        RESOURCE_LOCK texture-upload-shape-DirectGLES.log
         ENVIRONMENT "${MGL_ITEST_GLES_TEXTURE_UPLOAD_SHAPE_ENVIRONMENT}"
 )
 
@@ -1626,10 +1724,12 @@ if (MOBILEGL_PIPE_VERIFY)
     set(MGL_ITEST_VERIFY_TIMEOUT 900)
 
     mgl_itest_join_environment(MGL_ITEST_GLES_VERIFY_ENVIRONMENT
+        "MOBILEGL_TRANSPORT=monolith"
         "MOBILEGL_BACKEND_TYPE=DirectGLES" "MOBILEGL_PIPE_VERIFY=1"
         "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/pipe-verify-DirectGLES.log"
         ${MGL_ITEST_COMMON_ENV})
     mgl_itest_join_environment(MGL_ITEST_VULKAN_VERIFY_ENVIRONMENT
+        "MOBILEGL_TRANSPORT=monolith"
         "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MOBILEGL_PIPE_VERIFY=1"
         "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/pipe-verify-DirectVulkan.log"
         ${MGL_ITEST_VULKAN_ENV})
@@ -1644,10 +1744,12 @@ if (MOBILEGL_PIPE_VERIFY)
     # reason. MGITEST_PIPE_ARMING_LANE is a harness marker - the library never reads it - and it is
     # what makes the case skip in the ambient lane instead of racing there.
     mgl_itest_join_environment(MGL_ITEST_GLES_VERIFY_ARMING_ENVIRONMENT
+        "MOBILEGL_TRANSPORT=monolith"
         "MOBILEGL_BACKEND_TYPE=DirectGLES" "MOBILEGL_PIPE_VERIFY=1" "MGITEST_PIPE_ARMING_LANE=1"
         "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/pipe-verify-arming-DirectGLES.log"
         ${MGL_ITEST_COMMON_ENV})
     mgl_itest_join_environment(MGL_ITEST_VULKAN_VERIFY_ARMING_ENVIRONMENT
+        "MOBILEGL_TRANSPORT=monolith"
         "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MOBILEGL_PIPE_VERIFY=1" "MGITEST_PIPE_ARMING_LANE=1"
         "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/pipe-verify-arming-DirectVulkan.log"
         ${MGL_ITEST_VULKAN_ENV})
@@ -1657,11 +1759,13 @@ if (MOBILEGL_PIPE_VERIFY)
     # the same corruption against the ambient lane, where FATAL keeps its default of 1, asserts
     # the other half - that a divergence aborts and reds the entry.
     mgl_itest_join_environment(MGL_ITEST_GLES_VERIFY_CORRUPT_ENVIRONMENT
+        "MOBILEGL_TRANSPORT=monolith"
         "MOBILEGL_BACKEND_TYPE=DirectGLES" "MOBILEGL_PIPE_VERIFY=1"
         "MOBILEGL_PIPE_VERIFY_CORRUPT=GetRenderStateParameters" "MOBILEGL_PIPE_VERIFY_FATAL=0"
         "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/pipe-verify-corrupt-DirectGLES.log"
         ${MGL_ITEST_COMMON_ENV})
     mgl_itest_join_environment(MGL_ITEST_VULKAN_VERIFY_CORRUPT_ENVIRONMENT
+        "MOBILEGL_TRANSPORT=monolith"
         "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MOBILEGL_PIPE_VERIFY=1"
         "MOBILEGL_PIPE_VERIFY_CORRUPT=GetRenderStateParameters" "MOBILEGL_PIPE_VERIFY_FATAL=0"
         "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/pipe-verify-corrupt-DirectVulkan.log"
@@ -1671,11 +1775,13 @@ if (MOBILEGL_PIPE_VERIFY)
     # copying its value, which is indistinguishable from a fill row nobody wrote; the scenario
     # forks, so the resulting std::abort() is a datum in waitpid() rather than a dead lane.
     mgl_itest_join_environment(MGL_ITEST_GLES_POISON_OMIT_ENVIRONMENT
+        "MOBILEGL_TRANSPORT=monolith"
         "MOBILEGL_BACKEND_TYPE=DirectGLES" "MOBILEGL_PIPE_VERIFY=1"
         "MOBILEGL_PIPE_POISON_OMIT=GenerateMipmap:GetActiveTextureUnit"
         "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/pipe-poison-omit-DirectGLES.log"
         ${MGL_ITEST_COMMON_ENV})
     mgl_itest_join_environment(MGL_ITEST_VULKAN_POISON_OMIT_ENVIRONMENT
+        "MOBILEGL_TRANSPORT=monolith"
         "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MOBILEGL_PIPE_VERIFY=1"
         "MOBILEGL_PIPE_POISON_OMIT=GenerateMipmap:GetActiveTextureUnit"
         "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/pipe-poison-omit-DirectVulkan.log"
@@ -1688,17 +1794,25 @@ if (MOBILEGL_PIPE_VERIFY)
     # `ctest -L integration-gpu` still describes the whole registration set.
     gtest_discover_tests(MobileGLIntegrationTest
         TEST_PREFIX "DirectGLES.Verify."
+        TEST_FILTER "-${MGL_ITEST_GLES_VIEW_FILTER}"
         DISCOVERY_TIMEOUT 30
         PROPERTIES
-            LABELS "integration-gpu\;integration-verify"
+            LABELS "integration-gpu\;integration-verify\;integration-monolith-control"
             TIMEOUT ${MGL_ITEST_VERIFY_TIMEOUT}
             ENVIRONMENT "${MGL_ITEST_GLES_VERIFY_ENVIRONMENT}"
     )
     gtest_discover_tests(MobileGLIntegrationTest
+        TEST_PREFIX "DirectGLES.Verify."
+        TEST_FILTER "${MGL_ITEST_GLES_VIEW_FILTER}"
+        DISCOVERY_TIMEOUT 30
+        PROPERTIES LABELS "integration-verify\;integration-monolith-control"
+            TIMEOUT ${MGL_ITEST_VERIFY_TIMEOUT}
+            ENVIRONMENT "${MGL_ITEST_GLES_VERIFY_ENVIRONMENT}\;MOBILEGL_ESPRYT_ENABLE_TEXTURE_VIEW=1")
+    gtest_discover_tests(MobileGLIntegrationTest
         TEST_PREFIX "DirectVulkan.Verify."
         DISCOVERY_TIMEOUT 30
         PROPERTIES
-            LABELS "integration-gpu\;integration-verify"
+            LABELS "integration-gpu\;integration-verify\;integration-monolith-control"
             TIMEOUT ${MGL_ITEST_VERIFY_TIMEOUT}
             ENVIRONMENT "${MGL_ITEST_VULKAN_VERIFY_ENVIRONMENT}"
     )
@@ -1712,7 +1826,7 @@ if (MOBILEGL_PIPE_VERIFY)
         TEST_FILTER "PipeVerifyArmingScenario.Armed"
         DISCOVERY_TIMEOUT 30
         PROPERTIES
-            LABELS "integration-gpu\;integration-verify"
+            LABELS "integration-gpu\;integration-verify\;integration-monolith-control"
             TIMEOUT ${MGL_ITEST_VERIFY_TIMEOUT}
             ENVIRONMENT "${MGL_ITEST_GLES_VERIFY_ARMING_ENVIRONMENT}"
     )
@@ -1721,7 +1835,7 @@ if (MOBILEGL_PIPE_VERIFY)
         TEST_FILTER "PipeVerifyArmingScenario.Armed"
         DISCOVERY_TIMEOUT 30
         PROPERTIES
-            LABELS "integration-gpu\;integration-verify"
+            LABELS "integration-gpu\;integration-verify\;integration-monolith-control"
             TIMEOUT ${MGL_ITEST_VERIFY_TIMEOUT}
             ENVIRONMENT "${MGL_ITEST_VULKAN_VERIFY_ARMING_ENVIRONMENT}"
     )
@@ -1734,7 +1848,7 @@ if (MOBILEGL_PIPE_VERIFY)
         TEST_FILTER "PipeVerifyArmingScenario.CorruptedFieldIsReported"
         DISCOVERY_TIMEOUT 30
         PROPERTIES
-            LABELS "integration-gpu\;integration-verify"
+            LABELS "integration-gpu\;integration-verify\;integration-monolith-control"
             TIMEOUT ${MGL_ITEST_VERIFY_TIMEOUT}
             ENVIRONMENT "${MGL_ITEST_GLES_VERIFY_CORRUPT_ENVIRONMENT}"
     )
@@ -1743,7 +1857,7 @@ if (MOBILEGL_PIPE_VERIFY)
         TEST_FILTER "PipeVerifyArmingScenario.CorruptedFieldIsReported"
         DISCOVERY_TIMEOUT 30
         PROPERTIES
-            LABELS "integration-gpu\;integration-verify"
+            LABELS "integration-gpu\;integration-verify\;integration-monolith-control"
             TIMEOUT ${MGL_ITEST_VERIFY_TIMEOUT}
             ENVIRONMENT "${MGL_ITEST_VULKAN_VERIFY_CORRUPT_ENVIRONMENT}"
     )
@@ -1752,7 +1866,7 @@ if (MOBILEGL_PIPE_VERIFY)
         TEST_FILTER "PoisonOmissionScenario.OmittedFieldAbortsOnThatVerb"
         DISCOVERY_TIMEOUT 30
         PROPERTIES
-            LABELS "integration-gpu\;integration-verify"
+            LABELS "integration-gpu\;integration-verify\;integration-monolith-control"
             TIMEOUT ${MGL_ITEST_VERIFY_TIMEOUT}
             ENVIRONMENT "${MGL_ITEST_GLES_POISON_OMIT_ENVIRONMENT}"
     )
@@ -1761,7 +1875,7 @@ if (MOBILEGL_PIPE_VERIFY)
         TEST_FILTER "PoisonOmissionScenario.OmittedFieldAbortsOnThatVerb"
         DISCOVERY_TIMEOUT 30
         PROPERTIES
-            LABELS "integration-gpu\;integration-verify"
+            LABELS "integration-gpu\;integration-verify\;integration-monolith-control"
             TIMEOUT ${MGL_ITEST_VERIFY_TIMEOUT}
             ENVIRONMENT "${MGL_ITEST_VULKAN_POISON_OMIT_ENVIRONMENT}"
     )
@@ -1853,9 +1967,22 @@ endif()
 # generated ctest include file verbatim and never expanded.
 set(MGL_ITEST_SPLIT_SERVER_PATH "${CMAKE_BINARY_DIR}/libMobileGLServer.so")
 
+# P3b/P4b wave 2-D package D2: MOBILEGL_ESPRYT_ENABLE_TEXTURE_VIEW=1 IS ON THE SHARED GLES
+# SPLIT/SPAWN/TCP LISTS, not on a private entry, and that is the deliberate reading of the plan
+# row. The knob is Espryt's FEATURE opt-in (ConfigLoader.cpp:213), independent of transport: it
+# advertises GL_ARB_texture_view and nothing else. Without it TextureViewAliasScenario - and
+# TextureViewScenario, if it is ever registered here - green-skips in all three arms and the
+# gate is a name in a list. The monolith DirectGLES lane has carried it on its own view entry
+# since P4a for exactly this reason; the split arms had no equivalent.
+#
+# It is NOT added to MGL_ITEST_VULKAN_{SPLIT,SPAWN,TCP}_ENVIRONMENT below: the variable is read
+# only by ConfigLoader's Espryt feature block, so on DirectVulkan it would be a parsed-and-
+# ignored name, and tier 2's informational Magma replay of these registrations wants the two
+# backends' arms to differ only where the product differs.
 mgl_itest_join_environment(MGL_ITEST_GLES_SPLIT_ENVIRONMENT
     "MOBILEGL_BACKEND_TYPE=DirectGLES" "MOBILEGL_TRANSPORT=inproc"
     "MOBILEGL_IPC_SERVER_PATH=${MGL_ITEST_SPLIT_SERVER_PATH}" "MGITEST_SPLIT_LANE=1"
+    "MOBILEGL_ESPRYT_ENABLE_TEXTURE_VIEW=1"
     ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
 
 # The two counting lanes, one per transport, and they are a PAIR: exit gate E3(c) asks that the
@@ -1906,35 +2033,493 @@ if (MOBILEGL_BUILD_DISAGGREGATED)
     #
     # ClearThenReadPixelsScenario is target A of the reduced path and already existed; Triangle is
     # target B and PersistentCoherentMap is target C, both new in P5.
+    # ---- P6 `t6`: THE SPAWN ARM, beside the inproc one and never instead of it --------------
+    #
+    # EXIT GATES 9.2 AND 9.3: `integration-spawn`'s case-name set must be IDENTICAL to
+    # `integration-split`'s, and it must be green at the same count.
+    #
+    # THAT IDENTITY IS MADE STRUCTURAL RATHER THAN MAINTAINED. Registering the spawn arm as a
+    # second copy of each block would make the two sets agree today and drift the first time
+    # somebody adds a scenario to one of them - and a spawn lane covering LESS than the split
+    # lane goes green while proving less, with nothing to say so. One macro emits both arms from
+    # one filter, so a case added to either is added to both or to neither.
+    #
+    # ONE ENVIRONMENT DIFFERENCE, AND IT IS THE SUBJECT OF THE LANE. MOBILEGL_TRANSPORT=spawn
+    # makes the test process the CLIENT and has it launch a server from MOBILEGL_IPC_SERVER_PATH
+    # - the same path the inproc arm already carries, because under inproc the library reads it
+    # and decides it does not need one.
+    # D2: the texture-view opt-in, for the reason stated over the SPLIT list above. Under spawn
+    # the variable has to reach BOTH processes; it does, because the server is spawned from this
+    # process's environment.
+    mgl_itest_join_environment(MGL_ITEST_GLES_SPAWN_ENVIRONMENT
+        "MOBILEGL_BACKEND_TYPE=DirectGLES" "MOBILEGL_TRANSPORT=spawn"
+        "MOBILEGL_IPC_SERVER_PATH=${MGL_ITEST_SPLIT_SERVER_PATH}" "MGITEST_SPLIT_LANE=1"
+        "MOBILEGL_ESPRYT_ENABLE_TEXTURE_VIEW=1"
+        ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+
+    # A single supervisor serves one session at a time. Fixture teardown also reaps a
+    # child left behind by a failed client; the resource lock serializes this lane.
+    set(MOBILEGL_ITEST_TCP_ENDPOINT "tcp://127.0.0.1:40613" CACHE STRING "Loopback TCP integration endpoint")
+    set(MOBILEGL_ITEST_TCP_DEVICE_ENDPOINT "" CACHE STRING "Optional device TCP integration endpoint")
+    set(MOBILEGL_ITEST_TCP_DEVICE_TOKEN "" CACHE STRING "Token for the device TCP integration endpoint")
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    set(MGL_TCP_FIXTURE "${CMAKE_SOURCE_DIR}/scripts/ci/tcp_server_fixture.py")
+    set(MGL_TCP_STATE "${CMAKE_CURRENT_BINARY_DIR}/tcp-server.json")
+    add_test(NAME TcpServer.Start COMMAND "${Python3_EXECUTABLE}" "${MGL_TCP_FIXTURE}"
+        start --server "${MGL_ITEST_SPLIT_SERVER_PATH}" --endpoint "${MOBILEGL_ITEST_TCP_ENDPOINT}"
+        --state "${MGL_TCP_STATE}")
+    add_test(NAME TcpServer.Stop COMMAND "${Python3_EXECUTABLE}" "${MGL_TCP_FIXTURE}"
+        stop --state "${MGL_TCP_STATE}")
+    # P3b/P4b wave 2-D package D2: THE TCP LANE'S SERVER IS PRE-STARTED BY THIS FIXTURE, not
+    # spawned from a client that already carries the lane environment, so a FEATURE opt-in has to
+    # be set here as well as on MGL_ITEST_GLES_TCP_ENVIRONMENT. tcp_server_fixture.py builds the
+    # supervisor's environment from os.environ (:60) and strips only the transport keys (:63-65),
+    # so a ctest ENVIRONMENT property on this entry reaches the server process.
+    #
+    # Measured, not assumed: without it every TextureViewAliasScenario case SKIPPED in the Tcp
+    # arm with "GL_ARB_texture_view not advertised" while the identical Split and Spawn arms ran
+    # - because under inproc and spawn the server inherits the client's environment and under tcp
+    # it does not. A feature knob that reaches two of three arms is the worst of the three states:
+    # the lane is green and tests nothing.
+    set_tests_properties(TcpServer.Start PROPERTIES FIXTURES_SETUP mobilegl-tcp TIMEOUT 20
+        ENVIRONMENT "MOBILEGL_ESPRYT_ENABLE_TEXTURE_VIEW=1")
+    set_tests_properties(TcpServer.Stop PROPERTIES FIXTURES_CLEANUP mobilegl-tcp TIMEOUT 20)
+    add_test(NAME TcpLane.AccountingControls COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_SOURCE_DIR}/scripts/ci/tcp_lane_tools_test.py")
+    set_tests_properties(TcpLane.AccountingControls PROPERTIES LABELS unit TIMEOUT 20)
+    # P7 wave 0. scripts/ci/tcp_supervisor_smoke.py has been in the tree since P6.5 asserting the
+    # supervisor's Busy / token / wire-version / build-policy controls, and was referenced by
+    # NOTHING - no ctest entry, no workflow step - so nobody could have said whether those four
+    # controls were green. It also now carries Ph slice (1)'s negative control: a session child
+    # killed with SIGABRT must be NAMED in the supervisor log by pid and signal, and the next
+    # Hello must still be welcomed. It starts its own supervisor on its own free port, so it
+    # needs no fixture, but it takes the lane's resource lock because a second supervisor's
+    # session child would answer the other's peers with Busy and make both lanes flaky.
+    # It needs flatc, which is deliberately not in the build graph (gen_protocol.py's header):
+    # with none found the script exits 77 and this entry reports SKIP rather than passing on a
+    # test that did not run.
+    add_test(NAME TcpLane.SupervisorProtocolControls COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_SOURCE_DIR}/scripts/ci/tcp_supervisor_smoke.py"
+        --server "${MGL_ITEST_SPLIT_SERVER_PATH}"
+        --out "${CMAKE_CURRENT_BINARY_DIR}/tcp-supervisor-smoke")
+    set_tests_properties(TcpLane.SupervisorProtocolControls PROPERTIES
+        LABELS integration-tcp TIMEOUT 180 SKIP_RETURN_CODE 77
+        RESOURCE_LOCK mobilegl-tcp)
+    # Ph fuzz arm 3 (PH-6, ID-P7-2): A PEER THAT STOPS DRAINING SEG_EVENT, on both data planes.
+    # MG_Test/Wire/EventForfeitPeerTest.cpp starts its own `--serve` supervisor (an abstract unix
+    # endpoint for the shm plane, a free loopback port for the stream plane) with a NON-default
+    # MOBILEGL_IPC_EVENT_WAIT_MS, and asserts the whole arm: the server forfeits the reverse
+    # channel by name against that knob, counts the drop, ends the session with exit 0 inside the
+    # knob rather than the old 30 s Fatal, and the SAME supervisor welcomes the next connection.
+    # Each entry also runs the kill-the-peer case (knob 8000, over ServerLoop's 5000 ms join: the
+    # server must say PeerGone at once and exit 0), and the shm entry the LaunchServer case (the
+    # knob must cross ServerSpawn.cpp's scrub). The gtest filters are per plane. The names are not
+    # `DirectGLES.<Arm>.<Scenario>` on purpose: spawn_lane_parity.py compares the scenario arms and
+    # this is a supervisor control, one per lane, like the entry above. It needs no fixture (its
+    # supervisor is its own), and the CI lane names both entries to junit_tally.py
+    # --require-entry-passed so a missing build or a skip is red by name. The Tcp entry still takes
+    # the lane's resource lock, as the entry above does: every integration-tcp entry must, or
+    # spawn_lane_parity.py and junit_tally.py --discovery refuse the registration.
+    if (TARGET EventForfeitPeerTest)
+        # A plain list, not mgl_itest_join_environment's escaped one: that form is for values that
+        # travel through gtest_discover_tests' PROPERTIES, and these two entries are add_test's.
+        set(MGL_ITEST_EVENT_FORFEIT_ENVIRONMENT
+            "MOBILEGL_TEST_SERVER_PATH=${MGL_ITEST_SPLIT_SERVER_PATH}" ${MGL_ITEST_COMMON_ENV})
+        add_test(NAME SpawnLane.EventForfeitPeer COMMAND $<TARGET_FILE:EventForfeitPeerTest>
+            --gtest_filter=EventForfeitPeer.Shm*)
+        set_tests_properties(SpawnLane.EventForfeitPeer PROPERTIES
+            LABELS integration-spawn TIMEOUT 120
+            ENVIRONMENT "${MGL_ITEST_EVENT_FORFEIT_ENVIRONMENT}")
+        add_test(NAME TcpLane.EventForfeitPeer COMMAND $<TARGET_FILE:EventForfeitPeerTest>
+            --gtest_filter=EventForfeitPeer.Stream*)
+        set_tests_properties(TcpLane.EventForfeitPeer PROPERTIES
+            LABELS integration-tcp TIMEOUT 120 RESOURCE_LOCK mobilegl-tcp
+            ENVIRONMENT "${MGL_ITEST_EVENT_FORFEIT_ENVIRONMENT}")
+    endif()
+    # P7 F2: Ph fuzz arm 1 (PLAN-PH-P34B-P7.md §1.1, "gate: fuzz arm 1 malformed control
+    # frames"). Five malformed control frames - bad identifier, truncated length prefix, oversize
+    # length, garbage flatbuffer, wrong union type - sent to a live supervisor as a FIRST frame
+    # (answered by name with no child forked, PH-7 (5)) and inside an established session (the
+    # session ends with a named line and is not counted as a fault), with a well-formed client
+    # welcomed after each phase. Same shape as TcpLane.SupervisorProtocolControls: its own supervisor on its own
+    # port, the lane's resource lock, flatc or SKIP (77) - and CI requires it PASSED by name.
+    add_test(NAME TcpLane.ControlFrameFuzz COMMAND "${Python3_EXECUTABLE}"
+        "${CMAKE_SOURCE_DIR}/scripts/ci/ph_fuzz_control_frames.py"
+        --server "${MGL_ITEST_SPLIT_SERVER_PATH}"
+        --out "${CMAKE_CURRENT_BINARY_DIR}/tcp-control-frame-fuzz")
+    set_tests_properties(TcpLane.ControlFrameFuzz PROPERTIES
+        LABELS integration-tcp TIMEOUT 180 SKIP_RETURN_CODE 77
+        RESOURCE_LOCK mobilegl-tcp)
+    # D2: the texture-view opt-in on both TCP lists too, so the three shared GLES split arms
+    # carry one configuration. See the note over MGL_ITEST_GLES_SPLIT_ENVIRONMENT.
+    #
+    # THE TWO TCP LISTS ARE THE CLIENT'S HALF ONLY, and the two arms differ in whether that is
+    # enough. The loopback Tcp arm's server is started by the TcpServer.Start fixture below,
+    # which this package also gives the knob - so both halves have it. The TcpDevice arm's
+    # server is a supervisor already running ON A DEVICE, started outside this build by whoever
+    # set MOBILEGL_ITEST_TCP_DEVICE_ENDPOINT; nothing here can reach its environment. If that
+    # supervisor was started without MOBILEGL_ESPRYT_ENABLE_TEXTURE_VIEW=1 it will withhold
+    # GL_ARB_texture_view and every texture-view case in the TcpDevice arm will GREEN-SKIP,
+    # exactly as the loopback arm did before the fixture entry got the knob. The arm is
+    # unconfigured in this repo (the endpoint defaults empty, so the arm is not created at all),
+    # so this is a note for whoever configures it rather than a defect today.
+    mgl_itest_join_environment(MGL_ITEST_GLES_TCP_ENVIRONMENT
+        "MOBILEGL_BACKEND_TYPE=DirectGLES" "MOBILEGL_TRANSPORT=spawn"
+        "MOBILEGL_IPC_CONTROL=${MOBILEGL_ITEST_TCP_ENDPOINT}" "MOBILEGL_IPC_DATA=stream"
+        "MOBILEGL_IPC_REQUIRE_SAME_BUILD=1" "MOBILEGL_IPC_LOG_FORWARD=1" "MOBILEGL_IPC_TOKEN="
+        "MGITEST_SPLIT_LANE=1" "MGITEST_TCP_LANE=1" "MOBILEGL_ITEST_REQUIRE_GPU=1"
+        "MOBILEGL_ESPRYT_ENABLE_TEXTURE_VIEW=1"
+        ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+    mgl_itest_join_environment(MGL_ITEST_GLES_TCPDEVICE_ENVIRONMENT
+        "MOBILEGL_BACKEND_TYPE=DirectGLES" "MOBILEGL_TRANSPORT=spawn"
+        "MOBILEGL_IPC_CONTROL=${MOBILEGL_ITEST_TCP_DEVICE_ENDPOINT}" "MOBILEGL_IPC_DATA=stream"
+        "MOBILEGL_IPC_REQUIRE_SAME_BUILD=1" "MOBILEGL_IPC_LOG_FORWARD=1"
+        "MOBILEGL_IPC_TOKEN=${MOBILEGL_ITEST_TCP_DEVICE_TOKEN}"
+        "MGITEST_SPLIT_LANE=1" "MGITEST_TCP_LANE=1" "MOBILEGL_ITEST_REQUIRE_GPU=1"
+        "MOBILEGL_ESPRYT_ENABLE_TEXTURE_VIEW=1"
+        ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+
+    # ---- P7 package L: THE SAME THREE ARMS FOR MAGMA ----------------------------------------
+    #
+    # The three lists above are the DirectGLES half of a dimension that had only one value. P7
+    # exit gate 1 asks for integration AND trace green "under Magma push and split", and until
+    # this package the shared labels `integration-split` / `-spawn` / `-tcp` held ZERO
+    # DirectVulkan entries: every arm of mgl_itest_register_split_arms hardcoded
+    # MOBILEGL_BACKEND_TYPE=DirectGLES and MGL_ITEST_MAGMA_WIRE_ENVIRONMENT hardcoded
+    # MOBILEGL_TRANSPORT=inproc, so the gate was not merely unmet, it was UNMEASURABLE.
+    #
+    # THE ONE DIFFERENCE FROM THE GLES TRIO IS ${MGL_ITEST_VULKAN_ENV}, AND IT IS NOT COSMETIC.
+    # That list carries VK_ICD_FILENAMES and, on lavapipe, the three iterationRP repairs the
+    # monolith `DirectVulkan.` arm has been pinned to since they were added (see its definition
+    # near the top of this file). A DirectVulkan lane that appended ${MGL_ITEST_COMMON_ENV}
+    # instead would run against whatever ICD the loader found first, which is exactly how a lane
+    # measures a different driver from the one the gate it mirrors measures.
+    #
+    # MOBILEGL_ITEST_REQUIRE_GPU=1 IS PINNED, as the existing Magma lanes pin it: on a host with
+    # no usable Vulkan every one of these entries would otherwise SKIP, and a lane that skipped
+    # everything and a lane that passed everything are the same green in ctest.
+    mgl_itest_join_environment(MGL_ITEST_VULKAN_SPLIT_ENVIRONMENT
+        "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MOBILEGL_TRANSPORT=inproc"
+        "MOBILEGL_IPC_SERVER_PATH=${MGL_ITEST_SPLIT_SERVER_PATH}" "MGITEST_SPLIT_LANE=1"
+        "MOBILEGL_ITEST_REQUIRE_GPU=1"
+        ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_VULKAN_ENV})
+    mgl_itest_join_environment(MGL_ITEST_VULKAN_SPAWN_ENVIRONMENT
+        "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MOBILEGL_TRANSPORT=spawn"
+        "MOBILEGL_IPC_SERVER_PATH=${MGL_ITEST_SPLIT_SERVER_PATH}" "MGITEST_SPLIT_LANE=1"
+        "MOBILEGL_ITEST_REQUIRE_GPU=1"
+        ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_VULKAN_ENV})
+    mgl_itest_join_environment(MGL_ITEST_VULKAN_TCP_ENVIRONMENT
+        "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MOBILEGL_TRANSPORT=spawn"
+        "MOBILEGL_IPC_CONTROL=${MOBILEGL_ITEST_TCP_ENDPOINT}" "MOBILEGL_IPC_DATA=stream"
+        "MOBILEGL_IPC_REQUIRE_SAME_BUILD=1" "MOBILEGL_IPC_LOG_FORWARD=1" "MOBILEGL_IPC_TOKEN="
+        "MGITEST_SPLIT_LANE=1" "MGITEST_TCP_LANE=1" "MOBILEGL_ITEST_REQUIRE_GPU=1"
+        ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_VULKAN_ENV})
+
+    # THE TRANSPORT DIMENSION ON ITS OWN, for the Magma lanes further down this file that already
+    # have an environment of their OWN FLAVOUR (strict + dual-block state, run-ahead credits,
+    # cache pinning) and need only the transport half re-stated per arm. Kept beside the joined
+    # lists above so there is ONE place that says what "the spawn arm" and "the tcp arm" mean.
+    set(MGL_ITEST_SPLIT_ARM_TRANSPORT_ENV "MOBILEGL_TRANSPORT=inproc"
+        "MOBILEGL_IPC_SERVER_PATH=${MGL_ITEST_SPLIT_SERVER_PATH}")
+    set(MGL_ITEST_SPAWN_ARM_TRANSPORT_ENV "MOBILEGL_TRANSPORT=spawn"
+        "MOBILEGL_IPC_SERVER_PATH=${MGL_ITEST_SPLIT_SERVER_PATH}")
+    set(MGL_ITEST_TCP_ARM_TRANSPORT_ENV "MOBILEGL_TRANSPORT=spawn"
+        "MOBILEGL_IPC_CONTROL=${MOBILEGL_ITEST_TCP_ENDPOINT}" "MOBILEGL_IPC_DATA=stream"
+        "MOBILEGL_IPC_REQUIRE_SAME_BUILD=1" "MOBILEGL_IPC_LOG_FORWARD=1" "MOBILEGL_IPC_TOKEN="
+        "MGITEST_TCP_LANE=1")
+
+    # ---- P7 package L: ONE SHAPE FOR EVERY MAGMA LANE'S THREE ARMS --------------------------
+    #
+    # The gated Magma tier is six hand-laid blocks (Fm, Buffers, RunAhead, Caches, NamedBlit,
+    # P5fRsp) because each carries a flavour of its own. What they share is the ARM: the same
+    # three transports, the same tcp fixture, the same label and log-name arithmetic. This macro
+    # is that shared half, so a seventh block gets its arms right by calling one line.
+    #
+    # Sets, for the arm it is given:
+    #   mglItestArmLower          split | spawn | tcp
+    #   mglItestArmLogTag         "" on the inproc arm, "-spawn"/"-tcp" on the others - THE
+    #                             INPROC ARM'S PRIVATE LOG PATHS DO NOT MOVE. magma_cache_checks
+    #                             and magma_runahead_checks name entries and re-derive their logs
+    #                             from discovery, and P6.5's device evidence cites these paths.
+    #   mglItestArmProperties     the tcp fixture + resource lock; empty otherwise
+    #   mglItestArmTransportEnv   the arm's transport pins, to append to the lane's flavour
+    #   mglItestMagmaLabels       "integration-magma-<arm>" plus one label per WORD in ARGN
+    #
+    # THE SUB-LABEL SPELLING IS ASYMMETRIC ON PURPOSE. On the inproc arm a word keeps its
+    # historical name (`integration-magma-buffers`); on the others the ARM comes first
+    # (`integration-magma-spawn-buffers`). `ctest -L` is a regex, so the obvious
+    # `integration-magma-buffers-spawn` would be SELECTED by the CI step that runs
+    # `-L integration-magma-buffers` and require_greens its twenty-one inproc entries by name -
+    # the lane would red on "required green entries differ" the day this package landed.
+    macro(mgl_itest_magma_arm_shape mglItestArm)
+        string(TOLOWER "${mglItestArm}" mglItestArmLower)
+        set(mglItestArmProperties)
+        set(mglItestArmLogTag "")
+        set(mglItestArmTransportEnv ${MGL_ITEST_SPLIT_ARM_TRANSPORT_ENV})
+        if("${mglItestArm}" STREQUAL "Spawn")
+            set(mglItestArmTransportEnv ${MGL_ITEST_SPAWN_ARM_TRANSPORT_ENV})
+            set(mglItestArmLogTag "-spawn")
+        elseif("${mglItestArm}" STREQUAL "Tcp")
+            set(mglItestArmTransportEnv ${MGL_ITEST_TCP_ARM_TRANSPORT_ENV})
+            set(mglItestArmLogTag "-tcp")
+            set(mglItestArmProperties FIXTURES_REQUIRED mobilegl-tcp RESOURCE_LOCK mobilegl-tcp)
+        endif()
+        set(mglItestMagmaLabels "integration-magma-${mglItestArmLower}")
+        foreach(mglItestWord IN ITEMS ${ARGN})
+            if("${mglItestArm}" STREQUAL "Split")
+                set(mglItestMagmaLabels "${mglItestMagmaLabels}\\;integration-magma-${mglItestWord}")
+            else()
+                set(mglItestMagmaLabels
+                    "${mglItestMagmaLabels}\\;integration-magma-${mglItestArmLower}-${mglItestWord}")
+            endif()
+        endforeach()
+    endmacro()
+    set(MGL_ITEST_MAGMA_ARMS Split Spawn Tcp)
+
+    # scenarioFilter, a PREFIX TAIL (empty for most; "F1." and "Ct." for the two per-slot loops,
+    # which name their sub-lane in the test name), then zero or more EXTRA LABEL STEMS. A stem is
+    # suffixed with the arm's own name (`integration-clientarrays` becomes `-split` on one arm and
+    # `-spawn` on the other), so a lane-scoped label cannot accidentally name both lanes at once.
+    # A UNIQUE LIST VARIABLE PER CALL, and the names collected for SplitLogPaths to walk.
+    #
+    # gtest_discover_tests' TEST_LIST is not a configure-time value: the generated include file
+    # sets it when CTEST runs. So one shared variable would hold only the LAST block's entries -
+    # measured, and it is why the first version of this macro silently unhooked every private log
+    # path but one. The counter gives each call its own name; the names are what get walked.
+    set(MGL_SPLIT_ARM_TESTS "")
+    set(MGL_SPLIT_ARM_TEST_LISTS "")
+    set(MGL_SPLIT_ARM_INDEX 0)
+    set(MGL_SPLIT_ARM_CALLS "")
+    # ---- P7 package L: THE BACKEND IS NOW A PARAMETER, AND THE TWO TIERS IT REGISTERS -------
+    #
+    # TIER 1, GATED. DirectGLES keeps every label it had - `integration-gpu`,
+    # `integration-{split,spawn,tcp,tcp-device}` and the caller's extra stems - so the sets CI
+    # gates on and the names G14 ratchets are byte-for-byte what they were. Magma's own gated
+    # tier is `integration-magma-{split,spawn,tcp}`, laid out by hand further down this file
+    # because each of those lanes carries a FLAVOUR (strict + dual-block state, run-ahead
+    # credits, cache pinning) that no shared filter can express.
+    #
+    # TIER 2, INFORMATIONAL, AND THAT IS THE POINT. DirectVulkan through THIS macro registers
+    # `integration-magma-all-{split,spawn,tcp}`: every scenario the split arms run, on Magma, on
+    # all three transports. It is deliberately in NO CI gating step. P7's exit gate 1 needs a
+    # lane that can be RED - the first run's red list IS the work list wave 2 clusters A/B/C
+    # divide up - and a red list is worthless if the only way to record it is to break the
+    # build's green. When a cluster retires its share, its cases move from this tier into the
+    # gated one, and CI stays honest at every step in between.
+    #
+    # THE LABEL SPELLINGS ARE CHOSEN AGAINST `ctest -L`'s REGEX MATCH (ID-131's rule, which this
+    # file has paid for twice). `-L integration-magma-spawn` must NOT select this tier, so the
+    # tier's word goes in the MIDDLE - `integration-magma-all-spawn` does not contain
+    # `integration-magma-spawn` as a substring, while the obvious `integration-magma-spawn-all`
+    # does and would have quietly pulled ~100 expected-red entries into the gated lane. Checked
+    # in both directions for all six spellings.
+    #
+    # NO `integration-gpu` ON THE MAGMA ARMS, deliberately: that label is a hard CI gate and the
+    # existing Magma split entries do not carry it either. NO EXTRA LABEL STEMS either - a stem
+    # like `integration-clientarrays` would produce `integration-clientarrays-spawn`, which is
+    # the label the DirectGLES spawn arm already owns, and one `ctest -L` would then run two
+    # backends under one name.
+    #
+    # NO TcpDevice ARM ON MAGMA: the device endpoint is one phone, run serially, and doubling
+    # its matrix before the host lane is even green buys nothing. Stated rather than implied.
+    macro(mgl_itest_register_split_arms_for_backend mglItestBackend scenarioFilter prefixTail)
+        # QUOTED DEREFERENCE, NOT A BARE NAME: a macro parameter is a textual substitution and
+        # not a variable, so `if(mglItestBackend STREQUAL ...)` would compare the literal string
+        # "mglItestBackend" and take the else branch on every call.
+        if("${mglItestBackend}" STREQUAL "DirectGLES")
+            set(mglItestEnvStem GLES)
+            set(mglItestLaneStem "integration")
+            set(mglItestSharedLabels "integration-gpu\\;")
+            set(mglItestArms Split Spawn Tcp)
+            if(MOBILEGL_ITEST_TCP_DEVICE_ENDPOINT)
+                list(APPEND mglItestArms TcpDevice)
+            endif()
+        else()
+            set(mglItestEnvStem VULKAN)
+            set(mglItestLaneStem "integration-magma-all")
+            set(mglItestSharedLabels "")
+            set(mglItestArms Split Spawn Tcp)
+        endif()
+        foreach(mglItestArm IN LISTS mglItestArms)
+            string(TOLOWER "${mglItestArm}" mglItestArmLower)
+            string(TOUPPER "${mglItestArm}" mglItestArmUpper)
+            set(mglItestArmProperties)
+            if(mglItestArm STREQUAL "Tcp")
+                set(mglItestArmProperties FIXTURES_REQUIRED mobilegl-tcp RESOURCE_LOCK mobilegl-tcp)
+            elseif(mglItestArm STREQUAL "TcpDevice")
+                set(mglItestArmLower tcp-device)
+                set(mglItestArmProperties RESOURCE_LOCK mobilegl-tcp-device)
+            endif()
+            set(mglItestArmLabels "${mglItestSharedLabels}${mglItestLaneStem}-${mglItestArmLower}")
+            foreach(mglItestExtra IN ITEMS ${ARGN})
+                set(mglItestArmLabels "${mglItestArmLabels}\\;${mglItestExtra}-${mglItestArmLower}")
+            endforeach()
+            # ONE ACCUMULATED LIST FOR BOTH ARMS, and it is not bookkeeping: SplitLogPaths gives
+            # every entry a PRIVATE MOBILEGL_LOG_FILE_PATH, and SplitLogPaths.PrivateAndDistinct
+            # reds if one is missing or shared. The per-block TEST_LIST variables this macro
+            # replaced were what fed it - dropping them silently unhooked the whole mechanism,
+            # which that gate caught. Accumulating here means a block added later is covered
+            # without anyone remembering to add its variable to the list.
+            #
+            # IT MATTERS MORE ON THE SPAWN ARM: there TWO PROCESSES append to the path, so two
+            # entries sharing one file is not merely ambiguous, it interleaves two sessions.
+            gtest_discover_tests(MobileGLIntegrationTest
+                TEST_PREFIX "${mglItestBackend}.${mglItestArm}.${prefixTail}"
+                TEST_LIST "MGL_SPLIT_ARM_TESTS_${MGL_SPLIT_ARM_INDEX}"
+                TEST_FILTER "${scenarioFilter}"
+                DISCOVERY_TIMEOUT 30
+                PROPERTIES
+                    LABELS "${mglItestArmLabels}"
+                    TIMEOUT ${MGL_ITEST_TIMEOUT}
+                    ENVIRONMENT "${MGL_ITEST_${mglItestEnvStem}_${mglItestArmUpper}_ENVIRONMENT}"
+                    ${mglItestArmProperties}
+            )
+            list(APPEND MGL_SPLIT_ARM_TEST_LISTS "MGL_SPLIT_ARM_TESTS_${MGL_SPLIT_ARM_INDEX}")
+            math(EXPR MGL_SPLIT_ARM_INDEX "${MGL_SPLIT_ARM_INDEX} + 1")
+        endforeach()
+    endmacro()
+
+    # THE NAME EVERY EXISTING CALL SITE USES, unchanged in signature so that this package adds a
+    # dimension without touching one registration. It also RECORDS its call, which is what makes
+    # tier 2 structural rather than maintained: the informational Magma tier at the end of this
+    # file replays the recorded list, so a scenario added to the split arms tomorrow joins the
+    # Magma census the same day and nobody has to remember a second edit. `-` stands for an empty
+    # prefix tail, because a CMake list cannot tell "one empty element" from "no elements".
+    macro(mgl_itest_register_split_arms scenarioFilter prefixTail)
+        if("${prefixTail}" STREQUAL "")
+            set(mglItestRecordedTail "-")
+        else()
+            set(mglItestRecordedTail "${prefixTail}")
+        endif()
+        list(APPEND MGL_SPLIT_ARM_CALLS "${scenarioFilter}|${mglItestRecordedTail}")
+        mgl_itest_register_split_arms_for_backend(DirectGLES "${scenarioFilter}" "${prefixTail}"
+                                                  ${ARGN})
+    endmacro()
+
+    mgl_itest_register_split_arms("ClearThenReadPixelsScenario.*" "")
+    mgl_itest_register_split_arms("TriangleScenario.*" "")
+    mgl_itest_register_split_arms("PersistentCoherentMapScenario.*" "")
+
+    # ---- P3b/P4b espryt D1 slice 1: THE ORPHANED XFB CAPTURE TARGET -------------------------
+    #
+    # The two cases whose whole subject is the split arm. A scattered capture is a
+    # read-modify-write of the destination's pre-capture bytes, and under a transport those bytes
+    # are the SERVER's staged shadow - so a buffer the application orphaned
+    # (glBufferData(size, NULL)) and only partly uploaded is the one shape where the shadow
+    # legitimately cannot answer for the whole range. The scatter used to read that as "discard
+    # this target": silently for a wholly orphaned store, and as
+    # Fatal{StageSnapshotTooNarrow, "xfb_scatter_pre_capture"} for a partly uploaded one.
+    #
+    # ---- P3b/P4b espryt D1 slice 2: THE WHOLE XFB FAMILY, once the writeback is sliced -------
+    #
+    # Slice 1 registered only OrphanedCaptureTarget* here, because the rest of these two files
+    # could not survive a transport: both writeback producers posted the WHOLE bound range as one
+    # SEG_EVENT record, and a record above half the ring (128 KiB at the 256 KiB default) is
+    # refused outright, which the server answers with Fatal{EventRingOverflow}. With the event
+    # sliced, the two scenarios go on in full - including the megabyte-range pair whose whole
+    # subject is that slicing, and XfbRepeatedCaptureScenario's gl_NextBuffer compacted-target
+    # shape, which is the first thing outside the census to exercise the archive-served stride
+    # and varyings (ProgramArchive->Link's xfb fields) on the server.
+    mgl_itest_register_split_arms("XfbAfterClipDistanceScenario.*" "Xfb.")
+    mgl_itest_register_split_arms("XfbRepeatedCaptureScenario.*" "Xfb.")
+
+    # ---- P3b/P4b espryt D1 slice 4: THE READBACK FAMILY ON THE SPLIT ARMS -------------------
+    #
+    # The 回读 half of the plan's "回读 / pack state" row. The PACK half is done - server reads
+    # with neutral pack state, the client scatters (ID-49, EmitTables.cpp) - and the READBACK half
+    # had no split coverage at all, so every claim about it was a reading of the code rather than
+    # a run of it. Arming the lanes is the first half of the work and the census is the second:
+    # what reds here IS the remaining worklist, and each red is either D1's to fix or excluded BY
+    # NAME with the Fatal quoted, the way the d1 draw block excludes
+    # MultiDrawScenario.ClientSideIndicesBatchMatchesUnrolledDraws.
+    mgl_itest_register_split_arms("PixelStoreSweepScenario.*" "")
+    mgl_itest_register_split_arms("PackedWordReadbackScenario.*" "")
+    mgl_itest_register_split_arms("LayeredTextureReadbackScenario.*" "")
+    # FramebufferChurnScenario shares PixelStoreSweepScenario.cpp and is the other half of its
+    # story - ~3300 texture+framebuffer pairs per case, the shape that walked an Adreno driver to
+    # 1.2 GB of leaked objects and then answered every readback with someone else's pixels. Under
+    # a transport every one of those pairs is also a create/destroy record round trip, so this is
+    # the only entry in the readback block that says anything about the OBJECT lifetime half.
+    mgl_itest_register_split_arms("FramebufferChurnScenario.*" "")
+    # P7 gate 5 (g5-readback): a glReadPixels larger than one SEG_REPLY slot is banded by the
+    # client instead of Fatal{ReplyTooLarge}. Exactly 2 MiB (the CTS renderbuffers_storage shape),
+    # 2 MiB + one row, more than the whole 16 MiB segment, a non-neutral pack state, a pack
+    # buffer, depth and packed depth/stencil, and glGetTexImage's windowed twin. The Magma arms of
+    # the same cases are the `Band.` block after the Fm lane below.
+    mgl_itest_register_split_arms("BandedReadbackScenario.*" "")
+
+    # DepthStencilReadbackMatrixScenario GETS ITS OWN BLOCK, because it needs a variable the
+    # registration macro cannot carry: MOBILEGL_ESPRYT_FORCE_DS_READBACK_EMULATION=1.
+    #
+    # Without it this scenario is UNFALSIFIABLE on the machines this suite runs on, and the
+    # ambient DirectGLES.ForcedDepthStencilEmulation. lane says why: OpenGL ES has no depth or
+    # stencil readback in core, but Mesa accepts the reads anyway, so on llvmpipe every case goes
+    # green through a native path the Adreno device does not have - deleting the whole emulation
+    # left all of them passing. A split arm that inherited the ambient default would be measuring
+    # the same non-path three more times. So the pin is MIRRORED here, which is what the plan's
+    # row asks for.
+    foreach(mglItestDsArm IN LISTS MGL_ITEST_MAGMA_ARMS)
+        mgl_itest_magma_arm_shape(${mglItestDsArm})
+        string(TOLOWER "${mglItestDsArm}" mglItestDsArmLower)
+        mgl_itest_join_environment(mglItestDsEnvironment
+            "MOBILEGL_BACKEND_TYPE=DirectGLES" "MGITEST_SPLIT_LANE=1"
+            "MOBILEGL_ESPRYT_FORCE_DS_READBACK_EMULATION=1"
+            ${mglItestArmTransportEnv} ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+        gtest_discover_tests(MobileGLIntegrationTest
+            TEST_PREFIX "DirectGLES.${mglItestDsArm}.ForcedDs."
+            TEST_LIST "MGL_SPLIT_ARM_TESTS_${MGL_SPLIT_ARM_INDEX}"
+            TEST_FILTER "DepthStencilReadbackMatrixScenario.*"
+            DISCOVERY_TIMEOUT 30
+            PROPERTIES
+                LABELS "integration-gpu\;integration-${mglItestDsArmLower}"
+                TIMEOUT ${MGL_ITEST_TIMEOUT}
+                ENVIRONMENT "${mglItestDsEnvironment}"
+                ${mglItestArmProperties}
+        )
+        # Into the accumulated list like every other arm entry, so SplitLogPaths gives each of
+        # these a private MOBILEGL_LOG_FILE_PATH too - two processes append on the spawn arm.
+        list(APPEND MGL_SPLIT_ARM_TEST_LISTS "MGL_SPLIT_ARM_TESTS_${MGL_SPLIT_ARM_INDEX}")
+        math(EXPR MGL_SPLIT_ARM_INDEX "${MGL_SPLIT_ARM_INDEX} + 1")
+    endforeach()
+
+
+    # ---- P5e fix1: THE PUSH-MONOLITH ARM, INSIDE THE GATED SET (ID-107) ----------------------
+    #
+    # WHY A MONOLITH LANE CARRIES THE `integration-split` LABEL. That label does not mean "runs
+    # inproc" - it means "the set the disaggregation gate runs", which is exactly why it is
+    # registered inside this `if (MOBILEGL_BUILD_DISAGGREGATED)` and why the block above argues
+    # that a build without the option must match NOTHING under it. ID-81 gives the push build TWO
+    # server arms, selected at runtime by MG_Config::Transport, and until now only one of them had
+    # a gated entry: every Split block above exports MOBILEGL_TRANSPORT=inproc, and every
+    # split-only scenario skips itself the moment the runtime is not split (SplitRuntimeSkipReason
+    # in their SetUp), so the ambient monolith registration of those files runs zero cases. The
+    # arm the phone actually ships on was therefore ungated, and P5e landed a null dereference on
+    # it under 2250 green unit entries and 113 green split entries (ID-107: the game died in
+    # Lightmap.<init> -> clearColorTexture -> glClear). A second arm needs a second lane, in the
+    # same set, or "the gate is green" keeps meaning "one of the two arms is green".
+    #
+    # MOBILEGL_TRANSPORT=monolith IS NAMED, for review finding N-6's reason exactly as the
+    # PersistentMapArm pair above names it: a ctest ENVIRONMENT property overrides the job
+    # environment, and without it a gate-level `MOBILEGL_TRANSPORT=inproc` export would quietly
+    # turn this block into a fourth copy of the split lane - the one failure mode a lane whose
+    # whole purpose is to be the OTHER arm cannot survive.
+    #
+    # The scenario is registered ambiently as well (its source is in the list above), so
+    # `DirectGLES.MonolithAttachmentClearScenario.*` and `DirectVulkan.…` still exist in
+    # integration-gpu; this block is the copy the gate can see, under a prefix that says which arm
+    # it pins.
+    mgl_itest_join_environment(MGL_ITEST_GLES_PUSH_MONOLITH_ENVIRONMENT
+        "MOBILEGL_BACKEND_TYPE=DirectGLES" "MOBILEGL_TRANSPORT=monolith"
+        ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
     gtest_discover_tests(MobileGLIntegrationTest
-        TEST_PREFIX "DirectGLES.Split."
-        TEST_LIST MGL_SPLIT_CLEAR_TESTS
-        TEST_FILTER "ClearThenReadPixelsScenario.*"
+        TEST_PREFIX "DirectGLES.PushMonolithArm."
+        TEST_LIST MGL_PUSH_MONOLITH_ATTACHMENT_TESTS
+        TEST_FILTER "MonolithAttachmentClearScenario.*"
         DISCOVERY_TIMEOUT 30
         PROPERTIES
             LABELS "integration-gpu\;integration-split"
             TIMEOUT ${MGL_ITEST_TIMEOUT}
-            ENVIRONMENT "${MGL_ITEST_GLES_SPLIT_ENVIRONMENT}"
-    )
-    gtest_discover_tests(MobileGLIntegrationTest
-        TEST_PREFIX "DirectGLES.Split."
-        TEST_LIST MGL_SPLIT_TRIANGLE_TESTS
-        TEST_FILTER "TriangleScenario.*"
-        DISCOVERY_TIMEOUT 30
-        PROPERTIES
-            LABELS "integration-gpu\;integration-split"
-            TIMEOUT ${MGL_ITEST_TIMEOUT}
-            ENVIRONMENT "${MGL_ITEST_GLES_SPLIT_ENVIRONMENT}"
-    )
-    gtest_discover_tests(MobileGLIntegrationTest
-        TEST_PREFIX "DirectGLES.Split."
-        TEST_LIST MGL_SPLIT_PMAP_TESTS
-        TEST_FILTER "PersistentCoherentMapScenario.*"
-        DISCOVERY_TIMEOUT 30
-        PROPERTIES
-            LABELS "integration-gpu\;integration-split"
-            TIMEOUT ${MGL_ITEST_TIMEOUT}
-            ENVIRONMENT "${MGL_ITEST_GLES_SPLIT_ENVIRONMENT}"
+            ENVIRONMENT "${MGL_ITEST_GLES_PUSH_MONOLITH_ENVIRONMENT}"
     )
 
     # ---- P5b d1: the indexed / instanced / multi-draw / indirect draw family under inproc ----
@@ -1961,15 +2546,79 @@ if (MOBILEGL_BUILD_DISAGGREGATED)
     set(MGL_SPLIT_D1_FILTER_DrawParametersScenario "DrawParametersScenario.*")
     set(MGL_SPLIT_D1_FILTER_PrimitiveRestartScenario "PrimitiveRestartScenario.*")
     foreach(mglItestD1Scenario IN LISTS MGL_SPLIT_D1_SCENARIOS)
+        mgl_itest_register_split_arms("${MGL_SPLIT_D1_FILTER_${mglItestD1Scenario}}" "")
+    endforeach()
+
+    # ---- P5e mv: THE MULTI-DRAW TIERS, INSIDE THE GATED SET (ID-109's rule, one level down) --
+    #
+    # WHY FIVE MORE LANES FOR ONE FILE. MultiDrawImpl asks the bound index buffer three questions
+    # and P5e (mv) moved all three onto the applier's record. Five of this driver's six tiers ask
+    # them from a DIFFERENT place in the batch - `RunIndirect` before any GL work, the rebased
+    # tier from the CPU shadow, `FlattenWithCompute` before PrepareForDraw has even run - and the
+    # resolved tier is ONE process-wide read of MOBILEGL_ESPRYT_MULTIDRAW_MODE (MultiDraw.cpp's
+    # ResolveTierOnce). The d1 block above leaves it at `auto`, and on every driver this gate has
+    # run against, `auto` lands on `ext` - a real multi-draw entry point that asks the index
+    # buffer nothing at all. Three of the five migrated sites therefore had no gated entry.
+    #
+    # That is ID-107's shape exactly one level down: code on a real arm, with no entry in the set
+    # the gate runs. The phase already paid 137 SEGFAULTs across 38 scenarios for the version of
+    # this that lived at the transport level, and the lesson ID-109 drew - "the gate runs the SET,
+    # so put the second arm in the set" - does not stop being true because the selector is an env
+    # knob rather than MG_Config::Transport. A manual sweep run once by one package decays to
+    # nothing by the next one.
+    #
+    # MOBILEGL_ESPRYT_MULTIDRAW_MODE IS A ctest ENVIRONMENT PROPERTY, not a job-level export, for
+    # review finding N-6's reason and the PushMonolithArm block's: the property overrides the job
+    # environment, so a gate that exported a mode of its own could not silently collapse these
+    # five lanes into five more copies of the `auto` one - the single failure mode a lane whose
+    # whole purpose is to pin a tier cannot survive.
+    #
+    # `ext` IS NOT REGISTERED HERE, deliberately: it is what `auto` already resolves to, so the
+    # d1 block above IS the ext lane and a sixth block would only run it twice. Every other tier
+    # was confirmed to resolve to ITSELF on this driver rather than falling back
+    # (`ResolveTier`'s "MOBILEGL_ESPRYT_MULTIDRAW_MODE=<x> -> <x> (driver supports: ext,
+    # basevertex, multiindirect, indirect, drawelements, compute (opt-in))"); a tier the driver
+    # refuses would resolve to `ext` and register an entry that quietly proves nothing, so if this
+    # list ever runs somewhere poorer, drop the refused tier rather than keeping a green that
+    # means "ext again".
+    #
+    # THE FILTER IS THE TIER-SENSITIVE WORKLOAD and nothing else, which is this file's own rule
+    # for an armed Split entry: MultiDrawScenario (its whole point is that a batch matches the
+    # unrolled draws, which is precisely what a wrong index buffer breaks quietly) and
+    # IndexedDrawFamilyScenario's three MultiDraw cases. The client-side-indices case keeps the
+    # d1 block's exclusion - it is refused by name under split before any tier is chosen.
+    #
+    # NOTE FOR THE STRICT-MARKER CENSUS (PREAMBLE-ADDENDUM-WAVE3 §4): these entries carry a THIRD
+    # name segment, so `strict_census2.sh` re-derives their gtest filter from the last two
+    # components and re-runs them WITHOUT the mode this block pins - which for these lanes is the
+    # whole point of the entry. They join Ct. / F1. / SmallRing. / PersistentMapArm. / NamedBlit.
+    # in that blind spot, so SplitLogPaths.cmake.in gives each of them a private log path: read
+    # the marker out of `build-split/MobileGL/MG_IntegrationTest/split-logs/<entry>.log`, which
+    # the LANE wrote under its own pin, instead of out of a re-run that lost it.
+    set(MGL_SPLIT_MULTIDRAW_TIERS basevertex multiindirect indirect drawelements compute)
+    set(MGL_SPLIT_MULTIDRAW_TIER_PREFIX_basevertex "BaseVertex")
+    set(MGL_SPLIT_MULTIDRAW_TIER_PREFIX_multiindirect "MultiIndirect")
+    set(MGL_SPLIT_MULTIDRAW_TIER_PREFIX_indirect "Indirect")
+    set(MGL_SPLIT_MULTIDRAW_TIER_PREFIX_drawelements "DrawElements")
+    set(MGL_SPLIT_MULTIDRAW_TIER_PREFIX_compute "Compute")
+    set(MGL_SPLIT_MULTIDRAW_TIER_FILTER
+        "MultiDrawScenario.*:IndexedDrawFamilyScenario.MultiDraw*-MultiDrawScenario.ClientSideIndicesBatchMatchesUnrolledDraws")
+    foreach(mglItestMultiDrawTier IN LISTS MGL_SPLIT_MULTIDRAW_TIERS)
+        mgl_itest_join_environment(MGL_ITEST_GLES_SPLIT_MULTIDRAW_ENVIRONMENT
+            "MOBILEGL_BACKEND_TYPE=DirectGLES" "MOBILEGL_TRANSPORT=inproc"
+            "MOBILEGL_IPC_SERVER_PATH=${MGL_ITEST_SPLIT_SERVER_PATH}" "MGITEST_SPLIT_LANE=1"
+            "MOBILEGL_ESPRYT_MULTIDRAW_MODE=${mglItestMultiDrawTier}"
+            ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
         gtest_discover_tests(MobileGLIntegrationTest
-            TEST_PREFIX "DirectGLES.Split."
-            TEST_LIST "MGL_SPLIT_D1_${mglItestD1Scenario}_TESTS"
-            TEST_FILTER "${MGL_SPLIT_D1_FILTER_${mglItestD1Scenario}}"
+            TEST_PREFIX
+                "DirectGLES.Split.MultiDrawTier${MGL_SPLIT_MULTIDRAW_TIER_PREFIX_${mglItestMultiDrawTier}}."
+            TEST_LIST "MGL_SPLIT_MULTIDRAW_${mglItestMultiDrawTier}_TESTS"
+            TEST_FILTER "${MGL_SPLIT_MULTIDRAW_TIER_FILTER}"
             DISCOVERY_TIMEOUT 30
             PROPERTIES
                 LABELS "integration-gpu\;integration-split"
                 TIMEOUT ${MGL_ITEST_TIMEOUT}
-                ENVIRONMENT "${MGL_ITEST_GLES_SPLIT_ENVIRONMENT}"
+                ENVIRONMENT "${MGL_ITEST_GLES_SPLIT_MULTIDRAW_ENVIRONMENT}"
         )
     endforeach()
 
@@ -2010,17 +2659,24 @@ if (MOBILEGL_BUILD_DISAGGREGATED)
     set(MGL_SPLIT_I1_FILTER_AtomicCounterScenario          "AtomicCounterScenario.*")
     set(MGL_SPLIT_I1_FILTER_ProgramPipelineScenario        "ProgramPipelineScenario.*StorageBlock*")
     foreach(mglItestI1Scenario IN LISTS MGL_SPLIT_I1_SCENARIOS)
-        gtest_discover_tests(MobileGLIntegrationTest
-            TEST_PREFIX "DirectGLES.Split."
-            TEST_LIST "MGL_SPLIT_I1_${mglItestI1Scenario}_TESTS"
-            TEST_FILTER "${MGL_SPLIT_I1_FILTER_${mglItestI1Scenario}}"
-            DISCOVERY_TIMEOUT 30
-            PROPERTIES
-                LABELS "integration-gpu\;integration-split"
-                TIMEOUT ${MGL_ITEST_TIMEOUT}
-                ENVIRONMENT "${MGL_ITEST_GLES_SPLIT_ENVIRONMENT}"
-        )
+        mgl_itest_register_split_arms("${MGL_SPLIT_I1_FILTER_${mglItestI1Scenario}}" "")
     endforeach()
+
+    # ---- P7 gate 5 (g5-imgwin): AN IMAGE UNIT NAMING A (LEVEL, LAYER) ITS TEXTURE LACKS ------
+    #
+    # GL 4.6 core 8.26 makes every access through such a unit invalid - zero loads, dropped
+    # stores - and never an error. Espryt forwards the unit to the driver, which applies the rule
+    # itself; these are its three arms. The Magma arms of the same scenario are laid by hand in
+    # the Fm block (`DirectVulkan.<arm>.ImageUnitWindow.`), because that is where the wire arm's
+    # gated flavour lives.
+    #
+    # ALL SIX CASES, THE TEXTURE-VIEW ONE INCLUDED. The view case waited outside the gated arms
+    # while every glTextureView under a transport ended the session at Fatal{ProtocolCorruption,
+    # "StagedTextureStore.NoteLevelDefined"} (p7/f2's view descriptor carried internalFormat
+    # 0xFFFFFFFF); the F2 repair (f2-latch slice A) retired that death, so it joins them here and
+    # in the Magma ImageUnitWindow foreach. The shared GLES split lists carry
+    # MOBILEGL_ESPRYT_ENABLE_TEXTURE_VIEW=1, so it does not green-skip on these arms.
+    mgl_itest_register_split_arms("InvalidImageUnitScenario.*" "")
 
     # ---- P5b t2: the transform-feedback spans, the XFB object bind, the patch parameter -------
     #
@@ -2048,37 +2704,225 @@ if (MOBILEGL_BUILD_DISAGGREGATED)
     # Every DirectVulkan XFB capture entry in the inproc census fails on exactly that (t2-v1.md
     # §"the 51"), and it retires with P7 (Magma's resource family) / P9 (the readback carrier) -
     # not here. A DirectVulkan arm of this lane would be red for a reason t2 cannot fix.
-    gtest_discover_tests(MobileGLIntegrationTest
-        TEST_PREFIX "DirectGLES.Split."
-        TEST_LIST MGL_SPLIT_T2_TESS_TESTS
-        TEST_FILTER "TessellationXfbCaptureScenario.*"
-        DISCOVERY_TIMEOUT 30
-        PROPERTIES
-            LABELS "integration-gpu\;integration-split"
-            TIMEOUT ${MGL_ITEST_TIMEOUT}
-            ENVIRONMENT "${MGL_ITEST_GLES_SPLIT_ENVIRONMENT}"
-    )
-    gtest_discover_tests(MobileGLIntegrationTest
-        TEST_PREFIX "DirectGLES.Split."
-        TEST_LIST MGL_SPLIT_T2_XFB_TESTS
-        TEST_FILTER "XfbCaptureBufferReuseScenario.*"
-        DISCOVERY_TIMEOUT 30
-        PROPERTIES
-            LABELS "integration-gpu\;integration-split"
-            TIMEOUT ${MGL_ITEST_TIMEOUT}
-            ENVIRONMENT "${MGL_ITEST_GLES_SPLIT_ENVIRONMENT}"
-    )
+    mgl_itest_register_split_arms("TessellationXfbCaptureScenario.*" "")
+    mgl_itest_register_split_arms("XfbCaptureBufferReuseScenario.*" "")
 
-    gtest_discover_tests(MobileGLIntegrationTest
-        TEST_PREFIX "DirectGLES.Split."
-        TEST_LIST MGL_SPLIT_SYNC_TESTS
-        TEST_FILTER "SyncWireScenario.*"
-        DISCOVERY_TIMEOUT 30
-        PROPERTIES
-            LABELS "integration-gpu\;integration-split"
-            TIMEOUT ${MGL_ITEST_TIMEOUT}
-            ENVIRONMENT "${MGL_ITEST_GLES_SPLIT_ENVIRONMENT}"
-    )
+    # ---- P5e package vi (MG_Remote/CONTRACT-P5E.md §5.1, ID-82 / ruling 2) --------------------
+    #
+    # Client-memory vertices and indices now cross as owned ordinary buffers.
+    # Keep the original names and private logs; all six scenarios join the full
+    # GPU and split acceptance labels as well as their focused regression label.
+    mgl_itest_register_split_arms("ClientVertexArrayScenario.*" "" integration-clientarrays)
+
+    mgl_itest_register_split_arms("SyncWireScenario.*" "")
+
+    # =========================================================================================
+    # P3b/P4b WAVE 2-D PACKAGE D2 - OWN BLOCK. Package D1 (XFB / readback) registers its arms in
+    # its own block elsewhere in this file; keep the two apart so the integrator can merge both.
+    # =========================================================================================
+    #
+    # THE OWNER-KEYED EMISSION CURSOR, under all three transports. The claim is about WHICH
+    # emission cursor an upload through a texture VIEW lands on, and it is only interesting where
+    # the record actually crosses a wire: under monolith the drain's SubDataCount still moves but
+    # nothing downstream can disagree with the client's own dirty model, because there is one
+    # address space and one MipmapStorage. Under split the applier holds its own per-record
+    # pending-upload set, so a cursor that cleared the wrong flag produces a server-side level
+    # that never receives the texels - which is the failure this registration exists to reach.
+    #
+    # Every case draws and reads pixels, so each moves the client encoder's record ordinal and
+    # satisfies ScenarioFixture's armed-lane rule. The three GLES arm environments carry
+    # MOBILEGL_ESPRYT_ENABLE_TEXTURE_VIEW=1 (above); without it every case green-skips through
+    # TextureViewUsable() rather than failing - which is what the Tcp arm did until the fixture
+    # entry below got the same knob.
+    #
+    # ALL FOUR CASES RUN ON ALL THREE ARMS. TheOwnerUploadDrainRunsAgainAfterADrawBoundary was
+    # EXCLUDED BY NAME here by package D2, which found the defect but could not fix it inside its
+    # own footprint:
+    #
+    #   after a view has been SAMPLED once, a later glTexSubImage through the OWNER's own name
+    #   never becomes visible through the view.
+    #
+    # Package D3 fixed it and this is its red-once (rule J): the case is red on Split, Spawn AND
+    # Tcp at D2's head a7c06f4f with this exclusion lifted and nothing else changed, and green on
+    # all three with the fix. The client half was never at fault - the case's own counter
+    # assertions pass on the red run, so the records were emitted and the applier accepted them.
+    # The server's per-texture clean gate BackendTextureObject::IsDrawSyncCleanByRecord
+    # (MG_Backend/DirectGLES/Managers.cpp) compared the VIEW's record.Serial and
+    # record.PendingUploads, while an owner-side resource_subdata moves only the OWNER's
+    # (MG_Pipe/PipeApply.cpp ApplyTextureUpload). The gate now RESOLVES THROUGH Desc.ViewOf to the
+    # storage owner's record for those two clauses, which is the split equivalent of the monolith
+    # gate's GetContentVersion() forwarding (TextureObjectView.cpp:100-102). CONTRACT-P5E.md §5.2
+    # states the rule the code now implements.
+    mgl_itest_register_split_arms("TextureViewAliasScenario.*" "")
+
+    # ---- D2: THE UPLOAD-SHAPE GOLD, UNDER ALL THREE TRANSPORTS ------------------------------
+    #
+    # WRITTEN OUT PER ARM RATHER THAN THROUGH mgl_itest_register_split_arms, and the reason is
+    # structural rather than stylistic: the macro hands every arm the SHARED
+    # MGL_ITEST_GLES_<ARM>_ENVIRONMENT, and this case needs four things no shared list carries -
+    # MGITEST_TEXTURE_UPLOAD_SHAPE_LANE=1 (without it the case skips), MOBILEGL_PIPE_STATS=1 with
+    # PERIOD=1, MOBILEGL_PIPE_PUSH=0x1fff, and a MOBILEGL_LOG_FILE_PATH PRIVATE TO THE ARM. That
+    # last one is not negotiable: the library opens the log fopen(path, "w"), so two entries
+    # sharing a path truncate each other under `ctest -j` and the failure looks exactly like "the
+    # counter was never emitted". The PersistentMapArm pair above is the same shape for the same
+    # reason. A macro call here would produce three entries that all green-skip.
+    #
+    # WHAT THE SPLIT ARMS ADD OVER THE MONOLITH LANE. The monolith lane reads one log, because
+    # there is one role. Under SPAWN and TCP the client and the server are two PROCESSES with two
+    # independent counter sets - the client's line carries ctu= and the server's carries tex[] -
+    # and the `ctu == emit` comparison the whole scenario exists for is only a real comparison
+    # there. Under inproc it is one process with two log FILES, which is the arm that proves the
+    # role-derived path reading without needing two counter sets.
+    set(MGL_D2_TUS_FILTER "TextureUploadShapeScenario.TheEmittedUploadShapeIsRecordedAndTheTwoSidesAgree")
+    foreach(mglD2Arm Split Spawn Tcp)
+        string(TOLOWER "${mglD2Arm}" mglD2ArmLower)
+        set(mglD2Log "${CMAKE_CURRENT_BINARY_DIR}/texture-upload-shape-${mglD2ArmLower}-DirectGLES.log")
+        get_filename_component(mglD2LogName "${mglD2Log}" NAME)
+        set(mglD2Locks "${mglD2LogName}")
+        set(mglD2Extra)
+        if(mglD2Arm STREQUAL "Split")
+            set(mglD2Transport "MOBILEGL_TRANSPORT=inproc"
+                               "MOBILEGL_IPC_SERVER_PATH=${MGL_ITEST_SPLIT_SERVER_PATH}")
+        elseif(mglD2Arm STREQUAL "Spawn")
+            set(mglD2Transport "MOBILEGL_TRANSPORT=spawn"
+                               "MOBILEGL_IPC_SERVER_PATH=${MGL_ITEST_SPLIT_SERVER_PATH}")
+        else()
+            set(mglD2Transport "MOBILEGL_TRANSPORT=spawn"
+                               "MOBILEGL_IPC_CONTROL=${MOBILEGL_ITEST_TCP_ENDPOINT}"
+                               "MOBILEGL_IPC_DATA=stream" "MOBILEGL_IPC_REQUIRE_SAME_BUILD=1"
+                               "MOBILEGL_IPC_LOG_FORWARD=1" "MOBILEGL_IPC_TOKEN="
+                               "MGITEST_TCP_LANE=1" "MOBILEGL_ITEST_REQUIRE_GPU=1")
+            set(mglD2Extra FIXTURES_REQUIRED mobilegl-tcp)
+            # The loopback supervisor serves ONE session (ServerMain.cpp answers a second Hello
+            # Refuse{Busy}), and every other Tcp entry holds this lock. Without it `ctest -L
+            # integration-gpu -j N` ran this case beside another Tcp case and whichever client
+            # connected second died Refuse{Busy} -> Fatal{CapsBeforeFirstSnapshot}.
+            # scripts/ci/spawn_lane_parity.py and junit_tally.py --discovery now refuse any entry
+            # on the fixture that does not hold it.
+            set(mglD2Locks "${mglD2LogName}\;mobilegl-tcp")
+        endif()
+        mgl_itest_join_environment(MGL_D2_TUS_ENV_${mglD2Arm}
+            "MOBILEGL_BACKEND_TYPE=DirectGLES" ${mglD2Transport} "MGITEST_SPLIT_LANE=1"
+            "MGITEST_TEXTURE_UPLOAD_SHAPE_LANE=1" "MOBILEGL_PIPE_PUSH=0x1fff"
+            "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
+            "MOBILEGL_ESPRYT_ENABLE_TEXTURE_VIEW=1"
+            "MOBILEGL_LOG_FILE_PATH=${mglD2Log}"
+            ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+        gtest_discover_tests(MobileGLIntegrationTest
+            TEST_PREFIX "DirectGLES.${mglD2Arm}.TextureUploadShape."
+            TEST_FILTER "${MGL_D2_TUS_FILTER}"
+            DISCOVERY_TIMEOUT 30
+            PROPERTIES
+                LABELS "integration-gpu\;integration-${mglD2ArmLower}"
+                TIMEOUT ${MGL_ITEST_TIMEOUT}
+                RESOURCE_LOCK "${mglD2Locks}"
+                ${mglD2Extra}
+                ENVIRONMENT "${MGL_D2_TUS_ENV_${mglD2Arm}}"
+        )
+    endforeach()
+
+    # ---- P7 CI: THE SPAWN CLIENT'S COLD-START BUDGET ----------------------------------------
+    #
+    # A spawned server brings its native backend up lazily, inside the first surface creation
+    # (Espryt) or the first MakeCurrent (Magma). On loaded CI runners that took longer than the
+    # client's 5 s steady reply bound, and retrace-split's spawn legs died on "no SurfaceReply for
+    # CreatePbufferSurface seq 2" / "for MakeCurrent seq 3" while the server was about to answer.
+    # ClientSession now gives those two kinds of op MOBILEGL_IPC_COLD_START_MS (default 20 s)
+    # until the session's first MakeCurrent is answered ok.
+    #
+    # These two entries are that rule's red-once: the server's test lever
+    # MOBILEGL_TEST_DELAY_FIRST_BRINGUP_MS holds the first surface creation and the first
+    # MakeCurrent back by 6 s each - past the steady bound, which stays at its 5 s default. With
+    # the cold-start budget both ops land inside 20 s and the case is green. Against the client as
+    # it was before (every op on a hard-coded 5 s), with the budget selection removed, or with the
+    # cold-start default lowered to the old 5 s, the first one times out and the case reds on
+    # "remote spawn bring-up failed" - the CI failure in miniature. A 3 s lever under a 2 s steady
+    # knob was faster but proved less: the pre-fix client never read MOBILEGL_IPC_CONTROL_TIMEOUT_MS,
+    # so its 5 s bound outlasted the lever and the entries were green at 14e1c8b9 (measured).
+    # SINCE p7/spawnhang THEY ARE NO LONGER THE BUDGET SELECTION'S RED-ONCE: a 20 s bring-up outran
+    # the cold-start budget too (run 35912252677), so both budgets now bound SILENCE - the server
+    # reports Wire::SurfaceProgress every 250 ms while it runs the op, and each report restarts the
+    # client's budget. These entries stay as the end-to-end check that a held bring-up is waited
+    # for on both backends; the mechanism's red-once is ServerSpawnTest's cold-bring-up case (unit).
+    # Each entry takes ~25 s, because the harness's pre-flight child brings a server up as well.
+    # NOT on integration-spawn: this is not a copy of the split lane (spawn_lane_parity.py). The
+    # DirectVulkan entry does carry integration-gpu, unlike the Magma arms' informational tiers
+    # below: it is one expected-GREEN case, and Magma's bring-up is the MakeCurrent half.
+    set(MGL_COLDSTART_FILTER "ClearThenReadPixelsScenario.ClearWithNoDrawIsVisibleToDefaultFramebufferReadPixels")
+    foreach(mglColdBackend DirectGLES DirectVulkan)
+        if(mglColdBackend STREQUAL "DirectVulkan")
+            set(mglColdDriverEnv ${MGL_ITEST_VULKAN_ENV})
+        else()
+            set(mglColdDriverEnv ${MGL_ITEST_COMMON_ENV})
+        endif()
+        mgl_itest_join_environment(MGL_COLDSTART_ENV_${mglColdBackend}
+            "MOBILEGL_BACKEND_TYPE=${mglColdBackend}" ${MGL_ITEST_SPAWN_ARM_TRANSPORT_ENV}
+            "MGITEST_SPLIT_LANE=1" "MOBILEGL_ITEST_REQUIRE_GPU=1"
+            "MOBILEGL_TEST_DELAY_FIRST_BRINGUP_MS=6000"
+            "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/cold-start-spawn-${mglColdBackend}.log"
+            ${MGL_ITEST_CAPABILITY_ENV} ${mglColdDriverEnv})
+        gtest_discover_tests(MobileGLIntegrationTest
+            TEST_PREFIX "${mglColdBackend}.Spawn.ColdStart."
+            TEST_FILTER "${MGL_COLDSTART_FILTER}"
+            DISCOVERY_TIMEOUT 30
+            PROPERTIES
+                LABELS "integration-gpu\;integration-cold-start"
+                TIMEOUT ${MGL_ITEST_TIMEOUT}
+                ENVIRONMENT "${MGL_COLDSTART_ENV_${mglColdBackend}}"
+        )
+    endforeach()
+
+    # ---- D2: THE TEXTURE / PROGRAM SPLIT-SCENARIO CENSUS ------------------------------------
+    #
+    # PLAN-PH-P34B-P7.md 1.2, "门：纹理 / program 场景 split 覆盖". Each candidate was run once
+    # under MOBILEGL_TRANSPORT=inproc on build-split and its FIRST BLOCKER recorded; the row per
+    # scenario x backend x blocker is in notes/p34b/split-scenario-census.md. What follows is the
+    # result of that census, not a guess: every scenario listed here passed, and every case that
+    # did not is excluded BY NAME below with its blocker.
+    #
+    # D1 owns PixelStoreSweep, DepthStencilReadbackMatrix, PackedWordReadback and
+    # LayeredTextureReadback - they are not here.
+    #
+    # DIRECTVULKAN ARMS DEFAULT TO NONE, and that is not an omission. The macro records every
+    # call and the informational tier-2 block at the end of this file replays all of them on
+    # DirectVulkan under integration-magma-all-{split,spawn,tcp} - so these scenarios DO get a
+    # Magma reading, just not a gating one. Gating them there would be asserting P7 wave 2's
+    # exit gate 1 from inside a P3b/P4b package, on a backend whose own @P7 named refusals are
+    # still being retired in waves A/B/C.
+    set(MGL_SPLIT_D2_SCENARIOS
+        TextureViewScenario                       # glTextureView end to end, 10 cases
+        TextureParamsWithoutASamplerViewScenario  # G9's four cases; also settles the debt-table row
+        SampledSetStalenessScenario               # 2 cases
+        ImageSizeAfterRespecScenario              # 1 case
+        ImageTargetKindScenario                   # 29 cases
+        IntegerBorderColorScenario                # 6 cases
+        SwizzleAccessRoutineScenario              # 4 cases
+        PostLinkAttachScenario                    # 2 cases
+        RelinkStageSetScenario                    # 3 cases
+        UniformInitializerScenario                # 3 cases
+        Glsl420DeclarationScenario                # 6 cases
+        IoBlockNameCollisionScenario)             # 2 cases
+    # NO PER-SCENARIO FILTER INDIRECTION, unlike the d1 and i1 blocks above: every scenario here
+    # is registered whole, because the census found no case in any of them that needs excluding.
+    # The d1/i1 shape (a MGL_SPLIT_<pkg>_FILTER_<Scenario> variable consulted per entry) is what
+    # to reach for the day one does; carrying an `if(DEFINED ...)` that is never true today would
+    # be a branch no run takes.
+    foreach(mglItestD2Scenario IN LISTS MGL_SPLIT_D2_SCENARIOS)
+        mgl_itest_register_split_arms("${mglItestD2Scenario}.*" "")
+    endforeach()
+
+    # P7 gate 5 (g5-msrbo): AN EMPTY TEXTURE LEVEL. glTexImage*D with a zero extent is legal GL
+    # and dEQP's resetStateGLCore issues it for every target after every case; PH-4's extent
+    # carrier refused it as ProtocolCorruption on the apply thread, so no KHR-GL case could
+    # finish on a split arm. Backend-agnostic (the refusal was in MGPipeApplyResourceRespecify),
+    # so the DirectGLES gated arms carry it here and the Magma gated lanes below carry it too.
+    mgl_itest_register_split_arms("EmptyTextureLevelScenario.*" "")
+
+    # ProgramPipelineScenario BEYOND *StorageBlock*: the i1 block above already registers the two
+    # storage-block cases. The other nine are pure name/state cases that draw nothing, and
+    # ScenarioFixture's armed-lane rule (the client encoder's record ordinal must move) makes a
+    # case that produced no record RED for having nothing to say - which is the rule working, not
+    # a defect. They stay unregistered for that reason and are listed in the census note.
 
     # The split half of the counting pair. MGITEST_PERSISTENT_MAP_ARM=emulated is R-6: under split
     # the adopt tier is pinned at T2, the resource owner declines every acquisition and the client
@@ -2142,10 +2986,65 @@ if (MOBILEGL_BUILD_DISAGGREGATED)
                 ENVIRONMENT "${MGL_ITEST_GLES_SPLIT_SMALL_RING_ENVIRONMENT}"
         )
     endforeach()
-    # Apply per-entry paths after GoogleTest discovery has populated the TEST_LISTs.
-    configure_file(Harness/SplitLogPaths.cmake.in SplitLogPaths.cmake @ONLY)
-    set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES
-        "${CMAKE_CURRENT_BINARY_DIR}/SplitLogPaths.cmake")
+
+    # ---- P5e package pa: THE STRICT LANE GETS ENTRIES OF ITS OWN ------------------------------
+    #
+    # pa retired the two per-draw program rows - Fatal{UnmigratedPipeInput,
+    # "GetProgramForDraw@DrawArrays"} and "...GetProgramForDispatch@DispatchCompute", 69 of the
+    # 109 entries the strict lane was red on. NOTHING GATED THEM. MOBILEGL_IPC_STRICT_ERRORS=1 is
+    # a knob the phase's gate driver sets by hand, no REGISTERED entry exports it, and package
+    # pg's declared red-once for this exact marker never landed - so the row could come back and
+    # every gate would stay green. That is ID-109's finding in miniature: the gap was never a
+    # missing test case, it was a missing gated ENTRY for a whole reading.
+    #
+    # WHICH SCENARIOS MAY JOIN is decided by the knob itself: under it every BARRIER-PULLED read
+    # is Fatal, and most split scenarios end in a readback, whose GetFramebufferBindingSlot@ReadPixels
+    # is an allowlisted row that only P7 retires. So a scenario is eligible exactly when it
+    # reaches PrepareForDraw / PrepareForCompute and then does NOT read pixels back. Two do, one
+    # per half of pa, and both were red with pa's own marker before it landed:
+    #   * MultiDrawScenario.BaseVertexDrawsRejectMalformedArguments - the DRAW half; it prepares a
+    #     draw and then asserts on GL errors rather than on pixels.
+    #   * AtomicCounterScenario.* - the DISPATCH half, and all three cases were
+    #     GetProgramForDispatch@DispatchCompute entries.
+    #
+    # LABELS IS integration-split ALONE, deliberately, and it is not the hole ID-109 names. That
+    # hole was a runtime ARM with no entry anywhere; here the monolith arm of these same scenarios
+    # is registered under DirectGLES. already and this knob is a no-op on it - a monolith client
+    # fills and stamps all 63 fields at every verb, so no read is unfresh and nothing can trip.
+    # An entry that cannot fail for the reason it exists is worse than none (R-16), so this lane
+    # names the arm it is for in its own prefix. The F1. lane sets the same precedent.
+    mgl_itest_join_environment(MGL_ITEST_GLES_SPLIT_STRICT_ENVIRONMENT
+        "MOBILEGL_BACKEND_TYPE=DirectGLES" "MOBILEGL_TRANSPORT=inproc"
+        "MOBILEGL_IPC_SERVER_PATH=${MGL_ITEST_SPLIT_SERVER_PATH}" "MGITEST_SPLIT_LANE=1"
+        "MOBILEGL_IPC_STRICT_ERRORS=1"
+        ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+
+    gtest_discover_tests(MobileGLIntegrationTest
+        TEST_PREFIX "DirectGLES.Split.StrictProgramArm."
+        TEST_LIST MGL_SPLIT_PA_STRICT_DRAW_TESTS
+        TEST_FILTER "MultiDrawScenario.BaseVertexDrawsRejectMalformedArguments"
+        DISCOVERY_TIMEOUT 30
+        PROPERTIES
+            LABELS "integration-split"
+            TIMEOUT ${MGL_ITEST_TIMEOUT}
+            ENVIRONMENT "${MGL_ITEST_GLES_SPLIT_STRICT_ENVIRONMENT}"
+    )
+    gtest_discover_tests(MobileGLIntegrationTest
+        TEST_PREFIX "DirectGLES.Split.StrictProgramArm."
+        TEST_LIST MGL_SPLIT_PA_STRICT_DISPATCH_TESTS
+        TEST_FILTER "AtomicCounterScenario.*"
+        DISCOVERY_TIMEOUT 30
+        PROPERTIES
+            LABELS "integration-split"
+            TIMEOUT ${MGL_ITEST_TIMEOUT}
+            ENVIRONMENT "${MGL_ITEST_GLES_SPLIT_STRICT_ENVIRONMENT}"
+    )
+    # The configure_file that used to sit here MOVED TO THE END OF THIS FILE (P6 `t6`).
+    #
+    # It substitutes @MGL_SPLIT_ARM_TEST_LISTS@, which the registration macro appends to - so
+    # running it here captured only the calls made ABOVE this line and silently dropped the F1
+    # and Ct blocks below it. SplitLogPaths.PrivateAndDistinct is what caught that, naming
+    # F1WireScenario.ClearBufferfiPixels; the generated file now sees every call.
     # Python is mandatory for this split integration gate (also used by the CI controls).
     # Do not silently omit the ownership check when the interpreter is unavailable.
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -2160,15 +3059,762 @@ endif()
 if (MOBILEGL_BUILD_DISAGGREGATED)
     target_sources(MobileGLIntegrationTest PRIVATE Scenarios/F1WireScenario.cpp)
     foreach(f1Slot ClearBufferfi ClearBufferfv ClearBufferiv ClearBufferuiv ClearNamedFramebufferfi ClearNamedFramebufferfv ClearNamedFramebufferiv ClearNamedFramebufferuiv CopyTexImage2D CopyTexSubImage2D GenerateMipmap GenerateMipmapPackedFloat GenerateMipmapDepth)
+        mgl_itest_register_split_arms("F1WireScenario.${f1Slot}Pixels" "F1.")
+    endforeach()
+    # THE TWO PACK-STATE CASES OF F1, which are not ${slot}Pixels-shaped (P3b/P4b espryt D1
+    # slice 4). ID-49 splits a readback in two: the server reads with NEUTRAL pack state into a
+    # tight w*h*bpp reply, and the CLIENT scatters those rows into the application's destination
+    # per its own GL_PACK_*. Only the client half has ever been exercised by a unit case over
+    # ScatterTightReadbackIntoPackState; these two run the whole seam, one for the padding a
+    # non-default pack state must leave untouched and one for the overflow that has to be refused
+    # BEFORE anything is written.
+    mgl_itest_register_split_arms(
+        "F1WireScenario.TextureAndFramebufferReadsPreservePackBufferPadding" "F1.")
+    mgl_itest_register_split_arms(
+        "F1WireScenario.TextureReadbackRejectsPackedDestinationOverflowBeforeWriting" "F1.")
+    # P5f fm: the framebuffer/copy/mipmap verbs now consume server records on Magma too.
+    #
+    # P7 package L: THE SAME CASES ON ALL THREE TRANSPORTS. The flavour is everything this lane
+    # is except the transport, which the arm now supplies - so the inproc arm is byte-for-byte
+    # the lane P6.5 left green (same names, same labels, same log paths) and the two new arms
+    # differ from it in exactly one dimension. That is what makes a red here readable: it is a
+    # TRANSPORT fact, because nothing else changed.
+    #
+    # ${MGL_ITEST_VULKAN_ENV} AND NOT ${MGL_ITEST_COMMON_ENV} (P7 package L, integrator ruling).
+    # Until this ruling the six Magma lanes appended the COMMON list, so the monolith
+    # `DirectVulkan.` arm ran with VK_ICD_FILENAMES pinned and the three lavapipe iterationRP
+    # repairs forced on while these 73 entries ran against whatever ICD the loader happened to
+    # find first, with the repairs at their device auto-detection default. That is not a
+    # semantic difference between two lanes, it is a latent flake: the day a runner or a
+    # workstation grows a second ICD, this lane measures a different driver from the gate it
+    # mirrors and nothing in its output says so. Consistency over "meaning unchanged" - and the
+    # re-run after the change is part of the ruling: integration-magma-split stayed 71/0/2.
+    set(MGL_ITEST_MAGMA_WIRE_FLAVOUR_ENV
+        "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MOBILEGL_ITEST_REQUIRE_GPU=1" "MGITEST_SPLIT_LANE=1"
+        ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_VULKAN_ENV})
+    # Every entry here is green on the inproc arm, R11F_G11F_B10F packed-float mip generation
+    # included: the GPU shader blit retires the named native-format refusal, so
+    # GenerateMipmapPackedFloatPixels carries its siblings' label and their pixels assertion.
+    foreach(mglItestArm IN LISTS MGL_ITEST_MAGMA_ARMS)
+        mgl_itest_magma_arm_shape(${mglItestArm})
+        mgl_itest_join_environment(mglItestMagmaWireEnvironment
+            ${MGL_ITEST_MAGMA_WIRE_FLAVOUR_ENV} ${mglItestArmTransportEnv})
+        foreach(fmSlot ComputeImageStoreThroughViewPreservesOtherRootLayer EnabledVertexBufferDrawKeepsNamedP7Fatal SrgbDrawTracksFramebufferConversion Texture1DFramebufferClearPixels VertexIdSamplerAndScalarUniformPixels ComputeImageStoreFramebufferPixels PartialTextureUploadPreservesGpuClearPixels TextureViewClearTargetsItsRootMipAndLayer ClearBufferfiPixels ClearBufferfvPixels ClearBufferivPixels ClearBufferuivPixels ClearNamedFramebufferfiPixels ClearNamedFramebufferfvPixels ClearNamedFramebufferivPixels ClearNamedFramebufferuivPixels CopyTexImage2DPixels CopyTexSubImage2DPixels GenerateMipmapPixels GenerateMipmapPackedFloatPixels GenerateMipmapDepthPixels)
+            gtest_discover_tests(MobileGLIntegrationTest
+                TEST_PREFIX "DirectVulkan.${mglItestArm}.Fm."
+                TEST_FILTER "F1WireScenario.${fmSlot}"
+                DISCOVERY_TIMEOUT 30
+                PROPERTIES
+                    LABELS "${mglItestMagmaLabels}"
+                    TIMEOUT ${MGL_ITEST_TIMEOUT}
+                    ${mglItestArmProperties}
+                    ENVIRONMENT "${mglItestMagmaWireEnvironment}\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p5f-fm${mglItestArmLogTag}-${fmSlot}.log")
+        endforeach()
+        foreach(fmCase ClipDistanceScenario.AnEnabledClipDistanceRemovesTheNegativeHalf
+                       ClipDistanceScenario.ADisabledClipDistanceRemovesNothing
+                       ClipDistanceScenario.TheEnablesAreIndependentPerDistance
+                       CopyImageLayeredScenario.ArrayToArrayCopiesEverySlice
+                       CopyImageLayeredScenario.ArrayToArrayHonoursDifferentLayerOffsets
+                       CopyImageLayeredScenario.VolumeToVolumeHonoursNonZeroZ
+                       CopyImageLayeredScenario.VolumeToVolumeAtNonZeroMipLevel
+                       CopyImageLayeredScenario.ArrayToVolumeCopiesEverySlice
+                       CopyImageLayeredScenario.VolumeToArrayCopiesEverySlice)
+            gtest_discover_tests(MobileGLIntegrationTest
+                TEST_PREFIX "DirectVulkan.${mglItestArm}.Fm."
+                TEST_FILTER "${fmCase}"
+                DISCOVERY_TIMEOUT 30
+                PROPERTIES LABELS "${mglItestMagmaLabels}" TIMEOUT ${MGL_ITEST_TIMEOUT}
+                    ${mglItestArmProperties}
+                    ENVIRONMENT "${mglItestMagmaWireEnvironment}\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p5f-fm${mglItestArmLogTag}-${fmCase}.log")
+        endforeach()
+        # P7 gate 5 (g5-msrbo): the empty-level pair, on the gated Magma lanes as well - the CTS
+        # arm gate 5 measures is inproc x DirectVulkan, and every one of its cases ends in the
+        # empty-level reset this scenario reproduces.
+        foreach(emptyLevelCase TheCtsStateResetDefinesEveryDefaultTargetEmpty
+                               ALevelDefinedEmptyThenRedefinedCarriesTheNewTexels)
+            gtest_discover_tests(MobileGLIntegrationTest
+                TEST_PREFIX "DirectVulkan.${mglItestArm}.Fm."
+                TEST_FILTER "EmptyTextureLevelScenario.${emptyLevelCase}"
+                DISCOVERY_TIMEOUT 30
+                PROPERTIES LABELS "${mglItestMagmaLabels}" TIMEOUT ${MGL_ITEST_TIMEOUT}
+                    ${mglItestArmProperties}
+                    ENVIRONMENT "${mglItestMagmaWireEnvironment}\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p7-emptylevel${mglItestArmLogTag}-${emptyLevelCase}.log")
+        endforeach()
+        # ---- P7 wave 2-B: THE TWO SHADER MIP ARMS, FORCED ------------------------------------
+        #
+        # WHY A KNOB AND NOT A FORMAT. The refusal these two entries cover
+        # (`Magma:mipmap-shader-format-or-shape`) killed two Iris cases on an Adreno 830v2 and
+        # has never once fired on this host, because lavapipe reports BLIT_SRC|BLIT_DST for
+        # every colour format the integration binary can create - so GenerateWireMipmap takes
+        # its NATIVE arm for all of them and neither shader arm is reachable by choosing a
+        # format. `GenerateMipmapPackedFloatPixels` next door looks like it covers the shader
+        # arm and does not: R11F_G11F_B10F blits natively here too.
+        # MGITEST_MAGMA_FORCE_SHADER_MIPMAP drops that arm instead, one tier per shape, so the
+        # host lane exercises the code the device actually runs.
+        #
+        # ITS OWN ENTRIES RATHER THAN A LANE-WIDE FLIP, for the reason the strict-arming entry
+        # gives: the knob changes how EVERY mipmap in the process is generated, so putting it in
+        # the shared Fm environment would silently retarget GenerateMipmapPixels,
+        # GenerateMipmapPackedFloatPixels, GenerateMipmapDepthPixels and the two base/view cases
+        # as well - four green entries that would stop measuring the arm they were written for.
+        # ---- P7 wave 2-B2: A SERVER-SIDE KNOB HAS NO TCP ARM, AND THAT IS STRUCTURAL ---------
+        #
+        # Every MGITEST_MAGMA_FORCE_* knob in this block is read BY THE SERVER
+        # (WireFramebuffer.inc's three `std::getenv` readers run on the apply thread). A ctest
+        # ENVIRONMENT property reaches the process ctest starts - the CLIENT - and the two arms
+        # differ in where the server comes from:
+        #   inproc  the server is a thread of that same process, so it sees the knob;
+        #   spawn   ServerSpawn.cpp copies ::environ into the child, so it sees the knob;
+        #   tcp     the server is the LANE-WIDE TcpServer.Start fixture, started once from the
+        #           fixture's own os.environ (scripts/ci/tcp_server_fixture.py) long before any
+        #           case runs, and it forks a session child per Hello. Nothing a per-test
+        #           ENVIRONMENT says can reach it.
+        #
+        # So a tcp copy of a knob entry does not exercise the arm it names - it runs the
+        # DEFAULT arm under a name that claims otherwise, which for ShaderMip is precisely what
+        # that case's own skip message says must not happen ("this case would assert the native
+        # blit twice over"). MEASURED, not deduced: a temporary fatal in each of the three
+        # readers killed all five knob=1 entries on split and on spawn and left ALL FIVE GREEN
+        # on tcp.
+        #
+        # Registering them on split+spawn only is therefore a coverage statement, not a gap, and
+        # it is NAMED in scripts/ci/spawn_lane_parity.py (MAGMA_SERVER_ENV_KNOB_NO_TCP) the way
+        # MAGMA_INPROC_ONLY and MONOLITH_ONLY are, so the parity gate keeps its teeth for
+        # everything else. The knob=0 twins (DefaultBlitShape0, MsResolve0) DO stay on tcp: zero
+        # is the default, so those entries mean the same thing on all three arms.
+        #
+        # Making the tcp lane able to carry these would need the fixture to take a per-case
+        # server environment - a supervisor control, not a ctest property - and that is a debt,
+        # recorded in notes/p7/magma-b2.md §6.
+        set(mglItestServerEnvKnobArm TRUE)
+        if(mglItestArm STREQUAL "Tcp")
+            set(mglItestServerEnvKnobArm FALSE)
+        endif()
+        foreach(shaderMipTier 1 2)
+            if(NOT mglItestServerEnvKnobArm)
+                continue()
+            endif()
+            gtest_discover_tests(MobileGLIntegrationTest
+                TEST_PREFIX "DirectVulkan.${mglItestArm}.ShaderMip${shaderMipTier}."
+                TEST_FILTER "F1WireScenario.GenerateMipmapWithoutNativeBlitPixels"
+                DISCOVERY_TIMEOUT 30
+                PROPERTIES LABELS "${mglItestMagmaLabels}" TIMEOUT ${MGL_ITEST_TIMEOUT}
+                    ${mglItestArmProperties}
+                    ENVIRONMENT "${mglItestMagmaWireEnvironment}\;MGITEST_MAGMA_FORCE_SHADER_MIPMAP=${shaderMipTier}\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p7-shadermip${mglItestArmLogTag}-tier${shaderMipTier}.log")
+        endforeach()
+        # The DEPTH half of the same knob (CONTRACT-P7 §5.1 (A)). ONE TIER, not two: the depth
+        # pass renders into a depth ATTACHMENT view of the destination level, which a depth
+        # image always has usage for - there is no "cannot be attached" shape to force, so
+        # tier 2 would register a second copy of tier 1's run. Split+spawn only, for the
+        # server-side-knob reason above.
+        if(mglItestServerEnvKnobArm)
         gtest_discover_tests(MobileGLIntegrationTest
-            TEST_PREFIX "DirectGLES.Split.F1."
-            TEST_FILTER "F1WireScenario.${f1Slot}Pixels"
+            TEST_PREFIX "DirectVulkan.${mglItestArm}.DepthMip."
+            TEST_FILTER "F1WireScenario.GenerateMipmapDepthWithoutNativeBlitPixels"
             DISCOVERY_TIMEOUT 30
-            PROPERTIES
-                LABELS "integration-split"
+            PROPERTIES LABELS "${mglItestMagmaLabels}" TIMEOUT ${MGL_ITEST_TIMEOUT}
+                ${mglItestArmProperties}
+                ENVIRONMENT "${mglItestMagmaWireEnvironment}\;MGITEST_MAGMA_FORCE_SHADER_MIPMAP=1\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p7-depthmip${mglItestArmLogTag}.log")
+        endif()
+        # NO KNOB on the decline: it is decided on the aspect before the blit-support question
+        # is asked, so the plain Fm environment reaches it on every driver.
+        gtest_discover_tests(MobileGLIntegrationTest
+            TEST_PREFIX "DirectVulkan.${mglItestArm}.Fm."
+            TEST_FILTER "F1WireScenario.GenerateMipmapDepthStencilDeclinesAndKeepsTheSession"
+            DISCOVERY_TIMEOUT 30
+            PROPERTIES LABELS "${mglItestMagmaLabels}" TIMEOUT ${MGL_ITEST_TIMEOUT}
+                ${mglItestArmProperties}
+                ENVIRONMENT "${mglItestMagmaWireEnvironment}\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p7-dsmipdecline${mglItestArmLogTag}.log")
+        # `copy-image-in-place@P7`'s retirement and its one surviving decline. SPLIT-ONLY in the
+        # strongest sense: the monolith arm declines every in-place copy, so there is no
+        # DirectVulkan. entry to register these beside - the wire arm is the one that performs
+        # them, which is what §3.2 asks for.
+        # ---- P7 wave 2-B, EXIT GATE 3: the readback must not depend on how long a pipeline
+        # takes to create. --------------------------------------------------------------------
+        #
+        # The Redmi's OpenRA divergence reproduces only with a COLD driver pipeline cache (three
+        # cleared-cache runs: a bit-identical ssim 0.976494 / 14658 mismatched pixels; warm:
+        # 1.000000 from the second run on). What a cold cache changes is how long
+        # vkCreateGraphicsPipelines takes on the apply thread, and
+        # MOBILEGL_TEST_PIPELINE_CREATE_DELAY_MS buys that time on a host whose cache is warm.
+        #
+        # THESE ENTRIES ARE A REGRESSION GATE, NOT THE REPRODUCTION. The delay alone does NOT
+        # make lavapipe diverge, and the reason is in WireFramebuffer.inc's
+        # RecordWireReadbackWriteBarrier: the host's default framebuffer is tracked as
+        # VK_IMAGE_LAYOUT_GENERAL at the readback, which takes GetImageTransitionSourceState's
+        # `default:` arm (ALL_COMMANDS / MEMORY_WRITE) and orders the copy by accident. What these
+        # entries do pin is that a readback which follows a draw still returns that draw's pixels
+        # when every pipeline creation on the path costs 25 ms - i.e. that the answer does not
+        # move with timing.
+        foreach(pipelineDelayCase VertexIdSamplerAndScalarUniformPixels
+                                  ComputeImageStoreFramebufferPixels
+                                  GenerateMipmapPixels)
+            gtest_discover_tests(MobileGLIntegrationTest
+                TEST_PREFIX "DirectVulkan.${mglItestArm}.PipelineDelay."
+                TEST_FILTER "F1WireScenario.${pipelineDelayCase}"
+                DISCOVERY_TIMEOUT 30
+                PROPERTIES LABELS "${mglItestMagmaLabels}" TIMEOUT ${MGL_ITEST_TIMEOUT}
+                    ${mglItestArmProperties}
+                    ENVIRONMENT "${mglItestMagmaWireEnvironment}\;MOBILEGL_TEST_PIPELINE_CREATE_DELAY_MS=25\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p7-pipelinedelay${mglItestArmLogTag}-${pipelineDelayCase}.log")
+        endforeach()
+        # ---- P7 wave 2 package B3, EXIT GATE 3: the streamed `glBufferSubData -> draw` pair.
+        #
+        # TWO ENTRIES OVER ONE CASE, for the reason the ShaderMip pair gives. The plain entry is
+        # a regression gate that runs on every driver. The forced entry is the red-once of the
+        # DEFENCE term: it makes the serial half of VkBufferManager's busy predicate answer
+        # "idle" - the state an unsound completed-serial floor put the wire arm into on the
+        # device - so only the submission-fence half is left to order the copy. It does NOT
+        # cover the floor fix itself (forcing the serial term bypasses the floor entirely); the
+        # floor's lane is the OpenRA split retrace, which run_trace_case.cmake reds on any
+        # "MGWIRE-FLOOR unsound-serial-complete" line.
+        #
+        # ITS OWN ENTRY RATHER THAN A LANE-WIDE FLIP: the knob changes how EVERY streamed buffer
+        # write in the process is answered, so putting it in the shared Fm environment would
+        # retarget every other draw case in this lane.
+        gtest_discover_tests(MobileGLIntegrationTest
+            TEST_PREFIX "DirectVulkan.${mglItestArm}.Fm."
+            TEST_FILTER "F1WireScenario.StreamedBufferSubDataBeforeEachDrawIsOrdered"
+            DISCOVERY_TIMEOUT 30
+            PROPERTIES LABELS "${mglItestMagmaLabels}" TIMEOUT ${MGL_ITEST_TIMEOUT}
+                ${mglItestArmProperties}
+                ENVIRONMENT "${mglItestMagmaWireEnvironment}\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p7-streamedsubdata${mglItestArmLogTag}.log")
+        # SPLIT AND SPAWN ONLY - a parity exception, named in scripts/ci/spawn_lane_parity.py
+        # (MAGMA_SERVER_ENV_KNOB_NO_TCP, the same list as the B2 knobs above), not an omission.
+        # The knob is read by the SERVER, and the tcp arm's server is the lane fixture
+        # (scripts/ci/tcp_server_fixture.py) started once from its own environment: an
+        # entry-level ENVIRONMENT never reaches it, so a Tcp.StaleSerial. entry would run the
+        # plain Fm case under a name that claims the knob, and could never red. The inproc arm
+        # hosts the server in the test process and the spawn arm's server inherits the client's
+        # environment, so on those two the knob is real.
+        if(mglItestServerEnvKnobArm)
+            gtest_discover_tests(MobileGLIntegrationTest
+                TEST_PREFIX "DirectVulkan.${mglItestArm}.StaleSerial."
+                TEST_FILTER "F1WireScenario.StreamedBufferSubDataBeforeEachDrawIsOrdered"
+                DISCOVERY_TIMEOUT 30
+                PROPERTIES LABELS "${mglItestMagmaLabels}" TIMEOUT ${MGL_ITEST_TIMEOUT}
+                    ${mglItestArmProperties}
+                    ENVIRONMENT "${mglItestMagmaWireEnvironment}\;MGITEST_MAGMA_FORCE_STALE_BUFFER_SERIAL=1\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p7-streamedsubdata-stale${mglItestArmLogTag}.log")
+        endif()
+        # `default-color-blit-shape@P7`'s retirement. TWO ENTRIES OVER ONE CASE, and the second
+        # is the only way its arm is reachable here: every surface this lane creates reports
+        # VK_SURFACE_TRANSFORM_IDENTITY, so the scratch path that exists FOR rotation would
+        # never run. Forced onto an identity surface it must produce the SAME pixels as the
+        # fall-through, which is what the shared assertions check.
+        # The knob=1 copy is split+spawn only (the server-side-knob note above); knob=0 is the
+        # default and means the same thing on all three arms, so it keeps its tcp entry.
+        foreach(defaultBlitScratch 0 1)
+            if(defaultBlitScratch AND NOT mglItestServerEnvKnobArm)
+                continue()
+            endif()
+            gtest_discover_tests(MobileGLIntegrationTest
+                TEST_PREFIX "DirectVulkan.${mglItestArm}.DefaultBlitShape${defaultBlitScratch}."
+                TEST_FILTER "F1WireScenario.ColorBlitToDefaultFromANonSampleableSourceDegrades"
+                DISCOVERY_TIMEOUT 30
+                PROPERTIES LABELS "${mglItestMagmaLabels}" TIMEOUT ${MGL_ITEST_TIMEOUT}
+                    ${mglItestArmProperties}
+                    ENVIRONMENT "${mglItestMagmaWireEnvironment}\;MGITEST_MAGMA_FORCE_DEFAULT_BLIT_SCRATCH=${defaultBlitScratch}\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p7-defaultblit${mglItestArmLogTag}-scratch${defaultBlitScratch}.log")
+        endforeach()
+        # ---- P7 wave 2-B2: `multisample-blit-shape@P7`'s retirement and its decline ----------
+        #
+        # SPLIT-ONLY, like the in-place copy pair below and for the same reason: the retired arm
+        # does something the monolith arm does not. A scaled multisample colour blit takes the
+        # monolith's `vkCmdResolveImage` at 1:1 into the destination's offset - the scale is
+        # dropped - so there is no `DirectVulkan.` reading to register these beside, and an
+        # equality between the two arms would be an assertion that the wire arm is as wrong.
+        #
+        # NO KNOB: every driver that can host a 4x multisample RGBA8 renderbuffer reaches both
+        # entries with the plain Fm environment, and one that cannot says so as a SKIP.
+        foreach(multisampleBlitCase MultisampleColorBlitScalesAndFlipsThroughTheResolveScratch
+                                    MultisampleBlitOntoAMultisampleDestinationDeclinesAndKeepsTheSession
+                                    MultisampleBlitFromASingleSampleSourceDeclinesAndKeepsTheSession)
+            gtest_discover_tests(MobileGLIntegrationTest
+                TEST_PREFIX "DirectVulkan.${mglItestArm}.MsBlit."
+                TEST_FILTER "F1WireScenario.${multisampleBlitCase}"
+                DISCOVERY_TIMEOUT 30
+                PROPERTIES LABELS "${mglItestMagmaLabels}" TIMEOUT ${MGL_ITEST_TIMEOUT}
+                    ${mglItestArmProperties}
+                    ENVIRONMENT "${mglItestMagmaWireEnvironment}\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p7-msblit${mglItestArmLogTag}-${multisampleBlitCase}.log")
+        endforeach()
+        # ---- P7 wave 2-B2: `multisample-blit-aspect@P7`'s retirement, BOTH ARMS ---------------
+        #
+        # THE CASE IS PROMOTED, NOT WRITTEN. DepthStencilReadbackMatrixScenario already owns the
+        # observable - clear a 4x multisample DEPTH24_STENCIL8 renderbuffer, resolve it into a
+        # single-sampled framebuffer with glBlitFramebuffer, read both aspects back, and check
+        # that a depth-only resolve left the destination's stencil alone and vice versa - and it
+        # already ran on these three arms in the INFORMATIONAL tier (`…Full.`). What it did not
+        # have was a gated entry, which is what CONTRACT-P7 §3.2's aspect row needs.
+        #
+        # TWO ENTRIES OVER ONE CASE, and the second is the only way its arm is reachable here:
+        # lavapipe carries VK_KHR_create_renderpass2 AND VK_KHR_depth_stencil_resolve, so the
+        # extension arm answers every resolve on this host and the shader pass - which exists FOR
+        # the device that has neither, where the session used to end at
+        # `Magma:multisample-depth-resolve-capability` - would never execute.
+        # MGITEST_MAGMA_FORCE_SHADER_DEPTH_RESOLVE drops the extension arm, and the two entries
+        # then assert the same depth values and the same stencil indices, which is the whole
+        # claim: sample zero either way.
+        #
+        # ITS OWN ENTRIES RATHER THAN A LANE-WIDE FLIP, the shader-mip block's reason: the knob
+        # changes how EVERY depth/stencil resolve in the process is performed.
+        foreach(shaderDepthResolve 0 1)
+            # Same split+spawn restriction, same reason, same parity exception: the knob is read
+            # on the server and the tcp server is the lane fixture. MsResolve0 stays everywhere.
+            if(shaderDepthResolve AND NOT mglItestServerEnvKnobArm)
+                continue()
+            endif()
+            # P7 gate 5 (g5-msprobe): MsResolve0 on split and spawn also pins the REAL resolve probe
+            # on this host - it must run at the server's bring-up, find lavapipe's no-draw resolve
+            # render pass clean, and leave that pass first. MGITEST_EXPECT_DEPTH_RESOLVE_PROBE is a
+            # marker only the scenario reads (DepthStencilReadbackMatrixScenario::
+            # ExpectTheResolveArmWhereTheLaneAsks), and only where the server's private log belongs
+            # to the entry - the tcp server is the lane fixture, so its MsResolve0 asserts pixels only.
+            set(msResolveProbeMarker "")
+            if(NOT shaderDepthResolve AND mglItestServerEnvKnobArm)
+                set(msResolveProbeMarker "\;MGITEST_EXPECT_DEPTH_RESOLVE_PROBE=clean")
+            endif()
+            gtest_discover_tests(MobileGLIntegrationTest
+                TEST_PREFIX "DirectVulkan.${mglItestArm}.MsResolve${shaderDepthResolve}."
+                TEST_FILTER "DepthStencilReadbackMatrixScenario.AResolvedMultisampleDepthReadsBackFromTheDestination"
+                DISCOVERY_TIMEOUT 30
+                PROPERTIES LABELS "${mglItestMagmaLabels}" TIMEOUT ${MGL_ITEST_TIMEOUT}
+                    ${mglItestArmProperties}
+                    ENVIRONMENT "${mglItestMagmaWireEnvironment}\;MGITEST_MAGMA_FORCE_SHADER_DEPTH_RESOLVE=${shaderDepthResolve}${msResolveProbeMarker}\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p7-msresolve${mglItestArmLogTag}-shader${shaderDepthResolve}.log")
+        endforeach()
+        # ---- P7 gate 5 (g5-msrbo): the SINGLE-SAMPLED depth/stencil blit ----------------------
+        #
+        # KHR-GL46.direct_state_access.renderbuffers_storage_multisample's samples == 0 leg, every
+        # depth/stencil format: the wire arm moved every single-sample depth/stencil aspect with
+        # vkCmdBlitImage where the monolith copies at 1:1, and for one aspect of a packed format
+        # that moved the whole native word (a depth-only blit replaced the destination's stencil
+        # on lavapipe). NO KNOB: the packed-aspect leg is red on lavapipe without the copy arm
+        # (measured there only - a driver whose one-aspect blit keeps the other aspect stays green
+        # without it), and nothing in it is read on the server, so all three arms carry it.
+        gtest_discover_tests(MobileGLIntegrationTest
+            TEST_PREFIX "DirectVulkan.${mglItestArm}.DsBlit."
+            TEST_FILTER "DepthStencilReadbackMatrixScenario.ASingleSampledDepthStencilBlitCopiesEveryAspect"
+            DISCOVERY_TIMEOUT 30
+            PROPERTIES LABELS "${mglItestMagmaLabels}" TIMEOUT ${MGL_ITEST_TIMEOUT}
+                ${mglItestArmProperties}
+                ENVIRONMENT "${mglItestMagmaWireEnvironment}\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p7-dsblit${mglItestArmLogTag}.log")
+        # P7 wave 2-B2 (review round): a FLIPPED multisample depth/stencil resolve is a legal blit
+        # that used to end the session, and a SCALED one is INVALID_OPERATION that used to end it
+        # too. Both shapes are decided on the rectangles, before any capability question, so this
+        # entry needs NO knob and runs on all three arms.
+        gtest_discover_tests(MobileGLIntegrationTest
+            TEST_PREFIX "DirectVulkan.${mglItestArm}.MsFlip."
+            TEST_FILTER "DepthStencilReadbackMatrixScenario.AFlippedMultisampleResolveMirrorsTheBandsAndAScaleDeclines"
+            DISCOVERY_TIMEOUT 30
+            PROPERTIES LABELS "${mglItestMagmaLabels}" TIMEOUT ${MGL_ITEST_TIMEOUT}
+                ${mglItestArmProperties}
+                ENVIRONMENT "${mglItestMagmaWireEnvironment}\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p7-msflip${mglItestArmLogTag}.log")
+        # ITS KNOB TWIN (review round 2). Knob-free, lavapipe answers every resolve through the
+        # VK_KHR_depth_stencil_resolve arm, so the shader arm's min-corner rectangle under a
+        # flip - the device WITHOUT the extension - never ran. MsFlip1 forces it. Split+spawn
+        # only, the server-side-knob reason above, named in spawn_lane_parity.py's
+        # MAGMA_SERVER_ENV_KNOB_NO_TCP; the knob-free MsFlip. keeps all three arms.
+        if(mglItestServerEnvKnobArm)
+            gtest_discover_tests(MobileGLIntegrationTest
+                TEST_PREFIX "DirectVulkan.${mglItestArm}.MsFlip1."
+                TEST_FILTER "DepthStencilReadbackMatrixScenario.AFlippedMultisampleResolveMirrorsTheBandsAndAScaleDeclines"
+                DISCOVERY_TIMEOUT 30
+                PROPERTIES LABELS "${mglItestMagmaLabels}" TIMEOUT ${MGL_ITEST_TIMEOUT}
+                    ${mglItestArmProperties}
+                    ENVIRONMENT "${mglItestMagmaWireEnvironment}\;MGITEST_MAGMA_FORCE_SHADER_DEPTH_RESOLVE=1\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p7-msflip${mglItestArmLogTag}-shader1.log")
+        endif()
+        # ---- P7 gate 5 (g5-msrbo review round, g5-msprobe): THE DEFECT'S ARM ORDER, ON A HOST --
+        #
+        # What made KHR-GL46.direct_state_access.renderbuffers_storage_multisample pass on the
+        # Redmi is an arm ORDER: where the server's resolve probe measures the no-draw
+        # VK_KHR_depth_stencil_resolve render pass leaving its target unwritten (the Adreno 830's
+        # does) ResolveWireDepthStencil takes the shader pass first. Lavapipe resolves correctly
+        # through both arms - its probe verdict is clean, which MsResolve0 above pins - so no
+        # pixel on this host can see the order. MGITEST_MAGMA_DEPTH_RESOLVE_PROBE=bug replaces the
+        # probe's MEASUREMENT with a canned "the render pass wrote nothing, the shader control
+        # resolved" one (VulkanRenderer::ArmWireDepthResolveOrder) - nothing else reads it - and the
+        # two resolve cases then assert their pixels AND that the server's private log says the
+        # verdict was the defect, the shader pass resolved and the render pass never did
+        # (DepthStencilReadbackMatrixScenario::ExpectTheResolveArmWhereTheLaneAsks, which asserts
+        # the same of the MsResolve1./MsFlip1. entries above).
+        #
+        # Split+spawn only, the server-side-knob reason above, named in spawn_lane_parity.py's
+        # MAGMA_SERVER_ENV_KNOB_NO_TCP.
+        #
+        # Red once (executed, reverted): EvaluateWireDepthResolveProbe (WireDepthResolveArm.h)
+        # answering Clean for every measurement - the probe's detection switched off - fails all
+        # four entries on the arm assertions with their pixels green.
+        if(mglItestServerEnvKnobArm)
+            foreach(probeBugCase MsResolveBug:AResolvedMultisampleDepthReadsBackFromTheDestination
+                                 MsFlipBug:AFlippedMultisampleResolveMirrorsTheBandsAndAScaleDeclines)
+                string(REPLACE ":" ";" probeBugPair "${probeBugCase}")
+                list(GET probeBugPair 0 probeBugTail)
+                list(GET probeBugPair 1 probeBugTest)
+                string(TOLOWER "${probeBugTail}" probeBugLog)
+                gtest_discover_tests(MobileGLIntegrationTest
+                    TEST_PREFIX "DirectVulkan.${mglItestArm}.${probeBugTail}."
+                    TEST_FILTER "DepthStencilReadbackMatrixScenario.${probeBugTest}"
+                    DISCOVERY_TIMEOUT 30
+                    PROPERTIES LABELS "${mglItestMagmaLabels}" TIMEOUT ${MGL_ITEST_TIMEOUT}
+                        ${mglItestArmProperties}
+                        ENVIRONMENT "${mglItestMagmaWireEnvironment}\;MGITEST_MAGMA_DEPTH_RESOLVE_PROBE=bug\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p7-${probeBugLog}${mglItestArmLogTag}.log")
+            endforeach()
+        endif()
+        # ---- P7 gate 5 (g5-msprobe critic): THE REAL PROBE'S NEGATIVE CONTROL ------------------
+        #
+        # The Bug entries above hand the arm choice a CANNED measurement, and MsResolve0 only pins
+        # lavapipe's clean answer, so no entry could see the REAL probe (WireDepthResolveProbe.cpp -
+        # its recording, readback and tally) stop detecting a render pass that writes nothing.
+        # MGITEST_MAGMA_DEPTH_RESOLVE_PROBE=elide-subject runs the real probe with its render-pass
+        # resolve left unrecorded - the subject's target keeps the sentinel, the Adreno 830's
+        # reading - while the shader control runs as always. The entry asserts the case's pixels,
+        # that the real measurement reports verdict=render-pass-resolve-broken with a reading whose
+        # render pass kept the sentinel beside a resolving control, and that the shader pass
+        # resolved and the render pass never did
+        # (DepthStencilReadbackMatrixScenario::ExpectTheResolveArmWhereTheLaneAsks).
+        #
+        # Split+spawn only, the server-side-knob reason above, named in spawn_lane_parity.py's
+        # MAGMA_SERVER_ENV_KNOB_NO_TCP.
+        #
+        # Red once (executed, reverted): EvaluateWireDepthResolveProbe answering Clean for every
+        # measurement fails both entries; the probe's subject tally counting every texel as
+        # resolved fails both entries while the four Bug entries stay green.
+        if(mglItestServerEnvKnobArm)
+            gtest_discover_tests(MobileGLIntegrationTest
+                TEST_PREFIX "DirectVulkan.${mglItestArm}.MsResolveElide."
+                TEST_FILTER "DepthStencilReadbackMatrixScenario.AResolvedMultisampleDepthReadsBackFromTheDestination"
+                DISCOVERY_TIMEOUT 30
+                PROPERTIES LABELS "${mglItestMagmaLabels}" TIMEOUT ${MGL_ITEST_TIMEOUT}
+                    ${mglItestArmProperties}
+                    ENVIRONMENT "${mglItestMagmaWireEnvironment}\;MGITEST_MAGMA_DEPTH_RESOLVE_PROBE=elide-subject\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p7-msresolveelide${mglItestArmLogTag}.log")
+        endif()
+        foreach(inPlaceCase CopyImageInPlaceAcrossLevelsAndLayers
+                            CopyImageInPlaceOverlapDeclinesAndLeavesTheLevelAlone)
+            gtest_discover_tests(MobileGLIntegrationTest
+                TEST_PREFIX "DirectVulkan.${mglItestArm}.CopyInPlace."
+                TEST_FILTER "F1WireScenario.${inPlaceCase}"
+                DISCOVERY_TIMEOUT 30
+                PROPERTIES LABELS "${mglItestMagmaLabels}" TIMEOUT ${MGL_ITEST_TIMEOUT}
+                    ${mglItestArmProperties}
+                    ENVIRONMENT "${mglItestMagmaWireEnvironment}\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p7-copyinplace${mglItestArmLogTag}-${inPlaceCase}.log")
+        endforeach()
+        # ---- P7 gate 5 (g5-imgwin): the image-unit window ------------------------------------
+        #
+        # KHR-GL46.shader_image_load_store.incomplete_textures ended the inproc Redmi run at
+        # Fatal{UnmigratedVerb, "Magma:image-view-window"}: the unit named level 2 of a texture
+        # with only level 0, a monolith Fail turned into a SIGABRT. GL 4.6 core 8.26 makes that
+        # access invalid - zero loads, dropped stores - and the wire descriptor resolve now binds a
+        # null storage descriptor for it where the device enables VK_EXT_robustness2 nullDescriptor,
+        # else a placeholder private to the unit (UniformManager::ResolveWireImageDescriptor and
+        # ResolveWirePlaceholderImage). One entry per case for the private log path; NO KNOB,
+        # so all three arms. The monolith `DirectVulkan.` entry of the same scenario skips by
+        # name (it drops the draw: the gate 5 BASE, and a pull-build .text change to move).
+        # ALevelPastATextureViewsWindowReadsZero joined once the F2 repair retired the transport
+        # glTextureView death (see the split-arm registration of this scenario).
+        foreach(imageWindowCase AMissingMipLevelOfAnIncompleteTextureReadsZeroInADraw
+                                AMissingMipLevelOfAnIncompleteTextureReadsZeroInADispatch
+                                ALevelPastAnImmutableTexturesStorageReadsZero
+                                ALayerPastAnArraysLastSliceReadsZero
+                                ATextureWithNoStorageReadsZero
+                                ALevelPastATextureViewsWindowReadsZero
+                                AStoreThroughAnInvalidUnitIsLoadedThroughNeitherAnotherInvalidUnitNorItself
+                                AStoreThroughAnEmptyUnitIsLoadedThroughNeitherAnotherEmptyUnitNorItself)
+            gtest_discover_tests(MobileGLIntegrationTest
+                TEST_PREFIX "DirectVulkan.${mglItestArm}.ImageUnitWindow."
+                TEST_FILTER "InvalidImageUnitScenario.${imageWindowCase}"
+                DISCOVERY_TIMEOUT 30
+                PROPERTIES LABELS "${mglItestMagmaLabels}" TIMEOUT ${MGL_ITEST_TIMEOUT}
+                    ${mglItestArmProperties}
+                    ENVIRONMENT "${mglItestMagmaWireEnvironment}\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p7-imagewindow${mglItestArmLogTag}-${imageWindowCase}.log")
+        endforeach()
+        # ---- Codex closeout finding 2 (cf-magma): THE ARM WITHOUT A NULL DESCRIPTOR -----------
+        #
+        # The two AStoreThrough... cases above run the null-descriptor arm on this host: lavapipe
+        # enables VK_EXT_robustness2 nullDescriptor, so an invalid or empty storage unit binds a
+        # null descriptor. A device without it binds a placeholder PRIVATE to the unit (per shape)
+        # instead; MGITEST_MAGMA_FORCE_PRIVATE_IMAGE_PLACEHOLDER=1 puts the server on that arm
+        # (UniformManager::SetWireInvalidStorageImageArm), and the client reads the same marker to
+        # expect it: B's load zero (no alias), A's own load of its store = the recorded CONTRACT-P7
+        # §12 residual, which is also what proves the knob reached the server.
+        #
+        # Split+spawn only, the server-side-knob reason above, named in spawn_lane_parity.py's
+        # MAGMA_SERVER_ENV_KNOB_NO_TCP.
+        if(mglItestServerEnvKnobArm)
+            foreach(privateCase AStoreThroughAnInvalidUnitIsLoadedThroughNeitherAnotherInvalidUnitNorItself
+                                AStoreThroughAnEmptyUnitIsLoadedThroughNeitherAnotherEmptyUnitNorItself)
+                gtest_discover_tests(MobileGLIntegrationTest
+                    TEST_PREFIX "DirectVulkan.${mglItestArm}.ImageUnitPrivate."
+                    TEST_FILTER "InvalidImageUnitScenario.${privateCase}"
+                    DISCOVERY_TIMEOUT 30
+                    PROPERTIES LABELS "${mglItestMagmaLabels}" TIMEOUT ${MGL_ITEST_TIMEOUT}
+                        ${mglItestArmProperties}
+                        ENVIRONMENT "${mglItestMagmaWireEnvironment}\;MGITEST_MAGMA_FORCE_PRIVATE_IMAGE_PLACEHOLDER=1\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p7-imageprivate${mglItestArmLogTag}-${privateCase}.log")
+            endforeach()
+        endif()
+    endforeach()
+endif()
+
+# P7 gate 5 (g5-readback): BANDED READBACK ON MAGMA, all three arms, GATED. The flavour is the
+# one the device CTS window ran KHR-GL46 under (role-split state, strict errors, run-ahead), so the
+# host lane measures the configuration that aborted on the Redmi with
+# Fatal{ReplyTooLarge, "ReadPixels 256x512 0x1908/0x1406 2097152 > 2097136"}. One entry per case
+# for a private log each - two processes append to it on the spawn arm.
+if (MOBILEGL_BUILD_DISAGGREGATED)
+    set(MGL_ITEST_MAGMA_BAND_FLAVOUR_ENV
+        "MOBILEGL_BACKEND_TYPE=DirectVulkan"
+        "MOBILEGL_IPC_ROLE_SPLIT_STATE=1" "MOBILEGL_IPC_STRICT_ERRORS=1" "MOBILEGL_IPC_RUN_AHEAD=1"
+        "MOBILEGL_ITEST_REQUIRE_GPU=1" "MGITEST_SPLIT_LANE=1"
+        ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_VULKAN_ENV})  # the ICD pin, see the Fm lane above
+    foreach(mglItestArm IN LISTS MGL_ITEST_MAGMA_ARMS)
+        mgl_itest_magma_arm_shape(${mglItestArm})
+        mgl_itest_join_environment(mglItestMagmaBandEnvironment
+            ${MGL_ITEST_MAGMA_BAND_FLAVOUR_ENV} ${mglItestArmTransportEnv})
+        foreach(bandCase RenderbufferReadOfExactlyTwoMiBIsBandedNotRefused
+                         TwoMiBPlusOneRowIsBanded
+                         AReadLargerThanTheWholeReplySegmentIsBanded
+                         BandedReadsHonourPackAlignmentRowLengthAndSkips
+                         BandedReadIntoAPixelPackBufferKeepsItsPadding
+                         BandedDepthAndDepthStencilReads
+                         GetTexImageLargerThanAReplySlotIsWindowed)
+            gtest_discover_tests(MobileGLIntegrationTest
+                TEST_PREFIX "DirectVulkan.${mglItestArm}.Band."
+                TEST_FILTER "BandedReadbackScenario.${bandCase}"
+                DISCOVERY_TIMEOUT 30
+                PROPERTIES LABELS "${mglItestMagmaLabels}" TIMEOUT ${MGL_ITEST_TIMEOUT}
+                    ${mglItestArmProperties}
+                    ENVIRONMENT "${mglItestMagmaBandEnvironment}\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/g5-band${mglItestArmLogTag}-${bandCase}.log")
+        endforeach()
+    endforeach()
+endif()
+
+# Magma application buffers: public GL pixels/bytes, with the two role blocks and
+# strict field checks forced on. Existing public scenarios supply offset, mutation,
+# persistent-map, growth and indirect coverage; no copied backend implementation.
+if (MOBILEGL_BUILD_DISAGGREGATED)
+    set(MGL_ITEST_MAGMA_BUFFER_FLAVOUR_ENV
+        "MOBILEGL_BACKEND_TYPE=DirectVulkan"
+        "MOBILEGL_IPC_ROLE_SPLIT_STATE=1" "MOBILEGL_IPC_STRICT_ERRORS=1"
+        "MOBILEGL_IPC_ADOPT_TIER=2" "MGITEST_PERSISTENT_MAP_ARM=emulated"
+        "MOBILEGL_ITEST_REQUIRE_GPU=1" "MGITEST_SPLIT_LANE=1"
+        ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_VULKAN_ENV})  # the ICD pin, see the Fm lane above
+    foreach(mglItestArm IN LISTS MGL_ITEST_MAGMA_ARMS)
+    mgl_itest_magma_arm_shape(${mglItestArm} buffers)
+    mgl_itest_join_environment(MGL_ITEST_MAGMA_BUFFER_ENVIRONMENT
+        ${MGL_ITEST_MAGMA_BUFFER_FLAVOUR_ENV} ${mglItestArmTransportEnv})
+    foreach(bufferCase
+            F1WireScenario.EnabledVertexBufferDrawKeepsNamedP7Fatal
+            F1WireScenario.UniformBufferRangeAndRebindPixels
+            F1WireScenario.ShortUniformBufferRangePadsMissingBytes
+            F1WireScenario.SubWordUniformBufferRangePadsMissingBytes
+            F1WireScenario.UnalignedAtomicCounterRangeDeclinesAndTheSessionLives
+            F1WireScenario.ComputeWrittenVertexAndIndexBuffersDrawAndReadBack
+            F1WireScenario.ColorBlitToDefaultIgnoresViewportAndPreservesOrientation
+            F1WireScenario.ColorBlitToDefaultHonorsScissorAndReversedRect
+            IndexedDrawFamilyScenario.AnElementBufferDrawElementsOffsetSelectsTheRightQuad
+            IndexedDrawFamilyScenario.DrawElementsBaseVertexMovesTheSameIndicesToTheOtherQuad
+            IndexedDrawFamilyScenario.DrawRangeElementsDrawsTheRangedRun
+            IndexedDrawFamilyScenario.DrawElementsInstancedBaseVertexPaintsOneQuadPerInstance
+            IndexedDrawFamilyScenario.MultiDrawElementsBaseVertexPaintsEverySubDraw
+            IndexedDrawFamilyScenario.MultiDrawElementsIndirectDrawsFromTheIndirectBuffer
+            CrossFrameBufferScenario.VertexBufferSubData
+            CrossFrameBufferScenario.IndexBufferSubData
+            CrossFrameBufferScenario.VertexOrphanAndReupload
+            CrossFrameBufferScenario.IndexOrphanAndReupload
+            PersistentCoherentMapScenario.TwoWritesThroughTheCoherentPointerEachReachTheirOwnDraw
+            PersistentCoherentMapScenario.AWriteAfterAFrameBoundaryReachesTheNextFramesDraw
+            StorageBufferRegrowScenario.AGrownStoreIsVisibleThroughItsExistingIndexedBinding)
+        gtest_discover_tests(MobileGLIntegrationTest
+            TEST_PREFIX "DirectVulkan.${mglItestArm}.Buffers."
+            TEST_FILTER "${bufferCase}"
+            DISCOVERY_TIMEOUT 30
+            PROPERTIES LABELS "${mglItestMagmaLabels}"
                 TIMEOUT ${MGL_ITEST_TIMEOUT}
-                ENVIRONMENT "${MGL_ITEST_GLES_SPLIT_ENVIRONMENT}\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p5b-f1-${f1Slot}.log"
-        )
+                ${mglItestArmProperties}
+                ENVIRONMENT "${MGL_ITEST_MAGMA_BUFFER_ENVIRONMENT}\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/magma-buffers${mglItestArmLogTag}-${bufferCase}.log")
+    endforeach()
+    endforeach()
+endif()
+
+# Real Magma run-ahead, including client lead and present-credit backpressure.
+# The test fixture requires an actually armed production session; a missing cap
+# fails rather than turning this dedicated lane into a skip or a lockstep pass.
+if (MOBILEGL_BUILD_DISAGGREGATED)
+    target_sources(MobileGLIntegrationTest PRIVATE Scenarios/MagmaRunAheadScenario.cpp)
+    # P7 package L: THE INPROC ARM ALONE, AND IT IS A PROPERTY OF THE SCENARIO, NOT A GAP.
+    # MagmaRunAheadScenario::HoldNextBatch arms the hold through
+    # ServerLoopInstance().SetBeforeRetireHookForTesting (Harness/SplitRuntimePeek.cpp:43-50) -
+    # a hook on THIS PROCESS's server loop. Under spawn or tcp the server loop is in another
+    # process, so the hook is installed on a loop that never runs and the wait times out with
+    # "the clear waited for apply instead of returning while its server batch was held".
+    # MEASURED, not assumed: registering all three arms made all 14 entries red on both new
+    # arms, with that sentence and no Fatal in either role log. An entry that cannot pass for a
+    # reason that is not the subject of its lane is the mirror image of R-16's rule, and this
+    # file already keeps four DirectGLES lanes (DualBlock, StrictProgramArm, PersistentMapArm,
+    # StrictArming) on one arm for exactly this reason. The two-process reading of run-ahead
+    # needs a cross-process hold - a server-side knob, not a function pointer - and that is
+    # named in this package's report as a debt rather than left as a red nobody can act on.
+    foreach(credit 1 3)
+      foreach(mglItestArm IN ITEMS Split)
+        mgl_itest_magma_arm_shape(${mglItestArm} runahead)
+        mgl_itest_join_environment(MGL_ITEST_MAGMA_RUNAHEAD_ENVIRONMENT
+            "MOBILEGL_BACKEND_TYPE=DirectVulkan"
+            "MOBILEGL_IPC_ROLE_SPLIT_STATE=1" "MOBILEGL_IPC_STRICT_ERRORS=1"
+            "MOBILEGL_IPC_RUN_AHEAD=1" "MOBILEGL_IPC_PRESENT_CREDIT=${credit}"
+            "MOBILEGL_IPC_SPIN_US=0" "MOBILEGL_IPC_ADOPT_TIER=2"
+            "MGITEST_MAGMA_RUNAHEAD_LANE=1" "MGITEST_SPLIT_LANE=1"
+            "MOBILEGL_ITEST_REQUIRE_GPU=1"
+            ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_VULKAN_ENV}  # the ICD pin, see the Fm lane
+            ${mglItestArmTransportEnv})
+        foreach(runAheadCase
+                QueuedBufferVersionsAndDeletedNameReuseKeepTheirPixels
+                QueuedProgramRebindsKeepEachUniformSnapshot
+                QueuedGpuWritesReadBackTheLastDispatchBytes
+                MixedNativeAndConvertedGpuVertexStreamsKeepTheirReservation
+                TextureUploadCannotOvertakeThePreviouslyQueuedDraw
+                GpuClearSurvivesTheFirstStorageImageUpgrade
+                PresentCreditActuallyParksTheClientAtItsConfiguredLimit)
+            gtest_discover_tests(MobileGLIntegrationTest
+                TEST_PREFIX "DirectVulkan.${mglItestArm}.RunAhead.Credit${credit}."
+                TEST_FILTER "MagmaRunAheadScenario.${runAheadCase}"
+                DISCOVERY_TIMEOUT 30
+                PROPERTIES LABELS "${mglItestMagmaLabels}"
+                    TIMEOUT ${MGL_ITEST_TIMEOUT}
+                    ${mglItestArmProperties}
+                    ENVIRONMENT "${MGL_ITEST_MAGMA_RUNAHEAD_ENVIRONMENT}\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/magma-runahead${mglItestArmLogTag}-credit${credit}-${runAheadCase}.log")
+        endforeach()
+      endforeach()
+    endforeach()
+endif()
+
+# Magma wire caches: exact view/attachment identity across public GL mutations.
+# Split-only source preserves pull discovery; generic split-build registrations
+# retain these names but skip outside this dedicated, strict inproc environment.
+if (MOBILEGL_BUILD_DISAGGREGATED)
+    target_sources(MobileGLIntegrationTest PRIVATE Scenarios/MagmaWireCacheScenario.cpp)
+    set(MGL_ITEST_MAGMA_CACHES_FLAVOUR_ENV
+        "MOBILEGL_BACKEND_TYPE=DirectVulkan"
+        "MOBILEGL_IPC_ROLE_SPLIT_STATE=1" "MOBILEGL_IPC_STRICT_ERRORS=1"
+        "MOBILEGL_IPC_RUN_AHEAD=1" "MOBILEGL_IPC_PRESENT_CREDIT=3"
+        "MOBILEGL_IPC_SPIN_US=0" "MOBILEGL_IPC_ADOPT_TIER=2"
+        "MGITEST_MAGMA_CACHES_LANE=1" "MGITEST_SPLIT_LANE=1"
+        "MOBILEGL_ITEST_REQUIRE_GPU=1"
+        ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_VULKAN_ENV})  # the ICD pin, see the Fm lane above
+    # P7 package L: THE INPROC ARM ALONE, for the run-ahead lane's reason one step more
+    # explicit - MagmaWireCacheScenario::SetUp asserts `runtime.transportName == "inproc"`
+    # outright (MagmaWireCacheScenario.cpp:53), because the whole lane reads the SERVER's own
+    # view and attachment identity out of this process. MEASURED: all 7 entries red on both new
+    # arms with `Which is: "non-monolith" ... "inproc"` and no Fatal in either role log.
+    foreach(mglItestArm IN ITEMS Split)
+    mgl_itest_magma_arm_shape(${mglItestArm} caches)
+    mgl_itest_join_environment(MGL_ITEST_MAGMA_CACHES_ENVIRONMENT
+        ${MGL_ITEST_MAGMA_CACHES_FLAVOUR_ENV} ${mglItestArmTransportEnv})
+    foreach(cacheCase
+            SamplerSwizzleAtoBtoAKeepsEachQueuedPixel
+            SamplerRespecifyKeepsOldAndNewNativeImages
+            SamplerViewsDistinguishMipLayerAndViewType
+            FramebuffersAtoBtoAKeepDistinctAttachments
+            FramebufferReattachmentDistinguishesMipAndLayer
+            FramebufferSrgbPolicyAtoBtoAUsesDistinctFormats
+            FramebufferRespecifyRebindsTheNewNativeImage)
+        gtest_discover_tests(MobileGLIntegrationTest
+            TEST_PREFIX "DirectVulkan.${mglItestArm}.Caches."
+            TEST_FILTER "MagmaWireCacheScenario.${cacheCase}"
+            DISCOVERY_TIMEOUT 30
+            PROPERTIES LABELS "${mglItestMagmaLabels}"
+                TIMEOUT ${MGL_ITEST_TIMEOUT}
+                ${mglItestArmProperties}
+                ENVIRONMENT "${MGL_ITEST_MAGMA_CACHES_ENVIRONMENT}\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/magma-caches${mglItestArmLogTag}-${cacheCase}.log")
+    endforeach()
+    endforeach()
+endif()
+
+# =====================================================================================
+# P7 WAVE 2 PACKAGE C: THE `vertex-layout` RETIREMENT (CONTRACT-P7 §3.2)
+# =====================================================================================
+#
+# The source is NOT inside the `if (MOBILEGL_BUILD_DISAGGREGATED)` above, and that is the
+# point of the case pair: the claim is "the wire arm now does what the MONOLITH arm does",
+# so the monolith DirectVulkan arm has to run the very same two cases. The ambient
+# `TEST_PREFIX "DirectVulkan."` discovery near the top of this file picks them up from the
+# target sources with no entry of its own; the three transports are added below.
+target_sources(MobileGLIntegrationTest PRIVATE Scenarios/MagmaVertexLayoutScenario.cpp)
+
+if (MOBILEGL_BUILD_DISAGGREGATED)
+    # The flavour block is the buffers lane's minus the persistent-map knobs, which nothing
+    # here touches. MOBILEGL_BACKEND_TYPE and the ICD pin are the load-bearing pair: without
+    # them the entries run DirectGLES under a DirectVulkan prefix and skip themselves in
+    # SetUp, which reads as six green skips and proves nothing (measured, first cut).
+    set(MGL_ITEST_MAGMA_VERTEXLAYOUT_FLAVOUR_ENV
+        "MOBILEGL_BACKEND_TYPE=DirectVulkan"
+        "MOBILEGL_IPC_ROLE_SPLIT_STATE=1" "MOBILEGL_IPC_STRICT_ERRORS=1"
+        "MOBILEGL_ITEST_REQUIRE_GPU=1" "MGITEST_SPLIT_LANE=1"
+        ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_VULKAN_ENV})
+    # ALL THREE ARMS, unlike the caches and run-ahead lanes above: nothing here reads this
+    # process's server loop, so there is no inproc-only property to declare. The scenario's own
+    # SetUp skips DirectGLES, so a DirectGLES registration would only add three skips.
+    foreach(mglItestArm IN LISTS MGL_ITEST_MAGMA_ARMS)
+    mgl_itest_magma_arm_shape(${mglItestArm} vertexlayout)
+    mgl_itest_join_environment(MGL_ITEST_MAGMA_VERTEXLAYOUT_ENVIRONMENT
+        ${MGL_ITEST_MAGMA_VERTEXLAYOUT_FLAVOUR_ENV} ${mglItestArmTransportEnv})
+    foreach(vertexLayoutCase
+            AnUnmappableVertexFormatDeclinesTheDrawInsteadOfEndingTheSession
+            AnUnreadUnmappableArrayDoesNotStopTheRestOfTheDraw)
+        gtest_discover_tests(MobileGLIntegrationTest
+            TEST_PREFIX "DirectVulkan.${mglItestArm}.VertexLayout."
+            TEST_FILTER "MagmaVertexLayoutScenario.${vertexLayoutCase}"
+            DISCOVERY_TIMEOUT 30
+            PROPERTIES LABELS "${mglItestMagmaLabels}"
+                TIMEOUT ${MGL_ITEST_TIMEOUT}
+                ${mglItestArmProperties}
+                ENVIRONMENT "${MGL_ITEST_MAGMA_VERTEXLAYOUT_ENVIRONMENT}\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/magma-vertexlayout${mglItestArmLogTag}-${vertexLayoutCase}.log")
+    endforeach()
+    endforeach()
+endif()
+
+# =====================================================================================
+# P7 WAVE 4 PACKAGE M2: THE WIRE ARM RECLAIMS ORPHANED BUFFER STORES INSIDE A FRAME
+# =====================================================================================
+#
+# ID-P7-27 / ID-P7-32: bsl-esc-menu-854 delivers one present per replay, and the split server
+# held every orphaned VkBuffer until a frame boundary that never came. The three cases read the
+# server's own wbuf[] gauges (PipeStats.h) off its `MGPipe stats:` line, so the flavour pins the
+# stats channel at one line per swap, and MOBILEGL_IPC_WIRE_DEFERRED_MB=8 keeps the watermark
+# case at 48 MiB of traffic instead of 400.
+#
+# INPROC AND SPAWN ONLY - the ID-P7-14 shape, named in scripts/ci/spawn_lane_parity.py
+# (MAGMA_SERVER_ENV_KNOB_NO_TCP, one tail per case). Both knobs the lane depends on are SERVER-process environment: under inproc
+# and spawn the server inherits this entry's ENVIRONMENT, under tcp the server is the
+# TcpServer.Start supervisor's session child, started once for the whole lane with the fixture's
+# environment - setting the stats channel and an 8 MiB watermark there would change every other
+# tcp entry's server - and its log is not this entry's private server log to read.
+if (MOBILEGL_BUILD_DISAGGREGATED)
+    target_sources(MobileGLIntegrationTest PRIVATE Scenarios/MagmaWireReclaimScenario.cpp)
+    set(MGL_ITEST_MAGMA_RECLAIM_FLAVOUR_ENV
+        "MOBILEGL_BACKEND_TYPE=DirectVulkan"
+        "MOBILEGL_IPC_ROLE_SPLIT_STATE=1" "MOBILEGL_IPC_STRICT_ERRORS=1"
+        "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
+        "MOBILEGL_IPC_WIRE_DEFERRED_MB=8"
+        "MGITEST_MAGMA_RECLAIM_LANE=1"
+        "MOBILEGL_ITEST_REQUIRE_GPU=1" "MGITEST_SPLIT_LANE=1"
+        ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_VULKAN_ENV})  # the ICD pin, see the Fm lane above
+    foreach(mglItestArm IN ITEMS Split Spawn)
+    mgl_itest_magma_arm_shape(${mglItestArm} reclaim)
+    mgl_itest_join_environment(MGL_ITEST_MAGMA_RECLAIM_ENVIRONMENT
+        ${MGL_ITEST_MAGMA_RECLAIM_FLAVOUR_ENV} ${mglItestArmTransportEnv})
+    # Round 2 (ID-P7-43) adds the fourth: the reclaim's own memo hazard. M3 adds the fifth:
+    # fixed-store descriptor churn in a long frame. Both use this private-log fixture and two arms.
+    foreach(reclaimCase
+            RespecifiesWithNoDrawBetweenKeepTheLiveStoreCountBounded
+            RespecifyAndDrawEachStoreInOneFrameStaysWithinTheDeferredBudget
+            ManySmallRespecifyAndDrawRoundsStayUnderTheStoreCountCeiling
+            ADrawAfterTheEarlyReclaimFollowsTheNewStoreNotTheMemoizedHandle
+            DescriptorSetsRewindInsideOneLongFrameAfterTheirSubmitRetires)
+        gtest_discover_tests(MobileGLIntegrationTest
+            TEST_PREFIX "DirectVulkan.${mglItestArm}.Reclaim."
+            TEST_FILTER "MagmaWireReclaimScenario.${reclaimCase}"
+            DISCOVERY_TIMEOUT 30
+            PROPERTIES LABELS "${mglItestMagmaLabels}"
+                TIMEOUT ${MGL_ITEST_TIMEOUT}
+                ${mglItestArmProperties}
+                ENVIRONMENT "${MGL_ITEST_MAGMA_RECLAIM_ENVIRONMENT}\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/magma-reclaim${mglItestArmLogTag}-${reclaimCase}.log")
+    endforeach()
     endforeach()
 endif()
 
@@ -2179,38 +3825,624 @@ endif()
 # case's child truncates whatever path it inherits.
 if (MOBILEGL_BUILD_DISAGGREGATED)
     target_sources(MobileGLIntegrationTest PRIVATE Scenarios/CtWireScenario.cpp)
+    # P7 wave 2 package C adds the fifth: the OQ-10 capability read. It belongs in THIS list
+    # rather than in a buffer lane because the thing it reads is a property of the SESSION -
+    # what the server published at handshake and the client's mirror received - and this list
+    # is the one that is replayed on DirectVulkan by tier 2, so one name here gives the bit a
+    # reading on both backends and all three transports.
     foreach(ctCase ApplierResetCrossesAtThePrimedEdgeInSerialOrder
                    TextureDeathCrossesAndTheRecycledSlotAnswersTheNewObject
                    FramebufferDeathCrossesAndTheRecycledSlotAnswersTheNewObject
+                   TheServerPublishesTheResidentSubDataCapabilityFromItsOwnTable
                    TheDirectApplierResetCallOnTheGLThreadIsRoleViolation)
-        gtest_discover_tests(MobileGLIntegrationTest
-            TEST_PREFIX "DirectGLES.Split.Ct."
-            TEST_FILTER "CtWireScenario.${ctCase}"
-            DISCOVERY_TIMEOUT 30
-            PROPERTIES
-                LABELS "integration-gpu\;integration-split"
-                TIMEOUT ${MGL_ITEST_TIMEOUT}
-                ENVIRONMENT "${MGL_ITEST_GLES_SPLIT_ENVIRONMENT}\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p5c-ct-${ctCase}.log"
-        )
+        mgl_itest_register_split_arms("CtWireScenario.${ctCase}" "Ct.")
     endforeach()
 endif()
 
-# P5b measured named-blit blockers, exercising both backend bound-form lowerings.
+# P5b named-blit cases, now green on both backends after P5f fm's server framebuffer
+# and texture consumers. Keep the backend-specific label: the Magma lane has its own
+# strict + dual-block hard gate, while integration-split keeps the Espryt workset.
+# The separate spelling also avoids ctest's substring label match (see below).
 if (MOBILEGL_BUILD_DISAGGREGATED)
     foreach(namedBlitBackend DirectGLES DirectVulkan)
+        # P7 package L: the Magma half gets the three arms; the Espryt half stays inproc-only,
+        # because its spawn and tcp coverage of this scenario comes from the F1. blocks the
+        # registration macro already emits, and a second copy would only double the count.
+        set(namedBlitArms Split)
+        if (namedBlitBackend STREQUAL "DirectVulkan")
+            set(namedBlitArms ${MGL_ITEST_MAGMA_ARMS})
+        endif()
+        # The ICD pin follows the BACKEND here, not the lane: this block registers both, and
+        # handing VK_ICD_FILENAMES to the DirectGLES half would pin an ICD for a lane that
+        # never opens Vulkan (see the Fm lane above for the ruling).
+        if (namedBlitBackend STREQUAL "DirectVulkan")
+            set(namedBlitBaseEnv ${MGL_ITEST_VULKAN_ENV})
+        else()
+            set(namedBlitBaseEnv ${MGL_ITEST_COMMON_ENV})
+        endif()
+        foreach(mglItestArm IN LISTS namedBlitArms)
+        mgl_itest_magma_arm_shape(${mglItestArm})
         mgl_itest_join_environment(MGL_ITEST_NAMED_BLIT_ENVIRONMENT
-            "MOBILEGL_BACKEND_TYPE=${namedBlitBackend}" "MOBILEGL_TRANSPORT=inproc"
+            "MOBILEGL_BACKEND_TYPE=${namedBlitBackend}"
             "MOBILEGL_ITEST_REQUIRE_GPU=1" "MGITEST_SPLIT_LANE=1"
-            ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+            ${MGL_ITEST_CAPABILITY_ENV} ${namedBlitBaseEnv} ${mglItestArmTransportEnv})
+        # THE LABEL IS `integration-magma-split` AND NOT `integration-split-magma`, and that is not
+        # a preference: `ctest -L` takes a REGEX, not an exact name, so `-L integration-split`
+        # MATCHES a label spelled `integration-split-magma` as a substring. The obvious name would
+        # have left both entries in the Espryt lane while every listing showed them relabelled - a
+        # split that looks done and is not. Measured: with that spelling
+        # `ctest -N -L integration-split` still listed both DirectVulkan entries.
+        if (namedBlitBackend STREQUAL "DirectVulkan")
+            set(MGL_ITEST_NAMED_BLIT_LABELS "${mglItestMagmaLabels}")
+        else()
+            set(MGL_ITEST_NAMED_BLIT_LABELS "integration-split")
+        endif()
         foreach(namedBlitCase NamedBlitPreservesBindingsAndRestoresNextVerbsPixels NamedBlitDefaultEndpointPixels)
             gtest_discover_tests(MobileGLIntegrationTest
-                TEST_PREFIX "${namedBlitBackend}.Split.NamedBlit."
+                TEST_PREFIX "${namedBlitBackend}.${mglItestArm}.NamedBlit."
                 TEST_FILTER "F1WireScenario.${namedBlitCase}"
                 DISCOVERY_TIMEOUT 30
                 PROPERTIES
-                    LABELS "integration-split"
+                    LABELS "${MGL_ITEST_NAMED_BLIT_LABELS}"
                     TIMEOUT ${MGL_ITEST_TIMEOUT}
-                    ENVIRONMENT "${MGL_ITEST_NAMED_BLIT_ENVIRONMENT}\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p5b-${namedBlitBackend}-${namedBlitCase}.log")
+                    ${mglItestArmProperties}
+                    ENVIRONMENT "${MGL_ITEST_NAMED_BLIT_ENVIRONMENT}\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p5b-${namedBlitBackend}${mglItestArmLogTag}-${namedBlitCase}.log")
+        endforeach()
         endforeach()
     endforeach()
+endif()
+
+# =====================================================================================
+# P5e (gl), ID-115 / ID-119: THE STRICT LANE'S POSITIVE CONTROL, AND THE ONE COUNTING ENTRY
+# =====================================================================================
+#
+# ONE ENTRY, TWO JOBS, AND BOTH NEED THE SAME THING - a drawing split scenario that can read its
+# own PipeStats window.
+#
+#   ID-115: prove strict was ARMED. Of the seven entries that passed the strict lane before this
+#   phase, three were monolith transport (where nothing stamps a verb boundary and the whole
+#   mechanism is structurally unreachable), two self-skipped, one was a death test and one was a
+#   Python check - so "116/116" and "strict never ran on anything that draws" were the same
+#   observation. `vbs` on the summary line is the arming proof and this entry is where it is read.
+#
+#   ID-119: the `rsp` pin. The old wording ("rsp = 0 on unbarriered records") was true of every
+#   possible implementation, because CountBarrierPull's unbarriered arm is [[noreturn]] and runs
+#   BEFORE the counter. The checkable statement is the relation to `draws`, which is what the
+#   device measured (rsp ~= the draw count under inproc, 0 under monolith).
+#
+# IT IS ITS OWN ENTRY WITH ITS OWN LOG PATH, NOT A WHOLE-LANE ENV FLIP. The library opens
+# MOBILEGL_LOG_FILE_PATH with "w", so every process in a lane TRUNCATES it; two entries sharing
+# one path under `ctest -j` race into an empty read that looks exactly like "the counter was
+# never emitted" (Harness/PipeStatsWindow.h:19-24 has the long version). RESOURCE_LOCK is the
+# same belt as the PersistentMapArm entry's.
+#
+# BLOCK PLACED AT THE END OF THE FILE ON PURPOSE (wave-3 integration): `pa`'s
+# DirectGLES.Split.StrictProgramArm. block and `mv`'s multi-draw tiers are added inside the big
+# disaggregated section above, so keeping this one textually apart lets all three merge cleanly.
+if (MOBILEGL_BUILD_DISAGGREGATED)
+    mgl_itest_join_environment(MGL_ITEST_GLES_SPLIT_STRICT_ARMING_ENVIRONMENT
+        "MOBILEGL_BACKEND_TYPE=DirectGLES" "MOBILEGL_TRANSPORT=inproc"
+        "MOBILEGL_IPC_SERVER_PATH=${MGL_ITEST_SPLIT_SERVER_PATH}" "MGITEST_SPLIT_LANE=1"
+        "MGITEST_STRICT_ARMING_LANE=1"
+        "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
+        "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p5e-strict-arming-DirectGLES.log"
+        ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+
+    gtest_discover_tests(MobileGLIntegrationTest
+        TEST_PREFIX "DirectGLES.Split.StrictArming."
+        TEST_FILTER "TriangleScenario.TheServerStampedAVerbBoundaryOnThisDrawingFrame"
+        DISCOVERY_TIMEOUT 30
+        PROPERTIES
+            LABELS "integration-gpu\;integration-split"
+            TIMEOUT ${MGL_ITEST_TIMEOUT}
+            RESOURCE_LOCK p5e-strict-arming-DirectGLES.log
+            ENVIRONMENT "${MGL_ITEST_GLES_SPLIT_STRICT_ARMING_ENVIRONMENT}"
+    )
+endif()
+
+# =====================================================================================
+# P5f (f1), P5F-WIRE-COMPLETENESS.md §4/§6: THE DUAL-BLOCK REHEARSAL'S OWN LANE
+# =====================================================================================
+#
+# The lane has TWO halves, and only one of them registers entries here:
+#
+#   - the CENSUS half is an environment-variable lane, exactly like strict: the gate runs the
+#     EXISTING `integration-split` entries under MOBILEGL_IPC_ROLE_SPLIT_STATE=1 +
+#     MOBILEGL_IPC_STRICT_ERRORS=1, and every BARRIER-PULLED read there aborts with a named
+#     Fatal{UnmigratedPipeInput, "<field>@<verb>"} - the red IS the census, collected and
+#     ratcheted against Harness/dualblock-expected-fatals.txt by split_log_paths.py's
+#     `expect-fatal` mode. Re-registering the whole set under a second prefix would double the
+#     discovered test count for zero new information.
+#
+#   - the CONTROL half is the one entry below: DualBlockScenario is the mechanism's negative
+#     control (§6: turning the knob OFF must turn a named case from green to red), so it needs
+#     an entry of its own, under a label of its own.
+#
+# THE LABEL IS `integration-dualblock-split`, and the spelling is load-bearing twice over
+# (ID-131): `ctest -L` is a REGEX, so a label CONTAINING `integration-split` as a substring
+# would be selected by the main lane's runs - and this one is expected-red there, which must
+# never poison the hard-green gate. Checked both directions: `-L integration-split` does not
+# match it (`dualblock` stands between the two words), and `-L integration-dualblock-split`
+# matches nothing else in the tree. It does not carry `integration-gpu` either: that label must
+# be able to go green, and this entry goes green only under the armed knob.
+#
+# THE KNOB IS NOT PINNED IN THE ENTRY'S ENVIRONMENT, deliberately, and that is the ONE deviation
+# from the N-6 pinning rule every other split entry follows: a ctest ENVIRONMENT property
+# overrides the process environment, so pinning MOBILEGL_IPC_ROLE_SPLIT_STATE=1 here would make
+# the knob=0 form - which IS the negative control - unreachable through ctest. The failure
+# direction is safe: a bare `-L integration-dualblock-split` run without the knob is RED by
+# name, never silently green.
+#
+# MOBILEGL_IPC_RUN_AHEAD=0 IS pinned: the serial-separation half asserts on the fill side's
+# behaviour per verb boundary, and under run-ahead an unbarriered verb fills nothing, which
+# would make the assertion timing-dependent instead of deterministic.
+if (MOBILEGL_BUILD_DISAGGREGATED)
+    target_sources(MobileGLIntegrationTest PRIVATE
+        Scenarios/DualBlockScenario.cpp Harness/DualBlockPeek.cpp)
+    mgl_itest_join_environment(MGL_ITEST_GLES_DUALBLOCK_ENVIRONMENT
+        "MOBILEGL_BACKEND_TYPE=DirectGLES" "MOBILEGL_TRANSPORT=inproc"
+        "MOBILEGL_IPC_SERVER_PATH=${MGL_ITEST_SPLIT_SERVER_PATH}" "MGITEST_SPLIT_LANE=1"
+        "MOBILEGL_IPC_RUN_AHEAD=0"
+        ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+    gtest_discover_tests(MobileGLIntegrationTest
+        TEST_PREFIX "DirectGLES.Split.DualBlock."
+        TEST_FILTER "DualBlockScenario.*"
+        DISCOVERY_TIMEOUT 30
+        PROPERTIES
+            LABELS "integration-dualblock-split"
+            TIMEOUT ${MGL_ITEST_TIMEOUT}
+            ENVIRONMENT "${MGL_ITEST_GLES_DUALBLOCK_ENVIRONMENT}\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/split-logs/DirectGLES.Split.DualBlock.TheTwoRolesHaveDistinctBlocks.log"
+    )
+endif()
+
+# P5f exit: observe every one of three real drawing frames on both backend roles.
+if (MOBILEGL_BUILD_DISAGGREGATED)
+    foreach(backend DirectGLES DirectVulkan)
+        # P7 package L: the Magma half on all three transports. `integration-p5f-rsp` itself
+        # stays on the INPROC entries alone - the CI step that reads it require_greens exactly
+        # the two names it has always had, and `ctest -L` would have matched a suffixed spelling.
+        set(p5f_rsp_arms Split)
+        set(p5f_rsp_base_env ${MGL_ITEST_COMMON_ENV})
+        if (NOT backend STREQUAL "DirectGLES")
+            set(p5f_rsp_arms ${MGL_ITEST_MAGMA_ARMS})
+            # The ICD pin follows the backend, as in the NamedBlit block (see the Fm lane).
+            set(p5f_rsp_base_env ${MGL_ITEST_VULKAN_ENV})
+        endif()
+        foreach(mglItestArm IN LISTS p5f_rsp_arms)
+        mgl_itest_magma_arm_shape(${mglItestArm} p5f-rsp)
+        if (backend STREQUAL "DirectGLES")
+            set(p5f_rsp_label "integration-split\\;integration-p5f-rsp")
+        elseif (mglItestArm STREQUAL "Split")
+            set(p5f_rsp_label "integration-magma-split\\;integration-p5f-rsp")
+        else()
+            set(p5f_rsp_label "${mglItestMagmaLabels}")
+        endif()
+        mgl_itest_join_environment(p5f_rsp_environment
+            "MOBILEGL_BACKEND_TYPE=${backend}" "MGITEST_SPLIT_LANE=1"
+            "MGITEST_P5F_RSP_LANE=1" "MOBILEGL_PIPE_STATS=1" "MOBILEGL_PIPE_STATS_PERIOD=1"
+            "MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/p5f-rsp-${backend}${mglItestArmLogTag}.log"
+            ${MGL_ITEST_CAPABILITY_ENV} ${p5f_rsp_base_env} ${mglItestArmTransportEnv})
+        gtest_discover_tests(MobileGLIntegrationTest
+            TEST_PREFIX "${backend}.${mglItestArm}.P5fRsp."
+            TEST_FILTER "F1WireScenario.EachWireFrameHasZeroResidualPulls"
+            DISCOVERY_TIMEOUT 30
+            PROPERTIES LABELS "${p5f_rsp_label}"
+                TIMEOUT ${MGL_ITEST_TIMEOUT}
+                RESOURCE_LOCK "p5f-rsp-${backend}${mglItestArmLogTag}.log"
+                ${mglItestArmProperties}
+                ENVIRONMENT "${p5f_rsp_environment}")
+        endforeach()
+    endforeach()
+endif()
+
+# =====================================================================================
+# P7 PACKAGE L: THE INFORMATIONAL MAGMA CENSUS - TIER 2 OF TWO
+# =====================================================================================
+#
+# THE TWO TIERS, STATED ONCE AND IN ONE PLACE.
+#
+#   TIER 1 - GATED. `integration-magma-split` (inproc, and its meaning is unchanged: the same
+#   73 entries, names, labels and private log paths P6.5 left green), plus the two arms this
+#   package adds beside it, `integration-magma-spawn` and `integration-magma-tcp`. They run the
+#   SIX HAND-LAID MAGMA LANES - Fm, Buffers, RunAhead, Caches, NamedBlit, P5fRsp - because each
+#   carries a flavour (strict + dual-block state, adopt tier, run-ahead credits, cache pinning)
+#   that a shared scenario filter cannot express. A label here may enter a CI gating step only
+#   after it has been measured green.
+#
+#   TIER 2 - INFORMATIONAL, THIS BLOCK. Every scenario the DirectGLES split arms run, on
+#   DirectVulkan, on all three transports: `integration-magma-all-split` / `-spawn` / `-tcp`.
+#   It is in NO CI gating step and must not be added to one wholesale. Its first run's RED LIST
+#   IS THE P7 WORK LIST - the cases wave 2's clusters A (UniformManager alignment), B
+#   (blit/copy/mip) and C (vertex / death ops / resident subdata / reflection) divide between
+#   them - and a red list you cannot record without breaking the build's green is a red list
+#   nobody writes down. As a cluster retires its share, its cases move UP into tier 1 with the
+#   commit that retires them, and the gate is honest at every step in between.
+#
+# WHY IT REPLAYS A RECORDED LIST INSTEAD OF NAMING SCENARIOS. The same argument the spawn arm
+# won in P6 (`t6`), one dimension over: a hand-written second list agrees with the first today
+# and drifts the first time somebody adds a scenario to one of them, and a Magma census covering
+# LESS than the Espryt lane looks exactly like a Magma census covering all of it. The
+# registration macro records every call it is given; this replays them, so a scenario added to
+# the split arms tomorrow joins the Magma census the same day.
+#
+# THE THREE ARMS INCLUDE INPROC, and that is the block's diagnostic half: a case red on spawn
+# and tcp but GREEN on inproc is a two-process defect (plumbing, a death notice, a reply that
+# never crossed), while a case red on all three is Magma's own missing verb and belongs to a
+# wave 2 cluster. Without the inproc arm every red would need a hand re-run to tell those apart.
+if (MOBILEGL_BUILD_DISAGGREGATED)
+    list(LENGTH MGL_SPLIT_ARM_CALLS mglItestSplitArmCallCount)
+    message(STATUS "Integration tests: P7 package L replays ${mglItestSplitArmCallCount} split-arm "
+                   "registration(s) on DirectVulkan under the informational "
+                   "integration-magma-all-{split,spawn,tcp} labels")
+    foreach(mglItestCall IN LISTS MGL_SPLIT_ARM_CALLS)
+        # The recorded form is "<filter>|<tail>", with "-" standing for an empty tail. Split by
+        # regex rather than by list(GET): a filter is allowed to contain anything but `|`, and a
+        # CMake list cannot represent a trailing empty element unambiguously.
+        string(REGEX REPLACE "\\|[^|]*$" "" mglItestReplayFilter "${mglItestCall}")
+        string(REGEX REPLACE "^.*\\|" "" mglItestReplayTail "${mglItestCall}")
+        if(mglItestReplayTail STREQUAL "-")
+            set(mglItestReplayTail "")
+        endif()
+        mgl_itest_register_split_arms_for_backend(DirectVulkan "${mglItestReplayFilter}"
+                                                  "${mglItestReplayTail}")
+    endforeach()
+endif()
+
+# =====================================================================================
+# P7 PACKAGE L: THE WHOLE INTEGRATION BINARY UNDER MAGMA SPLIT - TIER 3, INFORMATIONAL
+# =====================================================================================
+#
+# WHY A THIRD TIER, AND WHY IT IS THE ONE THAT ANSWERS THE EXIT GATE. Tier 2 above replays the
+# split-arm registrations, which is ~100 scenarios - the set Espryt's disaggregation work has
+# been carrying since P5. It measured GREEN on Magma, all three transports, and that is a real
+# result but it is NOT exit gate 1. The gate says the INTEGRATION BINARY is green under Magma
+# split, and the set that phrase names is the one the monolith `DirectVulkan.` arm runs: the
+# whole suite minus MGL_ITEST_MONOLITH_MECHANISM_FILTER (the mechanism oracles, which toggle
+# process-local push masks, pointer-key ABA, direct persistent adoption or synchronous stats
+# slots and therefore must not inherit a transport). 511 cases, against tier 2's 102.
+#
+# THIS IS WHERE THE @P7 REFUSALS LIVE. None of tier 2's scenarios reaches one; the readback
+# matrices, the same-texture copy shapes and the odd-offset uniform ranges do, and they are in
+# this set and nowhere else in the disaggregated registry. THE FIRST RUN'S RED LIST IS WHAT
+# WAVE 2's CLUSTERS ARE SCHEDULED FROM - see notes/p7/magma-two-process-first-run.md.
+#
+# IN NO CI GATING STEP, and that is the whole design: a lane that must be green cannot carry a
+# census. A case leaves this tier for a gated one with the commit that retires its blocker.
+# The label spelling follows tier 2's rule (`ctest -L` is a regex, ID-131): the tier word goes
+# in the MIDDLE, so `-L integration-magma-split` and `-L integration-magma-all-split` cannot
+# reach `integration-magma-full-split` and vice versa.
+#
+# THE SAME PRIVATE-LOG DISCIPLINE as every other split-family entry, through a list of its own
+# rather than the shared MGL_SPLIT_ARM_TEST_LISTS: that list ALSO carries the per-entry lane
+# markers (strict-arming, pmap, server counters) and applying them to a census would arm three
+# unrelated oracles on cases that are here to be read, not to assert. SplitLogPaths.cmake.in
+# walks this list for the log path alone.
+#
+# PLACED AFTER TIER 2 AND BEFORE THE configure_file, for that file's stated reason.
+#
+# TWO DIFFERENCES FROM TIERS 1 AND 2's ENVIRONMENT, BOTH MEASURED RATHER THAN ASSUMED.
+#
+#   1. NO MGITEST_SPLIT_LANE=1. That marker arms ScenarioFixture's destructor assertion
+#      (ScenarioFixture.h:85-100): a case in an armed split lane must have MOVED the client
+#      encoder's record ordinal, because "the workload drew, cleared and read pixels, so
+#      records were due". That is exactly right for a CURATED lane, where every entry draws.
+#      It is wrong for a whole-binary census, which also contains query-only cases: the first
+#      run of this tier with the marker set produced 13 reds - AdvertisedLimitsScenario (8),
+#      SpirvShaderBinaryScenario (4) and ProgramPipelineScenario.AReservedName… - every one of
+#      them `EmitSeq was 20 at SetUp and is 20 now`, because a limits query is answered from
+#      the client's CapsMirror and a shader-binary error surface never reaches a verb. Those
+#      13 would red on a DirectGLES census too; they are a property of the census, not of
+#      Magma, and leaving them in would have buried the real list under noise.
+#      WHAT THIS GIVES UP, stated rather than discovered later: this tier does not prove its
+#      records crossed the wire, and the tcp arm's "Dial=Connect created no local server child"
+#      topology proof (ScenarioFixture.h:160-171, inside the same armed block) is inert here.
+#      Tiers 1 and 2 keep both, and they are the tiers that gate. MGITEST_TCP_LANE is still in
+#      the shared tcp fragment - it simply has no reader in this tier.
+#   2. DualBlockScenario.* IS FILTERED OUT. Its green REQUIRES MOBILEGL_IPC_ROLE_SPLIT_STATE=1,
+#      and a census must not set that knob - under it every barrier-pulled read aborts, which
+#      would replace this tier's subject with a different experiment. Without the knob the case
+#      is RED BY NAME (`MGPipeRoleSplitRehearsalActive() is false`), which is its documented
+#      negative-control behaviour and not a finding. The monolith `DirectVulkan.` arm has the
+#      same case and it SKIPS there, because that runtime is not split at all. Its own lane,
+#      `integration-dualblock-split`, is where it is read.
+if (MOBILEGL_BUILD_DISAGGREGATED)
+    set(MGL_MAGMA_FULL_TEST_LISTS "")
+    foreach(mglItestArm IN LISTS MGL_ITEST_MAGMA_ARMS)
+        mgl_itest_magma_arm_shape(${mglItestArm})
+        string(TOUPPER "${mglItestArm}" mglItestArmUpper)
+        mgl_itest_join_environment(mglItestMagmaFullEnvironment
+            "MOBILEGL_BACKEND_TYPE=DirectVulkan" "MOBILEGL_ITEST_REQUIRE_GPU=1"
+            ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_VULKAN_ENV} ${mglItestArmTransportEnv})
+        gtest_discover_tests(MobileGLIntegrationTest
+            TEST_PREFIX "DirectVulkan.${mglItestArm}.Full."
+            TEST_LIST "MGL_MAGMA_FULL_TESTS_${mglItestArmUpper}"
+            TEST_FILTER "-${MGL_ITEST_MONOLITH_MECHANISM_FILTER}:DualBlockScenario.*"
+            DISCOVERY_TIMEOUT 30
+            PROPERTIES
+                LABELS "integration-magma-full-${mglItestArmLower}"
+                TIMEOUT ${MGL_ITEST_TIMEOUT}
+                ${mglItestArmProperties}
+                ENVIRONMENT "${mglItestMagmaFullEnvironment}"
+        )
+        list(APPEND MGL_MAGMA_FULL_TEST_LISTS "MGL_MAGMA_FULL_TESTS_${mglItestArmUpper}")
+    endforeach()
+    message(STATUS "Integration tests: P7 package L tier 3 - the whole integration binary on "
+                   "DirectVulkan x {inproc, spawn, tcp} under the informational "
+                   "integration-magma-full-{split,spawn,tcp} labels (no CI gate)")
+endif()
+
+# =====================================================================================
+# P7 WAVE 3 (V1): integration-verify-split - THE COMPARATOR ON THE SPLIT ARM
+# =====================================================================================
+#
+# CONTRACT-P7 §6, exit gate 2: "verify x {monolith, split(inproc)} x Magma, zero divergence".
+# Until this block the verify block near the top of this file registered `MOBILEGL_TRANSPORT=
+# monolith` on every one of its 1136 entries, so the gate's second column had no entries at all
+# - not merely unmet, UNMEASURABLE, exactly as package L found exit gate 1's Magma column.
+#
+# IT HAD A PREREQUISITE AND THE PREREQUISITE IS PAID. A verify build under `inproc` used to die
+# on the server apply thread before one case could arm:
+#
+#   Fatal{PipeRespecifyScope} resource_respecify {slot=12, gen=0}: the descriptor carries a
+#   per-level respecify scope (target=258, level=0), and no path in this phase may set one
+#
+# That pin is now "a per-level producer must cover the range it declares"
+# (MG_Pipe/PipeApply.cpp), which is the invariant it was actually guarding.
+#
+# BOTH BACKENDS, AND THE MAGMA HALF IS THE HALF THE GATE NAMES. `${MGL_ITEST_VULKAN_ENV}` and
+# not `${MGL_ITEST_COMMON_ENV}` on the DirectVulkan entries, for package L's reason: that list
+# carries VK_ICD_FILENAMES and the three lavapipe iterationRP repairs the monolith `DirectVulkan.`
+# arm has been pinned to, and a lane that appended the common list would measure a different
+# driver from the gate it is compared against. `MOBILEGL_ITEST_REQUIRE_GPU=1` is pinned for the
+# same reason every split-family lane pins it: a lane that skipped everything and a lane that
+# passed everything are the same green in ctest, and this lane is here to be an ARM.
+#
+# THE CASE SET IS THE MONOLITH VERIFY LANE'S, MINUS THREE THINGS, the first two because
+# this arm carries a TRANSPORT and that lane does not:
+#
+#   1. ${MGL_ITEST_MONOLITH_MECHANISM_FILTER}. Those oracles toggle process-local push masks,
+#      pointer-key ABA, direct persistent adoption or synchronous stats slots and must not
+#      inherit a transport - which is why the ambient DirectGLES./DirectVulkan. registrations
+#      subtract them too and re-register them with MOBILEGL_TRANSPORT=monolith pinned. The
+#      monolith verify lane keeps them because there the pin and the lane agree. NOTE that the
+#      filter names PipeVerifyArmingScenario.* and PoisonOmissionScenario.*, which is why the
+#      arming entry and the two negative controls below are registered by hand, one per backend,
+#      exactly as the monolith verify block registers its own.
+#   2. DualBlockScenario.*. Its green REQUIRES MOBILEGL_IPC_ROLE_SPLIT_STATE=1, and pinning that
+#      knob here would replace this lane's subject (the comparator) with a different experiment;
+#      without it the case is red by name. Tier 3 above filters it for the same reason and says
+#      so at more length. Its own lane, `integration-dualblock-split`, is where it is read.
+#   3. On the DirectGLES half only, four Magma wire-arm decline cases that are red on DirectGLES
+#      x inproc with the comparator OFF (MGL_ITEST_VERIFY_SPLIT_GLES_MAGMA_DECLINE_FILTER below
+#      says which and why).
+#
+# NO MGITEST_SPLIT_LANE=1, AND THIS IS THE ONE PLACE THAT COSTS SOMETHING, so it is stated
+# rather than discovered. That marker arms ScenarioFixture's destructor assertion "this case
+# must have MOVED the client encoder's record ordinal", which is right for a curated lane where
+# every entry draws and wrong for a whole-binary set: tier 3 measured 13 reds from it
+# (AdvertisedLimitsScenario x8, SpirvShaderBinaryScenario x4, ProgramPipelineScenario's reserved
+# name), every one of them a query answered from the client's CapsMirror without a verb. They
+# would red on a DirectGLES set too - a property of the census, not of the transport.
+#
+# WHAT REPLACES IT IS STRONGER HERE THAN IT IS IN TIER 3, and it is why this lane is armed
+# rather than green-skipping: EVERY ENTRY GETS A PRIVATE LOG PATH (below, through
+# MGL_VERIFY_SPLIT_TEST_LISTS), and `.github/workflows/test.yml`'s integration-verify-split job
+# reads all of them: ConfigLoader's resolved `MOBILEGL_TRANSPORT=inproc` line is required in EVERY
+# client log, so a lane that silently ran monolith fails that step by name. The comparator's
+# `MGPipe: verify armed` line is latched at a process's FIRST FILL, so it is absent - honestly -
+# from the processes that never reach a verb (limits queries, CapsMirror answers, the poison
+# parent that only forks; 155 of 1064 on the landing run, 99 of them skips); the step therefore
+# requires it in both VerifySplitArming. logs and holds the per-entry count to a stated floor.
+# The VerifySplitArming. entries assert it from inside the process as well, which is the shape
+# the monolith lane's VerifyArming. entries already have.
+if (MOBILEGL_BUILD_DISAGGREGATED AND MOBILEGL_PIPE_VERIFY)
+    # The transport half, joined onto each backend's own list. One place says what "the verify
+    # split arm" means, as MGL_ITEST_SPLIT_ARM_TRANSPORT_ENV does for the Magma lanes.
+    set(MGL_ITEST_VERIFY_SPLIT_ARM_ENV
+        "MOBILEGL_TRANSPORT=inproc" "MOBILEGL_IPC_SERVER_PATH=${MGL_ITEST_SPLIT_SERVER_PATH}"
+        "MOBILEGL_PIPE_VERIFY=1" "MOBILEGL_ITEST_REQUIRE_GPU=1")
+    mgl_itest_join_environment(MGL_ITEST_GLES_VERIFY_SPLIT_ENVIRONMENT
+        "MOBILEGL_BACKEND_TYPE=DirectGLES" ${MGL_ITEST_VERIFY_SPLIT_ARM_ENV}
+        ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_COMMON_ENV})
+    mgl_itest_join_environment(MGL_ITEST_VULKAN_VERIFY_SPLIT_ENVIRONMENT
+        "MOBILEGL_BACKEND_TYPE=DirectVulkan" ${MGL_ITEST_VERIFY_SPLIT_ARM_ENV}
+        ${MGL_ITEST_CAPABILITY_ENV} ${MGL_ITEST_VULKAN_ENV})
+
+    # THE FOUR MAGMA DECLINE CASES ARE SUBTRACTED FROM THE DirectGLES HALF ONLY, and not because
+    # of the comparator. They assert Magma's wire-arm decline contract (`@P7` retirements: the
+    # depth-stencil mip decline, the two multisample blit declines, the overlapping in-place copy)
+    # and skip on every monolith arm, so the only arm that registers them is DirectVulkan's
+    # split family. On DirectGLES x inproc they are RED WITH THE COMPARATOR OFF - measured on
+    # this build with MOBILEGL_PIPE_VERIFY=0 in the same environment, the same four assertions
+    # (GL error 0x0502 where the decline promises none, or none where it promises one; the
+    # overlap copy writes the level the decline leaves alone) - because Espryt does not decline
+    # those shapes at all. That is a finding about the DirectGLES whole-binary set on split, not
+    # about verify, and it is recorded in notes/p7/verify-split.md rather than hidden in a green.
+    # This lane was NOT the only DirectGLES split lane to reach them: the primary integration job
+    # runs every integration-gpu entry under MOBILEGL_TRANSPORT=inproc, and there the same four
+    # were red in CI (the depth-stencil and overlap pair from run 35781886930, the two blits from
+    # 35793903365). Each case now skips by backend name at its top (F1WireScenario.cpp,
+    # "Magma wire-arm decline"), in every DirectGLES lane; this subtraction is therefore
+    # redundant, and kept so the verify-split registration and its counts do not move. The
+    # DirectVulkan half keeps them.
+    set(MGL_ITEST_VERIFY_SPLIT_GLES_MAGMA_DECLINE_FILTER
+        "F1WireScenario.GenerateMipmapDepthStencilDeclinesAndKeepsTheSession:F1WireScenario.MultisampleBlitOntoAMultisampleDestinationDeclinesAndKeepsTheSession:F1WireScenario.MultisampleBlitFromASingleSampleSourceDeclinesAndKeepsTheSession:F1WireScenario.CopyImageInPlaceOverlapDeclinesAndLeavesTheLevelAlone")
+
+    set(MGL_VERIFY_SPLIT_TEST_LISTS "")
+    # The ambient set, per backend. The GLES half is registered TWICE for the monolith verify
+    # lane's reason and with its spelling: the texture-view cases need
+    # MOBILEGL_ESPRYT_ENABLE_TEXTURE_VIEW=1 or DirectGLES withholds GL_ARB_texture_view and they
+    # green-skip, so they are subtracted from the first registration and re-registered with the
+    # knob. "Every existing verify case on the split arm" is false without the second block.
+    gtest_discover_tests(MobileGLIntegrationTest
+        TEST_PREFIX "DirectGLES.VerifySplit."
+        TEST_LIST MGL_VERIFY_SPLIT_TESTS_GLES
+        TEST_FILTER "-${MGL_ITEST_MONOLITH_MECHANISM_FILTER}:${MGL_ITEST_GLES_VIEW_FILTER}:DualBlockScenario.*:${MGL_ITEST_VERIFY_SPLIT_GLES_MAGMA_DECLINE_FILTER}"
+        DISCOVERY_TIMEOUT 30
+        PROPERTIES
+            LABELS "integration-verify-split"
+            TIMEOUT ${MGL_ITEST_VERIFY_TIMEOUT}
+            ENVIRONMENT "${MGL_ITEST_GLES_VERIFY_SPLIT_ENVIRONMENT}"
+    )
+    gtest_discover_tests(MobileGLIntegrationTest
+        TEST_PREFIX "DirectGLES.VerifySplit."
+        TEST_LIST MGL_VERIFY_SPLIT_TESTS_GLES_VIEW
+        TEST_FILTER "${MGL_ITEST_GLES_VIEW_FILTER}"
+        DISCOVERY_TIMEOUT 30
+        PROPERTIES
+            LABELS "integration-verify-split"
+            TIMEOUT ${MGL_ITEST_VERIFY_TIMEOUT}
+            ENVIRONMENT "${MGL_ITEST_GLES_VERIFY_SPLIT_ENVIRONMENT}\;MOBILEGL_ESPRYT_ENABLE_TEXTURE_VIEW=1"
+    )
+    gtest_discover_tests(MobileGLIntegrationTest
+        TEST_PREFIX "DirectVulkan.VerifySplit."
+        TEST_LIST MGL_VERIFY_SPLIT_TESTS_VULKAN
+        TEST_FILTER "-${MGL_ITEST_MONOLITH_MECHANISM_FILTER}:DualBlockScenario.*"
+        DISCOVERY_TIMEOUT 30
+        PROPERTIES
+            LABELS "integration-verify-split"
+            TIMEOUT ${MGL_ITEST_VERIFY_TIMEOUT}
+            ENVIRONMENT "${MGL_ITEST_VULKAN_VERIFY_SPLIT_ENVIRONMENT}"
+    )
+    list(APPEND MGL_VERIFY_SPLIT_TEST_LISTS MGL_VERIFY_SPLIT_TESTS_GLES
+         MGL_VERIFY_SPLIT_TESTS_GLES_VIEW MGL_VERIFY_SPLIT_TESTS_VULKAN)
+
+    # The arming assertion on this arm, one entry per backend, with a log path nothing else
+    # writes to - the monolith VerifyArming. entries' shape and their reason (the case reads the
+    # whole file, and a path shared with 500 neighbours races them under `-j 4`). This is the
+    # entry that cannot be green against a library with no comparator compiled in, and unlike the
+    # monolith pair it also cannot be green against one whose comparator never survived the
+    # server's bring-up - which is precisely what the relaxed respecify pin unblocked.
+    #
+    # MGITEST_PIPE_ARMING_LANE=1 is a harness marker the library never reads; it is what makes
+    # the case skip in an ambient lane rather than race there.
+    foreach(mglItestVerifyBackend DirectGLES DirectVulkan)
+        if (mglItestVerifyBackend STREQUAL "DirectGLES")
+            set(mglItestVerifyArmEnv "${MGL_ITEST_GLES_VERIFY_SPLIT_ENVIRONMENT}")
+        else()
+            set(mglItestVerifyArmEnv "${MGL_ITEST_VULKAN_VERIFY_SPLIT_ENVIRONMENT}")
+        endif()
+        gtest_discover_tests(MobileGLIntegrationTest
+            TEST_PREFIX "${mglItestVerifyBackend}.VerifySplitArming."
+            TEST_FILTER "PipeVerifyArmingScenario.Armed"
+            DISCOVERY_TIMEOUT 30
+            PROPERTIES
+                LABELS "integration-verify-split"
+                TIMEOUT ${MGL_ITEST_VERIFY_TIMEOUT}
+                ENVIRONMENT "${mglItestVerifyArmEnv}\;MGITEST_PIPE_ARMING_LANE=1\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/pipe-verify-split-arming-${mglItestVerifyBackend}.log"
+                RESOURCE_LOCK "pipe-verify-split-arming-${mglItestVerifyBackend}.log"
+        )
+
+        # THE TWO NEGATIVE CONTROLS ON THIS ARM (CONTRACT-P7 §6), the monolith verify block's
+        # four entries with the split environment underneath and nothing else changed: each is
+        # green when its control REPORTS, so each goes red the day the comparator or the poison
+        # stops reaching the split arm. Their CI halves - the same knob exported against the
+        # ambient VerifySplit. entries, where ctest has to FAIL - live in test.yml's
+        # integration-verify-split job.
+        #
+        # A (G4): the corruption perturbs the snapshot arm at the CLIENT's entry compare, so the
+        # report lands in the client role's log, which is the half LibraryLog() reads.
+        gtest_discover_tests(MobileGLIntegrationTest
+            TEST_PREFIX "${mglItestVerifyBackend}.VerifySplitCorrupted."
+            TEST_FILTER "PipeVerifyArmingScenario.CorruptedFieldIsReported"
+            DISCOVERY_TIMEOUT 30
+            PROPERTIES
+                LABELS "integration-verify-split"
+                TIMEOUT ${MGL_ITEST_VERIFY_TIMEOUT}
+                ENVIRONMENT "${mglItestVerifyArmEnv}\;MOBILEGL_PIPE_VERIFY_CORRUPT=GetRenderStateParameters\;MOBILEGL_PIPE_VERIFY_FATAL=0\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/pipe-verify-split-corrupt-${mglItestVerifyBackend}.log"
+                RESOURCE_LOCK "pipe-verify-split-corrupt-${mglItestVerifyBackend}.log"
+        )
+        # A ON THE OTHER ARM (P7 wave 3, V1). Control A above perturbs EntryCompare's snapshot,
+        # which runs on the CLIENT thread at a verb boundary and reports `where=entry`; the
+        # compare-at-read hook, which runs on the SERVER's apply thread at every backend read and
+        # is the only comparator that arm ever runs, had no control at all until this entry. The
+        # knob names GetPixelStoreParameters because ReadPixels is where the hook does its one
+        # piece of arm-specific reasoning - the ID-49 neutral pack window, whose oracle it rewrites
+        # - so a control aimed anywhere else would leave exactly that branch unproven.
+        #
+        # FATAL=0 for the corrupt entry's reason and one more: this field IS in kReadback's fill
+        # mask (FillPoints.def), so the client's entry compare fires first and with FATAL at its
+        # default the process would die before the server reached the read. The case reads the
+        # SERVER role's half of its private log and nothing else.
+        gtest_discover_tests(MobileGLIntegrationTest
+            TEST_PREFIX "${mglItestVerifyBackend}.VerifySplitReadCorrupted."
+            TEST_FILTER "PipeVerifyArmingScenario.CorruptedFieldIsReportedOnTheServerRead"
+            DISCOVERY_TIMEOUT 30
+            PROPERTIES
+                LABELS "integration-verify-split"
+                TIMEOUT ${MGL_ITEST_VERIFY_TIMEOUT}
+                ENVIRONMENT "${mglItestVerifyArmEnv}\;MOBILEGL_PIPE_VERIFY_CORRUPT=GetPixelStoreParameters\;MOBILEGL_PIPE_VERIFY_FATAL=0\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/pipe-verify-split-read-corrupt-${mglItestVerifyBackend}.log"
+                RESOURCE_LOCK "pipe-verify-split-read-corrupt-${mglItestVerifyBackend}.log"
+        )
+        # B (G5): the child brings up its own inproc session from the inherited environment, and
+        # PoisonOmissionScenario's ReadChildLog reads BOTH role halves of the child's log, because
+        # under a transport the poisoned read can fire on either side of the seam.
+        #
+        # A DIFFERENT PAIR FROM THE MONOLITH ENTRIES', and the monolith pair is not "also fine
+        # here": GenerateMipmap:GetActiveTextureUnit is inert on this arm - the split backend's
+        # generate_mipmap resolves its texture from the verb's handle and never reads the active
+        # unit, so the child exited 0 with that stamp withheld (measured, both backends).
+        # ReadPixels:GetPixelStoreParameters is read on the server under the server's stamp,
+        # which is the stamp the knob has to withhold on this arm (PipeInputs.cpp's
+        # ServerPoisonOmission). PoisonOmissionScenario.cpp's kOmittedPairs carries both.
+        gtest_discover_tests(MobileGLIntegrationTest
+            TEST_PREFIX "${mglItestVerifyBackend}.VerifySplitPoisonOmitted."
+            TEST_FILTER "PoisonOmissionScenario.OmittedFieldAbortsOnThatVerb"
+            DISCOVERY_TIMEOUT 30
+            PROPERTIES
+                LABELS "integration-verify-split"
+                TIMEOUT ${MGL_ITEST_VERIFY_TIMEOUT}
+                ENVIRONMENT "${mglItestVerifyArmEnv}\;MOBILEGL_PIPE_POISON_OMIT=ReadPixels:GetPixelStoreParameters\;MOBILEGL_LOG_FILE_PATH=${CMAKE_CURRENT_BINARY_DIR}/pipe-poison-omit-split-${mglItestVerifyBackend}.log"
+                RESOURCE_LOCK "pipe-poison-omit-split-${mglItestVerifyBackend}.log"
+        )
+        # B's AMBIENT TARGET. The monolith verify lane's control-B step aims its knob at
+        # `Verify.PoisonOmissionScenario.WithoutOmissionCompletes`, the one integration entry that
+        # calls glGenerateMipmap at all - and the mechanism filter took that entry out of the
+        # ambient set above along with the rest of the scenario. Registered back by hand, with no
+        # knob, so the CI step has an entry on THIS arm to turn red.
+        gtest_discover_tests(MobileGLIntegrationTest
+            TEST_PREFIX "${mglItestVerifyBackend}.VerifySplit."
+            TEST_LIST "MGL_VERIFY_SPLIT_TESTS_POISON_${mglItestVerifyBackend}"
+            TEST_FILTER "PoisonOmissionScenario.WithoutOmissionCompletes"
+            DISCOVERY_TIMEOUT 30
+            PROPERTIES
+                LABELS "integration-verify-split"
+                TIMEOUT ${MGL_ITEST_VERIFY_TIMEOUT}
+                ENVIRONMENT "${mglItestVerifyArmEnv}"
+        )
+        list(APPEND MGL_VERIFY_SPLIT_TEST_LISTS "MGL_VERIFY_SPLIT_TESTS_POISON_${mglItestVerifyBackend}")
+    endforeach()
+
+    # NOT ON SPAWN, AND THIS IS A PROPERTY OF THE INSTRUMENT, NOT A GAP IN THE REGISTRATION. The
+    # comparator is a same-address-space oracle: its two arms are the applier-written gPipeInputs
+    # and the frontend GLContext, and only inproc puts them in one process. Measured on this build
+    # (VerifySplitArming's DirectGLES entry with MOBILEGL_TRANSPORT=spawn): the client's entry
+    # compare aborts at the first verb with Fatal{PipeVerifyDiffer, "GetClearColor@Clear", verb=1,
+    # where=entry}, because the fill leaves every record-supplied field to the applier and the
+    # applier now writes ANOTHER process's block; and the server process runs no compare at all.
+    #
+    # THE SECOND HALF IS NOT "MG_Impl IS NOT IN THE SERVER" - it is, and saying otherwise sent a
+    # reader looking for a link-time gap that does not exist. MobileGLServer is an executable over
+    # ServerEntry.cpp linked against the WHOLE library (top-level CMakeLists.txt), PipeFill.cpp
+    # included, so MGPipeVerifyReadHook is present in that process and is called on every backend
+    # read. What is absent is its ORACLE: the server image's main reaches
+    # MG_Backend::InitServerRoleForSpawn() and never MG_State::Init(), so MG_State::pGLContext is
+    # null and the hook returns at its `ctx == nullptr` line before comparing anything. Same
+    # conclusion, different mechanism, and the difference matters because the fix is a cross-
+    # process compare shape (CONTRACT-P7 §12) rather than a link edit.
+
+    message(STATUS "Integration tests: P7 wave 3 - the verify comparator on the split (inproc) arm, "
+                   "both backends, under integration-verify-split")
+endif()
+
+if (MOBILEGL_BUILD_DISAGGREGATED)
+    # LAST, so every mgl_itest_register_split_arms call above has already contributed its list
+    # name. Apply per-entry paths after GoogleTest discovery has populated the TEST_LISTs.
+    configure_file(Harness/SplitLogPaths.cmake.in SplitLogPaths.cmake @ONLY)
+    set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/SplitLogPaths.cmake")
+
+    add_test(NAME SplitLogPaths.ResultAccountingControls
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/Harness/test_split_log_paths.py)
+    set_tests_properties(SplitLogPaths.ResultAccountingControls PROPERTIES LABELS "unit")
 endif()

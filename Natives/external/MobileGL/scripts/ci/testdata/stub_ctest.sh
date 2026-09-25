@@ -28,6 +28,12 @@
 #   retrace-noselect   `ctest -N` matches nothing; the run exits 8 the way --no-tests=error does
 #   retrace-unrelated  one match; the run fails without naming the transport
 #   retrace-evidence   one match; the run fails with run_trace_case.cmake's own sentence
+#   retrace-evidence-nolog
+#                      one match; the run fails one check earlier, with the runner's "wrote no
+#                      <client log> ... no evidence the transport ever resolved" - the shape a
+#                      PULL library produces since P6's per-role log rename
+#   retrace-evidence-prefixed, retrace-evidence-nolog-prefixed
+#                      the two above with `ctest -V`'s "1: " prefix on every line
 #   retrace-green      one match; the run PASSES
 #
 # EXIT GATE E2's DRAW-DROP CONTROL (scripts/ci/retrace_drop_draw_control.sh). The library's own
@@ -52,9 +58,79 @@ for a in "$@"; do
   [ "$a" = "--show-only=json-v1" ] && json_requested=1
   [ "$a" = "-N" ] && listing_requested=1
   if [ "$prev" = "--output-junit" ]; then junit="$a"; fi
+  if [ "$prev" = "-R" ]; then selector="$a"; fi
   prev="$a"
 done
 listing_requested="${listing_requested:-0}"
+
+# E1's CPU-only boundary probes use their own testcase results. Keep observations
+# inside each testcase so stdout-only and stale evidence remain rejected.
+if [[ "${selector:-}" == *RemoteWaitBoundaryControl* ]]; then
+  python3 - "${mode}" "${junit}" "${selector}" <<'PY'
+import os, re, sys
+import xml.etree.ElementTree as ET
+mode, path, selector = sys.argv[1:]
+barrier = int(os.environ['MOBILEGL_IPC_VERB_BARRIER'])
+negative = barrier == 0
+prefix = 'RemoteWaitBoundaryControl.'
+specs = [
+ ('AppliedClassWaitsWithRunAheadCap', 'GenerateMipmap', 1, True,
+  'E1 wait boundary: GenerateMipmap returned before apply'),
+ ('MissingServerCapKeepsClearLockstep', 'Clear', 0, True,
+  'E1 wait boundary: Clear without server cap returned before apply'),
+ ('ServerCapAllowsClearToRunAhead', 'Clear', 1, False, ''),
+]
+root = ET.Element('testsuite')
+failures = 0
+for index, (short, op, cap, waits, diagnostic) in enumerate(specs):
+    name = prefix + short
+    if not re.search(selector, name):
+        continue
+    if mode == 'e1-empty' or (negative and mode == 'missing-selection' and index == 1):
+        continue
+    case = ET.SubElement(root, 'testcase', name=name, status='run')
+    waited = int(waits and barrier == 1)
+    observation = (f'E1 observation: op={op} cap={cap} barrier={barrier} parked={waited} '
+                   f'applied_before_return={waited} emitted=1 peer_seen=1')
+    failed = negative and mode != 'green'
+    if mode == 'e1-red-baseline' and 'baseline' in path:
+        failed = True
+    if mode == 'e1-restore-red' and 'restored' in path:
+        failed = True
+    if mode == 'e1-waitall' and not waits:
+        failed = True
+        observation = observation.replace('parked=0', 'parked=1').replace('applied_before_return=0', 'applied_before_return=1')
+    if negative and mode == 'skipped-selection':
+        ET.SubElement(case, 'skipped')
+        failed = False
+    if negative and mode == 'notrun-selection':
+        case.set('status', 'notrun')
+        failed = False
+    if failed:
+        ET.SubElement(case, 'failure', message='control red')
+        failures += 1
+    text = observation + '\n' + (diagnostic if negative else '')
+    if negative:
+        if mode == 'unrelated' or mode == 'wrong-fatal':
+            text = observation + '\nUNRELATED_CONTROL_FAILURE'
+        elif mode == 'missing-fatal' or (mode == 'partial-fatal' and index == 1):
+            text = diagnostic
+        elif mode == 'stdout-fatal':
+            print(text)  # Must not qualify as this testcase's own evidence.
+            text = 'UNRELATED_CONTROL_FAILURE'
+        elif mode == 'stale-fatal':
+            text = text.replace('barrier=0', 'barrier=1')
+        elif mode == 'e1-no-peer':
+            text = text.replace('peer_seen=1', 'peer_seen=0')
+        elif mode == 'e1-no-emit':
+            text = text.replace('emitted=1', 'emitted=0')
+    ET.SubElement(case, 'system-out').text = text
+ET.ElementTree(root).write(path, encoding='utf-8', xml_declaration=True)
+print(f'E1 stub: {len(root)} selected, {failures} failed')
+sys.exit(8 if failures else 0)
+PY
+  exit $?
+fi
 
 emit_listing() {
   echo "Test project /stub"
@@ -113,7 +189,12 @@ write_junit() {
 }
 
 # Model the library file sink separately from ctest stdout (ID-53).
-log="${CONTROL_TMPDIR}/entry.log"
+#
+# P6: the real sink writes one file per ROLE, `<base>.client.log` / `<base>.server.log`, and the
+# validator derives those from the ENV base. So the manifest below keeps the base names (what the
+# lane sets) while the on-disk writes here land in the CLIENT file - which is the role that raises
+# these markers in a real run.
+log="${CONTROL_TMPDIR}/entry.client.log"
 if [ "${json_requested:-0}" = 1 ]; then
   python3 -c 'import json, os; p=os.environ["CONTROL_TMPDIR"]; entries=[("ClearThenReadPixelsScenario.ClearWithNoDrawIsVisibleToDefaultFramebufferReadPixels", "entry.log"), ("PersistentCoherentMapScenario.TwoWritesThroughTheCoherentPointerEachReachTheirOwnDraw", "pmap.log")]; entries += [("TriangleScenario.SecondEntry", "second.log")] if os.environ["STUB_MODE"] == "partial-fatal" else []; print(json.dumps({"tests": [{"name": "DirectGLES.Split."+n, "properties": [{"name": "LABELS", "value": ["integration-split"]}, {"name": "ENVIRONMENT", "value": ["MOBILEGL_LOG_FILE_PATH="+p+"/"+f]}]} for n,f in entries]}))'
   if [ "${mode}" = stale-fatal ]; then
@@ -151,7 +232,7 @@ fi
 # the pixel assertion arrives, the library says nothing, and the control must refuse the red.
 if [ "${MOBILEGL_IPC_PERSISTENT_BLOCK_KB:-64}" = 0 ] && [ "${mode}" = evidence ]; then
   echo 'MGPipe: persistent-map push disabled - MOBILEGL_IPC_PERSISTENT_BLOCK_KB=0 is exit gate E3(a)'"'"'s NEGATIVE CONTROL' \
-    > "${CONTROL_TMPDIR}/pmap.log"
+    > "${CONTROL_TMPDIR}/pmap.client.log"
 fi
 case "${mode}" in
   e3-skipped-selection)
@@ -215,6 +296,27 @@ case "${mode}" in
     echo "  reported resolving it: mobilegl.log carries no"
     echo '  "MOBILEGL_TRANSPORT=inproc - the MGPipe record stream".'
     exit 8
+    ;;
+  retrace-evidence-nolog)
+    # What a pull library gets since P6: it wrote output/mobilegl.log (one role, no suffix), the
+    # runner reads output/mobilegl.client.log and stops at the no-log check BEFORE the marker
+    # search. CMake-wrapped like the mode above, with the clause split across lines.
+    echo "1/1 Test #1: MobileGLTraceReplay.OpenRA.DirectGLES ...***Failed"
+    echo "CMake Error at run_trace_case.cmake:270 (message):"
+    echo "  MOBILEGL_TRANSPORT=inproc is set for OpenRA DirectGLES but the run wrote no"
+    echo "  OpenRA/DirectGLES/output/mobilegl.client.log, so there is no evidence the"
+    echo "  transport ever resolved.  A split retrace with no library log cannot be"
+    echo "  counted as a split retrace."
+    exit 8
+    ;;
+  retrace-evidence-prefixed|retrace-evidence-nolog-prefixed)
+    # The two modes above as `ctest -V` really prints them: EVERY line of a test's output carries
+    # a "<test number>: " prefix, continuation lines included, so after whitespace folding the
+    # wrapped sentence reads "never 1: reported resolving it" / "no evidence the 1: transport ever
+    # resolved". A short case directory breaks the sentence at exactly those words; CI's long
+    # paths happened not to (retrace-split, run 35671704873: 5 false reds from this shape).
+    STUB_MODE="${mode%-prefixed}" bash "$0" "$@" | sed 's/^/1: /'
+    exit "${PIPESTATUS[0]}"
     ;;
   retrace-green)
     echo "100% tests passed, 0 tests failed out of 1"

@@ -1,5 +1,9 @@
 # CONTRACT-P5E — the client runs ahead of apply on the Espryt draw path
 
+> Historical P5e backend scope: the later [Magma run-ahead contract](CONTRACT-MAGMA-RUNAHEAD.md)
+> supersedes this document's "Magma never publishes bit 10" restriction after P5f and the
+> server-buffer migration. The wire wait classes, events and present-credit protocol remain.
+
 Authority: this file, beside `CONTRACT-P5.md` (table 0, byte carriers, field ownership, R-1…R-17),
 `CONTRACT-P5B.md` (the class-C slots) and `CONTRACT-P5C.md` (rule E, the two named exemptions,
 SEG_EVENT, the guards). Where it disagrees with any of them this file is newer and wins; §8 lists
@@ -103,6 +107,32 @@ must not be told a draw is unbarriered on that account. Escalation (ii) is a ref
 (§5.1), so on a run-ahead server it never reaches the sink; it is listed so the predicate is total.
 **No other runtime escalation exists**; adding one is an integrator ruling and a row here.
 
+**There was an escalation (iii) and it was WITHDRAWN — ID-133 added it, ID-136 took it back out,
+and the reason is the most reusable thing P5e learned about escalations.** ID-133 barriered a
+plain multi-draw (`NumDraws > 1 && !kDrawIsIndirect`) so that `MultiDrawImpl::RunIndirect`'s read
+of the client's `GL_DRAW_INDIRECT_BUFFER` binding became a legal barriered pull instead of
+`Fatal{UnmigratedPipeInput, "GetBufferBindingSlot@DrawArrays"}` on 18 lane entries. It worked, and
+it was the wrong instrument:
+
+- There is exactly **one draw opcode** — all twenty draw entry points collapse onto `draw_vbo` —
+  and the multi-draw tier is resolved on the SERVER, per batch (`MultiDraw.cpp`'s
+  `ResolveTierForBatch`), from driver caps the client does not hold. So "escalate the indirect
+  multi-draw op" has no op to name and no predicate both roles can compute, and the narrowest
+  available key charged **every plain `glMultiDraw*` on every tier**, including the `auto` → `ext`
+  default the phone ships — a per-batch rendezvous on the shipping arm, added to satisfy a lane.
+- And the read was never a data dependency: `BoundDrawIndirectBufferId` SAVES AND RESTORES a GL
+  binding name around the tier's own scratch command buffer. Giving it the handle arm its
+  neighbour `ResolveBoundIndexBuffer` already had retires the pull outright.
+
+**The rule this leaves for the next candidate escalation: ask WHICH ARM PAYS FOR IT, not which
+lane it turns green.** A wait added to make a lane green is a real cost on a real path; if the
+predicate cannot name the arm that needs it, the escalation is charging arms that do not.
+
+The two halves — retiring the pull and withdrawing the clause — landed in one commit (ID-136
+overrode ID-113's package boundary for it): the pull retired without the clause withdrawn is a
+cost with no reason, and the clause withdrawn without the pull retired puts the 18 entries back
+on the unbarriered arm.
+
 ### 2.2 The static column, row by row
 
 | class | rows | why |
@@ -134,7 +164,7 @@ keeps its lockstep meaning (nothing but reply rows waits); under run-ahead it re
 ### 2.4 Present pacing
 
 `EmitPresent` (`EmitTables.cpp:977-1053`): `BeforeReadOnlyVerb(); if (m_presentsSent >= PresentCredit)
-WaitForPresentAck(m_presentsSent + 1 - PresentCredit, 30 s)` — `ShutDown` returns, `TimedOut` is
+WaitForPresentAck(m_presentsSent + 1 - PresentCredit, kBarrierTimeoutMs)` — `ShutDown` returns, `TimedOut` is
 `Fatal{PresentCreditTimeout}`; then `DrainEventRing`, encode, publish, `PumpControlPlane`. Credit 1
 = the client publishes frame N+1 while the server applies and swaps frame N: one frame of overlap,
 at most one frame of added latency. Budget at ~850 draws + ~0.36 MB pmap/frame: SEG_CMD ~70 KB +
@@ -149,8 +179,8 @@ bell), the four EGL RPC returns (`BackendObject_Remote.cpp:200-245`), `Stop`. Fo
 `MapBuffer(READ)` / `GetBufferSubData` / a `CopyBufferSubData` source → `SyncGpuWrites` (reply
 row, unchanged); `glFinish` → `WaitForApplied(LastPublishedSeq)` + drain (a new client `Finish`
 slot; `Flush`/`Finish` stay no-ops on the wire, ARCHITECTURE:415); every `Server*` EGL forwarder
-waits `WaitForApplied(LastPublishedSeq)` BEFORE the RPC (the mailbox is pumped between drain
-batches, `ServerLoop.cpp:385-390`, so a make-current would otherwise land between two run-ahead
+waits `WaitForApplied(LastPublishedSeq)` BEFORE the RPC (the control channel is pumped between
+drain batches, `ServerLoop.cpp:400-404`, so a make-current would otherwise land between two run-ahead
 records); `ServerSwapEGLBuffers` is not on that list — present is the swap. **`glGetError`
 relaxation:** a run-ahead verb's `kEventGlError` is observed at the next drain point, i.e. at most
 one present credit later than the call after it; P5C §4.2 already assigns ordering to P9 and P5e
@@ -164,7 +194,7 @@ push (`PersistentMapTracker.cpp:735, 850`) fire-and-forget; the TEXTURE half kee
 
 On a run-ahead server `Reserve == nullptr` is NOT `Fatal{EventRingOverflow}`: the producer latches
 `eventRingFull` (exists, `EventRing.h:135-143`), publishes, rings, and `ApplyThreadMain` parks at
-the record boundary with `eventRingFull == 0` added to `ready` (`ServerLoop.cpp:380-383`). The
+the record boundary with `eventRingFull == 0` added to `ready` (`ServerLoop.cpp:391-398`). The
 client re-checks `m_events.RingIsFull()` at every park exit and drains before re-parking. Deadlock
 argument: the server blocks only on the event ring; the client blocks only on watermarks the
 server advances; every client wait drains; so at most one side is parked at any instant. The
@@ -201,6 +231,22 @@ UNBARRIERED apply is a finding: `MGLOG_E_ONCE` with the kind, Fatal under strict
    transport. For a barriered record the server reads the client's fill (the client is parked) and
    its own stamp; for an unbarriered one it does not touch the block. `SetIdentity` (`:3001`) moves
    to `ApplyOne`, once per session. This removes the E note's hazard (b.4).
+
+   **LANDED by P5f f1 — as the dual block, not as moved fields** (`MOBILEGL_IPC_ROLE_SPLIT_STATE=1`,
+   `PipeInputs.h`'s `gPipeInputsClientBlock`). The client could not be stopped from writing the
+   server's stamp storage while both roles shared one object, so the split landed one level down:
+   the fill side writes the CLIENT block (`MGPipeClientInputs()`, `PipeFill.cpp`), the stamp and
+   every backend read keep the SERVER block (`gPipeInputs`), and "applier-owned storage" is the
+   server block itself. The GL-thread `MGPipeServerClearVerbBoundary()` calls are re-pointed, not
+   deleted: they now clear the client block's flag (`MGPipeClientClearVerbBoundary()`), which is
+   never raised, so withdrawing the server's stamp is the applier's job alone
+   (`PipeApplier::LeaveApplier`). `SetIdentity` landed as `MGPipeServerBlockNoteIdentity()`, called
+   from `PipeApplier::Attach` and refreshed by each server stamp from the applier's own
+   served-context serial. And the ra2 caveat below is discharged by the knob's other half: under
+   the dual block a BARRIER_PULLED read has no value to be stale WITH, so `CountBarrierPull` is an
+   unconditional named `Fatal{UnmigratedPipeInput}` there — never a silent stale read. The
+   knob-off arm keeps the shared block and the old semantics, byte for byte; it is the A/B arm and
+   the negative control, not a second contract.
 3. **The detector.** `MGPipeInputUnfreshRead` (`PipeInputs.cpp:191-224`) under an unbarriered
    record takes `StrictBarrierPullFatal` (`:60-66`) regardless of `StrictErrors`; the seven sticky
    forwards (`MGPipeStickyForwardPull`, `:251-257`) the same; `CountBarrierPull` stays for barriered
@@ -211,6 +257,42 @@ UNBARRIERED apply is a finding: `MGLOG_E_ONCE` with the kind, Fatal under strict
    `BatchWaits` early return at `:1037` goes; under `RunAheadArmed` any GL-thread write to the block
    outside a barriered fill is `Fatal{RoleViolation, "gPipeInputs"}` by name.
    `Fatal{BarrierViolation}` (`:840`) stays for `BatchWaits==0 && !RunAhead`.
+
+   **AMENDED by ra2 (ID-132, and it is the sentence this section got wrong).** "Outside a
+   barriered fill" was the whole test, and a barriered fill was exempted on the strength of what
+   the caller SAID about itself: *"this touch is the residual fill of a record this thread is
+   about to park behind"*. That is a claim about the **future**, and the write is in the
+   **present** — the order at the validate point is fill, then emit, then park, so at the instant
+   of the write the apply thread is still draining the unbarriered records the client ran ahead
+   of. **A guard whose exemption cannot be false on the class it exists for is not a guard.** It
+   never fired on any of the 70 red lane entries; what fired instead was the apply thread, on
+   `Fatal{UnmigratedPipeInput, "<field>@<the CLIENT's verb>"}`, after the GL thread had bumped
+   `CurrentVerbSerial`, withdrawn `m_serverStampedVerb` and renamed `m_currentVerb` underneath a
+   record it was inside.
+
+   **The rule as landed:** under `RunAheadArmed` a GL-thread write to the block is legal only
+   while `ApplyThreadIsInsideApplier()` is false, barriered fill or not; and the three fill sites
+   (`MGPipeValidateForVerb` phase 1, its step-4 residual walk, `MGPipeNoteFrontendMutation`)
+   establish that by taking §2.5's forced wait first (`QuiesceApplierBeforeFill`,
+   `PipeFill.cpp`). **Two waits per filling verb, not one**, because the block is written in two
+   phases that straddle publication — the serial bump / stamp withdrawal / verb rename before the
+   emitters, the 63-field walk after them — and the records those emitters published are records
+   whose apply reads the block. The red-once is deleting a wait; the guard then aborts by name on
+   the first filling verb behind a run-ahead backlog. Pinned by
+   `RemoteGuards.ClientBarrieredFillWhileTheApplierIsInsideUnderRunAheadIsFatalByName` with its
+   green control beside it; both run in the `unit` lane, because the strict lane runs under
+   lockstep and cannot see this class by construction.
+
+   The same correction applies to **§3.2 above, which is UNLANDED and was never marked as such**:
+   "the server's stamp is server-private … never into the shared block" describes storage the
+   applier owns, and `MGPipeServerStampVerbBoundary` still writes `m_filled` / `m_currentVerb` /
+   `m_serverStampedVerb` into `gPipeInputs` itself. That gap is exactly what made the race
+   possible, and splitting the stamp is the P11 item — but note that per-role stamps **without**
+   versioning the BARRIER_PULLED values would be worse than today, because it turns a loud
+   `Fatal{UnmigratedPipeInput}` into a silent stale read. Both, or the values retired first.
+   *(P5f f1: LANDED — see the LANDED note on §3.2 above. The dual block makes the server block
+   itself applier-owned, and the unconditional dual-block Fatal in `CountBarrierPull` is the
+   "both": no BARRIER_PULLED value survives to be read stale.)*
 
 ---
 
@@ -306,11 +388,41 @@ vertex-elements CSO stays identity-addressed.
 Every draw-path entry is `SyncTextureToBackendByHandle(h, imageBindable)`: record first, twin by
 `GetOrCreateByHandle`, three syncs `(h, *rec)`; the by-value twin copy + second `Find`
 (`DirectGLES.cpp:1745-1755, 1781-1805`) go with the map arm. Clean = `m_isInitialized &&
-m_syncedResourceSerial == rec->Serial && rec->PendingUploads.empty() && m_syncedParamsSerial ==
+m_syncedResourceSerial == storage->Serial && storage->PendingUploads.empty() && m_syncedParamsSerial ==
 rec->ParamsSerial && !rec->Params.ForceResync && !m_forceTextureParamsResync &&
 m_syncedBuiltinSampler == rec->Params.BuiltinSampler && m_syncedBuiltinSamplerSerial ==
 SamplerCso(rec->Params.BuiltinSampler)->Serial && !rec->Params.SamplerResync && !m_forceSamplerResync
-&& rec->Desc.StorageKind == Mipmap` — no new state. The four in-body live reads (`GetTarget` at
+&& rec->Desc.StorageKind == Mipmap` — no new state.
+
+**`storage` is the STORAGE RECORD, which is `rec` itself for a texture that owns its texels and
+the record `rec->Desc.ViewOf` names for a `glTextureView`** (P3b/P4b wave 2-D package D3;
+`Managers.cpp PipeTextureStorageRecordForRecord`). This clause was `rec->Serial` /
+`rec->PendingUploads` through P5e and **that was wrong**, which is why it is corrected here rather
+than restated: a view owns no texels and the client keeps ONE emission cursor per storage — an
+upload through a view's own name is remapped onto its owner before it is emitted
+(`MG_Impl/Pipe/TextureEmit.h`) — so every `resource_subdata` for either name is keyed on the OWNER
+and `ApplyTextureUpload` moves the OWNER's `Serial` and `PendingUploads` alone. A view's own
+`Serial` is moved by nothing an upload does, so a gate that read it answered CLEAN for every owner
+write after the view's first sample and the view went on sampling the texels it was minted with.
+The monolith gate has this for free: `GetContentVersion()` through a view is forwarded to the owner
+(`TextureObjectView.cpp:100-102`). The three PARAMETER clauses stay `rec`'s — a view has its own
+texture parameters and its own built-in sampler, which is the whole reason the second name exists —
+as does `Desc.StorageKind`. The resolution is transitive and BOUNDED (one hop always reaches
+storage, because `glTextureView` composes a view-of-a-view onto the root at creation, but this side
+may not depend on a client invariant to terminate), and a storage record that cannot be resolved is
+**not clean**: the direction that re-syncs, not a refusal, and it raises nothing.
+`SyncTextureViewToBackendByRecord` stamps that same storage serial — or 0, which reads as never
+clean — at both its arms, so the stamp and the gate name one quantity. Deletion ordering cannot
+strand the walk, and the guarantee is the check, not the emit order: a view holds a strong
+reference to its storage owner and the client emits `resource_destroy` from the DESTRUCTOR rather
+than from `glDeleteTextures` (`TextureObject.cpp:63`), so the storage cannot go away under a live
+view whatever order the application deletes the two names in — but the two destroys leave one
+destructor chain back to back, owner FIRST when the view held the owner's last reference, so for
+one apply the view record is live with `ViewOf` naming a freed slot. No draw can land in that
+window, and the walk tests `Live`/`Gen`, so it answers null (not clean) rather than a recycled
+stranger's record.
+
+The four in-body live reads (`GetTarget` at
 `Managers.cpp:8876-8877, 8620-8621`; `IsTextureView` `:7060`; the TexBuffer backing `:8223-8231`)
 read `Desc.Target / Desc.ViewOf / Desc.BufferForTexBuffer`; `GetExternalIndex` in logs becomes
 `Desc.GlNameForDiag`. The unit work list is `{Res, backend}` keyed `(ContextSerial,
@@ -474,16 +586,56 @@ BRIEF-P5E per package. `MOBILEGL_PIPE_VERIFY` forces lockstep (`ConfigLoader.cpp
 
 ## §7 The strict gate
 
-`integration-split-strict` (`.github/workflows/test.yml:1140-1206`) becomes a HARD GREEN lane for
-the Espryt run-ahead server: with `MOBILEGL_IPC_STRICT_ERRORS=1` and the caps bit published, every
-scenario must complete and every `[BARRIER-PULLED, ...]` marker in a private log is red. Because
-§3.3 aborts on an unbarriered pull regardless of the knob, strict adds only the barriered rows'
-pulls (readbacks, GenerateMipmap until tx2, XFB, CopyTex, set_storage_block_binding) — the lane's
-step lists those rows as the ONLY admitted markers (an allowlist by `<field>@<verb>`) and fails on
-any other. A revert of any handle arm in vi/sb/pg/tx2/fb goes red HERE, by field and verb, not in
-a picture. Magma keeps the expected-red step. `rsp` on unbarriered records is 0 in every scenario
-summary (pinned: a non-zero count would be a Fatal that did not fire). The `PipeSlotPeek` harness
-asserts zero scope entries per frame on the draw path.
+`integration-split-strict` (`.github/workflows/test.yml`) becomes a HARD GREEN lane for the Espryt
+run-ahead server: with `MOBILEGL_IPC_STRICT_ERRORS=1` and the caps bit published, every scenario
+must complete. Because §3.3 aborts on an unbarriered pull regardless of the knob, strict adds only
+the barriered rows' pulls, and a revert of any handle arm in vi/sb/pg/tx2/fb goes red HERE, by
+field and verb, not in a picture. The `PipeSlotPeek` harness asserts zero scope entries per frame
+on the draw path.
+
+**The allowlist is DERIVED, not written** (ID-116, refined by ID-125 and ID-128). A
+`<field>@<verb>` pull is ADMITTED iff the field's ownership row is `BARRIER_PULLED`, the verb has a
+stamp row, the field is inside `kMGPipeClassFieldMask[class of verb]`, and any one of:
+
+1. the verb's wire op is statically barriered (`MGPipeWaitClassFor(op) != kWaitNone`);
+2. the field's retiring phase does not name P5e — a debt some later phase owes;
+3. the record was barriered BY ESCALATION (`MGPipeBarriered(op, payload, st)` true while the op is
+   `kWaitNone`): an open transform-feedback span or a draw carrying client vertex arrays, both of
+   which this contract puts outside P5e (§5.7, ID-82).
+
+Disjuncts 1 and 2 are static and generated by `scripts/gen_pipe_field_ownership.py` into
+`MGPipeBarrierPullAdmitted(field, verb)`; `--print-admitted` gives CI the same table. Disjunct 3 is
+a fact about the record and is stamped beside the barriered stamp in `PipeApplier::ApplyOne`. An
+admitted pull is **loud, not fatal** (ID-117): one deduped `Admitted{UnmigratedPipeInput,
+"<F>@<V>"} [BARRIER-PULLED, ADMITTED|ADMITTED-ESCALATED, retires in <phase>]` per process, keeping
+the `Fatal{UnmigratedPipeInput` grammar so every filter written since P5c still means "red".
+
+**The lane is a two-sided ratchet** (ID-119). Its log set comes from
+`ctest --show-only=json-v1`, not from a directory — the directory form missed 26 of the entries,
+exactly the readback population the allowlist is about. An unadmitted marker fails; so does an
+admitted pair the expected set (`MG_IntegrationTest/Harness/strict-expected-markers.txt`) does not
+carry, AND an expected pair that no longer appears, so the lane cannot rot green.
+
+**The `rsp` pin, restated** (ID-119). The former pin — "`rsp` is 0 on unbarriered records" — was
+VACUOUS: `CountBarrierPull`'s unbarriered arm is `[[noreturn]]` and runs before `++g_residualPulls`,
+so it was true of every possible implementation. What is checkable: `rsp` counts barriered pulls
+only, and under the strict knob every one it counts is an ADMITTED pull, because the rest abort.
+Its shape is asserted against `draws` rather than against 0 — `rsp == 0 || rsp >= draws` — since
+the draw path's retirement is observable as `rsp` ceasing to scale with `draws` (measured on the
+device: `rsp` ~= the draw count under inproc, 0 under monolith).
+
+**The lane has a positive control** (ID-115). `DirectGLES.Split.StrictArming.` runs one drawing
+inproc entry with `MOBILEGL_PIPE_STATS=1`, `MOBILEGL_PIPE_STATS_PERIOD=1` and a private log path,
+and asserts `vbs > 0` — the server stamped a verb boundary. Everything strict checks is downstream
+of that stamp and the monolith arm never stamps, so without it "the lane is green" and "strict was
+never armed" are the same observation.
+
+**Magma keeps the expected-red step, in a lane of its own.** The two `DirectVulkan.Split.NamedBlit`
+entries carry `integration-magma-split` (so spelled: `ctest -L` is a regex and
+`-L integration-split` matches `integration-split-magma`) and are asserted RED on
+`Fatal{UnmigratedPipeInput, "GetFramebufferBindingSlot@Clear"}`. Admitting that pair instead would
+forgive the same read on Espryt, where it is this phase's debt — one retiring-phase string serves
+both backends.
 
 ---
 
@@ -499,9 +651,29 @@ asserts zero scope entries per frame on the draw path.
    re-derived as `MGPipeBarriered`. 7. **§3.3's state note** is retired by fb (§5.4).
 8. **`FieldOwnership.def`**: `GetBoundVertexArray`, `GetTextureUnitObject`, `GetImageTextureBinding`,
    `GetFramebufferBindingSlot`, `GetProgramForDraw/Dispatch`, `GetBufferBindingPoint` gain retiring
-   phase "P5e (Espryt unbarriered), P7 (Magma)"; `GetBufferBindingPointCount`'s forward → FATAL under
-   split; `GetTransformFeedbackProgram`, `GetProgramObject`, `GetTextureObject`, `ValidateProgramName`,
-   `HasOpenTransformFeedbackSpan`, `RecordError` keep their rows (barriered-only readers).
+   phase "P5e (Espryt unbarriered), P7 (Magma)"; ~~`GetBufferBindingPointCount`'s forward → FATAL under
+   split~~ (**UNLANDED — see below**); `GetTransformFeedbackProgram`, `GetProgramObject`,
+   `GetTextureObject`, `ValidateProgramName`, `HasOpenTransformFeedbackSpan`, `RecordError` keep
+   their rows (barriered-only readers).
+
+   > **UNLANDED, and deliberately so (P5e gl, ruling ID-120). Lands with P7/P13.** The clause
+   > "`GetBufferBindingPointCount`'s forward → FATAL under split" is NOT in the code and must not
+   > be put there this phase. `FieldOwnership.def:147` (the field row) and `:179` (the forward row)
+   > both say `BARRIER_PULLED`, and the generator refuses a field/forward pair that disagrees —
+   > pinned by `FieldOwnershipTest.TheSevenStickyForwardsAgreeWithTheirFieldRows`. So landing the
+   > clause as written would either trip the generator or drag the FIELD row to FATAL with it, and
+   > that second reading changes **23 pairs** of the derived admitted set (§7, measured with
+   > `--print-admitted | grep -c '^GetBufferBindingPointCount@'`; ID-120 said 10, which was
+   > counted before ID-125's retiring-phase disjunct widened the set). The row's retiring phase is
+   > "P7/P13", which is exactly what admits it on every stamped verb today; a FATAL row is
+   > admitted nowhere, so those reads would start aborting on a migration this phase never
+   > promised.
+   >
+   > The divergence is STATED HERE rather than discovered from a red gate, for ID-105's reason:
+   > when a contract clause is arithmetically impossible against the code, the contract is what
+   > changes. The phase that retires the buffer-binding-point family (P7 for the Magma half, P13
+   > for the transfer half) lands the field row and its forward TOGETHER, in one commit, and
+   > deletes this note.
 9. **Table 1** gains `set_program_bindings` (80), appended; `set_shader_buffers` (38) gains its
    route, sink and emitter (`PipeCatalogueTest.cpp:170-171, 242-243` invert). **Table 0** gains §1's
    thirteen rows. **Table 3** gains `IpcTable::RunAhead/PresentCredit`.

@@ -25,7 +25,8 @@ public final class TraceReplayActivity extends Activity {
 
     private TextView statusView;
     private TraceReplayRequest request;
-    private boolean started;
+    private TraceReplaySession<TraceReplayResult> replaySession;
+    private final TraceReplaySession.Listener<TraceReplayResult> replayListener = this::onReplayComplete;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     @Override
@@ -44,7 +45,10 @@ public final class TraceReplayActivity extends Activity {
         request = TraceReplayRequest.from(
                 intent,
                 getFilesDir(),
-                getString(top.mobilegl.plugin.R.string.mobilegl_default_backend)
+                getString(top.mobilegl.plugin.R.string.mobilegl_default_backend),
+                // P6: the ONE place that knows where an exec-able file lives. See
+                // resolveSpawnServerPath.
+                getApplicationInfo().nativeLibraryDir
         );
         statusView = new TextView(this);
         statusView.setText("Waiting for render surface\n" + request.outputDir);
@@ -61,6 +65,18 @@ public final class TraceReplayActivity extends Activity {
             runSpawnSpike(spikeLibrary);
             return;
         }
+
+        @SuppressWarnings("unchecked")
+        TraceReplaySession<TraceReplayResult> retained =
+                (TraceReplaySession<TraceReplayResult>) getLastNonConfigurationInstance();
+        replaySession = retained != null ? retained : new TraceReplaySession<>(
+                command -> new Thread(command, "MobileGLTraceReplay").start(),
+                command -> new Handler(Looper.getMainLooper()).post(command));
+        if (replaySession.hasStarted()) {
+            Log.i(TAG, "Reattaching to retained trace replay: " + request.outputDir);
+            statusView.setText("Running trace replay\n" + request.outputDir);
+        }
+        replaySession.attach(replayListener);
 
         SurfaceHolder holder = surfaceView.getHolder();
         if (request.width > 0 && request.height > 0) {
@@ -87,20 +103,43 @@ public final class TraceReplayActivity extends Activity {
         mainHandler.postDelayed(() -> startReplay(holder), 250);
     }
 
+    @Override
+    public Object onRetainNonConfigurationInstance() {
+        return replaySession;
+    }
+
+    @Override
+    protected void onDestroy() {
+        // A callback queued by an old Surface must not start after that Activity is gone.
+        mainHandler.removeCallbacksAndMessages(null);
+        if (replaySession != null) {
+            replaySession.detach(replayListener);
+        }
+        super.onDestroy();
+    }
+
     private void startReplay(SurfaceHolder holder) {
-        if (started) {
+        if (isFinishing() || isDestroyed() || replaySession.hasStarted()) {
             return;
         }
         Surface surface = holder.getSurface();
         if (surface == null || !surface.isValid()) {
             return;
         }
-        started = true;
         statusView.setText("Running trace replay\n" + request.outputDir);
-        new Thread(() -> runRequest(request, surface), "MobileGLTraceReplay").start();
+        TraceReplayRequest replayRequest = request;
+        // The worker retains the request and Surface, not the Activity. JNI also acquires
+        // its own ANativeWindow reference until the replay and native cleanup finish.
+        replaySession.start(() -> runRequest(replayRequest, surface));
     }
 
-    private void runRequest(TraceReplayRequest request, Surface surface) {
+    private void onReplayComplete(TraceReplayResult result) {
+        statusView.setText(result.toString());
+        finish();
+    }
+
+    private static TraceReplayResult runRequest(TraceReplayRequest request, Surface surface) {
+        Log.i(TAG, "Starting native trace replay: " + request.outputDir);
         TraceReplayResult result = nativeRunTraceReplay(
                 surface,
                 request.tracePath,
@@ -135,11 +174,7 @@ public final class TraceReplayActivity extends Activity {
                 request.envOverrides
         );
         Log.i(TAG, result.toString());
-        TraceReplayResult finalResult = result;
-        runOnUiThread(() -> {
-            statusView.setText(finalResult.toString());
-            finish();
-        });
+        return result;
     }
 
     private static native TraceReplayResult nativeRunTraceReplay(
@@ -202,9 +237,7 @@ public final class TraceReplayActivity extends Activity {
     }
 
     private void runSpawnSpike(String libraryName) {
-        // The surface callbacks fire regardless; this keeps them from starting a replay
-        // underneath the spike.
-        started = true;
+        // onCreate returns before installing replay surface callbacks in this mode.
         File outputDir = new File(request.outputDir);
         String serverPath = new File(getApplicationInfo().nativeLibraryDir, libraryName)
                 .getAbsolutePath();
@@ -324,7 +357,24 @@ public final class TraceReplayActivity extends Activity {
             this.envOverrides = envOverrides;
         }
 
-        static TraceReplayRequest from(Intent intent, File filesDir, String defaultBackend) {
+        // P6: MOBILEGL_TRANSPORT=spawn NEEDS AN ABSOLUTE PATH TO AN EXEC-ABLE FILE, and this is
+        // the one process that can spell it. The reasoning, and the K=V;K=V parsing rules it has
+        // to share with ApplyEnvOverrides, live in SpawnServerPath - a class with no android.*
+        // import, so test_android_lifecycle.py compiles and runs it with plain javac.
+        //
+        // P7: THE TWO DECISIONS BELOW USED TO BE String.contains() ON THE WHOLE JOINED LIST, and
+        // neither of them was entry-aware. The one that bit: `--env MOBILEGL_IPC_SERVER_PATH`
+        // (no '='), the documented UNSET spelling and the only way to ask for "spawn with no
+        // image" and watch LaunchServer refuse by name, did not match "MOBILEGL_IPC_SERVER_PATH="
+        // - so the resolved path was appended AFTER it and, because the last entry wins, the
+        // deliberate unset was silently undone. That is precisely the "silently replacing it
+        // would make that knob untestable" SpawnServerPath's own contract forbids.
+        static String resolveSpawnServerPath(String envOverrides, String nativeLibraryDir) {
+            return SpawnServerPath.resolve(envOverrides, nativeLibraryDir);
+        }
+
+        static TraceReplayRequest from(Intent intent, File filesDir, String defaultBackend,
+                                       String nativeLibraryDir) {
             String outputDir = readString(intent, "output_dir", new File(filesDir, "trace-replay").getAbsolutePath());
             String diffPath = readString(intent, "diff_path", "");
             String benchmarkResultPath =
@@ -359,7 +409,7 @@ public final class TraceReplayActivity extends Activity {
                     intent.getIntExtra("benchmark_tail_frames", 200),
                     intent.getBooleanExtra("benchmark_finish", true),
                     benchmarkResultPath,
-                    readString(intent, "mobilegl_env", "")
+                    resolveSpawnServerPath(readString(intent, "mobilegl_env", ""), nativeLibraryDir)
             );
         }
 

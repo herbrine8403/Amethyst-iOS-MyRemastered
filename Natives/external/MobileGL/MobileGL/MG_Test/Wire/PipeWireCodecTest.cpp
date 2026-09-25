@@ -22,6 +22,7 @@
 // comes back through the recording ReplySink on the record's own seq (R-3/R-5).
 
 #include <gtest/gtest.h>
+#include <MG_Util/Debug/Log.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -75,10 +76,10 @@ namespace {
     std::string g_logPath;
 
     std::string ReadLog() {
-        std::ifstream in(g_logPath, std::ios::binary);
-        std::ostringstream ss;
-        ss << in.rdbuf();
-        return ss.str();
+        // BOTH ROLES' LOGS (P6). A death test asserts that the CHILD said something; which
+        // role's thread said it is not what these cases are about, and refusals raised on the
+        // apply thread are written under the SERVER role by construction.
+        return MobileGL::MG_Util::Debug::ReadRoleLogs(g_logPath.c_str());
     }
 
     long ProcessId() {
@@ -143,10 +144,10 @@ namespace {
             }
             const bool result = m_decoder.DecodeAndApply(view);
             ++m_sessionApplied;
-            m_control.appliedSeq.store(m_sessionApplied, std::memory_order_release);
+            m_control.Progress.appliedSeq.store(m_sessionApplied, std::memory_order_release);
             // Nothing in P5 borrows a ring slot into the GPU timeline, so a record's SEG_STAGE
             // runs retire as soon as it is applied (table 1's "retires: apply").
-            m_control.retiredSeq.store(m_sessionApplied, std::memory_order_release);
+            m_control.Progress.retiredSeq.store(m_sessionApplied, std::memory_order_release);
             m_consumer.PublishRetired();
             if (applied != nullptr) {
                 *applied = result;
@@ -561,8 +562,8 @@ TEST_F(PipeWireCodecTest, KNoneRoundTripsAndReachesItsApplier) {
     ASSERT_TRUE(wire.PumpOne(&applied));
     EXPECT_TRUE(applied);
     EXPECT_EQ(wire.Decoder().AppliedSeq(), 1u);
-    EXPECT_EQ(wire.Control().appliedSeq.load(), 1u);
-    EXPECT_EQ(wire.Control().retiredSeq.load(), 1u);
+    EXPECT_EQ(wire.Control().Progress.appliedSeq.load(), 1u);
+    EXPECT_EQ(wire.Control().Progress.retiredSeq.load(), 1u);
 }
 
 TEST_F(PipeWireCodecTest, KHasBlobRoundTripsWithARealChunkBlob) {
@@ -703,7 +704,7 @@ TEST_F(PipeWireCodecTest, KNeedsAckRespecifyCarriesItsRedefinitionScope) {
     ASSERT_TRUE(wire.PumpOne(&applied));
 
     MGPResourceDesc respecify = create;
-    MGPipeSetRespecifiedLevel(respecify, 0x0102u, 1u);
+    MGPipeSetRespecifiedLevel(respecify, 0x0102u, 1u, 4u, 4u, 1u);
     EXPECT_FALSE(MGPipeRespecifyIsWholeResource(respecify));
     ASSERT_NE(wire.Encoder().EncodeRecord(MGPWireOp::ResourceRespecify, &respecify, sizeof(respecify)),
               kInvalidSeq);
@@ -756,9 +757,11 @@ TEST_F(PipeWireCodecTest, KHostSpanClassIsValidatedEvenThoughP5ProducesNone) {
               kInvalidSeq);
     bool applied = false;
     ASSERT_TRUE(wire.PumpOne(&applied));
-    // No applier entry point exists and the call is off the reduced path, so the honest answer
-    // is "this build does not implement it" - after the tails have been checked.
-    EXPECT_FALSE(applied);
+    // P5e (sb): the applier entry point EXISTS now, so the record is applied after the tails
+    // have been checked. The case's own subject is unchanged and is what its name says - the
+    // kHostSpan class is validated whether or not P5 ever produces one - and the flip is the
+    // proof that the honesty pass runs IN FRONT of the apply rather than instead of it.
+    EXPECT_TRUE(applied);
 }
 
 // =====================================================================================
@@ -833,7 +836,7 @@ TEST_F(PipeWireCodecTest, ResourceDescPadsCrossToo) {
     desc.ArrayLayers = 6;
     desc.Levels = 3;
     desc.Samples = 1;
-    MGPipeSetRespecifiedLevel(desc, 0x0304u, 2u);
+    MGPipeSetRespecifiedLevel(desc, 0x0304u, 2u, 4u, 4u, 1u);
 
     ASSERT_NE(wire.Encoder().EncodeRecord(MGPWireOp::ResourceRespecify, &desc, sizeof(desc)),
               kInvalidSeq);
@@ -848,6 +851,9 @@ TEST_F(PipeWireCodecTest, ResourceDescPadsCrossToo) {
     EXPECT_FALSE(MGPipeRespecifyIsWholeResource(*crossed));
     EXPECT_EQ(MGPipeRespecifiedUploadTargetOf(*crossed), 0x0304u);
     EXPECT_EQ(MGPipeRespecifiedLevelOf(*crossed), 2u);
+    EXPECT_EQ(MGPipeRespecifiedWidthOf(*crossed), 4u);
+    EXPECT_EQ(MGPipeRespecifiedHeightOf(*crossed), 4u);
+    EXPECT_EQ(MGPipeRespecifiedDepthOf(*crossed), 1u);
 
 }
 
@@ -877,7 +883,9 @@ TEST_F(PipeWireCodecTest, SetShaderBuffersCarriesBothTailsWhenTheSpanTailIsPrese
               kInvalidSeq);
     bool applied = false;
     ASSERT_TRUE(wire.PumpOne(&applied));
-    EXPECT_FALSE(applied);
+    // P5e (sb): applied, for the reason the sibling case above states. BOTH tails still cross
+    // and both are still laid out by MGPipeWireRecordLayout, which is what this case is about.
+    EXPECT_TRUE(applied);
 }
 
 TEST_F(PipeWireCodecTest, ResourceSubDataCarriesABlobAndARegionTailTogether) {
@@ -1190,6 +1198,9 @@ TEST_F(PipeWireCodecTest, TheFourStreamOutputSpanRowsReachTheSink) {
     Wire2 wire;
     MGPStreamOutputBegin begin{};
     begin.PrimitiveMode = 4;
+    begin.CaptureProgram = MakeHandle(95);
+    begin.LifetimeId = 0x100000002ull;
+    begin.Targets[3] = {MakeHandle(96), 0x100000010ull, 64};
     MGPStreamOutputControl control{};
     MGPXfbAccounting end{};
     end.CapturedVertices = 300;
@@ -1206,6 +1217,11 @@ TEST_F(PipeWireCodecTest, TheFourStreamOutputSpanRowsReachTheSink) {
     }
     ASSERT_EQ(wire.Sink().Begins.size(), 1u);
     EXPECT_EQ(wire.Sink().Begins[0].PrimitiveMode, 4u);
+    EXPECT_EQ(wire.Sink().Begins[0].CaptureProgram, MakeHandle(95));
+    EXPECT_EQ(wire.Sink().Begins[0].LifetimeId, 0x100000002ull);
+    EXPECT_EQ(wire.Sink().Begins[0].Targets[3].Res, MakeHandle(96));
+    EXPECT_EQ(wire.Sink().Begins[0].Targets[3].Offset, 0x100000010ull);
+    EXPECT_EQ(wire.Sink().Begins[0].Targets[3].Size, 64u);
     EXPECT_EQ(wire.Sink().Pauses, 1u);
     EXPECT_EQ(wire.Sink().Resumes, 1u);
     ASSERT_EQ(wire.Sink().Ends.size(), 1u);
@@ -1557,8 +1573,14 @@ TEST_F(PipeWireCodecTest, CreateShaderStateCrossesAsOneArchiveAndSixUndeclaredRu
     }
     spirv.globalUboScratch.assign(32, 0xAB);
 
+    // P5e (pg): THE FRAMED archive is what crosses now - the codec's own stream with the stage
+    // of each module in front of it. SpirvArtifacts does not carry the stages and StageMask
+    // cannot stand in for them (two shader objects may share a stage, so a list rebuilt from
+    // the mask can be shorter than generatedSpirv), and the server pairs the two by one running
+    // index. See ProgramArtifactsCodec.h.
+    const Vector<Uint32> stages{0, 1, 2, 3, 4, 5};
     Vector<Uint8> archive;
-    MG_State::GLState::EncodeProgramArtifacts(link, spirv, archive);
+    MG_State::GLState::EncodeProgramArchive(link, spirv, stages, archive);
     ASSERT_FALSE(archive.empty());
 
     MGPProgramDesc desc{};
@@ -1582,16 +1604,16 @@ TEST_F(PipeWireCodecTest, CreateShaderStateCrossesAsOneArchiveAndSixUndeclaredRu
     EXPECT_TRUE(applied);
 
     // And the archive really did carry the six modules: decode it the way the arm does.
-    MG_State::GLState::LinkArtifacts back;
-    MG_State::GLState::SpirvArtifacts backSpirv;
-    ASSERT_TRUE(MG_State::GLState::DecodeProgramArtifacts(archive.data(), archive.size(), back,
-                                                          backSpirv));
-    ASSERT_EQ(backSpirv.generatedSpirv.size(), 6u);
+    MG_State::GLState::ProgramArchive back;
+    ASSERT_TRUE(MG_State::GLState::DecodeProgramArchive(archive.data(), archive.size(), back));
+    ASSERT_EQ(back.Spirv.generatedSpirv.size(), 6u);
     for (std::size_t stage = 0; stage < 6; ++stage) {
-        EXPECT_EQ(backSpirv.generatedSpirv[stage].size(), 4 + stage);
-        EXPECT_EQ(backSpirv.generatedSpirv[stage][0], 0x07230203u + stage);
+        EXPECT_EQ(back.Spirv.generatedSpirv[stage].size(), 4 + stage);
+        EXPECT_EQ(back.Spirv.generatedSpirv[stage][0], 0x07230203u + stage);
     }
-    EXPECT_TRUE(backSpirv.spirvStatus);
+    EXPECT_TRUE(back.Spirv.spirvStatus);
+    // The frame's own half: one stage word per module, at the same index.
+    EXPECT_EQ(back.LinkedStages, stages);
 }
 
 // =====================================================================================
@@ -1724,7 +1746,7 @@ TEST_F(PipeWireCodecTest, AppliedSeqAdvancesByExactlyOnePerRecordAndIsNeverBatch
         bool applied = false;
         ASSERT_TRUE(wire.PumpOne(&applied));
         EXPECT_EQ(wire.Decoder().AppliedSeq(), i);
-        EXPECT_EQ(wire.Control().appliedSeq.load(), i);
+        EXPECT_EQ(wire.Control().Progress.appliedSeq.load(), i);
         EXPECT_EQ(wire.SessionAppliedSeq(), wire.Decoder().AppliedSeq());
     }
     EXPECT_EQ(wire.Encoder().EmitSeq(), 5u);
@@ -1745,18 +1767,18 @@ TEST_F(PipeWireCodecTest, TheDecoderWritesNoRingControlFieldOfItsOwn) {
     bool corrupt = false;
     ASSERT_TRUE(wire.Consumer().Pop(view, &corrupt));
     ASSERT_FALSE(corrupt);
-    const std::uint64_t appliedBefore = wire.Control().appliedSeq.load();
-    const std::uint64_t retiredBefore = wire.Control().retiredSeq.load();
+    const std::uint64_t appliedBefore = wire.Control().Progress.appliedSeq.load();
+    const std::uint64_t retiredBefore = wire.Control().Progress.retiredSeq.load();
 
     (void)wire.Decoder().DecodeAndApply(view);
 
-    EXPECT_EQ(wire.Control().appliedSeq.load(), appliedBefore);
-    EXPECT_EQ(wire.Control().retiredSeq.load(), retiredBefore);
+    EXPECT_EQ(wire.Control().Progress.appliedSeq.load(), appliedBefore);
+    EXPECT_EQ(wire.Control().Progress.retiredSeq.load(), retiredBefore);
     EXPECT_EQ(wire.Decoder().AppliedSeq(), 1u); // the decoder's own tally did move
 }
 
 TEST_F(PipeWireCodecTest, MaxRecordBytesSeenStaysFarBelowHalfTheRing) {
-    // R-10's proof obligation. P5 does no chunking and must instead show it never needed any.
+    // R-10's proof obligation, over a record's own bytes: the content rows cut their blobs.
     //
     // THE CAP IS ASKED FOR AT RUNTIME AND NEVER DERIVED FROM MOBILEGL_IPC_RING_MB, and this
     // phase is why: the number moved twice in one afternoon. s1 first found that the control
@@ -2311,7 +2333,7 @@ TEST_F(PipeWireCodecTest, ANonZeroSizeWithNoSegmentIsFatal) {
 
 TEST_F(PipeWireCodecTest, ARecordLargerThanHalfTheRingIsFatalRingOverrun) {
     // R-10's PROOF OBLIGATION, FAILING ON PURPOSE - the red-once for everything the phase
-    // publishes as `maxrec=`. P5 does no chunking: a record above
+    // publishes as `maxrec=`. Nothing cuts a record's own bytes, so a record above
     // RingProducer::MaxRecordBytes() == Capacity()/2 must abort by name at the ENCODER, on the
     // producing side, rather than becoming a nullptr from Reserve that some caller reads as
     // "the ring is full, wait" - which on an EMPTY ring would be a wait that never ends.
@@ -2333,9 +2355,10 @@ TEST_F(PipeWireCodecTest, ARecordLargerThanHalfTheRingIsFatalRingOverrun) {
     ASSERT_TRUE(DiedOfAbort(r)) << DescribeStatus(r) << "\n" << r.Log;
     EXPECT_NE(r.Log.find("Fatal{RingOverrun,"), std::string::npos) << r.Log;
     EXPECT_NE(r.Log.find("exceeds RingProducer::MaxRecordBytes()"), std::string::npos) << r.Log;
-    // The diagnostic has to name R-10 and the decision it forces, because the person reading it
-    // has to choose between early chunking and a bigger ring and neither is a local fix.
-    EXPECT_NE(r.Log.find("does not chunk (R-10)"), std::string::npos) << r.Log;
+    // The diagnostic has to name the decision it forces, because the person reading it
+    // has to choose between a cut for this row and a bigger ring and neither is a local fix.
+    EXPECT_NE(r.Log.find("budget cuts blobs, not a record's own bytes"), std::string::npos)
+        << r.Log;
 }
 
 TEST_F(PipeWireCodecTest, ARunThatLeavesItsSegmentIsFatal) {
@@ -2820,7 +2843,8 @@ TEST_F(PipeWireCodecTest, AdoptTierZeroIsFatalOnTheWirePathAndNamesP11) {
         (void)wire.PumpOne(&applied);
     });
     ASSERT_TRUE(DiedOfAbort(r)) << DescribeStatus(r) << "\n" << r.Log;
-    EXPECT_NE(r.Log.find("MOBILEGL_IPC_ADOPT_TIER=0 names adoption tier T0, which P11 implements"),
+    EXPECT_NE(r.Log.find("Fatal{UnimplementedAdoptTier, \"T0\"} - MOBILEGL_IPC_ADOPT_TIER=0 "
+                          "names an adoption tier P11 implements"),
               std::string::npos)
         << r.Log;
 }
@@ -2836,7 +2860,8 @@ TEST_F(PipeWireCodecTest, AdoptTierOneIsFatalOnTheWirePathAndNamesP11) {
         (void)wire.PumpOne(&applied);
     });
     ASSERT_TRUE(DiedOfAbort(r)) << DescribeStatus(r) << "\n" << r.Log;
-    EXPECT_NE(r.Log.find("MOBILEGL_IPC_ADOPT_TIER=1 names adoption tier T1, which P11 implements"),
+    EXPECT_NE(r.Log.find("Fatal{UnimplementedAdoptTier, \"T1\"} - MOBILEGL_IPC_ADOPT_TIER=1 "
+                          "names an adoption tier P11 implements"),
               std::string::npos)
         << r.Log;
 }
@@ -2990,6 +3015,131 @@ TEST(FenceWireRoundTrip, NullNativeFenceUsesOnlyTheExistingMonolithFallback) {
     EXPECT_EQ(result, 1u);
     EXPECT_TRUE(sink.OnFenceDestroy(fence));
     EXPECT_EQ(fenceDeletes, 0u);
+    sink.SetBackend(nullptr);
+}
+
+namespace {
+    int nativeQueryToken = 0;
+    Bool queryGpuReady = false;
+    Bool queryGenerated = false;
+    Uint32 queryReads = 0, queryEnds = 0, queryDeletes = 0;
+    constexpr Uint64 queryNativeValue = 0xfedcba9876543210ull;
+
+    void InstallQueryProbe(FenceProbeBackend& backend) {
+        InstallFenceProbe(backend);
+        queryGpuReady = queryGenerated = false;
+        queryReads = queryEnds = queryDeletes = 0;
+        backend.Table.GL.BeginXfbPrimitivesQuery = +[](Bool generated) -> MG_Backend::BackendQueryHandle {
+            queryGenerated = generated;
+            return &nativeQueryToken;
+        };
+        backend.Table.GL.EndXfbPrimitivesQuery = +[](MG_Backend::BackendQueryHandle query) {
+            EXPECT_EQ(query, &nativeQueryToken);
+            ++queryEnds;
+        };
+        backend.Table.GL.IsQueryResultAvailable = +[](MG_Backend::BackendQueryHandle query) -> Bool {
+            EXPECT_EQ(query, &nativeQueryToken);
+            return queryGpuReady;
+        };
+        backend.Table.GL.GetQueryResult64 = +[](MG_Backend::BackendQueryHandle query, Bool, Uint64* value) -> Bool {
+            EXPECT_EQ(query, &nativeQueryToken);
+            ++queryReads;
+            *value = queryNativeValue;
+            return true;
+        };
+        backend.Table.GL.DeleteBackendQuery = +[](MG_Backend::BackendQueryHandle query) {
+            EXPECT_EQ(query, &nativeQueryToken);
+            ++queryDeletes;
+        };
+        backend.Table.GL.ClientWaitSync = +[](MG_Backend::BackendSyncHandle sync, GLbitfield flags,
+                                              GLuint64 timeout) -> GLenum {
+            EXPECT_EQ(sync, &nativeFenceToken);
+            fenceFlags = flags;
+            fenceTimeout = timeout;
+            return queryGpuReady ? GL_CONDITION_SATISFIED : GL_TIMEOUT_EXPIRED;
+        };
+    }
+}
+
+TEST(QueryWireRoundTrip, PrimitiveQueriesPreservePendingStateNativeResultsAndIdentity) {
+    Wire2 wire;
+    FenceProbeBackend backend;
+    InstallQueryProbe(backend);
+    Server::ServerVerbSink sink;
+    sink.SetBackend(&backend);
+    wire.Decoder().SetVerbSink(&sink);
+    auto send = [&](MGPWireOp op, const auto& payload) {
+        const auto seq = wire.Encoder().EncodeRecord(op, &payload, sizeof(payload));
+        EXPECT_NE(seq, kInvalidSeq);
+        bool applied = false;
+        EXPECT_TRUE(wire.PumpOne(&applied));
+        EXPECT_TRUE(applied);
+        return seq;
+    };
+    const MGPQueryDesc desc{{51, 0}, GL_PRIMITIVES_GENERATED, 0};
+    send(MGPWireOp::QueryCreate, desc);
+    send(MGPWireOp::QueryBegin, desc);
+    EXPECT_TRUE(queryGenerated);
+    send(MGPWireOp::QueryEnd, desc);
+    EXPECT_EQ(queryEnds, 1u);
+    MGPQueryResultRequest request{};
+    request.Query = desc.Query;
+    const auto pendingSeq = send(MGPWireOp::QueryResult, request);
+    ASSERT_EQ(wire.Answers().All.back().Bytes.size(), sizeof(QueryResultReply));
+    QueryResultReply reply{};
+    std::memcpy(&reply, wire.Answers().All.back().Bytes.data(), sizeof(reply));
+    EXPECT_EQ(wire.Answers().All.back().Seq, pendingSeq);
+    EXPECT_EQ(wire.Answers().All.back().Status, ReplySink::kStatusOk);
+    EXPECT_EQ(reply.Produced, 0u);
+    EXPECT_EQ(queryReads, 0u) << "NO_WAIT must not call a potentially blocking native result read";
+    EXPECT_EQ(fenceTimeout, 0u);
+    queryGpuReady = true;
+    request.Wait = 1;
+    send(MGPWireOp::QueryResult, request);
+    std::memcpy(&reply, wire.Answers().All.back().Bytes.data(), sizeof(reply));
+    EXPECT_EQ(reply.Produced, 1u);
+    EXPECT_EQ(reply.Value, queryNativeValue);
+    EXPECT_EQ(queryReads, 1u);
+    EXPECT_EQ(fenceTimeout, GL_TIMEOUT_IGNORED);
+    EXPECT_EQ(fenceFlags, GL_SYNC_FLUSH_COMMANDS_BIT);
+    const MGPHandleOnly handle{desc.Query, static_cast<Uint32>(MGPipeKind::Query), 0};
+    send(MGPWireOp::QueryAvailable, handle);
+    Uint32 available = 0;
+    ASSERT_EQ(wire.Answers().All.back().Bytes.size(), sizeof(available));
+    std::memcpy(&available, wire.Answers().All.back().Bytes.data(), sizeof(available));
+    EXPECT_EQ(available, 1u);
+    send(MGPWireOp::QueryDestroy, handle);
+    EXPECT_EQ(queryDeletes, 1u);
+    EXPECT_EQ(fenceDeletes, 1u);
+    const MGPQueryDesc replacement{{51, 1}, GL_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, 0};
+    send(MGPWireOp::QueryCreate, replacement);
+    send(MGPWireOp::QueryBegin, replacement);
+    EXPECT_FALSE(queryGenerated);
+    sink.SetBackend(nullptr);
+    EXPECT_EQ(queryEnds, 2u);
+    EXPECT_EQ(queryDeletes, 2u);
+}
+
+TEST(QueryWireRoundTrip, FailedNativeCreationDoesNotBecomeAnAvailableZeroResult) {
+    FenceProbeBackend backend;
+    InstallQueryProbe(backend);
+    backend.Table.GL.BeginXfbPrimitivesQuery = +[](Bool) -> MG_Backend::BackendQueryHandle { return nullptr; };
+    Server::ServerVerbSink sink;
+    sink.SetBackend(&backend);
+    const MGPQueryDesc desc{{7, 0}, GL_PRIMITIVES_GENERATED, 0};
+    ASSERT_TRUE(sink.OnQueryCreate(desc));
+    ASSERT_TRUE(sink.OnQueryBegin(desc));
+    ASSERT_TRUE(sink.OnQueryEnd(desc));
+    Uint32 available = 1;
+    EXPECT_TRUE(sink.OnQueryAvailable({desc.Query, static_cast<Uint32>(MGPipeKind::Query), 0}, available));
+    EXPECT_EQ(available, 0u);
+    MGPQueryResultRequest request{};
+    request.Query = desc.Query;
+    request.Wait = 1;
+    QueryResultReply reply{};
+    EXPECT_TRUE(sink.OnQueryResult(request, reply));
+    EXPECT_EQ(reply.Produced, 0u);
+    EXPECT_EQ(queryReads, 0u);
     sink.SetBackend(nullptr);
 }
 

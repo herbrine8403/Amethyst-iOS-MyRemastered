@@ -29,6 +29,7 @@
 //     exists to test: bytes that were copied survive the source being overwritten with 0xDD.
 
 #include <Config.h>
+#include <MG_Util/Debug/Log.h>
 #include <MG_Backend/BackendObject.h>
 #include <MG_Backend/BackendObjects.h>
 #include <MG_Backend/DirectGLES/BackendObject_DirectGLES.h>
@@ -36,12 +37,17 @@
 #include <MG_Backend/DirectGLES/Managers.h>
 #include <MG_Backend/DirectGLES/Utils.h>
 #include <MG_Backend/MGPipe/PipeInputs.h>
+#include <MG_Backend/DirectVulkan/Renderer/VulkanRenderer.h>
 #include <MG_Impl/Pipe/PipeFill.h>
+#include <MG_Impl/Pipe/ResourceTracker.h>
 #include <MG_Pipe/MGPipe.h>
+#include <MG_Pipe/MGPipeCallbacks.h>
 #include <MG_Pipe/PipeApply.h>
 #include <MG_Remote/CapsCodec.h>
 #include <MG_Remote/Client/ClientSession.h>
+#include <MG_Remote/FatalFunnel.h>
 #include <MG_Remote/Protocol/generated/protocol_generated.h>
+#include <MG_Remote/Protocol/SurfaceOpCodec.h>
 #include <MG_Remote/Server/PipeApplier.h>
 #include <MG_Remote/Server/ServerLoop.h>
 #include <MG_Remote/Server/ServerSession.h>
@@ -53,6 +59,7 @@
 #include <MG_Remote/Wire/PipeWireCodec.h>
 #include <MG_State/GLState/BufferState/BufferObject.h>
 #include <MG_State/GLState/Core.h>
+#include <MG_State/GLState/ErrorState/ErrorInfo.h>
 #include <MG_State/GLState/TextureState/TextureEnum.h>
 #include <MGGitHash.h>
 
@@ -68,6 +75,7 @@
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -97,9 +105,10 @@ namespace {
     std::string g_logPath;
 
     std::string ReadLog() {
-        std::ifstream in(g_logPath, std::ios::binary);
-        if (!in) return {};
-        return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        // BOTH ROLES' LOGS (P6). A death test asserts that the CHILD said something; which
+        // role's thread said it is not what these cases are about, and refusals raised on the
+        // apply thread are written under the SERVER role by construction.
+        return MobileGL::MG_Util::Debug::ReadRoleLogs(g_logPath.c_str());
     }
 
     unsigned ProcessId() {
@@ -139,14 +148,15 @@ namespace {
         Codec::PipeWireEncoder encoder;
         Server::ServerSession* session = nullptr;
 
-        bool Handshake() {
+        bool Handshake(Server::ServerSession* owner = nullptr) {
             Transport::InProcessTransport::CreatePair(clientTransport, serverTransport);
             {
                 ::flatbuffers::FlatBufferBuilder builder(512);
                 auto stamp = builder.CreateString(GIT_COMMIT_HASH_SHORT);
                 auto hello = ::MobileGL::Wire::CreateHello(
                     builder, MOBILEGL_PROTOCOL_ABI_MAJOR, MOBILEGL_PROTOCOL_ABI_MINOR, stamp,
-                    /*backendType=*/0u, /*pid=*/0u, /*configBlob=*/0, CapsAbiFingerprint());
+                    /*backendType=*/0u, /*pid=*/0u, /*configBlob=*/0, CapsAbiFingerprint(),
+                    CapsAbiFingerprint(), ::MobileGL::Wire::CreateLinkTerms(builder));
                 auto root = ::MobileGL::Wire::CreateCtrlEnvelope(
                     builder, ::MobileGL::Wire::CtrlMsg::Hello, hello.Union());
                 ::MobileGL::Wire::FinishCtrlEnvelopeBuffer(builder, root);
@@ -155,7 +165,7 @@ namespace {
                     return false;
                 }
             }
-            session = &Server::ServerSessionInstance();
+            session = owner != nullptr ? owner : &Server::ServerSessionInstance();
             session->SetSegmentSizes(TestSizes());
             // The two halves v1 owns. Neither has a default and CallMask() Fatals on an unset
             // one, which is s1's BLOCKER fix and the reason this is stated rather than derived.
@@ -288,7 +298,7 @@ TEST(ServerLoopTest, AControlRequestRunsOnTheApplyThreadAndUnparksIt) {
     std::thread::id posterId{};
     std::thread poster([&] {
         posterId = std::this_thread::get_id();
-        rc = loop.RunOnApplyThread(
+        rc = loop.RunProbeOnApplyThreadForTesting(
             +[](void* user) -> MobileGLResult {
                 auto* p = static_cast<Probe*>(user);
                 p->ranOn = std::this_thread::get_id();
@@ -375,7 +385,7 @@ TEST(ServerLoopTest, TheControlShadowIsClearedWhenThePumpTakesTheRequest) {
     std::atomic<Bool> answered{false};
     MobileGLResult rc = MOBILEGL_ERR_INVALID_ARGUMENT;
     std::thread poster([&] {
-        rc = loop.RunOnApplyThread(
+        rc = loop.RunProbeOnApplyThreadForTesting(
             +[](void* user) -> MobileGLResult {
                 Gate* g = static_cast<Gate*>(user);
                 g->running.store(true, std::memory_order_release);
@@ -435,6 +445,175 @@ TEST(ServerLoopTest, TheControlShadowIsClearedWhenThePumpTakesTheRequest) {
     fixture.Stop();
 }
 
+// =====================================================================================
+// p7/spawnhang: the poster reports a frame the apply thread is RUNNING, and only that
+// =====================================================================================
+//
+// retrace-split run 35912252677: a spawned server's first CreatePbufferSurface ran its lazy native
+// bring-up (eglInitialize, a software rasteriser read off a cold runner disk) for ~20 s - the whole
+// cold-start reply budget - and the client, which could not tell a busy server from a wedged one,
+// gave up while the server was about to answer. The poster now waits in slices and, after every
+// slice the apply thread spent RUNNING its frame, tells the installed sink (ServerMain's sends
+// Wire::SurfaceProgress; ServerSpawnTest's cold-bring-up case is the end-to-end half). Two
+// halves, each red for its own reason:
+//   - a frame the apply thread runs for several slices IS reported, with its kind, one seq and a
+//     growing elapsed time - with the old untimed wait there is no report at all;
+//   - a frame POSTED BUT NOT TAKEN (the apply thread is held in a drain) is NOT, however long it
+//     waits: that silence is what the client's budget still names, and a poster that reported
+//     every slice regardless would turn a stuck apply thread into an endless wait.
+namespace {
+    struct ProgressLog {
+        struct Report {
+            Server::SurfaceControlOp kind;
+            Uint64 seq;
+            Uint32 elapsedMs;
+        };
+        std::mutex mutex;
+        std::vector<Report> reports;
+
+        static void Sink(void* user, Server::SurfaceControlOp kind, Uint64 seq, Uint32 elapsedMs) {
+            auto* log = static_cast<ProgressLog*>(user);
+            const std::lock_guard<std::mutex> lock(log->mutex);
+            log->reports.push_back(Report{kind, seq, elapsedMs});
+        }
+        std::vector<Report> Snapshot() {
+            const std::lock_guard<std::mutex> lock(mutex);
+            return reports;
+        }
+    };
+
+    // Six slices: long enough that a poster oversleeping by most of a second under a loaded `-j`
+    // still wakes at least once while the frame runs.
+    constexpr Uint32 kProgressProbeRunMs = 6 * Server::ServerLoop::kControlProgressIntervalMs;
+
+    // Posts `hook` from a helper thread (N-9's reason: a lost post must be said in the case's own
+    // words, not as ctest's timeout) and waits for its answer within `deadlineMs`.
+    bool PostProbeAndWait(Server::ServerLoop::ControlProbeHook hook, void* user, Uint32 deadlineMs,
+                          MobileGLResult* rc, long long* waitedMs) {
+        std::atomic<Bool> answered{false};
+        std::thread poster([&] {
+            const auto start = std::chrono::steady_clock::now();
+            *rc = Server::ServerLoopInstance().RunProbeOnApplyThreadForTesting(hook, user);
+            *waitedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - start).count();
+            answered.store(true, std::memory_order_release);
+        });
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(deadlineMs);
+        while (!answered.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        const Bool ok = answered.load(std::memory_order_acquire);
+        if (!ok) Server::ServerLoopInstance().Stop(); // frees the poster (C2's exit block answers it)
+        poster.join();
+        return ok;
+    }
+} // namespace
+
+TEST(ServerLoopTest, AFrameTheApplyThreadIsRunningIsReportedToTheProgressSinkWhileItRuns) {
+    ServerFixture fixture;
+    ASSERT_TRUE(fixture.Handshake());
+    ASSERT_TRUE(fixture.StartLoop());
+    Server::ServerLoop& loop = Server::ServerLoopInstance();
+    ProgressLog log;
+    loop.SetControlProgressSink(&ProgressLog::Sink, &log);
+
+    MobileGLResult rc = MOBILEGL_ERR_INVALID_ARGUMENT;
+    long long waitedMs = 0;
+    const Bool answered = PostProbeAndWait(
+        +[](void*) -> MobileGLResult {
+            std::this_thread::sleep_for(std::chrono::milliseconds(kProgressProbeRunMs));
+            return MOBILEGL_OK;
+        },
+        nullptr, 20000, &rc, &waitedMs);
+    loop.SetControlProgressSink(nullptr, nullptr);
+    // EXPECT, never ASSERT, from here to Stop(): a case that returns early leaves the apply thread
+    // parked and the process does not exit.
+    EXPECT_TRUE(answered) << "a posted probe was never answered";
+    EXPECT_EQ(rc, MOBILEGL_OK);
+
+    const std::vector<ProgressLog::Report> reports = log.Snapshot();
+    EXPECT_FALSE(reports.empty())
+        << "the apply thread ran the frame for " << waitedMs << " ms and the poster said nothing: "
+        << "a spawn client would have seen silence for the whole of a cold bring-up and given up "
+           "on a server that was about to answer";
+    for (std::size_t i = 0; i < reports.size(); ++i) {
+        EXPECT_EQ(reports[i].kind, Server::SurfaceControlOp::ProbeForTesting) << "report " << i;
+        EXPECT_NE(reports[i].seq, 0u) << "report " << i << " names no seq";
+        EXPECT_EQ(reports[i].seq, reports.front().seq) << "one frame, one seq (report " << i << ")";
+        EXPECT_GE(reports[i].elapsedMs, Server::ServerLoop::kControlProgressIntervalMs)
+            << "report " << i << " came before one whole interval had passed";
+        if (i != 0) EXPECT_GT(reports[i].elapsedMs, reports[i - 1].elapsedMs) << "report " << i;
+    }
+
+    // THE SERVER LOG NAMES THE SLOW DISPATCH TOO: the line the investigation did not have.
+    const std::string text = ReadLog();
+    EXPECT_NE(text.find("ProbeForTesting seq"), std::string::npos)
+        << "a dispatch that ran " << waitedMs << " ms was not named in the server log";
+    EXPECT_NE(text.find("ms on mgl-srv-apply"), std::string::npos);
+
+    fixture.Stop();
+}
+
+TEST(ServerLoopTest, AFramePostedButNotYetTakenIsNotReportedHoweverLongItWaits) {
+    ServerFixture fixture;
+    ASSERT_TRUE(fixture.Handshake());
+    ASSERT_TRUE(fixture.StartLoop());
+    Server::ServerLoop& loop = Server::ServerLoopInstance();
+
+    // HOLD THE APPLY THREAD IN A DRAIN, where it cannot take a posted frame: the retire hook runs
+    // on the apply thread after a record is applied and before it is retired (DrainRing).
+    static std::atomic<Bool> s_inDrain{false};
+    static std::atomic<Bool> s_releaseDrain{false};
+    s_inDrain.store(false);
+    s_releaseDrain.store(false);
+    loop.SetBeforeRetireHookForTesting(+[] {
+        s_inDrain.store(true, std::memory_order_release);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!s_releaseDrain.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+    const MG_Pipe::MGPClear clear = WholeFramebufferClear();
+    const Uint64 seq = fixture.encoder.EncodeRecord(MG_Pipe::MGPWireOp::Clear, &clear, sizeof(clear));
+    ASSERT_NE(seq, Codec::kInvalidSeq);
+    fixture.encoder.Publish();
+    fixture.producer.PublishAndNotify(seq);
+    const auto holdDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!s_inDrain.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < holdDeadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(s_inDrain.load(std::memory_order_acquire)) << "the apply thread never reached the drain";
+
+    ProgressLog log;
+    loop.SetControlProgressSink(&ProgressLog::Sink, &log);
+    // The probe is posted from a helper while the drain holds the apply thread for six slices,
+    // then the drain is let go from here and the probe - instant once taken - is answered.
+    std::thread releaser([] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(kProgressProbeRunMs));
+        s_releaseDrain.store(true, std::memory_order_release);
+    });
+    MobileGLResult rc = MOBILEGL_ERR_INVALID_ARGUMENT;
+    long long waitedMs = 0;
+    const Bool answered =
+        PostProbeAndWait(+[](void*) -> MobileGLResult { return MOBILEGL_OK; }, nullptr, 20000, &rc, &waitedMs);
+    releaser.join();
+    loop.SetControlProgressSink(nullptr, nullptr);
+    loop.SetBeforeRetireHookForTesting(nullptr);
+    EXPECT_TRUE(answered) << "a posted probe was never answered once the drain let go";
+    EXPECT_EQ(rc, MOBILEGL_OK);
+
+    // THE WINDOW WAS REAL: the probe waited behind the drain for several slices.
+    EXPECT_GE(waitedMs, static_cast<long long>(2 * Server::ServerLoop::kControlProgressIntervalMs))
+        << "the probe was answered after " << waitedMs << " ms, so it was never posted-and-waiting "
+           "long enough for this case to say anything";
+    EXPECT_TRUE(log.Snapshot().empty())
+        << log.Snapshot().size() << " progress report(s) for a frame the apply thread had NOT "
+        << "taken: the poster reports every slice, so a client would wait on a server whose apply "
+           "thread never started its op";
+
+    fixture.Stop();
+}
+
 // Re-entrancy is not a deadlock: ~BackendObject_DirectGLES reaches ReleaseEGLResources FROM the
 // apply thread, so a post from there must run inline.
 TEST(ServerLoopTest, APostFromTheApplyThreadItselfRunsInlineRatherThanDeadlocking) {
@@ -446,10 +625,10 @@ TEST(ServerLoopTest, APostFromTheApplyThreadItselfRunsInlineRatherThanDeadlockin
         Bool innerRan = false;
         MobileGLResult innerRc = MOBILEGL_ERR_INVALID_ARGUMENT;
     } outer;
-    const MobileGLResult rc = Server::ServerLoopInstance().RunOnApplyThread(
+    const MobileGLResult rc = Server::ServerLoopInstance().RunProbeOnApplyThreadForTesting(
         +[](void* user) -> MobileGLResult {
             auto* o = static_cast<Outer*>(user);
-            o->innerRc = Server::ServerLoopInstance().RunOnApplyThread(
+            o->innerRc = Server::ServerLoopInstance().RunProbeOnApplyThreadForTesting(
                 +[](void* inner) -> MobileGLResult {
                     *static_cast<Bool*>(inner) = true;
                     return MOBILEGL_OK;
@@ -463,6 +642,72 @@ TEST(ServerLoopTest, APostFromTheApplyThreadItselfRunsInlineRatherThanDeadlockin
     EXPECT_EQ(outer.innerRc, MOBILEGL_OK);
     EXPECT_TRUE(outer.innerRan);
 
+    fixture.Stop();
+}
+
+TEST(ServerLoopTest, WireSequenceSurvivesRealDispatchAndFailureReply) {
+    ServerFixture fixture;
+    ASSERT_TRUE(fixture.Handshake());
+    ASSERT_TRUE(fixture.StartLoop());
+    flatbuffers::FlatBufferBuilder builder(256);
+    const auto op = ::MobileGL::Wire::CreateSurfaceOp(
+        builder, 4242, ::MobileGL::Wire::SurfaceOpKind::SetSwapInterval);
+    const auto envelope = ::MobileGL::Wire::CreateCtrlEnvelope(
+        builder, ::MobileGL::Wire::CtrlMsg::SurfaceOp, op.Union());
+    ::MobileGL::Wire::FinishCtrlEnvelopeBuffer(builder, envelope);
+    Server::SurfaceControlFrame reply;
+    EXPECT_EQ(MG_Remote::ServerApplyWireSurfaceOp(
+                  *::MobileGL::Wire::GetCtrlEnvelope(builder.GetBufferPointer())->msg_as_SurfaceOp(), &reply),
+              MOBILEGL_ERR_NOT_INITIALIZED);
+    EXPECT_EQ(Server::ServerLoopInstance().ControlFramesDispatched(), 1u);
+    flatbuffers::FlatBufferBuilder replies(256);
+    MG_Remote::EncodeSurfaceReplyFrame(reply, &replies);
+    const auto* wireReply = ::MobileGL::Wire::GetCtrlEnvelope(replies.GetBufferPointer())->msg_as_SurfaceReply();
+    EXPECT_EQ(wireReply->seq(), 4242u);
+    EXPECT_FALSE(wireReply->ok());
+    fixture.Stop();
+}
+
+TEST(ServerLoopTest, ConcurrentProbesKeepTheirArgumentsAcrossNestedProbes) {
+    ServerFixture fixture;
+    ASSERT_TRUE(fixture.Handshake());
+    ASSERT_TRUE(fixture.StartLoop());
+    constexpr int kPosters = 8;
+    constexpr int kCalls = 128;
+    struct Probe {
+        std::atomic<int> calls{0};
+        std::atomic<int> nested{0};
+        std::atomic<int> errors{0};
+    } probes[kPosters];
+    std::atomic<bool> go{false};
+    std::vector<std::thread> posters;
+    for (auto& probe : probes) {
+        posters.emplace_back([&go, &probe] {
+            while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+            for (int i = 0; i < kCalls; ++i) {
+                const auto rc = Server::ServerLoopInstance().RunProbeOnApplyThreadForTesting(
+                    +[](void* user) -> MobileGLResult {
+                        auto* p = static_cast<Probe*>(user);
+                        p->calls.fetch_add(1);
+                        // Same argument type keeps a regressed mixed pair observable without UB.
+                        return Server::ServerLoopInstance().RunProbeOnApplyThreadForTesting(
+                            +[](void* nestedUser) -> MobileGLResult {
+                                static_cast<Probe*>(nestedUser)->nested.fetch_add(1);
+                                return MOBILEGL_OK;
+                            }, p);
+                    }, &probe);
+                if (rc != MOBILEGL_OK) probe.errors.fetch_add(1);
+            }
+        });
+    }
+    go.store(true, std::memory_order_release);
+    for (auto& poster : posters) poster.join();
+    for (const auto& probe : probes) {
+        EXPECT_EQ(probe.calls.load(), kCalls) << "another poster or nested probe replaced this hook/user pair";
+        EXPECT_EQ(probe.nested.load(), kCalls);
+        EXPECT_EQ(probe.errors.load(), 0);
+    }
+    EXPECT_EQ(Server::ServerLoopInstance().ControlFramesDispatched(), 2u * kPosters * kCalls);
     fixture.Stop();
 }
 
@@ -622,11 +867,11 @@ TEST(ServerLoopTest, TheSessionWatermarkAndTheDecoderTallyAgreeAfterEveryRecord)
     // instantly would be asserting a promise R-9 deliberately does not make. The BOUND is what
     // keeps this a check: a loop that never retires times out here instead of passing.
     const auto retireDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (fixture.clientSegments.CmdControl()->retiredSeq.load() < 8u &&
+    while (fixture.clientSegments.CmdControl()->Progress.retiredSeq.load() < 8u &&
            std::chrono::steady_clock::now() < retireDeadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    EXPECT_GE(fixture.clientSegments.CmdControl()->retiredSeq.load(), 8u)
+    EXPECT_GE(fixture.clientSegments.CmdControl()->Progress.retiredSeq.load(), 8u)
         << "the apply loop advanced appliedSeq but never retired within 2 s, so SEG_STAGE would "
            "never be reclaimed and the first MOBILEGL_IPC_STAGE_MB would end in "
            "Fatal{RingOverrun}";
@@ -661,7 +906,9 @@ TEST(ServerLoopTest, TheAuditPoisonFillsExactlyTheStagedRunAfterTheApplierReturn
     create.Resource.Slot = 61;
     create.Resource.Gen = 1;
     create.Target = static_cast<Uint8>(MG_Pipe::MGPipeResourceTarget::Tex2D);
-    create.InternalFormat = 1;
+    // RGBA8, because the 64 staged bytes below are 4x4 texels of four bytes: PH-4 bounds the run
+    // by the declared level's w*h*d*bpp, and the old `1` (R8Snorm, one byte) bounded it at 16.
+    create.InternalFormat = static_cast<Uint32>(TextureInternalFormat::RGBA8);
     create.Width = 4;
     create.Height = 4;
     create.Depth = 1;
@@ -669,6 +916,16 @@ TEST(ServerLoopTest, TheAuditPoisonFillsExactlyTheStagedRunAfterTheApplierReturn
     create.Levels = 1;
     create.Samples = 1;
     ASSERT_TRUE(fixture.EmitAndWait(MG_Pipe::MGPWireOp::ResourceCreate, &create, sizeof(create)));
+    // PH-4: a level exists for resource_subdata only once a respecify declared it (the emitter's
+    // glTexImage*D always does). Declare level 0 at upload target 0 - the target the upload below
+    // packs - at the 4x4x1 extent the upload's descriptor-derived extent will name.
+    MG_Pipe::MGPResourceDesc respecify = create;
+    respecify.HasDefinedContent = 1;
+    MG_Pipe::MGPipeSetRespecifiedLevel(
+        respecify,
+        MG_Pipe::MGPipePackSubDataTarget(static_cast<Uint32>(MG_Pipe::MGPipeResourceTarget::Tex2D), 0u),
+        0, 4, 4, 1);
+    ASSERT_TRUE(fixture.EmitAndWait(MG_Pipe::MGPWireOp::ResourceRespecify, &respecify, sizeof(respecify)));
 
     Vector<Uint8> texels(4 * 4 * 4, 0x5A);
     MG_Pipe::MGPSubData upload{};
@@ -905,7 +1162,7 @@ TEST(ServerLoopTest, AForwarderCallAfterTheLoopStoppedReturnsNotInitializedAndDo
     struct Probe {
         Bool ran = false;
     } probe;
-    const MobileGLResult rc = Server::ServerLoopInstance().RunOnApplyThread(
+    const MobileGLResult rc = Server::ServerLoopInstance().RunProbeOnApplyThreadForTesting(
         +[](void* user) -> MobileGLResult {
             static_cast<Probe*>(user)->ran = true;
             return MOBILEGL_OK;
@@ -915,6 +1172,31 @@ TEST(ServerLoopTest, AForwarderCallAfterTheLoopStoppedReturnsNotInitializedAndDo
     EXPECT_EQ(rc, MOBILEGL_ERR_NOT_INITIALIZED)
         << "a forwarder call after Stop() did not return NOT_INITIALIZED (old code ran it inline)";
     EXPECT_FALSE(probe.ran) << "the work ran on the caller after the loop stopped";
+}
+
+// P5f (fc): the frame channel's own red-once handle. A forwarder no longer posts a function
+// pointer and a stack address; it packs a SurfaceControlFrame and the loop's dispatch counter is
+// the proof the frame crossed. The revert this guards: turn ServerSetEGLSwapInterval back into a
+// direct `Backend()->SetEGLSwapInterval(...)` (or any shape that skips the frame) and the counter
+// below does not move - the test goes red even though the swap interval itself would still reach a
+// backend in an inproc build, which is exactly why "the EGL call happened" cannot be the check.
+TEST(ServerLoopTest, AVoidForwarderCrossesAsOneDispatchedFrame) {
+    ServerFixture fixture;
+    ASSERT_TRUE(fixture.Handshake());
+    ASSERT_TRUE(fixture.StartLoop());
+    Server::ServerLoop& loop = Server::ServerLoopInstance();
+    ASSERT_TRUE(fixture.WaitUntilTrulyParked());
+    ASSERT_EQ(loop.ControlFramesDispatched(), 0u);
+
+    // No backend lives in this process, so the dispatch declines with NOT_INITIALIZED - but the
+    // frame must still have CROSSED the channel, which is the property under test.
+    Server::ServerSetEGLSwapInterval(1);
+
+    EXPECT_EQ(loop.ControlFramesDispatched(), 1u)
+        << "ServerSetEGLSwapInterval did not dispatch exactly one control frame; the forwarder "
+           "reached the backend (or did nothing) without crossing the frame channel";
+
+    fixture.Stop();
 }
 
 // P5d round 3, package D: THE IDENTITY MUST DIE WITH THE THREAD, and this is the case that says
@@ -928,7 +1210,7 @@ TEST(ServerLoopTest, AForwarderCallAfterTheLoopStoppedReturnsNotInitializedAndDo
 // after a context-loss restart. That thread then answers OnApplyThread() TRUE, which inverts
 // RunsAsTheServerRole() and PersistentMapTracker::OnServerRole() on the client, aborts
 // BufferObject's accessors with Fatal{RoleViolation, "buffer-legacy-arm"}, and makes
-// RunOnApplyThread run EGL work inline on it - the "EGL on the app thread" outcome R-1 exists to
+// RunSurfaceControlFrame run EGL work inline on it - the "EGL on the app thread" outcome R-1 exists to
 // make impossible.
 //
 // Two halves, because the mechanism and the consequence fail differently. (a) is deterministic
@@ -1293,10 +1575,10 @@ namespace {
     }
 
     // A control request that runs an arbitrary callable on the apply thread. A std::function is
-    // fine in a test; production's ControlWork is a raw pointer for the teardown path's sake.
+    // fine in a test; production's probe hook is a raw pointer for the teardown path's sake.
     MobileGLResult OnApply(const std::function<void()>& body) {
         std::function<void()> copy = body;
-        return Server::ServerLoopInstance().RunOnApplyThread(
+        return Server::ServerLoopInstance().RunProbeOnApplyThreadForTesting(
             +[](void* user) -> MobileGLResult {
                 (*static_cast<std::function<void()>*>(user))();
                 return MOBILEGL_OK;
@@ -1428,6 +1710,35 @@ namespace {
     }
 
 } // namespace
+
+TEST(ServerLoopEglTest, SuccessfulVoidWireOperationsReplyWithSuccessAndOriginalSequence) {
+    EglServerFixture fixture;
+    MGL_EGL_BRING_UP_OR_BAIL(fixture);
+    // Release last: it deliberately destroys the native context used by the preceding ops.
+    const auto kinds = {::MobileGL::Wire::SurfaceOpKind::SetSwapInterval,
+                        ::MobileGL::Wire::SurfaceOpKind::SetWindowHandle,
+                        ::MobileGL::Wire::SurfaceOpKind::ReleaseSurface,
+                        ::MobileGL::Wire::SurfaceOpKind::ReleaseResources};
+    Uint64 seq = 9000;
+    for (const auto kind : kinds) {
+        flatbuffers::FlatBufferBuilder builder(256);
+        const auto op = ::MobileGL::Wire::CreateSurfaceOp(
+            builder, ++seq, kind, 0, 0, ::MobileGL::Wire::WindowKind::None, 0, 0, 0, 1);
+        const auto envelope = ::MobileGL::Wire::CreateCtrlEnvelope(
+            builder, ::MobileGL::Wire::CtrlMsg::SurfaceOp, op.Union());
+        ::MobileGL::Wire::FinishCtrlEnvelopeBuffer(builder, envelope);
+        Server::SurfaceControlFrame reply;
+        EXPECT_EQ(MG_Remote::ServerApplyWireSurfaceOp(
+                      *::MobileGL::Wire::GetCtrlEnvelope(builder.GetBufferPointer())->msg_as_SurfaceOp(), &reply),
+                  MOBILEGL_OK) << static_cast<int>(kind);
+        flatbuffers::FlatBufferBuilder replies(256);
+        MG_Remote::EncodeSurfaceReplyFrame(reply, &replies);
+        const auto* wireReply = ::MobileGL::Wire::GetCtrlEnvelope(replies.GetBufferPointer())->msg_as_SurfaceReply();
+        EXPECT_EQ(wireReply->seq(), seq) << static_cast<int>(kind);
+        EXPECT_TRUE(wireReply->ok()) << "successful void operation encoded failure: " << static_cast<int>(kind);
+    }
+    fixture.TearDown();
+}
 
 // C7 / ID-54, THE NATIVE HALF, measured where the review said it was not: at the driver. Surface
 // creation binds the context natively on the apply thread (that is bind #1 of the "2 per process"
@@ -1573,6 +1884,80 @@ TEST(ServerLoopEglTest, ADestroyedContextForgetsTheTupleSoTheSameHandleValuesBin
     fixture.TearDown();
 }
 
+TEST(ServerLoopEglTest, RenderShadowCannotSkipAnUnchangedVersionAfterContextEpochChanges) {
+    EglServerFixture fixture;
+    MGL_EGL_BRING_UP_OR_BAIL(fixture);
+    ASSERT_TRUE(fixture.MakeCurrent());
+    Bool nativeRestored = false, servedRestored = false;
+    ASSERT_EQ(OnApply([&] {
+        using namespace MG_Backend::DirectGLES;
+        MG_Pipe::MGPipeServerStampVerbBoundary(MG_Pipe::MGPipeVerb::Clear);
+        RenderStateImpl::SyncRenderState(true);
+        // Simulate the successor driver's default/foreign state while retaining exactly
+        // the same parameter bytes and version. Epoch, not a value diff, must force it.
+        g_GLESFuncs.glEnable(GL_BLEND);
+        ++g_backendContextGeneration;
+        RenderStateImpl::SyncRenderState(true);
+        nativeRestored = g_GLESFuncs.glIsEnabled(GL_BLEND) == GL_FALSE;
+        g_GLESFuncs.glEnable(GL_BLEND);
+        MG_Pipe::MGPipeApplierReset();
+        MG_Pipe::MGPipeServerStampVerbBoundary(MG_Pipe::MGPipeVerb::Clear);
+        RenderStateImpl::SyncRenderState(true);
+        servedRestored = g_GLESFuncs.glIsEnabled(GL_BLEND) == GL_FALSE;
+        MG_Pipe::MGPipeServerClearVerbBoundary();
+    }), MOBILEGL_OK);
+    EXPECT_TRUE(nativeRestored) << "unchanged render version hid a new native context";
+    EXPECT_TRUE(servedRestored) << "unchanged render version hid a new served context";
+    fixture.TearDown();
+}
+
+TEST(ServerLoopEglTest, ServerLivenessFollowsControlFramesAcrossReleaseAndRecreation) {
+    EglServerFixture fixture;
+    MGL_EGL_BRING_UP_OR_BAIL(fixture);
+    const auto live = [] {
+        Bool answer = false;
+        EXPECT_EQ(OnApply([&] { answer = MG_Pipe::gPipeInputs.IsLive(); }), MOBILEGL_OK);
+        return answer;
+    };
+    EXPECT_FALSE(live()) << "surface creation alone is not a served current context";
+    ASSERT_TRUE(fixture.MakeCurrent());
+    EXPECT_TRUE(live());
+    auto client = Move(MG_State::pGLContext);
+    EXPECT_TRUE(live()) << "server liveness must not consult the client GLContext";
+    MG_State::pGLContext = Move(client);
+    ASSERT_TRUE(fixture.ReleaseCurrent());
+    EXPECT_FALSE(live());
+    ASSERT_TRUE(fixture.MakeCurrent()); // identical held native tuple, new logical binding
+    EXPECT_TRUE(live());
+    Server::ServerReleaseEGLResources();
+    EXPECT_FALSE(live());
+    EGLint major = 0, minor = 0;
+    ASSERT_TRUE(Server::ServerInitializeEGLDisplay(EglServerFixture::Dpy(), &major, &minor));
+    ASSERT_TRUE(Server::ServerCreateEGLPbufferSurface(EglServerFixture::Surf(), 64, 64));
+    EXPECT_FALSE(live());
+    ASSERT_TRUE(fixture.MakeCurrent());
+    EXPECT_TRUE(live());
+    fixture.TearDown();
+    EXPECT_FALSE(MG_Pipe::MGPipeServerContextIsLive());
+}
+
+// P5f (fc): InitializeEGLDisplay's out-pointers are the frame's reply fields now (the one place
+// the old mailbox carried pointers INTO the poster's stack). The answer is the driver's real
+// version through the frame - the BringUp already consumed one init; a second call is an
+// idempotent eglInitialize and its version answer must still cross back.
+TEST(ServerLoopEglTest, TheInitializeDisplayReplyArrivesThroughTheFrame) {
+    EglServerFixture fixture;
+    MGL_EGL_BRING_UP_OR_BAIL(fixture);
+
+    EGLint major = 0;
+    EGLint minor = 0;
+    ASSERT_TRUE(Server::ServerInitializeEGLDisplay(EglServerFixture::Dpy(), &major, &minor));
+    EXPECT_GE(major, 1) << "eglInitialize's major version did not cross back through the frame's "
+                           "reply fields";
+
+    fixture.TearDown();
+}
+
 // ID-49's tight-size half, gated (review v2 N-5: "nothing, unit and joint"). The client's DstSize is
 // deliberately WRONG - 80, the size a ROW_LENGTH=8 / SKIP_* client would compute for a 4x3 RGBA8
 // read whose tight extent is 48 - and the reply must still be the tight 48 bytes: posted at 48,
@@ -1580,18 +1965,50 @@ TEST(ServerLoopEglTest, ADestroyedContextForgetsTheTupleSoTheSameHandleValuesBin
 // the slot header the client reads. Red once, three ways: post at info.DstSize, size the scratch from
 // info.DstSize, compute `tight` from info.DstSize.
 TEST(ServerLoopEglTest, AReadPixelsReplyIsTheTightExtentWhateverDstSizeTheClientSent) {
+    // Arm the record consumers before any backend helper can latch its subsystem choice.
+    struct PushMaskScope {
+        Uint64 saved = MG_Config::Features.PipePush;
+        PushMaskScope() { MG_Config::Features.PipePush = MG_Pipe::kMGPipeSubsystemsMigratedAtP5e; }
+        ~PushMaskScope() { MG_Config::Features.PipePush = saved; }
+    } pushMaskScope;
     EglServerFixture fixture;
     MGL_EGL_BRING_UP_OR_BAIL(fixture);
     ASSERT_TRUE(fixture.MakeCurrent());
 
-    // THE CLIENT'S HALF OF THE VERB, exactly as glReadPixels runs it before it reaches a backend
-    // (MGP_FILL(ReadPixels) in MG_Impl): the validate point fills gPipeInputs' residual fields
-    // from the frontend context - the texture-unit base, the bound framebuffers, the pack state
-    // - which the server's ReadPixels reads BARRIER-PULLED under R-1 while the client is parked
-    // in the barrier (PipeInputs.h's class table). Without it the apply thread reads a block
-    // nobody filled and walks a null texture-unit base; with it the case drives the same two
-    // halves the inproc lane drives, in the same order, on the same process-wide block.
-    MG_Pipe::MGPipeValidateForVerb(MG_Pipe::MGPipeVerb::ReadPixels);
+    // This fixture owns its encoder directly, so publish the same record-owned inputs the
+    // normal client would send. Residual frontend pointers are deliberately not a source.
+    MG_Pipe::MGPFramebufferState framebuffer{};
+    framebuffer.Fbo = MG_Pipe::kMGPipeDefaultFramebuffer;
+    framebuffer.Target = static_cast<Uint8>(MG_Pipe::MGPipeFramebufferTarget::Both);
+    framebuffer.IsDefault = 1;
+    framebuffer.Complete = 1;
+    framebuffer.Width = framebuffer.Height = 64;
+    framebuffer.Layers = framebuffer.Samples = 1;
+    framebuffer.FixedSampleLocations = 1;
+    for (auto& drawBuffer : framebuffer.DrawBuffers) drawBuffer = -1;
+    framebuffer.DrawBuffers[0] = 0;
+    framebuffer.ContentHash = 1;
+    ASSERT_TRUE(fixture.EmitAndWait(MG_Pipe::MGPWireOp::SetFramebufferState,
+                                   &framebuffer, sizeof(framebuffer)));
+
+    MG_Pipe::MGPPixelPackState pack{};
+    pack.Pack.Alignment = 4;
+    pack.Pack.RowLength = 8; // the application's padded layout must not size server scratch
+    ASSERT_TRUE(fixture.EmitAndWait(MG_Pipe::MGPWireOp::SetPixelPackState, &pack, sizeof(pack)));
+    // Unit zero is part of the initial touched-unit window even when unbound.
+    // Explicit empty bindings distinguish that state from records that never arrived.
+    MG_Pipe::MGPSamplerViews views{};
+    views.Count = 1;
+    MG_Pipe::MGPBoundView unboundView{};
+    ASSERT_TRUE(fixture.EmitAndWaitWithTail(MG_Pipe::MGPWireOp::SetSamplerViews,
+                                          &views, sizeof(views), &unboundView, sizeof(unboundView)));
+    MG_Pipe::MGPSamplerStates samplers{};
+    samplers.Count = 1;
+    const MG_Pipe::MGPipeHandle unboundSampler = MG_Pipe::kMGPipeNullHandle;
+    ASSERT_TRUE(fixture.EmitAndWaitWithTail(MG_Pipe::MGPWireOp::BindSamplerStates,
+                                          &samplers, sizeof(samplers), &unboundSampler, sizeof(unboundSampler)));
+    MG_Pipe::MGPContextValues context{}; // unit zero is unbound; no open XFB capture
+    ASSERT_TRUE(fixture.EmitAndWait(MG_Pipe::MGPWireOp::SetContextValues, &context, sizeof(context)));
 
     MG_Pipe::MGPReadbackInfo info{};
     info.Res = MG_Pipe::kMGPipeNullHandle; // read_pixels: the bound read surface answers
@@ -2124,6 +2541,975 @@ TEST(ServerLoopTest, AnIndirectDrawRecordReachesTheSinkWithItsBlockIntact) {
     fixture.Stop();
 }
 
+namespace {
+    Uint32 g_fvErrorCode = 0;
+    String g_fvErrorMessage;
+    Uint32 g_fvErrorCalls = 0;
+
+    void CaptureFvError(Uint32 code, const char* message) {
+        g_fvErrorCode = code;
+        g_fvErrorMessage = message ? message : "";
+        ++g_fvErrorCalls;
+    }
+
+    struct FvGlobals {
+        MG_Pipe::MGPipeCallbacks callbacks = MG_Pipe::gMGPipeCallbacks;
+        Bool strict = MG_Config::Ipc.StrictErrors;
+        Bool split = MG_Config::Ipc.RoleSplitState;
+        ~FvGlobals() {
+            MG_Pipe::MGPipeServerClearVerbBoundary();
+            MG_Pipe::gMGPipeCallbacks = callbacks;
+            MG_Config::Ipc.StrictErrors = strict;
+            MG_Config::Ipc.RoleSplitState = split;
+        }
+    };
+
+    struct FvSession : ServerFixture {
+        ~FvSession() { Stop(); }
+    };
+}
+
+namespace {
+    // Exercise the real hidden-resource constructors without adding a production test API.
+    // Explicit template instantiation permits naming a private member ([temp.explicit]).
+    using FvRenderer = MG_Backend::DirectVulkan::VulkanRenderer;
+    struct FvBlitInitTag {
+        using type = Bool (FvRenderer::*)();
+        friend type FvPrivateMember(FvBlitInitTag);
+    };
+    struct FvMipmapInitTag {
+        using type = Bool (FvRenderer::*)();
+        friend type FvPrivateMember(FvMipmapInitTag);
+    };
+    template <class Tag, typename Tag::type Member> struct FvMemberAccess {
+        friend typename Tag::type FvPrivateMember(Tag) { return Member; }
+    };
+    template struct FvMemberAccess<FvBlitInitTag, &FvRenderer::InitializeBlitResources>;
+    template struct FvMemberAccess<FvMipmapInitTag, &FvRenderer::InitializeDepthMipmapResources>;
+}
+
+TEST(P5fReverseChannel, TransportDoesNotConstructHiddenFrontendPrograms) {
+    // No Vulkan device, program factory or client GLContext is supplied. A transport
+    // initialization must not need any of them merely to skip these monolith resources.
+    FvRenderer renderer({});
+    EXPECT_TRUE((renderer.*FvPrivateMember(FvBlitInitTag{}))());
+    EXPECT_TRUE((renderer.*FvPrivateMember(FvMipmapInitTag{}))());
+}
+
+TEST(P5fReverseChannel, GlErrorsUseTheOwnedCallbackWithoutAResidualPull) {
+    FvGlobals restore;
+    MG_Config::Ipc.StrictErrors = true;
+    MG_Config::Ipc.RoleSplitState = true;
+    MG_Pipe::gMGPipeCallbacks.OnGlError = &CaptureFvError;
+    g_fvErrorCalls = 0;
+    MG_Pipe::MGPipeResetResidualPullCountForTesting();
+    MG_Pipe::MGPipeServerStampVerbBoundary(MG_Pipe::MGPipeVerb::Clear);
+    MG_Pipe::gPipeInputs.RecordError(ErrorCode::InvalidOperation,
+        MakeUnique<GenericErrorInfo>("fv", "draw", "driver message"));
+    EXPECT_EQ(g_fvErrorCalls, 1u);
+    EXPECT_EQ(g_fvErrorCode, static_cast<Uint32>(ErrorCode::InvalidOperation));
+    EXPECT_EQ(g_fvErrorMessage, "[fv] [draw] driver message");
+    EXPECT_EQ(MG_Pipe::MGPipeResidualPullCount(), 0u);
+}
+
+TEST(P5fReverseChannel, AcceptCloseAndReacceptOwnTheGlErrorCallback) {
+    FvGlobals restore;
+    MG_Pipe::gMGPipeCallbacks.OnGlError = nullptr;
+    FvSession fixture;
+    ASSERT_TRUE(fixture.Handshake());
+    const auto producer = MG_Pipe::gMGPipeCallbacks.OnGlError;
+    ASSERT_NE(producer, nullptr);
+    EXPECT_EQ(fixture.session->Accept(*fixture.serverTransport), MOBILEGL_ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(MG_Pipe::gMGPipeCallbacks.OnGlError, producer);
+    fixture.Stop();
+    EXPECT_EQ(MG_Pipe::gMGPipeCallbacks.OnGlError, nullptr);
+    ASSERT_TRUE(fixture.Handshake());
+    EXPECT_EQ(MG_Pipe::gMGPipeCallbacks.OnGlError, producer);
+    fixture.Stop();
+    EXPECT_EQ(MG_Pipe::gMGPipeCallbacks.OnGlError, nullptr);
+}
+
+TEST(P5fReverseChannel, CloseDoesNotEraseAnotherGlErrorOwner) {
+    FvGlobals restore;
+    MG_Pipe::gMGPipeCallbacks.OnGlError = nullptr;
+    FvSession fixture;
+    ASSERT_TRUE(fixture.Handshake());
+    MG_Pipe::gMGPipeCallbacks.OnGlError = &CaptureFvError;
+    fixture.Stop();
+    EXPECT_EQ(MG_Pipe::gMGPipeCallbacks.OnGlError, &CaptureFvError);
+}
+
+#if !defined(_WIN32)
+TEST(P5fReverseChannel, GlErrorCallbackRejectsDoubleInstallation) {
+    EXPECT_EXIT({
+        MG_Pipe::gMGPipeCallbacks.OnGlError = &CaptureFvError;
+        FvSession fixture;
+        (void)fixture.Handshake();
+        std::_Exit(9);
+    }, ::testing::KilledBySignal(SIGABRT), "");
+    EXPECT_NE(ReadLog().find("callback-double-install"), std::string::npos);
+}
+
+TEST(P5fReverseChannel, ASecondSessionCannotClaimTheSameReverseChannel) {
+    EXPECT_EXIT({
+        FvSession owner;
+        if (!owner.Handshake()) std::_Exit(7);
+        std::unique_ptr<Transport::InProcessTransport> client;
+        std::unique_ptr<Transport::InProcessTransport> server;
+        Transport::InProcessTransport::CreatePair(client, server);
+        Server::ServerSession other;
+        // The owner refusal precedes receiving a Hello or replacing the segment resolver.
+        (void)other.Accept(*server);
+        std::_Exit(9);
+    }, ::testing::KilledBySignal(SIGABRT), "");
+    EXPECT_NE(ReadLog().find("another ServerSession already owns"), std::string::npos);
+}
+
+TEST(P5fReverseChannel, RecordErrorWithoutCallbackIsNamedFatal) {
+    EXPECT_EXIT({
+        MG_Config::Ipc.StrictErrors = true;
+        MG_Config::Ipc.RoleSplitState = true;
+        MG_Pipe::gMGPipeCallbacks.OnGlError = nullptr;
+        MG_Pipe::gPipeInputs.RecordError(ErrorCode::InvalidOperation, nullptr);
+        std::_Exit(9);
+    }, ::testing::KilledBySignal(SIGABRT), "");
+    EXPECT_NE(ReadLog().find("OnGlError.callback-missing"), std::string::npos);
+}
+
+TEST(P5fReverseChannel, LegacyGpuWrittenNeverReadsAFrontendObjectInTransport) {
+    for (Bool installed : {false, true}) {
+        EXPECT_EXIT({
+            MG_Pipe::gMGPipeCallbacks.OnGpuWritten = installed ?
+                +[](MG_Pipe::MGPipeHandle, Uint, const MG_Pipe::MGPRange*) {} : nullptr;
+            // Deliberately unreadable object: a guard after a lifetime-id probe or
+            // either MarkGpuWritten fallback would SIGSEGV instead of the named abort.
+            SharedPtr<MG_State::GLState::BufferObject> foreign(
+                reinterpret_cast<MG_State::GLState::BufferObject*>(std::uintptr_t{1}),
+                [](MG_State::GLState::BufferObject*) {});
+            MG_Pipe::MGPipeAnnounceBufferGpuWritten(foreign);
+            std::_Exit(9);
+        }, ::testing::KilledBySignal(SIGABRT), "");
+    }
+    EXPECT_NE(ReadLog().find("gpu-written-legacy-object"), std::string::npos);
+}
+#endif
+
+TEST(P5fReverseChannel, GlErrorMessagesShareFifoWithOtherReverseEvents) {
+    FvGlobals restore;
+    MG_Config::Ipc.StrictErrors = true;
+    MG_Config::Ipc.RoleSplitState = true;
+    MG_Pipe::gMGPipeCallbacks.OnGlError = nullptr;
+    FvSession fixture;
+    ASSERT_TRUE(fixture.Handshake());
+    ASSERT_TRUE(fixture.StartLoop());
+    ASSERT_EQ(Server::ServerLoopInstance().RunProbeOnApplyThreadForTesting(
+        +[](void*) -> MobileGLResult {
+            MG_Pipe::MGPipeServerStampVerbBoundary(MG_Pipe::MGPipeVerb::Clear);
+            MG_Pipe::gPipeInputs.RecordError(ErrorCode::InvalidOperation,
+                MakeUnique<GenericErrorInfo>("fv", "driver error"));
+            const MG_Pipe::MGPRange whole{0, MG_Pipe::kMGPipeWholeBuffer};
+            MG_Pipe::gMGPipeCallbacks.OnGpuWritten({17, 3}, 1, &whole);
+            Uint8 bytes[] = {11, 22, 33, 44};
+            MG_Pipe::gMGPipeCallbacks.OnBufferWriteback({17, 3}, 24,
+                MG_Pipe::MGPBlobRef{reinterpret_cast<Uint64>(bytes), sizeof(bytes),
+                                   MG_Pipe::kMGHostSpanSegNone, 0});
+            std::memset(bytes, 0xDD, sizeof(bytes));
+            String longMessage(Transport::kEventGlErrorMaxMessageBytes * 2, 'Q');
+            MG_Pipe::gMGPipeCallbacks.OnGlError(static_cast<Uint32>(ErrorCode::InvalidValue),
+                                               longMessage.c_str());
+            std::fill(longMessage.begin(), longMessage.end(), '?');
+            MG_Pipe::gMGPipeCallbacks.OnGlError(static_cast<Uint32>(ErrorCode::InvalidEnum), nullptr);
+            MG_Pipe::MGPipeServerClearVerbBoundary();
+            return MOBILEGL_OK;
+        }, nullptr), MOBILEGL_OK);
+
+    Transport::EventRingConsumer events(fixture.clientSegments.EventControl(),
+        fixture.clientSegments.CmdControl(), fixture.clientSegments.EventRingBase(),
+        fixture.clientSegments.EventRingCapacity(), fixture.clientSegments.EventSegmentBase());
+    ASSERT_TRUE(events.Valid());
+    const Uint16 kinds[] = {Transport::kEventGlError, Transport::kEventGpuWritten,
+        Transport::kEventBufferWriteback, Transport::kEventGlError, Transport::kEventGlError};
+    for (SizeT i = 0; i < 5; ++i) {
+        Transport::RingRecordView event;
+        ASSERT_TRUE(events.Pop(event)) << i;
+        EXPECT_EQ(event.kind, kinds[i]) << i;
+        if (event.kind == Transport::kEventGlError) {
+            const auto* head = static_cast<const Transport::EventGlErrorHead*>(event.payload);
+            ASSERT_GE(event.payloadSize, sizeof(*head) + head->MessageBytes);
+            ASSERT_GT(head->MessageBytes, 0u);
+            const auto* text = reinterpret_cast<const char*>(head + 1);
+            EXPECT_EQ(text[head->MessageBytes - 1], '\0');
+            const String message(text, head->MessageBytes - 1);
+            if (i == 0) {
+                EXPECT_EQ(head->Code, static_cast<Uint32>(ErrorCode::InvalidOperation));
+                EXPECT_EQ(message, "[fv] driver error");
+            } else if (i == 3) {
+                EXPECT_EQ(head->Code, static_cast<Uint32>(ErrorCode::InvalidValue));
+                EXPECT_EQ(head->MessageBytes, Transport::kEventGlErrorMaxMessageBytes);
+                EXPECT_EQ(message, String(Transport::kEventGlErrorMaxMessageBytes - 1, 'Q'));
+            } else {
+                EXPECT_EQ(head->Code, static_cast<Uint32>(ErrorCode::InvalidEnum));
+                EXPECT_EQ(head->MessageBytes, 1u);
+                EXPECT_TRUE(message.empty());
+            }
+        } else if (event.kind == Transport::kEventGpuWritten) {
+            const auto* head = static_cast<const Transport::EventGpuWrittenHead*>(event.payload);
+            EXPECT_EQ(head->Resource.Slot, 17u);
+            EXPECT_EQ(head->Resource.Gen, 3u);
+            EXPECT_EQ(head->RangeCount, 1u);
+            const auto* range = reinterpret_cast<const Transport::EventRange*>(head + 1);
+            EXPECT_EQ(range->Size, MG_Pipe::kMGPipeWholeBuffer);
+        } else {
+            const auto* head = static_cast<const Transport::EventBufferWritebackHead*>(event.payload);
+            EXPECT_EQ(head->Offset, 24u);
+            EXPECT_EQ(head->Size, 4u);
+            const Uint8 expected[] = {11, 22, 33, 44};
+            EXPECT_EQ(std::memcmp(head + 1, expected, sizeof(expected)), 0);
+        }
+    }
+    Transport::RingRecordView extra;
+    EXPECT_FALSE(events.Pop(extra));
+    events.Drained();
+}
+
+TEST(P5fReverseChannel, ANonSingletonSessionOwnsAllFourReverseCallbacks) {
+    FvGlobals restore;
+    ASSERT_EQ(Server::ServerSession::Active(), nullptr);
+    ASSERT_FALSE(Server::ServerSessionInstance().Accepted());
+    Server::ServerSession owner;
+    FvSession fixture;
+    ASSERT_TRUE(fixture.Handshake(&owner));
+    ASSERT_EQ(Server::ServerSession::Active(), &owner);
+    ASSERT_NE(fixture.session, &Server::ServerSessionInstance());
+    ASSERT_TRUE(fixture.StartLoop());
+    ASSERT_EQ(Server::ServerLoopInstance().RunProbeOnApplyThreadForTesting(
+        +[](void*) -> MobileGLResult {
+            MG_Pipe::gMGPipeCallbacks.OnGlError(static_cast<Uint32>(ErrorCode::InvalidOperation),
+                                               "non-singleton owner");
+            const MG_Pipe::MGPRange whole{0, MG_Pipe::kMGPipeWholeBuffer};
+            MG_Pipe::gMGPipeCallbacks.OnGpuWritten({41, 7}, 1, &whole);
+            const Uint8 bytes[] = {17, 34, 51, 68};
+            MG_Pipe::gMGPipeCallbacks.OnBufferWriteback({41, 7}, 20,
+                MG_Pipe::MGPBlobRef{reinterpret_cast<Uint64>(bytes), sizeof(bytes),
+                                   MG_Pipe::kMGHostSpanSegNone, 0});
+            MG_Pipe::MGPSurfaceInfo surface{};
+            surface.Width = 321;
+            surface.Height = 123;
+            surface.InternalFormat = static_cast<Uint32>(TextureInternalFormat::RGBA8);
+            surface.Samples = 4;
+            surface.Layers = 2;
+            surface.IsDefault = 1;
+            MG_Pipe::gMGPipeCallbacks.OnSurfaceChanged(&surface);
+            return MOBILEGL_OK;
+        }, nullptr), MOBILEGL_OK);
+
+    Transport::EventRingConsumer events(fixture.clientSegments.EventControl(),
+        fixture.clientSegments.CmdControl(), fixture.clientSegments.EventRingBase(),
+        fixture.clientSegments.EventRingCapacity(), fixture.clientSegments.EventSegmentBase());
+    ASSERT_TRUE(events.Valid());
+    Transport::RingRecordView event;
+    ASSERT_TRUE(events.Pop(event));
+    ASSERT_EQ(event.kind, Transport::kEventGlError);
+    const auto* error = static_cast<const Transport::EventGlErrorHead*>(event.payload);
+    EXPECT_EQ(error->Code, static_cast<Uint32>(ErrorCode::InvalidOperation));
+    EXPECT_STREQ(reinterpret_cast<const char*>(error + 1), "non-singleton owner");
+
+    ASSERT_TRUE(events.Pop(event));
+    ASSERT_EQ(event.kind, Transport::kEventGpuWritten);
+    const auto* written = static_cast<const Transport::EventGpuWrittenHead*>(event.payload);
+    EXPECT_EQ(written->Resource.Slot, 41u);
+    EXPECT_EQ(written->Resource.Gen, 7u);
+    ASSERT_EQ(written->RangeCount, 1u);
+    const auto* range = reinterpret_cast<const Transport::EventRange*>(written + 1);
+    EXPECT_EQ(range->Offset, 0u);
+    EXPECT_EQ(range->Size, MG_Pipe::kMGPipeWholeBuffer);
+
+    ASSERT_TRUE(events.Pop(event));
+    ASSERT_EQ(event.kind, Transport::kEventBufferWriteback);
+    const auto* writeback = static_cast<const Transport::EventBufferWritebackHead*>(event.payload);
+    EXPECT_EQ(writeback->Resource.Slot, 41u);
+    EXPECT_EQ(writeback->Resource.Gen, 7u);
+    EXPECT_EQ(writeback->Offset, 20u);
+    ASSERT_EQ(writeback->Size, 4u);
+    const Uint8 expected[] = {17, 34, 51, 68};
+    EXPECT_EQ(std::memcmp(writeback + 1, expected, sizeof(expected)), 0);
+
+    ASSERT_TRUE(events.Pop(event));
+    ASSERT_EQ(event.kind, Transport::kEventSurfaceChanged);
+    const auto* surface = static_cast<const Transport::EventSurfaceChangedHead*>(event.payload);
+    EXPECT_EQ(surface->Width, 321u);
+    EXPECT_EQ(surface->Height, 123u);
+    EXPECT_EQ(surface->InternalFormat, static_cast<Uint32>(TextureInternalFormat::RGBA8));
+    EXPECT_EQ(surface->Samples, 4u);
+    EXPECT_EQ(surface->Layers, 2u);
+    EXPECT_EQ(surface->IsDefault, 1u);
+    EXPECT_FALSE(events.Pop(event));
+    events.Drained();
+    EXPECT_FALSE(Server::ServerSessionInstance().Accepted());
+}
+
+#if !defined(_WIN32)
+TEST(P5fReverseChannel, CachedReverseCallbacksRejectAMissingSessionOwner) {
+    FvGlobals restore;
+    Server::ServerSession owner;
+    FvSession fixture;
+    ASSERT_TRUE(fixture.Handshake(&owner));
+    const auto callbacks = MG_Pipe::gMGPipeCallbacks;
+    fixture.Stop();
+    ASSERT_EQ(Server::ServerSession::Active(), nullptr);
+    const char* names[] = {"OnGlError", "OnGpuWritten", "OnBufferWriteback", "OnSurfaceChanged"};
+    for (Uint32 callback = 0; callback < 4; ++callback) {
+        const auto logSize = ReadLog().size();
+        EXPECT_EXIT({
+            switch (callback) {
+            case 0: callbacks.OnGlError(0, "retired"); break;
+            case 1: callbacks.OnGpuWritten(MG_Pipe::kMGPipeNullHandle, 0, nullptr); break;
+            case 2: callbacks.OnBufferWriteback(MG_Pipe::kMGPipeNullHandle, 0, MG_Pipe::MGPBlobRef{}); break;
+            case 3: callbacks.OnSurfaceChanged(nullptr); break;
+            }
+            std::_Exit(9);
+        }, ::testing::KilledBySignal(SIGABRT), "");
+        const auto marker = String(names[callback]) + ".session-missing";
+        EXPECT_NE(ReadLog().substr(logSize).find(marker), String::npos) << marker;
+    }
+}
+#endif
+
+// =====================================================================================
+// PH-1 (3), ID-P7-1: THE LATCH'S DECLINE HALF, IN PROCESS
+// =====================================================================================
+//
+// The latch is ARMED only in a spawn / TCP session child (ServerMain::RunSession), and arming is
+// one-way and process-wide, so every case here arms it in a FORKED CHILD (EXPECT_EXIT) and reports
+// through the child's exit status: 0 is "the claim held", anything else is a bitmask naming each
+// part that did not (the failure message decodes it). This process's own latch is never armed, so
+// every other case in the binary keeps its deaths. PeerLatchTest holds the same checks across a
+// real process boundary; scripts/ci/ph_latch_sites.py's MECHANICS list maps each check to both.
+#if !defined(_WIN32)
+namespace {
+    namespace Remote = MobileGL::MG_Remote;
+
+    bool PollUntil(const std::function<bool()>& predicate, int timeoutMs) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (predicate()) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        return predicate();
+    }
+
+    // THREE RECORDS UNDER ONE PUBLISH, THE FIRST OF WHICH LATCHES: ObjectDeath with Kind 999, then
+    // ObjectDeath with a null handle (a latching fault of its own), then a legal MemoryBarrier.
+    enum : int {
+        kBatchThreadStayed = 1, // the apply thread was still running 3 s after the latch, no Stop()
+        kBatchDrainedMore = 2,  // a record behind the latched one reached the applier
+        kBatchLatchedMore = 4,  // a second named fault was latched (the null-handle record ran)
+        kBatchWrongFirst = 8,   // the latched line is not the Kind fault's
+        kBatchWatermark = 16,   // appliedSeq moved past the latched record
+    };
+
+    [[noreturn]] void RunALatchedBatchAndExit() {
+        Remote::ArmSessionLatch();
+        ServerFixture fixture;
+        if (!fixture.Handshake() || !fixture.StartLoop()) ::_exit(64);
+        if (!fixture.WaitUntilTrulyParked()) ::_exit(65);
+        Server::ServerLoop& loop = Server::ServerLoopInstance();
+        MG_Pipe::MGPHandleOnly kind{};
+        kind.Handle = MG_Pipe::MGPipeHandle{5u, 1u};
+        kind.Kind = 999;
+        const MG_Pipe::MGPHandleOnly nullHandle{};
+        MG_Pipe::MGPMemoryBarrier barrier{};
+        barrier.Bits = 0x2000u;
+        (void)fixture.encoder.EncodeRecord(MG_Pipe::MGPWireOp::ObjectDeath, &kind, sizeof(kind));
+        (void)fixture.encoder.EncodeRecord(MG_Pipe::MGPWireOp::ObjectDeath, &nullHandle, sizeof(nullHandle));
+        const Uint64 last =
+            fixture.encoder.EncodeRecord(MG_Pipe::MGPWireOp::MemoryBarrier, &barrier, sizeof(barrier));
+        if (last == Codec::kInvalidSeq) ::_exit(66);
+        fixture.encoder.Publish();
+        fixture.producer.PublishAndNotify(last);
+
+        int failed = 0;
+        if (!PollUntil([&] { return !loop.Running(); }, 3000)) failed |= kBatchThreadStayed;
+        if (loop.DrainedRecords() != 1) failed |= kBatchDrainedMore;
+        if (Remote::SessionLatchCount() != 1) failed |= kBatchLatchedMore;
+        if (std::strstr(Remote::SessionLatchedLine(), "\"ObjectDeath.Kind\"") == nullptr) failed |= kBatchWrongFirst;
+        if (fixture.session->Consumer().AppliedSeq() != 1) failed |= kBatchWatermark;
+        fixture.Stop();
+        ::_exit(failed);
+    }
+
+    // A CONTROL FRAME POSTED AFTER THE LATCH, before the apply thread has looked at it.
+    enum : int {
+        kPostRan = 1,        // the probe ran on the apply thread
+        kPostAnswered = 2,   // the poster was not answered PROTOCOL_MISMATCH
+        kPostDispatched = 4, // ControlFramesDispatched moved
+    };
+
+    [[noreturn]] void PostAfterALatchAndExit() {
+        Remote::ArmSessionLatch();
+        ServerFixture fixture;
+        if (!fixture.Handshake() || !fixture.StartLoop()) ::_exit(64);
+        if (!fixture.WaitUntilTrulyParked()) ::_exit(65);
+        Server::ServerLoop& loop = Server::ServerLoopInstance();
+        const Uint64 dispatchedBefore = loop.ControlFramesDispatched();
+        // Latched OFF the apply thread - where RunSession's SurfaceOp arm latches for real - so
+        // the parked thread has not seen it: the latch is not in its park predicate, and the
+        // frame below is what wakes it.
+        (void)Remote::SessionLatch(Remote::MGFatalFamily::ProtocolCorruption,
+                                   "MGPipe: Fatal{ProtocolCorruption, \"unit.control\"} - latched off the "
+                                   "apply thread before the frame was taken");
+        std::atomic<int> ran{0};
+        const MobileGLResult rc = loop.RunProbeOnApplyThreadForTesting(
+            +[](void* user) -> MobileGLResult {
+                static_cast<std::atomic<int>*>(user)->fetch_add(1);
+                return MOBILEGL_OK;
+            },
+            &ran);
+        int failed = 0;
+        if (ran.load() != 0) failed |= kPostRan;
+        if (rc != MOBILEGL_ERR_PROTOCOL_MISMATCH) failed |= kPostAnswered;
+        if (loop.ControlFramesDispatched() != dispatchedBefore) failed |= kPostDispatched;
+        fixture.Stop();
+        ::_exit(failed);
+    }
+
+    // TWO FAULTS, ONE LATCH: the funnel's own bookkeeping.
+    enum : int {
+        kSemReturned = 1,   // an armed SessionLatch returned true (or did not return)
+        kSemNotLatched = 2, // SessionLatched() is false after a fault
+        kSemNotFirst = 4,   // the latched family / line is not the FIRST fault's
+        kSemCount = 8,      // SessionLatchCount / SessionFaultCount did not count both
+        kSemFrames = 16,    // not exactly one SessionFault frame, naming the first fault
+    };
+
+    [[noreturn]] void LatchTwiceAndExit() {
+        Remote::ArmSessionLatch();
+        ServerFixture fixture;
+        if (!fixture.Handshake()) ::_exit(64);
+        std::vector<Uint8> buffer(64 * 1024);
+        const auto pump = [&](int* fatalFrames, bool* namesFirst) {
+            for (;;) {
+                std::uint64_t size = 0;
+                const MobileGLResult rc =
+                    fixture.clientTransport->ReceiveFrame({buffer.data(), buffer.size()}, &size, 100);
+                if (rc == MOBILEGL_ERR_BUFFER_TOO_SMALL) {
+                    buffer.resize(static_cast<SizeT>(size));
+                    continue;
+                }
+                if (rc != MOBILEGL_OK) return;
+                if (fatalFrames == nullptr) continue;
+                const auto* envelope = ::MobileGL::Wire::GetCtrlEnvelope(buffer.data());
+                if (envelope == nullptr || envelope->msg_type() != ::MobileGL::Wire::CtrlMsg::Fatal) continue;
+                ++*fatalFrames;
+                const auto* fatal = envelope->msg_as_Fatal();
+                if (fatal != nullptr && fatal->message() != nullptr &&
+                    std::strstr(fatal->message()->c_str(), "unit.first") != nullptr) {
+                    *namesFirst = true;
+                }
+            }
+        };
+        pump(nullptr, nullptr); // what the handshake left for the client (Welcome, caps)
+        const Uint64 faultsBefore = Remote::SessionFaultCount();
+        const bool first = Remote::SessionLatch(Remote::MGFatalFamily::ProtocolCorruption,
+                                                "MGPipe: Fatal{ProtocolCorruption, \"unit.first\"} - the first "
+                                                "named fault (%d)",
+                                                1);
+        const bool second = Remote::SessionLatch(Remote::MGFatalFamily::UnmigratedVerb,
+                                                 "MGPipe: Fatal{UnmigratedVerb, \"unit.second\"} - a later one (%d)", 2);
+        int failed = 0;
+        if (first || second) failed |= kSemReturned;
+        if (!Remote::SessionLatched()) failed |= kSemNotLatched;
+        const char* line = Remote::SessionLatchedLine();
+        if (Remote::SessionLatchedFamily() != Remote::MGFatalFamily::ProtocolCorruption ||
+            std::strstr(line, "unit.first") == nullptr || std::strstr(line, "unit.second") != nullptr) {
+            failed |= kSemNotFirst;
+        }
+        if (Remote::SessionLatchCount() != 2 || Remote::SessionFaultCount() - faultsBefore != 2) failed |= kSemCount;
+        int fatalFrames = 0;
+        bool namesFirst = false;
+        pump(&fatalFrames, &namesFirst);
+        if (fatalFrames != 1 || !namesFirst) failed |= kSemFrames;
+        fixture.Stop();
+        ::_exit(failed);
+    }
+
+    // A RECORD SHORTER THAN ITS OWN TYPE, refused before the applier stamps or reads it.
+    enum : int {
+        kShortStamped = 1,    // the Clear verb was stamped from a record the pre-gate refuses
+        kShortWrongFault = 2, // the latched line is not record.Minimum
+        kShortDrained = 4,    // not exactly the setup draw and the short record reached the applier
+    };
+
+    [[noreturn]] void AShortRecordIsLatchedBeforeItIsStampedAndExit() {
+        Remote::ArmSessionLatch();
+        ServerFixture fixture;
+        if (!fixture.Handshake() || !fixture.StartLoop()) ::_exit(64);
+        // A legal draw first: it stamps DrawArrays, so the verb read below is this child's own
+        // doing whatever the parent had stamped before the fork.
+        MG_Pipe::MGPDrawInfo info{};
+        info.Mode = 0x0004; // GL_TRIANGLES
+        info.InstanceCount = 1;
+        info.MinIndex = ~0u;
+        info.MaxIndex = ~0u;
+        info.NumDraws = 1;
+        const MG_Pipe::MGPDrawRange range{0, 3, 0};
+        if (!fixture.EmitAndWaitWithTail(MG_Pipe::MGPWireOp::DrawVbo, &info, sizeof(info), &range, sizeof(range)))
+            ::_exit(65);
+        if (MG_Pipe::gPipeInputs.CurrentVerb() == MG_Pipe::MGPipeVerb::Clear) ::_exit(66);
+        // A Clear encoded legally and then SHORTENED in the ring before it is published - the
+        // raw-record peer driver's move, in process: its header says 8 bytes, a header and no
+        // MGPClear at all.
+        const MG_Pipe::MGPClear clear = WholeFramebufferClear();
+        const Uint64 seq = fixture.encoder.EncodeRecord(MG_Pipe::MGPWireOp::Clear, &clear, sizeof(clear));
+        if (seq == Codec::kInvalidSeq) ::_exit(67);
+        const Uint64 total = (sizeof(MG_Pipe::MGPWireRecHeader) + sizeof(clear) + 7u) & ~Uint64{7u};
+        auto* ring = static_cast<Uint8*>(fixture.clientSegments.CmdRingBase());
+        const Uint64 mask = fixture.clientSegments.CmdRingCapacity() - 1;
+        auto* header =
+            reinterpret_cast<Transport::RingRecordHeader*>(ring + ((fixture.cmd.LocalHead() - total) & mask));
+        if (header->size != total || header->kind != static_cast<std::uint16_t>(MG_Pipe::MGPWireOp::Clear))
+            ::_exit(68);
+        header->size = 8;
+        fixture.encoder.Publish();
+        fixture.producer.PublishAndNotify(seq);
+        Server::ServerLoop& loop = Server::ServerLoopInstance();
+        (void)PollUntil([&] { return !loop.Running(); }, 3000);
+        int failed = 0;
+        if (MG_Pipe::gPipeInputs.CurrentVerb() == MG_Pipe::MGPipeVerb::Clear) failed |= kShortStamped;
+        if (!Remote::SessionLatched() || std::strstr(Remote::SessionLatchedLine(), "\"record.Minimum\"") == nullptr)
+            failed |= kShortWrongFault;
+        if (loop.DrainedRecords() != 2) failed |= kShortDrained;
+        fixture.Stop();
+        ::_exit(failed);
+    }
+
+    // A LATCH FROM ANOTHER THREAD, BETWEEN TWO RECORDS OF ONE BATCH (codex closeout finding 6).
+    // RunSession's control thread latches a malformed SurfaceOp while the apply thread is mid-batch;
+    // the interleaving the finding names is "just after the apply thread's per-record check". The
+    // loop's between-records hook is that point, made deterministic: on its FIRST call - after the
+    // first record's own checks, before the second pop's latch check - it starts a thread that
+    // latches, and joins it, so the latch is stored by another thread and complete before the apply
+    // thread moves on. This pins the NARROWED window only: DrainRing's check-before-pop sees a latch
+    // stored here, but one stored between that check and the pop still lets that record through
+    // (the window is check-to-pop, not closed), and the session then ends at the next check.
+    enum : int {
+        kBetweenThreadStayed = 1, // the apply thread was still running 3 s after the latch, no Stop()
+        kBetweenDrainedMore = 2,  // a record behind the latch point reached the applier
+        kBetweenWrongFault = 4,   // not exactly one fault latched, or it is not the control thread's
+        kBetweenWatermark = 8,    // appliedSeq moved past the first record
+        kBetweenHookCalls = 16,   // the hook did not run exactly once (the case did not interleave)
+    };
+
+    std::atomic<int> g_betweenRecordsCalls{0};
+
+    void LatchFromAControlThreadOnTheFirstCall() {
+        if (g_betweenRecordsCalls.fetch_add(1, std::memory_order_acq_rel) != 0) return;
+        std::thread control([] {
+            (void)MobileGL::MG_Remote::SessionLatch(
+                MobileGL::MG_Remote::MGFatalFamily::ProtocolCorruption,
+                "MGPipe: Fatal{ProtocolCorruption, \"unit.between-records\"} - latched by a control "
+                "thread after the apply thread's checks on the first record");
+        });
+        control.join();
+    }
+
+    [[noreturn]] void LatchFromAnotherThreadBetweenTwoRecordsAndExit() {
+        Remote::ArmSessionLatch();
+        ServerFixture fixture;
+        if (!fixture.Handshake() || !fixture.StartLoop()) ::_exit(64);
+        if (!fixture.WaitUntilTrulyParked()) ::_exit(65);
+        Server::ServerLoop& loop = Server::ServerLoopInstance();
+        loop.SetBetweenRecordsHookForTesting(&LatchFromAControlThreadOnTheFirstCall);
+        // Three LEGAL draws under ONE publish (the draw ARecordShorterThanItsType... proves applies
+        // in an armed child without latching), so nothing but the control thread's latch can stop
+        // the batch.
+        MG_Pipe::MGPDrawInfo info{};
+        info.Mode = 0x0004; // GL_TRIANGLES
+        info.InstanceCount = 1;
+        info.MinIndex = ~0u;
+        info.MaxIndex = ~0u;
+        info.NumDraws = 1;
+        const MG_Pipe::MGPDrawRange range{0, 3, 0};
+        Uint64 last = Codec::kInvalidSeq;
+        for (int i = 0; i < 3; ++i) {
+            last = fixture.encoder.EncodeRecord(MG_Pipe::MGPWireOp::DrawVbo, &info, sizeof(info), &range,
+                                                sizeof(range));
+            if (last == Codec::kInvalidSeq) ::_exit(66);
+        }
+        fixture.encoder.Publish();
+        fixture.producer.PublishAndNotify(last);
+
+        int failed = 0;
+        if (!PollUntil([&] { return !loop.Running(); }, 3000)) failed |= kBetweenThreadStayed;
+        if (loop.DrainedRecords() != 1) failed |= kBetweenDrainedMore;
+        if (Remote::SessionLatchCount() != 1 ||
+            std::strstr(Remote::SessionLatchedLine(), "\"unit.between-records\"") == nullptr) {
+            failed |= kBetweenWrongFault;
+        }
+        if (fixture.session->Consumer().AppliedSeq() != 1) failed |= kBetweenWatermark;
+        if (g_betweenRecordsCalls.load(std::memory_order_acquire) != 1) failed |= kBetweenHookCalls;
+        loop.SetBetweenRecordsHookForTesting(nullptr);
+        fixture.Stop();
+        ::_exit(failed);
+    }
+} // namespace
+
+// DrainRing's pre-pop latch check and the apply thread's own exit, in process. Red with the check
+// deleted (the drain applies both records behind the latched one: bits 2|4|16 - the exit-path drain
+// would too), and with ApplyThreadMain's latched break deleted (bit 1: the thread spins on a ring it
+// will not drain).
+TEST(ServerLoopLatchTest, ALatchedRecordEndsItsBatchAndTheApplyThreadLeavesWithoutAStop) {
+    EXPECT_EXIT(RunALatchedBatchAndExit(), ::testing::ExitedWithCode(0), ".*")
+        << "bits: 1 = the apply thread was still running 3 s after the latch; 2 = a record behind the "
+           "latched one reached the applier; 4 = a second fault was latched; 8 = the latched line is "
+           "not ObjectDeath.Kind; 16 = appliedSeq moved past the latched record (64+ = setup)";
+}
+
+// ServerLoop::PumpControlRequest's latched arm. A frame taken after the latch - posted before it
+// was seen, or pumped by the exit path - is answered PROTOCOL_MISMATCH and never dispatched. Red
+// with the arm deleted: the probe runs (bits 1|2|4).
+TEST(ServerLoopLatchTest, AControlFrameTakenAfterTheLatchIsAnsweredWithoutRunning) {
+    EXPECT_EXIT(PostAfterALatchAndExit(), ::testing::ExitedWithCode(0), ".*")
+        << "bits: 1 = the probe ran; 2 = the poster was not answered PROTOCOL_MISMATCH; 4 = the dispatch "
+           "counter moved (64+ = setup)";
+}
+
+// FatalFunnel's SessionLatch: armed, every fault returns false and is counted, the FIRST one is the
+// latched cause, and exactly one SessionFault frame - the first fault's - reaches the peer.
+TEST(ServerLoopLatchTest, AnArmedSessionLatchKeepsTheFirstFaultCountsEveryOneAndPublishesOnce) {
+    EXPECT_EXIT(LatchTwiceAndExit(), ::testing::ExitedWithCode(0), ".*")
+        << "bits: 1 = an armed SessionLatch did not return false; 2 = not latched; 4 = the latched "
+           "family/line is not the first fault's; 8 = not both faults counted; 16 = not exactly one "
+           "SessionFault frame naming the first fault (64+ = setup)";
+}
+
+// And unarmed - inproc, the client, every unit case - it IS SessionFail: the same line, and a death.
+TEST(ServerLoopLatchTest, AnUnarmedSessionLatchDiesWithItsLineLikeSessionFail) {
+    EXPECT_EXIT((void)MobileGL::MG_Remote::SessionLatch(MobileGL::MG_Remote::MGFatalFamily::ProtocolCorruption,
+                                                        "MGPipe: Fatal{ProtocolCorruption, \"unit.unarmed\"} - "
+                                                        "no session child armed this process"),
+                ::testing::KilledBySignal(SIGABRT), "unit\\.unarmed");
+}
+
+// PipeApplier::ApplyOne admits the record BEFORE it stamps the verb boundary or computes
+// MGPipeBarriered (which reads payload fields). Red with the admission moved back behind the stamp:
+// the short Clear stamps the Clear verb before DecodeAndApply's pre-gate refuses it (bit 1).
+TEST(ServerLoopLatchTest, ARecordShorterThanItsTypeIsLatchedBeforeTheApplierStampsIt) {
+    EXPECT_EXIT(AShortRecordIsLatchedBeforeItIsStampedAndExit(), ::testing::ExitedWithCode(0), ".*")
+        << "bits: 1 = the Clear verb was stamped from a record shorter than MGPClear; 2 = the latched "
+           "line is not record.Minimum; 4 = not exactly two records reached the applier (64+ = setup)";
+}
+
+// Codex closeout finding 6: a latch ANOTHER thread stores between two records of one batch, before the
+// next pop's check, stops that pop (the check-to-pop span itself stays open - narrowed, not closed). Red with DrainRing's pre-pop check put back to the F2 shape (a check at the function's
+// top and one under `++applied;`, the hook where it is now): the latch lands after the first
+// record's checks, the drain pops and applies the second draw, and only then looks again (bits 2|8).
+TEST(ServerLoopLatchTest, ALatchFromAnotherThreadBetweenTwoRecordsStopsTheNextPop) {
+    EXPECT_EXIT(LatchFromAnotherThreadBetweenTwoRecordsAndExit(), ::testing::ExitedWithCode(0), ".*")
+        << "bits: 1 = the apply thread was still running 3 s after the latch; 2 = a record behind the "
+           "latch point reached the applier; 4 = not exactly the control thread's fault latched; 8 = "
+           "appliedSeq moved past the first record; 16 = the between-records hook did not run exactly "
+           "once (64+ = setup)";
+}
+
+// =====================================================================================
+// P12 (on-screen server window): the surface mode (D4), the display-less refusal (D3) and the lost
+// window (D6), on a real apply thread with no GL context
+// =====================================================================================
+
+namespace {
+    // The apply-thread side of AcquireServerWindow, through the probe seam.
+    struct ServerWindowProbe {
+        Uint32 width = 0;
+        Uint32 height = 0;
+        Uint32 timeoutMs = 1000;
+        Server::ServerWindowLease lease;
+        Server::SurfaceRefusalCode refusal = Server::SurfaceRefusalCode::None;
+        MobileGLResult rc = MOBILEGL_ERR_INVALID_ARGUMENT;
+        Bool onApplyThread = false;
+    };
+
+    MobileGLResult AcquireServerWindowOnTheApplyThread(void* user) {
+        auto& probe = *static_cast<ServerWindowProbe*>(user);
+        probe.onApplyThread = Server::ServerLoop::OnApplyThread();
+        probe.rc = Server::ServerLoopInstance().AcquireServerWindow(probe.width, probe.height, probe.timeoutMs,
+                                                                    &probe.lease, &probe.refusal);
+        return MOBILEGL_OK;
+    }
+
+    struct CountingWindowHooks {
+        static inline std::atomic<int> acquires{0};
+        static inline std::atomic<int> releases{0};
+        static void Acquire(void*, void*) { ++acquires; }
+        static void Release(void*, void*) { ++releases; }
+        static Server::ServerDisplayHooks Hooks() {
+            Server::ServerDisplayHooks hooks;
+            hooks.acquire = &Acquire;
+            hooks.release = &Release;
+            return hooks;
+        }
+    };
+
+    int g_fakeServerWindow = 0;
+
+    // D6 ON THE REAL APPLY THREAD. The session holds the display's window (a lease taken on the apply
+    // thread, as the ServerOwned arm takes it); the UI thread's surfaceDestroyed (Detach) must get the
+    // apply thread to release it, see the session latch ServerWindowLost, and only then release the
+    // window's reference - all while the apply thread was PARKED when the request came.
+    enum : int {
+        kLostNotLeased = 1,     // the probe could not take the lease
+        kLostDetach = 2,        // Detach did not answer ReleasedBySession
+        kLostReleases = 4,      // the window's reference was not released exactly once
+        kLostNotLatched = 8,    // the session did not latch ServerWindowLost
+        kLostCounter = 16,      // ServerWindowsLost() != 1
+        kLostThreadStayed = 32, // the apply thread was still running 3 s after the latch
+    };
+
+    [[noreturn]] void LoseTheServerWindowAndExit() {
+        Remote::ArmSessionLatch();
+        ServerFixture fixture;
+        if (!fixture.Handshake() || !fixture.StartLoop()) ::_exit(64);
+        if (!fixture.WaitUntilTrulyParked()) ::_exit(65);
+        Server::ServerLoop& loop = Server::ServerLoopInstance();
+        Server::ServerDisplay& display = Server::ServerDisplayInstance();
+        display.Install(CountingWindowHooks::Hooks());
+        display.Attach(&g_fakeServerWindow, 64, 48);
+        ServerWindowProbe probe;
+        probe.width = 64;
+        probe.height = 48;
+        if (loop.RunProbeOnApplyThreadForTesting(&AcquireServerWindowOnTheApplyThread, &probe) != MOBILEGL_OK) ::_exit(66);
+        int failed = 0;
+        if (probe.rc != MOBILEGL_OK || probe.lease.window != &g_fakeServerWindow || !probe.onApplyThread)
+            failed |= kLostNotLeased;
+        if (!fixture.WaitUntilTrulyParked()) ::_exit(67);
+        const Server::ServerWindowDetach detached = display.Detach(3000);
+        if (detached != Server::ServerWindowDetach::ReleasedBySession) failed |= kLostDetach;
+        if (CountingWindowHooks::releases.load() != 1) failed |= kLostReleases;
+        if (!Remote::SessionLatched() || Remote::SessionLatchedFamily() != Remote::MGFatalFamily::ServerWindowLost)
+            failed |= kLostNotLatched;
+        if (loop.ServerWindowsLost() != 1) failed |= kLostCounter;
+        if (!PollUntil([&] { return !loop.Running(); }, 3000)) failed |= kLostThreadStayed;
+        fixture.Stop();
+        ::_exit(failed);
+    }
+} // namespace
+
+// D6. Red with PumpControlRequest's lost-window arm deleted: nobody answers the request, Detach waits
+// out its bound and says TimedOut, the reference is kept and no latch is raised (bits 2|4|8|16|32);
+// red with the park predicate's lost-window wake deleted: the apply thread sleeps through it the same
+// way.
+TEST(ServerLoopLatchTest, ALostServerWindowIsReleasedOnTheApplyThreadBeforeDetachReturnsAndLatchesByName) {
+    EXPECT_EXIT(LoseTheServerWindowAndExit(), ::testing::ExitedWithCode(0), ".*")
+        << "bits: 1 = the lease was not taken on the apply thread; 2 = Detach did not answer "
+           "ReleasedBySession; 4 = the reference was not released exactly once; 8 = no ServerWindowLost "
+           "latch; 16 = ServerWindowsLost() != 1; 32 = the apply thread stayed (64+ = setup)";
+}
+
+namespace {
+    // P12 review fix (major): THE LOST WINDOW IS ANSWERED IN THE MIDDLE OF A BATCH. A client streaming
+    // frames keeps the command ring from emptying, and the first version answered a window-lost request
+    // only between batches (PumpControlRequest). The between-records hook is that stream here: after
+    // the first record it runs the UI thread's surfaceDestroyed (Detach, on a thread of its own) and
+    // waits until the lost hook has been called; after every record it takes kStreamRecordMs, so the
+    // 200-record batch is a 4 s stream - longer than Detach's 3 s bound.
+    constexpr int kStreamRecords = 200;
+    constexpr int kStreamRecordMs = 20;
+    enum : int {
+        kStreamNotLeased = 1,       // the probe could not take the lease
+        kStreamDetach = 2,          // Detach did not answer ReleasedBySession
+        kStreamDetachSlow = 4,      // Detach took 1 s or more (the batch ran on under it)
+        kStreamDrainedOn = 8,       // more than two records were applied (the stream was not cut)
+        kStreamNotLatched = 16,     // the session did not latch ServerWindowLost
+        kStreamThreadStayed = 32,   // the apply thread was still running 3 s after the latch
+    };
+
+    std::atomic<int> g_streamRecords{0};
+    std::thread g_streamDetachThread;
+    std::atomic<int> g_streamDetachResult{-1};
+    std::atomic<long long> g_streamDetachMs{-1};
+
+    void StreamOneRecordAndLoseTheWindowAfterTheFirst() {
+        if (g_streamRecords.fetch_add(1, std::memory_order_acq_rel) == 0) {
+            g_streamDetachThread = std::thread([] {
+                const auto started = std::chrono::steady_clock::now();
+                const Server::ServerWindowDetach detached = Server::ServerDisplayInstance().Detach(3000);
+                g_streamDetachMs.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                           std::chrono::steady_clock::now() - started)
+                                           .count(),
+                                       std::memory_order_release);
+                g_streamDetachResult.store(static_cast<int>(detached), std::memory_order_release);
+            });
+            // Detach clears the window and calls the lost hook under one lock hold, so once the window
+            // reads detached the request is published.
+            (void)PollUntil([] { return !Server::ServerDisplayInstance().Attached(); }, 1000);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(kStreamRecordMs));
+    }
+
+    [[noreturn]] void LoseTheServerWindowMidStreamAndExit() {
+        Remote::ArmSessionLatch();
+        ServerFixture fixture;
+        if (!fixture.Handshake() || !fixture.StartLoop()) ::_exit(64);
+        if (!fixture.WaitUntilTrulyParked()) ::_exit(65);
+        Server::ServerLoop& loop = Server::ServerLoopInstance();
+        Server::ServerDisplay& display = Server::ServerDisplayInstance();
+        display.Install(CountingWindowHooks::Hooks());
+        display.Attach(&g_fakeServerWindow, 64, 48);
+        ServerWindowProbe probe;
+        probe.width = 64;
+        probe.height = 48;
+        if (loop.RunProbeOnApplyThreadForTesting(&AcquireServerWindowOnTheApplyThread, &probe) != MOBILEGL_OK) ::_exit(66);
+        int failed = 0;
+        if (probe.rc != MOBILEGL_OK || probe.lease.window != &g_fakeServerWindow) failed |= kStreamNotLeased;
+        if (!fixture.WaitUntilTrulyParked()) ::_exit(67);
+        loop.SetBetweenRecordsHookForTesting(&StreamOneRecordAndLoseTheWindowAfterTheFirst);
+        // LEGAL draws under ONE publish (ALatchFromAnotherThread...'s records), so only the lost window
+        // can cut the batch short.
+        MG_Pipe::MGPDrawInfo info{};
+        info.Mode = 0x0004; // GL_TRIANGLES
+        info.InstanceCount = 1;
+        info.MinIndex = ~0u;
+        info.MaxIndex = ~0u;
+        info.NumDraws = 1;
+        const MG_Pipe::MGPDrawRange range{0, 3, 0};
+        Uint64 last = Codec::kInvalidSeq;
+        for (int i = 0; i < kStreamRecords; ++i) {
+            last = fixture.encoder.EncodeRecord(MG_Pipe::MGPWireOp::DrawVbo, &info, sizeof(info), &range,
+                                                sizeof(range));
+            if (last == Codec::kInvalidSeq) ::_exit(68);
+        }
+        fixture.encoder.Publish();
+        fixture.producer.PublishAndNotify(last);
+
+        if (!PollUntil([] { return g_streamDetachResult.load(std::memory_order_acquire) >= 0; }, 8000)) ::_exit(69);
+        if (g_streamDetachThread.joinable()) g_streamDetachThread.join();
+        if (g_streamDetachResult.load() != static_cast<int>(Server::ServerWindowDetach::ReleasedBySession))
+            failed |= kStreamDetach;
+        if (g_streamDetachMs.load() >= 1000) failed |= kStreamDetachSlow;
+        if (!PollUntil([&] { return !loop.Running(); }, 3000)) failed |= kStreamThreadStayed;
+        if (loop.DrainedRecords() > 2) failed |= kStreamDrainedOn;
+        if (!Remote::SessionLatched() || Remote::SessionLatchedFamily() != Remote::MGFatalFamily::ServerWindowLost)
+            failed |= kStreamNotLatched;
+        std::fprintf(stderr, "[stream] Detach answered %s in %lld ms after %llu of %d streamed records\n",
+                     Server::ServerWindowDetachName(
+                         static_cast<Server::ServerWindowDetach>(g_streamDetachResult.load())),
+                     g_streamDetachMs.load(), static_cast<unsigned long long>(loop.DrainedRecords()),
+                     kStreamRecords);
+        loop.SetBetweenRecordsHookForTesting(nullptr);
+        fixture.Stop();
+        ::_exit(failed);
+    }
+} // namespace
+
+// P12 review fix (major). Red with DrainRing's pre-pop lost-window check deleted: the whole 4 s batch
+// runs under the UI thread's Detach, which gives up at its 3 s bound and answers TimedOut (bits 2|4|8).
+TEST(ServerLoopLatchTest, ALostServerWindowIsReleasedMidBatchWhileTheClientStreams) {
+    EXPECT_EXIT(LoseTheServerWindowMidStreamAndExit(), ::testing::ExitedWithCode(0), ".*")
+        << "bits: 1 = the lease was not taken; 2 = Detach did not answer ReleasedBySession; 4 = Detach took "
+           "1 s or more; 8 = more than two records applied after the window went; 16 = no ServerWindowLost "
+           "latch; 32 = the apply thread stayed (64+ = setup)";
+}
+
+namespace {
+    // P12 review fix: A STOPPING SERVER UNDER A STREAMING CLIENT. 200 records at 40 ms each is an 8 s
+    // stream, longer than Stop()'s 5 s bounded join. The display server's stop marks the queue
+    // abandoned first; the join must then come back within a record or two.
+    std::atomic<int> g_stopStreamRecords{0};
+    void StreamSlowly() {
+        g_stopStreamRecords.fetch_add(1, std::memory_order_acq_rel);
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    }
+
+    enum : int {
+        kStopSlow = 1,      // Stop() took 1 s or more
+        kStopDrainedOn = 2, // more than three records were applied
+    };
+
+    [[noreturn]] void StopTheServerMidStreamAndExit() {
+        Remote::ArmSessionLatch();
+        ServerFixture fixture;
+        if (!fixture.Handshake() || !fixture.StartLoop()) ::_exit(64);
+        if (!fixture.WaitUntilTrulyParked()) ::_exit(65);
+        Server::ServerLoop& loop = Server::ServerLoopInstance();
+        loop.SetBetweenRecordsHookForTesting(&StreamSlowly);
+        MG_Pipe::MGPDrawInfo info{};
+        info.Mode = 0x0004; // GL_TRIANGLES
+        info.InstanceCount = 1;
+        info.MinIndex = ~0u;
+        info.MaxIndex = ~0u;
+        info.NumDraws = 1;
+        const MG_Pipe::MGPDrawRange range{0, 3, 0};
+        Uint64 last = Codec::kInvalidSeq;
+        for (int i = 0; i < 200; ++i) {
+            last = fixture.encoder.EncodeRecord(MG_Pipe::MGPWireOp::DrawVbo, &info, sizeof(info), &range,
+                                                sizeof(range));
+            if (last == Codec::kInvalidSeq) ::_exit(66);
+        }
+        fixture.encoder.Publish();
+        fixture.producer.PublishAndNotify(last);
+        if (!PollUntil([] { return g_stopStreamRecords.load(std::memory_order_acquire) >= 1; }, 3000)) ::_exit(67);
+        // RunSession's order when mobilegl_server_stop_inprocess raised the stop.
+        const auto started = std::chrono::steady_clock::now();
+        loop.AbandonQueuedRecords();
+        loop.Stop();
+        const auto stopMs =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+        int failed = 0;
+        if (stopMs >= 1000) failed |= kStopSlow;
+        if (loop.DrainedRecords() > 3) failed |= kStopDrainedOn;
+        std::fprintf(stderr, "[stop] Stop() returned in %lld ms after %llu of 200 streamed records\n",
+                     static_cast<long long>(stopMs), static_cast<unsigned long long>(loop.DrainedRecords()));
+        loop.SetBetweenRecordsHookForTesting(nullptr);
+        fixture.Stop();
+        ::_exit(failed);
+    }
+} // namespace
+
+// P12 review fix. Red with AbandonQueuedRecords a no-op: the batch and the exit-path drain apply the
+// whole stream, Stop()'s join gives up at 5 s and Fatal{ApplyThreadJoinTimeout} aborts the process.
+TEST(ServerLoopTest, StoppingTheServerUnderAStreamingClientLeavesTheQueueAndJoinsPromptly) {
+    EXPECT_EXIT(StopTheServerMidStreamAndExit(), ::testing::ExitedWithCode(0), ".*")
+        << "bits: 1 = Stop() took 1 s or more; 2 = more than three records applied after the stop "
+           "(64+ = setup; SIGABRT = Fatal{ApplyThreadJoinTimeout})";
+}
+
+// D3. A server that owns no display - the host, the exec'd supervisor's children - refuses a request
+// for its window BY NAME and does NOT latch: it is the client's configuration, not corrupt bytes. Red
+// with the refusal turned into a latch: this unarmed process aborts.
+TEST(ServerLoopTest, AServerWindowRequestOnAServerWithNoDisplayIsRefusedByNameWithoutALatch) {
+    ServerFixture fixture;
+    ASSERT_TRUE(fixture.Handshake());
+    ASSERT_TRUE(fixture.StartLoop());
+    ASSERT_FALSE(Server::ServerDisplayInstance().HasDisplay());
+    ServerWindowProbe probe;
+    probe.width = 640;
+    probe.height = 480;
+    ASSERT_EQ(Server::ServerLoopInstance().RunProbeOnApplyThreadForTesting(&AcquireServerWindowOnTheApplyThread, &probe),
+              MOBILEGL_OK);
+    EXPECT_EQ(probe.rc, MOBILEGL_ERR_UNSUPPORTED);
+    EXPECT_EQ(probe.refusal, Server::SurfaceRefusalCode::NoServerDisplay);
+    EXPECT_FALSE(MobileGL::MG_Remote::SessionLatched());
+    EXPECT_TRUE(Server::ServerLoopInstance().Running()) << "a refusal must not stop the session";
+    fixture.Stop();
+    EXPECT_NE(ReadLog().find("Refuse ServerOwned: this server owns no display"), std::string::npos) << ReadLog();
+}
+
+// D4. The decision the dispatch asks, pure: the first surface decides, and the OTHER kind is refused
+// afterwards. Red with SessionSurfaceModeAdmits answering true for everything (the check deleted).
+TEST(ServerLoopTest, SessionSurfaceModeAdmitsOnlyTheModeTheFirstSurfaceChose) {
+    using Server::SessionSurfaceMode;
+    EXPECT_TRUE(Server::SessionSurfaceModeAdmits(SessionSurfaceMode::None, /*serverOwnedWindow=*/true));
+    EXPECT_TRUE(Server::SessionSurfaceModeAdmits(SessionSurfaceMode::None, false));
+    EXPECT_TRUE(Server::SessionSurfaceModeAdmits(SessionSurfaceMode::OnScreen, true))
+        << "an on-screen session may re-create its window surface (a resize)";
+    EXPECT_FALSE(Server::SessionSurfaceModeAdmits(SessionSurfaceMode::OnScreen, false))
+        << "a pbuffer in an on-screen session is SurfaceModeMismatch";
+    EXPECT_TRUE(Server::SessionSurfaceModeAdmits(SessionSurfaceMode::Offscreen, false));
+    EXPECT_FALSE(Server::SessionSurfaceModeAdmits(SessionSurfaceMode::Offscreen, true))
+        << "a ServerOwned window in an offscreen session is SurfaceModeMismatch";
+}
+#endif
+
 int main(int argc, char** argv) {
     // Before anything logs: MG_Util::Debug::InitFile() reads the variable once, on the first
     // write, and caches the FILE*. The name carries this process's pid, because
@@ -2144,6 +3530,14 @@ int main(int argc, char** argv) {
     // left it at Monolith would be a server test running the monolith answers, which is the
     // failure this phase is built to make impossible.
     MG_Config::Transport = MG_Config::TransportMode::InProcess;
+    // AND IT SETS THE MODE BY HAND, WITHOUT MG_ConfigLoader::Init (P7 F1). That is not an
+    // accident of this suite and it is load-bearing for the caps gate: the client-side rule
+    // "a record family's liveness may never be decided from a placeholder caps mirror" is
+    // armed by ConfigLoader resolving a split transport for a process that will therefore go
+    // on to build a CLIENT. This binary builds server sessions and - in
+    // EglServerFixture::BringUp - the server's own frontend GLContext, and never a client
+    // session at all, so the gate stays disarmed here and the placeholder keeps answering
+    // exactly what it answered before.
     ::testing::InitGoogleTest(&argc, argv);
     const int rc = RUN_ALL_TESTS();
     fs::remove(path, ec);

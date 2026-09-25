@@ -97,7 +97,9 @@ namespace MobileGL::MG_Pipe {
 #if MOBILEGL_BUILD_DISAGGREGATED
 #define MGP_INPUT_CHECK(Field)                                                                                         \
     do {                                                                                                               \
-        if (!::MobileGL::MG_Pipe::MGPipeInputFieldIsFresh(m_filled, (Field))) {                                        \
+        if ((m_serverStampedVerb && ::MobileGL::MG_Pipe::MGPipeFieldOwnershipOf(Field) ==                            \
+                                      ::MobileGL::MG_Pipe::MGPipeFieldOwnership::kFatal) ||                           \
+            !::MobileGL::MG_Pipe::MGPipeInputFieldIsFresh(m_filled, (Field))) {                                        \
             ::MobileGL::MG_Pipe::MGPipeInputUnfreshRead((Field), m_currentVerb, m_serverStampedVerb);                  \
         }                                                                                                              \
     } while (0)
@@ -834,6 +836,123 @@ namespace MobileGL::MG_Pipe {
     // (P3a; the exit-time heap corruption this closes is p3a-results/exit-order-v1.md.)
     inline PipeInputs& gPipeInputs = *new PipeInputs();
 
+#if MOBILEGL_BUILD_DISAGGREGATED
+    // ============================================================================
+    // P5f (f1), P5F-WIRE-COMPLETENESS.md §4: THE DUAL-BLOCK REHEARSAL
+    // ============================================================================
+    //
+    // One gPipeInputs served both roles because the verb barrier (R-1) made "the client filled
+    // it" and "the server is reading it" mutually exclusive in TIME on the same object. The
+    // rehearsal removes the same-object half of that sentence: under
+    // MOBILEGL_IPC_ROLE_SPLIT_STATE=1 the client's residual fill writes the CLIENT block below
+    // and the backend/applier keep reading gPipeInputs, which is the SERVER block. Every path
+    // that worked only because the two were one object - a BARRIER-PULLED field, a sticky
+    // forward's read of the fill side's stamps - then has no value to read, and the read
+    // becomes a NAMED Fatal{UnmigratedPipeInput, "<field>@<verb>"} (CountBarrierPull's
+    // dual-block arm, PipeInputs.cpp) instead of a silent cross-role answer.
+    //
+    // THE READ SIDE'S SPELLING DOES NOT MOVE. gPipeInputs remains the server-role block, so the
+    // 379 MGB_CTX sites and PipeApply.cpp's applier writes are untouched; the only new spelling
+    // is on the fill side (MG_Impl/Pipe/PipeFill.cpp), which asks MGPipeClientInputs(). Under
+    // monolith transport - every unit and integration-gpu lane of a split build - the selection
+    // folds back to the single shared block and behaviour is byte-for-byte the old one.
+    //
+    // Same leak-at-exit storage as gPipeInputs above, for the same reason.
+    inline PipeInputs& gPipeInputsClientBlock = *new PipeInputs();
+
+    // PipeInputs.cpp. Whether the REHEARSAL is armed: the knob AND a real transport (and not
+    // the verify build, which ConfigLoader forces off). Constant for the life of the process.
+    //
+    // D13 RENAMED THIS FROM MGPipeRoleSplitActive, which is what it has always meant. The old
+    // name read like "the roles are split", and the widening D1c needed would have made a
+    // narrow name lie - so the rename came FIRST and the wider predicate was introduced beside
+    // it rather than by quietly changing what this one answers.
+    Bool MGPipeRoleSplitRehearsalActive();
+
+    // ---- D1c: the role predicates (CONTRACT-P6 3.2) ---------------------------------------
+    //
+    // ONE QUESTION EACH, and the reason they are separate functions rather than one `split`
+    // flag is that the tree asks genuinely different things. a6 proposed three; three do not
+    // cover it.
+    //
+    // D14: IN A NON-DISAGGREGATED BUILD THESE GET A DIFFERENT DEFINITION, not a runtime-false
+    // one. The `#else` arm is `constexpr`, so every consult folds at compile time and the pull
+    // build gains no symbol, no branch and no byte - which G1 measures rather than assumes.
+#if MOBILEGL_BUILD_DISAGGREGATED
+    // Am I executing as the SERVER right now? A thread-scoped question in the inproc shape,
+    // where both roles live in one process, and a process-scoped one under spawn.
+    Bool MGPipeServerArm();
+
+    // Is a peer session live? Distinct from "is the transport split": a spawn SERVER has no
+    // ClientSession at all, so a guard that asked for one was permanently disarmed there.
+    Bool MGPipeSessionLive();
+
+    // Do the two roles use DIFFERENT PipeInputs storage objects?
+    //
+    // TRUE FOR TWO DIFFERENT REASONS, which is the whole point of the predicate. Under the
+    // rehearsal the two blocks are distinct objects in one process; under SPAWN they are
+    // distinct because they are in different address spaces, and no knob is involved. The
+    // guards below used to ask the rehearsal question and were therefore silently off in the
+    // one shape where the answer matters most.
+    Bool MGPipeBlocksAreDistinct();
+
+    // The two facts the predicates above are built from, stated ONCE by the code that knows
+    // them. Neither is discoverable from MG_Backend: "this process is the server" is something
+    // only ServerMain can say, and "am I on the apply thread" is MG_Remote's thread-local.
+    //
+    // A PROBE RATHER THAN A FLAG for the thread half, because it is a question about the
+    // CALLING thread and a flag would answer for whichever thread wrote it last.
+    void MGPipeSetServerProcessRole(Bool isServerProcess);
+    void MGPipeSetApplyThreadProbe(Bool (*probe)());
+    void MGPipeSetSessionLive(Bool live);
+#else
+    inline constexpr Bool MGPipeServerArm() { return false; }
+    inline constexpr Bool MGPipeSessionLive() { return false; }
+    inline constexpr Bool MGPipeBlocksAreDistinct() { return false; }
+    // Setters too: a caller guarded only at its own site would still need these to LINK.
+    inline void MGPipeSetServerProcessRole(Bool) {}
+    inline void MGPipeSetApplyThreadProbe(Bool (*)()) {}
+    inline void MGPipeSetSessionLive(Bool) {}
+#endif
+    // PipeInputs.cpp. THE FILL SIDE'S ONE NEW SPELLING: the client block when the rehearsal is
+    // armed, gPipeInputs otherwise. Everything in MG_Impl/Pipe/PipeFill.cpp that used to spell
+    // gPipeInputs spells this instead.
+    PipeInputs& MGPipeClientInputs();
+    // PipeInputs.cpp. The client-role half of MGPipeServerClearVerbBoundary: clears the stamp
+    // flag on the FILL side's block. With the rehearsal off that IS gPipeInputs, so the two
+    // client call sites keep their old semantics exactly; with it on the client block's flag is
+    // never raised (nothing server-stamps it) and the clear is a no-op - which is the point:
+    // the client no longer reaches into the server's block at all.
+    void MGPipeClientClearVerbBoundary();
+    // PipeInputs.cpp. CONTRACT-P5E §3.2's other half: the server block's identity is
+    // SERVER-OWNED. Called from PipeApplier::Attach and from MGPipeServerStampVerbBoundary;
+    // with the rehearsal armed it sets m_live and points m_contextIdentity at a token derived
+    // from MGPipeApplierContextSerial() - the server's own served-context clock, which is what
+    // moves when the served context does. Without it the server block's ContextIdentity() would
+    // stay nullptr, and DirectGLES' fb-slot memo cache compares identity FIRST (a nullptr
+    // against its own nullptr initialiser reads as a hit and hands out a null slot): an
+    // unnamed crash where the rehearsal exists to produce a named one. A no-op with the
+    // rehearsal off, so the client's per-verb SetIdentity keeps owning the shared block there.
+    void MGPipeServerBlockNoteIdentity();
+    // P5f fs: owned by the server's control lifecycle, never inferred from a client
+    // GLContext or resurrected by stamping a verb after teardown.
+    void MGPipeServerSetContextLive(Bool live);
+    Bool MGPipeServerContextIsLive();
+    // P12 review fix (size reports without the knob). The SERVER's own display window while this
+    // session holds its lease (ServerLoop's ServerOwned arm sets it, the lease's end clears it), else
+    // null. A backend whose window surface does not otherwise publish its extent (Espryt) publishes
+    // it only for this window: a window the client named itself keeps the format-only publish every
+    // earlier session relied on. Apply thread only.
+    void MGPipeServerSetOwnedWindow(const void* window);
+    const void* MGPipeServerOwnedWindow();
+#else
+    // The push-without-transport build has one role and one block, so the fill side's spelling
+    // folds onto gPipeInputs and PipeFill.cpp reads identically in both build flavours. An
+    // inline that no caller in such a build ever has a reason to call twice - the disaggregated
+    // arm above is the real one.
+    inline PipeInputs& MGPipeClientInputs() { return gPipeInputs; }
+#endif
+
     // Every field has storage or is forwarded, and nothing else.
 #define MGP_INPUT_COUNT_ONE(Field, Member) +1
     static_assert(0 MGP_INPUT_STORAGE_LIST(MGP_INPUT_COUNT_ONE) + kMGPipeForwardedFieldCount == kMGPipeInputFieldCount,
@@ -938,5 +1057,12 @@ namespace MobileGL::MG_Pipe {
     // dereferenced, the snapshot is only ever compared). Returns false for a forwarded field,
     // which has nothing to corrupt.
     Bool MGPipeApplyVerifyCorruption(PipeInputs& snapshot, MGPipeInputField field);
+    // PipeFill.cpp. Writes the MOBILEGL_PIPE_VERIFY_FATAL=0 summary line ("N divergence(s)
+    // survived") NOW, while the role's log file is still open. MobileGL::Destroy calls it right
+    // before MG_Util::Debug::Close(): the line used to come from a namespace-scope static's
+    // destructor, which runs AFTER Close, and Log.cpp reopens a closed sink with "w" - so that
+    // summary was the only line the client half of every FATAL=0 run kept. Idempotent: a second
+    // call with nothing new to report, the destructor's own included, writes nothing.
+    void MGPipeVerifyFlushSummary();
 #endif
 } // namespace MobileGL::MG_Pipe

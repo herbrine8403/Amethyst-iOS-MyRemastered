@@ -44,6 +44,9 @@
 #include <Config.h>
 #include <MG_Backend/DirectVulkan/Renderer/MagmaPipeArms.h>
 #endif
+#if MOBILEGL_BUILD_DISAGGREGATED
+#include <MG_Backend/DirectVulkan/Renderer/MagmaProgramSource.h>
+#endif
 
 using namespace MobileGL;
 
@@ -215,30 +218,14 @@ namespace {
         EXPECT_EQ(mint.Count(), 1u);
     }
 
-    // ---- P5e (MG_Remote/CONTRACT-P5E.md §1, §6, ruling 12) -------------------------------
-    //
-    // MAGMA DOES NOT RUN AHEAD, AND THIS IS WHERE THAT IS A TEST RATHER THAN A COMMENT.
-    // kCapRunAheadApply is the client's whole permission to publish a record and move on: the
-    // moment a server sets it, the apply thread promises it reads nothing of the client's. That
-    // promise is FALSE for Magma for the whole of P5e - the four apply-thread allocator sites
-    // inside MagmaP7AllocatorDebtScope are real debt P7 retires, and
-    // MGPipeApplierCurrentRecordIsBarriered() answering true for every record on a server
-    // without the bit is exactly what keeps them inside P5C's semantics and keeps rsp honest.
-    //
-    // The arm is a pure function precisely so this case can reach it: InitSplitRoles needs a
-    // live session, a backend and a handshake, and none of those belong in a unit lane. RED
-    // ONCE by making MGPipeRunAheadCapBitsFor answer for DirectVulkan too (the exact
-    // perturbation the phase's red-once list names) - both EXPECTs below fail, by name.
+    // Historical test name retained. Each backend's readiness is now a real gate:
+    // false forbids the capability, true permits it. Production keeps its own
+    // Magma readiness constant, which the bootstrap and GPU queue tests also check.
     TEST_F(MagmaPipeIdentityTest, AMagmaServerNeverPublishesTheRunAheadCapBit) {
-        // Whatever the integration constant says. `true` is what the P5e integration commit
-        // will pass, so the Magma answer is pinned on BOTH sides of that flip and the case
-        // does not quietly stop asserting anything the day the constant moves.
-        EXPECT_EQ(MG_Pipe::MGPipeRunAheadCapBitsFor(BackendType::DirectVulkan, /*ready=*/false) &
-                      static_cast<Uint64>(MG_Pipe::kCapRunAheadApply),
-                  0u);
-        EXPECT_EQ(MG_Pipe::MGPipeRunAheadCapBitsFor(BackendType::DirectVulkan, /*ready=*/true) &
-                      static_cast<Uint64>(MG_Pipe::kCapRunAheadApply),
-                  0u);
+        EXPECT_EQ(MG_Pipe::MGPipeRunAheadCapBitsFor(BackendType::DirectVulkan, /*ready=*/false), 0u);
+        EXPECT_EQ(MG_Pipe::MGPipeRunAheadCapBitsFor(BackendType::DirectVulkan, /*ready=*/true),
+                  static_cast<Uint64>(MG_Pipe::kCapRunAheadApply));
+        EXPECT_EQ(MG_Pipe::MGPipeRunAheadCapBitsFor(BackendType::Unknown, /*ready=*/true), 0u);
 
         // And the Espryt half, so the case says what the arm IS and not only what it is not:
         // the bit is published for DirectGLES and ONLY once the integration commit flips
@@ -258,4 +245,99 @@ namespace {
                       "kCapRunAheadApply moved bit; CONTRACT-P5E table 0 names bit 10");
     }
 #endif // MOBILEGL_PIPE_PUSH
+
+    TEST(MagmaProgramSourceTest, ServerBindingTailsReplaceLinkTimeDefaults) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        auto archive = MakeShared<MG_State::GLState::ProgramArchive>();
+        archive->Link.glBlockIndexToTProgram = {0};
+        archive->Link.blockReflection.resize(1);
+        archive->Link.blockReflection[0].name = "Block";
+        archive->Link.blockReflection[0].size = 12;
+        archive->Link.uniformBlockBinding = {9};
+        archive->Link.uniformSamplerOrImageUnitIndex = {12, 13};
+        archive->Spirv.globalUboScratch = {99, 98};
+        MG_Pipe::MGPipeShaderCsoRecord record{};
+        record.Archive = archive;
+        record.BlockBindings = {3};
+        record.SamplerUnits = {{0, 4}};
+        record.GlobalConstants = {5, 6};
+        record.GlobalConstantsVersion = 11;
+        const MagmaProgramSource source({7, 2}, record);
+        EXPECT_TRUE(source.IsWire());
+        EXPECT_EQ(source.Frontend(), nullptr);
+        EXPECT_EQ(source.GetUniformBlockBinding(0), 3u);
+        EXPECT_EQ(source.GetUniformBlockName(0), "Block");
+        EXPECT_EQ(source.GetUBOSizeAt(0), 16u);
+        EXPECT_EQ(source.GetUniformSamplerOrImageUnitIndex(0), 4);
+        EXPECT_EQ(source.GetUniformSamplerOrImageUnitIndex(1), -1)
+            << "an absent tail entry must not resurrect the archive's stale unit";
+        ASSERT_EQ(source.GetUBOSize(), 2u);
+        EXPECT_EQ(static_cast<const Uint8*>(source.GetUBOData())[0], 5u);
+        EXPECT_EQ(source.GetUBOContentVersion(), 11u);
+        record.BlockBindings[0] = 6;
+        record.SamplerUnits[0].Unit = 8;
+        record.GlobalConstants[0] = 42;
+        record.GlobalConstantsVersion = 12;
+        EXPECT_EQ(source.GetUniformBlockBinding(0), 6u);
+        EXPECT_EQ(source.GetUniformSamplerOrImageUnitIndex(0), 8);
+        EXPECT_EQ(static_cast<const Uint8*>(source.GetUBOData())[0], 42u);
+        EXPECT_EQ(source.GetUBOContentVersion(), 12u);
+#else
+        GTEST_SKIP() << "server program sources require the disaggregated build";
+#endif
+    }
+
+    TEST(MagmaProgramSourceTest, ArrayUniformNamesResolveWithinTheArchivedUniform) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        auto archive = MakeShared<MG_State::GLState::ProgramArchive>();
+        auto& link = archive->Link;
+        link.maxUniformLocation = 2;
+        link.uniformLocations["arr[0]"] = 0;
+        link.uniformIndexInTProgram = {0, 0, 0};
+        link.tProgramUniformIndexToGl = {0};
+        link.uniformReflection.resize(1);
+        link.uniformReflection[0].type.isArray = true;
+        link.uniformReflection[0].arraySize = 3;
+        link.uniformReflection[0].glDefineType = GL_SAMPLER_2D;
+        MG_Pipe::MGPipeShaderCsoRecord record{};
+        record.Archive = archive;
+        const MagmaProgramSource source({8, 1}, record);
+        EXPECT_EQ(source.GetUniformLocation("arr"), 0);
+        EXPECT_EQ(source.GetUniformLocation("arr[2]"), 2);
+        EXPECT_EQ(source.GetUniformLocation("arr[3]"), -1);
+        EXPECT_EQ(source.GetUniformLocation("arr[-1]"), -1);
+        EXPECT_EQ(source.GetUniformLocation("arr[999999999999999]"), -1);
+        EXPECT_EQ(source.GetUniformLocation("unknown"), -1);
+        EXPECT_TRUE(source.UniformLocationsAliasSameUniform(0, 2));
+        EXPECT_FALSE(source.UniformLocationsAliasSameUniform(0, 3));
+        EXPECT_EQ(source.GetUniformType(2), GL_SAMPLER_2D);
+#else
+        GTEST_SKIP() << "server program sources require the disaggregated build";
+#endif
+    }
+
+    TEST(MagmaProgramSourceTest, ReusedHandlesAndRecordVersionsHaveDistinctCacheIdentity) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        MG_Pipe::MGPipeShaderCsoRecord record{};
+        record.Archive = MakeShared<MG_State::GLState::ProgramArchive>();
+        record.Serial = 17;
+        record.BindingsSerial = 21;
+        record.GlobalConstantsVersion = 25;
+        const MagmaProgramSource first({9, 2}, record);
+        const MagmaProgramSource recycled({9, 3}, record);
+        EXPECT_NE(first.GetLifetimeId(), recycled.GetLifetimeId());
+        EXPECT_EQ(first.Handle(), (MG_Pipe::MGPipeHandle{9, 2}));
+        const auto identity = first.GetLifetimeId();
+        record.Serial = 18;
+        record.BindingsSerial = 22;
+        record.GlobalConstantsVersion = 26;
+        EXPECT_EQ(first.GetLifetimeId(), identity) << "content changes do not mint object identities";
+        EXPECT_EQ(first.GetBackendStateVersion(), 18u);
+        EXPECT_EQ(first.GetBlockBindingVersion(), 22u);
+        EXPECT_EQ(first.GetImageUnitVersion(), 22u);
+        EXPECT_EQ(first.GetUBOContentVersion(), 26u);
+#else
+        GTEST_SKIP() << "server program sources require the disaggregated build";
+#endif
+    }
 } // namespace

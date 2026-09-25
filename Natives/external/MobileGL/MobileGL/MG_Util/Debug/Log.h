@@ -122,6 +122,9 @@
     {}
 #endif
 
+#include <cstdio>
+#include <string>
+
 namespace MobileGL {
     namespace MG_Util {
         namespace Debug {
@@ -131,6 +134,132 @@ namespace MobileGL {
             constexpr char* GetOSName();
             std::string GetThreadName();
             void Close();
+
+#if MOBILEGL_BUILD_DISAGGREGATED
+            using LogForwarder = void (*)(void*, const char*);
+            void SetLogForwarder(LogForwarder forwarder, void* user);
+            // P12 review fix (log forwarding). THE IN-PROCESS DISPLAY SERVER'S FORWARDER, scoped to
+            // the live session's own threads. SetLogForwarder forwards every server-role thread's
+            // line, which is right for a session child (the process IS the session) and wrong for the
+            // display Activity's process, where the UI thread, the listener (naming other peers'
+            // addresses) and a previous session share the process: their lines went into the live
+            // client's socket. This one forwards only from the calling thread and from threads that
+            // opt in (SetThreadForwardsLogToPeer - the session's apply thread), and it sends OUTSIDE
+            // the log mutex, under a forward mutex of its own, so a client that stops reading stalls
+            // the session's threads and not every thread that logs (the UI thread's surface
+            // callbacks). SetLogForwarder(nullptr, nullptr) clears either kind and waits for a send in
+            // flight.
+            void SetSessionLogForwarder(LogForwarder forwarder, void* user);
+            void SetThreadForwardsLogToPeer(bool forwards);
+            void WritePeerLog(const char* message);
+            void WithLogBarrier(void (*action)(void*), void* user);
+            // P6: ONE LOG PER ROLE, and the role is a per-THREAD fact because under inproc both
+            // roles live in one process. The client keeps MOBILEGL_LOG_FILE_PATH unchanged so
+            // every existing reader keeps its path; the server's lines go to the same path with
+            // `.server` inserted before the extension.
+            //
+            // WHY NOT ONE SHARED FILE. It worked - O_APPEND made the spawn case correct - but it
+            // put two sessions' lines in one place and made every per-side assertion a search
+            // rather than a read. The `--require-spawn` gate had to accept "ANY Config: IPC line
+            // matches" because the server's own line is scrubbed of the client's knobs by
+            // construction; with the two separated it can demand that THE client's line matches.
+            //
+            // THREAD-SCOPED, NOT PROCESS-SCOPED, for the case that is easy to miss: under inproc
+            // the server role is the mgl-srv-apply THREAD, so a process-wide flag would file its
+            // lines under whichever role set it last.
+            enum class LogRole { Client, Server };
+
+            // Called by the apply thread when it starts (inproc), and once by ServerMain for a
+            // whole spawned server process. Without it a thread defaults to the process role,
+            // which MOBILEGL_IPC_ROLE=server sets for the spawned image.
+            void SetThreadLogRole(LogRole role);
+
+            // THE NAMING RULE, EXPORTED, so that no reader has to reimplement it. Every consumer
+            // of a lane's log - the unit mains, the integration harness, the retrace runner -
+            // needs the same `<stem>.<role><ext>` derivation, and a second copy is a copy that
+            // can fall behind: the one that does opens a file that does not exist and reports
+            // "the library never logged", which reads as a product failure.
+            std::string RoleLogPath(const char* basePath, LogRole role);
+
+            // WHICH ROLE IS THE CALLING THREAD, exported for the same reason the naming rule is:
+            // a second answer to "am I the server" is a second answer that can disagree, and this
+            // one already exists twice inside this file (ThreadIsServerRole, ProcessIsSpawnedServer)
+            // in a form nothing outside can read.
+            //
+            // P6 GATE 8 NEEDS IT, and that is the caller that made it worth exporting. The MGPipe
+            // counters' JSON dump is written by whichever role reaches PipeStats::Shutdown(), and
+            // under `spawn` both roles do - in two processes, onto the same configured path. The
+            // fix is the log sink's own split (each role gets its own file), and the role is the
+            // only input that split needs.
+            LogRole CurrentThreadRole();
+            // The same question about a whole PROCESS rather than a thread: true only for a
+            // spawned server image, which is the server on every thread. Exported because the
+            // distinction matters to callers that are deciding a FILE NAME before any role has
+            // been stamped on a thread. `bool` rather than `Bool`: this header is included from
+            // translation units that do not pull MobileGL/Defines.h (Log.cpp is one of them).
+            bool CurrentProcessIsSpawnedServer();
+
+            // THE TWO OPERATIONS EVERY READER ACTUALLY WANTS, so that no caller has to know how
+            // many roles there are or how they are spelled.
+            //
+            // A test asserts that THE RUN said something; which role's thread said it is not
+            // what the assertion is about, and guessing wrong turns a real diagnostic into "the
+            // child aborted and said nothing". Refusals raised on the apply thread are written
+            // under the SERVER role by construction, which is exactly the class of diagnostic
+            // these readers exist to check.
+            std::string ReadRoleLogs(const char* basePath);
+            void TruncateRoleLogs(const char* basePath);
+#else
+            // THE SAME VOCABULARY IN THE PULL BUILD, where there is exactly one log because there
+            // is exactly one role. A reader that asks for "what this run logged" has to compile
+            // and mean the right thing in BOTH flavours; the alternative is an `#if` at every
+            // call site, and the call site that forgets one is the one that silently reads
+            // nothing. (It was not hypothetical: PipeInputsTest built only in the verify flavour
+            // and took the whole `build-linux-verify` job down with it.)
+            //
+            // HEADER-ONLY ON PURPOSE, FOR G1. The pull library's symbol set and `.text` must stay
+            // byte-identical to the baseline, so these may not become library symbols. Nothing
+            // inside the library calls them - only tests and harnesses do - so an inline
+            // definition emits code into those readers and nothing at all into libMobileGL.so.
+            enum class LogRole { Client, Server };
+
+            // No roles to separate, so nothing to record. Present so that a harness may say which
+            // role a thread is without asking which build it is in.
+            inline void SetThreadLogRole(LogRole) {}
+
+            // One role, one file: the pull build writes MOBILEGL_LOG_FILE_PATH unchanged.
+            inline std::string RoleLogPath(const char* basePath, LogRole) {
+                return basePath == nullptr ? std::string() : std::string(basePath);
+            }
+
+            // INLINE, like everything else in this pull arm, and for the same G1 reason. There is
+            // one role in this build, so "which role is this thread" has exactly one true answer
+            // and no state to read - but a caller must still compile and mean the right thing in
+            // both flavours rather than wrapping these in an `#if` it might get wrong once.
+            inline LogRole CurrentThreadRole() { return LogRole::Client; }
+            inline bool CurrentProcessIsSpawnedServer() { return false; }
+
+            inline std::string ReadRoleLogs(const char* basePath) {
+                std::string all;
+                if (basePath == nullptr) return all;
+                if (FILE* file = std::fopen(basePath, "rb")) {
+                    char chunk[4096];
+                    std::size_t got = 0;
+                    while ((got = std::fread(chunk, 1, sizeof(chunk), file)) > 0) {
+                        all.append(chunk, got);
+                    }
+                    std::fclose(file);
+                }
+                return all;
+            }
+
+            inline void TruncateRoleLogs(const char* basePath) {
+                if (basePath == nullptr) return;
+                if (FILE* file = std::fopen(basePath, "w")) {
+                    std::fclose(file);
+                }
+            }
+#endif
         } // namespace Debug
     } // namespace MG_Util
 } // namespace MobileGL

@@ -330,7 +330,25 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         PopulateFormatCapabilitiesImpl(physicalDevice, getFormatProperties, capabilities, cache);
     }
 
+#if MOBILEGL_BUILD_DISAGGREGATED
+    BackendObject_DirectVulkan::~BackendObject_DirectVulkan() {
+        // P12 review fix: A SERVER SESSION THAT ENDS WITHOUT A CLEAN TEARDOWN LEAVES NO RENDERER ON
+        // THE WINDOW. The renderer - swapchain and VkSurfaceKHR on the window - is a process global
+        // that only ReleaseEGLResources / a released surface drops, and a client that went away
+        // without eglTerminate (a crash, a kill, a dropped connection) sends neither. Under a
+        // transport this object is the server's and its destruction is the session's end (ServerLoop's
+        // apply thread, after the final drain, before the display lease ends), so the renderer goes
+        // here: nothing of the ended session keeps presenting into, or holding a surface on, the
+        // server's window once its lease is over. Monolith keeps its renderer.
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith && pVulkanRenderer != nullptr) {
+            BumpRendererGeneration();
+            pVulkanRenderer.reset();
+            ClearProgramResourceCaches();
+        }
+    }
+#else
     BackendObject_DirectVulkan::~BackendObject_DirectVulkan() = default;
+#endif
 
     BackendObject_DirectVulkan::BackendObject_DirectVulkan() : m_rendererInfo{GetRendererIdentity()} {}
 
@@ -365,6 +383,18 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     }
 
     void BackendObject_DirectVulkan::Initialize() {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        VkBufferManager::RegisterWireResourceOps();
+#if MOBILEGL_PIPE_PUSH
+        // P7 wave 2 package C (CONTRACT-P7 §5.5). BESIDE the resource ops and for the same
+        // reason: this is the one place both Magma server roles pass through - the inproc
+        // role and the spawn/TCP session child - and ServerLoop::CreateBackend calls it at
+        // step 1 of InitServerRoleCommon, before the client session exists and therefore
+        // before any frontend object can die unheard. A per-transport install is how one of
+        // the two roles ends up without it.
+        InstallStateObjectDeathOps();
+#endif
+#endif
         m_initialized = true;
     }
 

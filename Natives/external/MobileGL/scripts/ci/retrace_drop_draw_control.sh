@@ -40,7 +40,7 @@
 # Usage:  retrace_drop_draw_control.sh <case> <backend>
 #   CTEST           ctest binary                      (default: ctest)
 #   CONTROL_TMPDIR  scratch dir                       (default: ${RUNNER_TEMP:-/tmp})
-#   LIBRARY_LOG     the replay's library log          (default: <case>/<backend>/output/mobilegl.log)
+#   LIBRARY_LOG     the replay's CLIENT library log   (default: <case>/<backend>/output/mobilegl.client.log)
 set -u
 
 CASE="${1:?usage: retrace_drop_draw_control.sh <case> <backend>}"
@@ -48,7 +48,10 @@ BACKEND="${2:?usage: retrace_drop_draw_control.sh <case> <backend>}"
 
 CTEST="${CTEST:-ctest}"
 CONTROL_TMPDIR="${CONTROL_TMPDIR:-${RUNNER_TEMP:-/tmp}}"
-LIBRARY_LOG="${LIBRARY_LOG:-${CASE}/${BACKEND}/output/mobilegl.log}"
+# P6: BOTH ROLES HAVE THEIR OWN LOG and neither keeps the old name, so an un-updated default
+# here would be a file that does not exist rather than half a session read as a whole one. This
+# control's marker (`E2 control armed`) is a CLIENT-side line.
+LIBRARY_LOG="${LIBRARY_LOG:-${CASE}/${BACKEND}/output/mobilegl.client.log}"
 mkdir -p "${CONTROL_TMPDIR}"
 FROZEN_LIBRARY="${FROZEN_LIBRARY:?FROZEN_LIBRARY must name the split library the replay loads}"
 symbols=$(nm --defined-only "${FROZEN_LIBRARY}") || exit 1
@@ -84,14 +87,21 @@ if [ "${matched}" -lt 1 ]; then
   exit 1
 fi
 
-# A PREVIOUS RUN'S LINE MUST NEVER ARM THIS ONE. The library opens its log fopen(path, "w"), so
-# the replay truncates it - but only if the replay gets that far, and a run that died in the
-# loader would leave the baseline's log in place with a perfectly good "control armed" line in
-# it. Removing it first is the same rule split_negative_controls.sh's `reset` step follows.
+# A PREVIOUS RUN'S LINE MUST NEVER ARM THIS ONE. The CLIENT truncates this log once at open and
+# then appends (P6 made the sink O_APPEND, because under spawn a second process writes the same
+# file and two truncating handles overwrite each other's bytes) - but it only truncates if the
+# replay gets that far, and a run that died in the loader would leave the baseline's log in place
+# with a perfectly good "control armed" line in it. Removing it first is the same rule
+# split_negative_controls.sh's `reset` step follows.
 rm -f "${LIBRARY_LOG}"
 
 out="${CONTROL_TMPDIR}/retrace-drop-draw-output.txt"
-export MOBILEGL_TRANSPORT=inproc
+# THE TRANSPORT COMES FROM THE JOB, not from this file. retrace-split is a matrix over
+# {backend, case, transport} as of P6, and a control that hard-coded `inproc` would have gone on
+# proving something about the OTHER arm while the spawn arm ran unguarded. Default inproc so a
+# caller that sets nothing behaves exactly as before.
+transport="${SPLIT_TRANSPORT:-inproc}"
+export MOBILEGL_TRANSPORT="${transport}"
 export MOBILEGL_IPC_E2_DROP_DRAW=1
 "${CTEST}" -V --no-tests=error --timeout 10800 -R "${selector}" > "${out}" 2>&1
 control_rc=$?

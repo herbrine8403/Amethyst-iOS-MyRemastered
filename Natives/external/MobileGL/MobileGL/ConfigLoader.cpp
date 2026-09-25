@@ -16,6 +16,11 @@
 
 #include <cerrno>
 #include <cstdlib>
+#if MOBILEGL_BUILD_DISAGGREGATED
+// std::strcmp, for InitIpc's server-role check (P12). Split-only, so the pull build's TU is
+// unchanged (G1).
+#include <cstring>
+#endif
 
 #ifndef _WIN32
 extern char** environ;
@@ -32,6 +37,7 @@ namespace MobileGL::MG_Config {
     // and there is nothing to define.
     TransportMode Transport = TransportMode::Monolith;
     String TransportEndpoint;
+    Bool SplitTransportRequestedByConfig = false;
     IpcTable Ipc;
 #endif
 } // namespace MobileGL::MG_Config
@@ -330,16 +336,43 @@ namespace MobileGL::MG_ConfigLoader {
         }
         if (lowered == "inproc") {
             MG_Config::Transport = MG_Config::TransportMode::InProcess;
+            // P7 F1: see Config.h. Set beside the mode, on the two arms that actually resolve
+            // one, and NOT on the two that name a transport and then stay monolith - a process
+            // that was refused its transport brings no client half up either.
+            MG_Config::SplitTransportRequestedByConfig = true;
             MGLOG_I("Config: MOBILEGL_TRANSPORT=inproc - the MGPipe record stream crosses a real "
                     "ring to an apply thread");
             return;
         }
         // The three P6 forms. Recognised precisely, so the diagnostic can say "not yet"
         // rather than "unknown", which are different bugs on the operator's side.
-        if (lowered == "spawn" || lowered.compare(0, 5, "unix:") == 0 ||
-            lowered.compare(0, 5, "pipe:") == 0) {
-            MGLOG_E("Config: MOBILEGL_TRANSPORT='%s' names a transport P6 implements and P5 does "
-                    "not; staying on monolith. This run is NOT a split run.",
+        // P6 `sm`/`cp`: spawn is IMPLEMENTED. It launches a server process on a
+        // rendezvous of its own and connects to it - the two processes are
+        // independent, so this is `Dial = Connect` with a launcher attached
+        // rather than the fork-coupled shape ARCHITECTURE.md:488 described.
+        if (lowered == "spawn") {
+            MG_Config::Transport = MG_Config::TransportMode::Spawn;
+            MG_Config::SplitTransportRequestedByConfig = true; // P7 F1, as above.
+            // THE SAME SHAPE AS THE inproc LINE ABOVE, AND FOR THE SAME REASON.
+            // run_trace_case.cmake asserts on a distinctive sentence from this
+            // function rather than on `MOBILEGL_TRANSPORT=spawn` alone, because
+            // ConfigLoader logs an `Accepted env variable: KEY=VALUE` line for
+            // every MOBILEGL_* in EVERY build including the pull one - so the
+            // bare KEY=VALUE is satisfied by a monolith library that parsed
+            // nothing (review M-5). A spawn arm with no line of its own could
+            // only have been asserted with the inproc marker, which spawn never
+            // emits: the arm would have been red for a missing sentence rather
+            // than green for a working transport.
+            MGLOG_I("Config: MOBILEGL_TRANSPORT=spawn - the MGPipe record stream crosses a real "
+                    "ring to an apply thread in ANOTHER PROCESS");
+            return;
+        }
+        if (lowered.compare(0, 5, "unix:") == 0 || lowered.compare(0, 5, "pipe:") == 0) {
+            // unix: and pipe: remain P6+ - connecting to an endpoint SOMEBODY
+            // ELSE is listening on needs the server lifecycle to be somebody
+            // else's too, which is P12's. Named, never a silent degrade.
+            MGLOG_E("Config: MOBILEGL_TRANSPORT='%s' names a transport P6 does not implement yet; "
+                    "staying on monolith. This run is NOT a split run.",
                     value.c_str());
             MG_Config::Transport = MG_Config::TransportMode::Monolith;
             return;
@@ -356,13 +389,22 @@ namespace MobileGL::MG_ConfigLoader {
     inline void InitIpc() {
         auto& ipc = MG_Config::Ipc;
         QueryEnvVariable("MOBILEGL_IPC_SERVER_PATH", ipc.ServerPath, "");
+        QueryEnvVariable("MOBILEGL_IPC_CONTROL", ipc.Control, "fork");
+        QueryEnvVariable("MOBILEGL_IPC_DATA", ipc.Data, "auto");
         // Both ring floors are 1 MiB, not 0: a ring caps ONE record at half its size, and
         // the catalogue's largest fixed payload (MGPFramebufferState, 304 bytes) plus a
         // create_shader_state archive already needs far more than a toy ring. The ceilings
         // are sanity, not policy.
         ipc.RingMb = QueryEnvUint32("MOBILEGL_IPC_RING_MB", 8, 1, 1024);
         ipc.StageMb = QueryEnvUint32("MOBILEGL_IPC_STAGE_MB", 32, 1, 4096);
+        // P7 wave 4 M2 (Config.h has the semantics). 0 is admitted ON PURPOSE as the negative
+        // control: no forced sync, and MagmaWireReclaimScenario's watermark case must go red.
+        ipc.WireDeferredMb = QueryEnvUint32("MOBILEGL_IPC_WIRE_DEFERRED_MB", 64, 0, 65536);
         ipc.SpinUs = QueryEnvUint32("MOBILEGL_IPC_SPIN_US", 50, 0, 1000000);
+        // PH-6 (ID-P7-2; Config.h has the semantics). 0 is NOT admitted: a server with no
+        // patience at all would forfeit a healthy run-ahead client the first time its ring
+        // filled between two of the client's drains, which is an ordinary backlog.
+        ipc.EventWaitMs = QueryEnvUint32("MOBILEGL_IPC_EVENT_WAIT_MS", 2000, 1, 600000);
         // 0 is admitted ON PURPOSE and is the negative control of exit gate E3(a): it turns
         // the persistent-map push OFF, and PersistentCoherentMapScenario must go red.
         ipc.PersistentBlockKb = QueryEnvUint32("MOBILEGL_IPC_PERSISTENT_BLOCK_KB", 64, 0, 65536);
@@ -390,24 +432,101 @@ namespace MobileGL::MG_ConfigLoader {
         // deeper queue buys nothing on a CPU-bound client and pays for it in latency. 0 is NOT
         // admitted: a credit of zero would mean "publish no present at all".
         ipc.PresentCredit = QueryEnvUint32("MOBILEGL_IPC_PRESENT_CREDIT", 1, 1, 8);
+        // CONTRACT-P6 D5b's reply bound and P7's cold-start budget (Config.h has the semantics).
+        // Both are floored at 100 ms: a zero bound would declare every live server silent.
+        ipc.ControlTimeoutMs = QueryEnvUint32("MOBILEGL_IPC_CONTROL_TIMEOUT_MS", 5000, 100, 600000);
+        ipc.ColdStartMs = QueryEnvUint32("MOBILEGL_IPC_COLD_START_MS", 20000, 100, 600000);
         ipc.StrictErrors = QueryEnvFlag("MOBILEGL_IPC_STRICT_ERRORS");
         ipc.Audit = QueryEnvFlag("MOBILEGL_IPC_AUDIT");
         QueryEnvVariable("MOBILEGL_IPC_SERVER_AFFINITY", ipc.ServerAffinity, "auto");
+        // P5f f1: the dual-block rehearsal (P5F-WIRE-COMPLETENESS.md §4). Forced OFF by the
+        // verify harness: the comparator's entry compare and compare-at-read hook are built on
+        // there being ONE filled block (the hook pins itself to &gPipeInputs,
+        // PipeFill.cpp's MGPipeVerifyReadHook), which is exactly what the rehearsal splits.
+        ipc.RoleSplitState = QueryEnvFlag("MOBILEGL_IPC_ROLE_SPLIT_STATE");
+        if (MG_Config::Features.PipeVerify && ipc.RoleSplitState) {
+            MGLOG_W("Config: MOBILEGL_IPC_ROLE_SPLIT_STATE=1 is incompatible with "
+                    "MOBILEGL_PIPE_VERIFY (the comparator owns the single fill block); "
+                    "the dual-block rehearsal is OFF for this run");
+            ipc.RoleSplitState = false;
+        }
+
+        // P6 `dl` (CONTRACT-P6 5.3): MOBILEGL_IPC_RESPAWN IS A NAMED REFUSAL, NOT A NO-OP.
+        //
+        // The device-lost latch is deliberately one-way - a session whose server died has
+        // nothing to recover into, because every handle the client minted names an object in a
+        // process that no longer exists. Re-pushing the world onto a fresh server is the work
+        // this knob would turn on, and no stage has written it.
+        //
+        // Refused BY NAME rather than parsed and ignored, for the reason Config.h gives about
+        // the whole IPC family: an environment variable nothing consumes is indistinguishable
+        // from one that is consumed and does nothing, and an operator who set this one would
+        // otherwise conclude that recovery had been tried and had not helped.
+        {
+            String respawn;
+            QueryEnvVariable("MOBILEGL_IPC_RESPAWN", respawn, "");
+            if (!respawn.empty() && respawn != "0") {
+                MGLOG_E("Config: MOBILEGL_IPC_RESPAWN='%s' names a recovery NO STAGE HAS "
+                        "IMPLEMENTED. The device-lost latch is one-way on purpose: every handle "
+                        "this client minted names an object inside the server process, so a new "
+                        "server would have to be re-pushed the entire world before a single verb "
+                        "could land. This run will latch device-lost and stay there.",
+                        respawn.c_str());
+            }
+        }
+
+        // P12 (on-screen server window): MOBILEGL_IPC_SURFACE = offscreen | server (Config.h has
+        // the semantics). An unknown value is named and read as the default, like every knob here.
+        {
+            String surface;
+            QueryEnvVariable("MOBILEGL_IPC_SURFACE", surface, "offscreen");
+            std::transform(surface.begin(), surface.end(), surface.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (surface.empty() || surface == "offscreen") {
+                ipc.Surface = MG_Config::IpcSurface::Offscreen;
+            } else if (surface == "server") {
+                ipc.Surface = MG_Config::IpcSurface::Server;
+            } else {
+                MGLOG_W("Config: Ignoring invalid env variable MOBILEGL_IPC_SURFACE='%s'; expected "
+                        "offscreen|server, using offscreen",
+                        surface.c_str());
+                ipc.Surface = MG_Config::IpcSurface::Offscreen;
+            }
+            // (Not said by a server process: a spawned server inherits the client's environment,
+            // parses this before RunSession sets its own transport, and has no client half anyway.)
+            const char* role = std::getenv("MOBILEGL_IPC_ROLE");
+            const Bool serverProcess = role != nullptr && std::strcmp(role, "server") == 0;
+            if (ipc.Surface == MG_Config::IpcSurface::Server && !serverProcess &&
+                MG_Config::Transport != MG_Config::TransportMode::Spawn) {
+                // Said, not silently honoured: there is no remote server here to own a window.
+                MGLOG_W("Config: MOBILEGL_IPC_SURFACE=server is IGNORED - it asks a remote server "
+                        "(MOBILEGL_TRANSPORT=spawn, a fork or tcp:// control) to own the window surface, "
+                        "and this run has none. Window surfaces stay the client's own");
+            }
+        }
 
         if (MG_Config::Transport == MG_Config::TransportMode::Monolith) return;
         // One line, on the arm where these numbers decide behaviour, because every one of
         // them is a number a bug report has to quote.
-        MGLOG_I("Config: IPC ring=%uMiB stage=%uMiB spin=%uus persistent-block=%uKiB "
-                "adopt-tier=%u verb-barrier=%u run-ahead=%u present-credit=%u strict=%d "
-                "audit=%d affinity='%s'",
-                ipc.RingMb, ipc.StageMb, ipc.SpinUs, ipc.PersistentBlockKb, ipc.AdoptTier,
-                ipc.VerbBarrier, ipc.RunAhead, ipc.PresentCredit,
+        MGLOG_I("Config: IPC ring=%uMiB stage=%uMiB wire-deferred=%uMiB spin=%uus event-wait=%ums "
+                "persistent-block=%uKiB "
+                "adopt-tier=%u verb-barrier=%u run-ahead=%u present-credit=%u control-timeout=%ums "
+                "cold-start=%ums strict=%d audit=%d role-split-state=%d affinity='%s' surface=%s",
+                ipc.RingMb, ipc.StageMb, ipc.WireDeferredMb, ipc.SpinUs, ipc.EventWaitMs,
+                ipc.PersistentBlockKb, ipc.AdoptTier,
+                ipc.VerbBarrier, ipc.RunAhead, ipc.PresentCredit, ipc.ControlTimeoutMs, ipc.ColdStartMs,
                 static_cast<int>(ipc.StrictErrors), static_cast<int>(ipc.Audit),
-                ipc.ServerAffinity.c_str());
+                static_cast<int>(ipc.RoleSplitState), ipc.ServerAffinity.c_str(),
+                MG_Config::ServerOwnedWindowSurfaces() ? "server" : "offscreen");
         if (ipc.VerbBarrier == 0) {
             MGLOG_W("Config: MOBILEGL_IPC_VERB_BARRIER=0 is the R-1 NEGATIVE CONTROL and is "
                     "expected to fail: the client still pulls 31 of 63 PipeInputs fields from a "
                     "live GLContext, so an unbarriered queue lets the server read future values");
+        }
+        if (ipc.WireDeferredMb == 0) {
+            MGLOG_W("Config: MOBILEGL_IPC_WIRE_DEFERRED_MB=0 is the M2 NEGATIVE CONTROL: the "
+                    "server never forces a sync for orphaned wire buffer stores, so a long frame "
+                    "that respecifies and draws holds every one of them until the frame ends");
         }
         if (ipc.PersistentBlockKb == 0) {
             MGLOG_W("Config: MOBILEGL_IPC_PERSISTENT_BLOCK_KB=0 is the E3(a) NEGATIVE CONTROL: "

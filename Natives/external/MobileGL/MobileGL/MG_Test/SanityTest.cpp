@@ -47,6 +47,9 @@
 // a split-armed case has to arm that half too - registering an op table is the SERVER's arming.
 #include <MG_Remote/CapsCodec.h>
 #include <MG_Remote/Client/CapsMirror.h>
+// PH-2 (F2): the handle-keyed tables' backstop refusals die through MG_Pipe's session-fail seam.
+#include <MG_Pipe/PipeSessionFail.h>
+#include <cstdio>
 #endif
 #include <MG_Util/BackendLoaders/OpenGL/Loader.h>
 #include <MG_Util/Types.h>
@@ -2113,7 +2116,16 @@ TEST(LogSanity, UsesEnvOverrideForFilePath) {
     UnsetEnvVar("MOBILEGL_LOG_FILE_PATH");
 
     {
-        std::ifstream logFile(logPath);
+        // P6: the sink writes ONE FILE PER ROLE, so the base name is not itself a file. This
+        // process logs on the main thread - the client role - so the line landed in the
+        // client-derived path. In a pull build there is no split and the base IS the file.
+#if MOBILEGL_BUILD_DISAGGREGATED
+        const fs::path readPath = MobileGL::MG_Util::Debug::RoleLogPath(
+            logPath.string().c_str(), MobileGL::MG_Util::Debug::LogRole::Client);
+#else
+        const fs::path readPath = logPath;
+#endif
+        std::ifstream logFile(readPath);
         ASSERT_TRUE(logFile.good());
 
         const std::string contents((std::istreambuf_iterator<char>(logFile)), std::istreambuf_iterator<char>());
@@ -2121,6 +2133,10 @@ TEST(LogSanity, UsesEnvOverrideForFilePath) {
     }
 
     fs::remove(logPath);
+#if MOBILEGL_BUILD_DISAGGREGATED
+    fs::remove(MobileGL::MG_Util::Debug::RoleLogPath(
+        logPath.string().c_str(), MobileGL::MG_Util::Debug::LogRole::Client));
+#endif
 }
 
 // ---- Pure-state entry points: glHint / glPointParameter* / glPixelStoref / glGetDoublev -----------
@@ -3141,6 +3157,95 @@ TEST(DirectGLESTextureSync, UnitMemoRefusesToDriveATwinFromAnotherTexture) {
     MG_Impl::GLImpl::BindTexture(GL_TEXTURE_2D, 0);
 }
 
+#if MOBILEGL_PIPE_PUSH
+// P5e (tx2), CONTRACT-P5E §4.3: THE HANDLE ARM'S SIBLING OF THE CASE ABOVE, WITH ABA AS THE
+// HAZARD INSTEAD OF A SILENT SLOT SWAP.
+//
+// The case above pins what the BORROWED-SLOT work list needs: a pointer compare per entry,
+// because its key is derived state and a slot swap that never reached the key would drive
+// texture A's twin from texture B. The by-handle work list carries no such pointer and no
+// PairingsIntact, and this is the argument for why it does not have to:
+//
+//   a handle is {slot, gen}. A slot recycled to a NEW object arrives as {s, g+1}, and
+//   GetOrCreateByHandle RESETS the entry on a forward generation (SlotTables.h) - so the
+//   successor gets a fresh twin with a fresh driver texture, and the predecessor's handle
+//   stops resolving. There is no window in which one handle names two objects, which is
+//   exactly the window the pointer compare above exists to close.
+//
+// THE RED: drop the forward-Gen reset (make GetOrCreate return the live entry for any
+// generation) and `reMinted` below is the SAME twin as `first` - the successor inherits its
+// predecessor's driver texture and its predecessor's synced serials, so the first draw that
+// samples it reads the dead object's pixels and the clean gate says there is nothing to do.
+TEST(DirectGLESTextureSync, ARecycledTextureSlotReMintsTheTwinOnTheHandleArm) {
+    using namespace MobileGL;
+    using namespace MobileGL::MG_Backend::DirectGLES;
+    ScopedDirectGLESTextureBindings scoped; // fresh GLContext + registry + binding caches
+    // The {slot, gen} table is what this case is about; the FAMILY bit is not.
+    if (!EsprytSlotTablesEnabled()) {
+        GTEST_SKIP() << "the {slot, gen} twin table arm is not selected in this configuration";
+    }
+
+    // ON THE REAL TEXTURE REGISTRY, not a fake one: id's DirectGLESSlotTable cases pin the
+    // TABLE's rule in isolation, and this pins that the table tx2's work list indexes is the one
+    // that keeps it. Two lifetime ids stand in for two frontend textures, so the client
+    // allocator hands the SAME SLOT back at a higher generation for the second - the hazard.
+    //
+    // No applier record and no SyncTextureToBackendByHandle here: MGPipeApplyResourceCreate
+    // declines for a texture on a process with no P4a consumer (NoP4aConsumer), which is every
+    // unit-lane process, and the ABA answer is the twin TABLE's rather than the record's.
+    auto firstOwner = MakeShared<MG_State::GLState::SamplerObject>(0u);
+    const MG_Pipe::MGPipeHandle first =
+        MG_Pipe::MGPipeSlots().Acquire(MG_Pipe::MGPipeKind::Texture, firstOwner->GetLifetimeId());
+    ASSERT_FALSE(MG_Pipe::MGPipeHandleIsNull(first));
+
+    auto& registry = TextureImpl::g_backendTextureObjects;
+    auto* firstSlot = registry.GetOrCreateByHandle(first);
+    ASSERT_NE(firstSlot, nullptr);
+    if (!*firstSlot) *firstSlot = MakeShared<TextureImpl::BackendTextureObject>();
+    (*firstSlot)->NotePushedSyncHandle(first);
+    ASSERT_EQ((*firstSlot)->PushedSyncHandle().Slot, first.Slot);
+
+    // The recycle: the client frees the slot and hands it straight back out at {s, g+1}.
+    MG_Pipe::MGPipeSlots().Free(MG_Pipe::MGPipeKind::Texture, first);
+    auto secondOwner = MakeShared<MG_State::GLState::SamplerObject>(0u);
+    const MG_Pipe::MGPipeHandle second =
+        MG_Pipe::MGPipeSlots().Acquire(MG_Pipe::MGPipeKind::Texture, secondOwner->GetLifetimeId());
+    ASSERT_FALSE(MG_Pipe::MGPipeHandleIsNull(second));
+    ASSERT_EQ(second.Slot, first.Slot) << "the allocator did not recycle the slot, so this case "
+                                          "is not exercising ABA at all";
+    ASSERT_GT(second.Gen, first.Gen);
+
+    auto* secondSlot = registry.GetOrCreateByHandle(second);
+    ASSERT_NE(secondSlot, nullptr);
+    EXPECT_EQ(*secondSlot, nullptr)
+        << "the successor at a recycled texture slot inherited its predecessor's twin: it would "
+           "sample the dead object's driver texture, and the twin's synced serials and noted "
+           "handle would tell the clean gate there is nothing to do";
+    // DELIBERATELY NOT A POINTER COMPARE against the predecessor's twin: the reset released it,
+    // so the allocator is free to hand the successor's twin the very same heap address - which
+    // it does, and which is exactly why a raw address is never an identity in this tree
+    // (section 4.2.1). "The slot came back empty" is the assertion; "it came back at a different
+    // address" is a coincidence that would make this case pass for the wrong reason.
+    if (!*secondSlot) *secondSlot = MakeShared<TextureImpl::BackendTextureObject>();
+    EXPECT_TRUE(MG_Pipe::MGPipeHandleIsNull((*secondSlot)->PushedSyncHandle()))
+        << "the re-minted twin kept the dead handle, so its sync prologues would resolve the "
+           "predecessor's record";
+
+    // ...and the predecessor's handle stops resolving, which is what makes a stale entry left in
+    // a by-handle work list harmless: the lookup answers null and the entry is skipped, where a
+    // borrowed slot would have been replayed against the wrong object.
+    EXPECT_EQ(registry.FindByHandle(first), nullptr)
+        << "the predecessor's handle still resolves at a recycled slot";
+
+    MG_Pipe::MGPipeSlots().Free(MG_Pipe::MGPipeKind::Texture, second);
+}
+#else
+// G2/G14: the same ctest entry exists in the pull build and skips visibly.
+TEST(DirectGLESTextureSync, ARecycledTextureSlotReMintsTheTwinOnTheHandleArm) {
+    GTEST_SKIP() << "the by-handle texture twin is compiled only under MOBILEGL_PIPE_PUSH";
+}
+#endif
+
 namespace {
     // What glTexParameteri actually reached the driver, and which backend texture was bound
     // when it did. The G9 probe below is a WHITE-BOX assertion (ID-19): the parameter push is
@@ -3417,6 +3522,19 @@ namespace {
     using FakeShaderCsoSlotTable = MobileGL::MG_Backend::DirectGLES::
         BackendSlotTable<FakeStateObject, FakeBackendObject, MobileGL::MG_Pipe::MGPipeKind::ShaderCso>;
 
+#if MOBILEGL_BUILD_DISAGGREGATED
+    // PH-2 (F2, ID-P7-54): on a disaggregated build the handle overload's backward-generation and
+    // past-the-bound refusals are NAMED session faults through MG_Pipe's seam, not a quiet null
+    // twin - the handle arrived in a peer's payload. The seam's no-hook default writes the line to
+    // the log FILE only, so a death child installs this hook first to put the same line where the
+    // death matcher reads it; the seam then logs and aborts exactly as it would have.
+    void EchoPipeSessionFailToStderr(MobileGL::MG_Pipe::MGPipeFatalFamily, const char* line) {
+        std::fputs(line, stderr);
+        std::fputc('\n', stderr);
+        std::fflush(stderr);
+    }
+#endif
+
     // A log file path no other process and no other case can be writing to: the pid keeps two
     // SanityTest processes on one host apart, the counter keeps two cases in one process apart.
     std::filesystem::path UniqueScratchLogPath(const char* stem) {
@@ -3460,11 +3578,19 @@ namespace {
         ScopedLogFileRedirect& operator=(const ScopedLogFileRedirect&) = delete;
 
         // Everything written so far. Closes the log first so the last line is on disk.
+        //
+        // P6: BOTH ROLES, because "everything written" now spans two files - the sink writes one
+        // per role - and a caller of a general "give me the log" helper cannot know which role
+        // wrote the line it wants. In a pull build there is no split and m_path is the file.
         std::string Contents() const {
             MobileGL::MG_Util::Debug::Close();
+#if MOBILEGL_BUILD_DISAGGREGATED
+            return MobileGL::MG_Util::Debug::ReadRoleLogs(m_path.string().c_str());
+#else
             std::ifstream logFile(m_path);
             if (!logFile.good()) return {};
             return std::string(std::istreambuf_iterator<char>(logFile), std::istreambuf_iterator<char>());
+#endif
         }
 
     private:
@@ -4223,10 +4349,21 @@ TEST(DirectGLESSlotTable, EverySwitchedOverKindResolvesItsTwinThroughTheHandleAr
         // adoption the live twin at `second` is gone. The first is kept because a non-null there
         // would mean the table handed back the incumbent's own twin under the dead handle, which
         // is a third outcome and a worse one.
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // PH-2: the refusal is a named session fault here, so it is asserted in a death child;
+        // the live twin below is then the parent's, untouched by construction AND by assertion.
+        EXPECT_DEATH(
+            {
+                MG_Pipe::MGPipeInstallSessionFailHook(&EchoPipeSessionFailToStderr);
+                (void)table.GetOrCreate(first);
+            },
+            "BackendSlotTable.Generation");
+#else
         auto& stale = table.GetOrCreate(first);
         EXPECT_EQ(stale, nullptr)
             << "SamplerViewCso: a stale handle was answered with the LIVE twin at its slot (this "
                "assertion cannot tell a refusal from an adoption - the next one does)";
+#endif
         EXPECT_NE(table.FindByHandle(second), nullptr)
             << "SamplerViewCso: the live twin was destroyed by a handle from its slot's past - "
                "the backward generation was ADOPTED rather than refused";
@@ -4914,10 +5051,22 @@ TEST(DirectGLESSlotTable, AGenerationBehindTheLiveTwinIsRefusedRatherThanAdopted
     incumbent->marker = 0xC0FFEE;
     const FakeBackendObject* const raw = incumbent.get();
 
+#if MOBILEGL_BUILD_DISAGGREGATED
+    // PH-2 (F2): the backwards generation is a NAMED session fault on this build - the handle is a
+    // peer's payload - so the refusal is asserted in a death child and the incumbent below is the
+    // parent's, which the refused call never touched.
+    EXPECT_DEATH(
+        {
+            MobileGL::MG_Pipe::MGPipeInstallSessionFailHook(&EchoPipeSessionFailToStderr);
+            (void)table.GetOrCreate(stale);
+        },
+        "BackendSlotTable.Generation");
+#else
     auto& answer = table.GetOrCreate(stale);
     EXPECT_EQ(answer, nullptr)
         << "a backwards generation was handed a twin rather than refused; FindByHandle refuses "
            "the same input, so the two entry points disagreed";
+#endif
 
     auto* const still = table.FindByHandle(current);
     ASSERT_NE(still, nullptr) << "the live twin's entry was retired by a handle from its past";
@@ -4933,8 +5082,17 @@ TEST(DirectGLESSlotTable, AGenerationBehindTheLiveTwinIsRefusedRatherThanAdopted
     EXPECT_EQ(table.FindByHandle(current), nullptr) << "the predecessor's handle still resolves";
 
     // And a slot past the table's bound is refused rather than resized to.
+#if MOBILEGL_BUILD_DISAGGREGATED
+    EXPECT_DEATH(
+        {
+            MobileGL::MG_Pipe::MGPipeInstallSessionFailHook(&EchoPipeSessionFailToStderr);
+            (void)table.GetOrCreate(MG_Pipe::MGPipeHandle{FakeSlotTable::kMaxHandleSlot, 1u});
+        },
+        "BackendSlotTable.HandleSlot");
+#else
     auto& absurd = table.GetOrCreate(MG_Pipe::MGPipeHandle{FakeSlotTable::kMaxHandleSlot, 1u});
     EXPECT_EQ(absurd, nullptr) << "an unbounded client slot decided a vector resize";
+#endif
     EXPECT_EQ(table.FindByHandle(MG_Pipe::MGPipeHandle{FakeSlotTable::kMaxHandleSlot, 1u}), nullptr);
 }
 
@@ -5002,6 +5160,168 @@ TEST(DirectGLESSlotTable, ACompositeHandleDoesNotGrowTheOrdinaryTable) {
                                    "predecessor's driver program";
     EXPECT_EQ(table.FindByHandle(composite), nullptr) << "the predecessor's handle still resolves";
     EXPECT_EQ(table.CompositeCapacityForTest(), 4u) << "the recycle re-grew the band";
+}
+
+// ==========================================================================================
+// P5e (vi), CONTRACT-P5E §5.1: THE DRAW'S BUFFERS COME FROM THE RECORD, NOT FROM THE VAO.
+// ==========================================================================================
+//
+// The two cases below are BRIEF-P5E's red-onces (2) and (3) for this package, and they are
+// built the way ID-102 says a red-once has to be: the thing under test is THE PRODUCTION
+// DECISION ITSELF (BufferImpl::ResolveDrawVertexBuffersFromRecord and
+// ResolveDrawIndexBufferFromRecord, which are the only enumeration
+// SyncNeccessaryBuffers' record arm has), not a copy of it written here. Both take the applier
+// state and NOTHING ELSE, so the only way to revert §5.1's substitution is to put a frontend
+// read back inside one of them - and then these go red naming the field.
+//
+// THE SETUP IS THE DIVERGENCE ITSELF: the frontend VAO is pointed at a buffer the RECORD does
+// not name. That state is unreachable in one process today (the client re-emits at every
+// validate point, so the two always agree); under run-ahead it is the ordinary state of the
+// world, because the client has moved on by the time the record is applied. Producing it here
+// by hand is the only way to ask "which one did you read" at all.
+//
+// WHAT IS NOT HERE, and deliberately: the ensure, the memo and the clean probe. They need an ES
+// context and a driver, and DirectGLES.Split.* is where they are exercised
+// (ClientVertexArrayScenario, TriangleScenario, IndexedDrawFamilyScenario and the rest of the
+// lane draw through exactly this arm).
+TEST(DirectGLESVertexInputDraw, TheAttributeWalkTakesItsBuffersFromTheRecordNotTheFrontendVao) {
+    using namespace MobileGL;
+    using namespace MobileGL::MG_Backend::DirectGLES;
+    using namespace MobileGL::MG_State::GLState;
+#if !MOBILEGL_BUILD_DISAGGREGATED
+    GTEST_SKIP() << "the record arm of the attribute walk is compiled only under "
+                    "MOBILEGL_BUILD_DISAGGREGATED";
+#else
+    // A, B and C, with handles minted the way the client mints them.
+    auto bufferA = MakeShared<BufferObject>(0u);
+    auto bufferB = MakeShared<BufferObject>(0u);
+    auto bufferC = MakeShared<BufferObject>(0u);
+    const MG_Pipe::MGPipeHandle a =
+        MG_Pipe::MGPipeSlots().Acquire(MG_Pipe::MGPipeKind::Buffer, bufferA->GetLifetimeId());
+    const MG_Pipe::MGPipeHandle b =
+        MG_Pipe::MGPipeSlots().Acquire(MG_Pipe::MGPipeKind::Buffer, bufferB->GetLifetimeId());
+    const MG_Pipe::MGPipeHandle c =
+        MG_Pipe::MGPipeSlots().Acquire(MG_Pipe::MGPipeKind::Buffer, bufferC->GetLifetimeId());
+    ASSERT_FALSE(MG_Pipe::MGPipeHandleIsNull(a));
+    ASSERT_FALSE(MG_Pipe::MGPipeHandleIsNull(b));
+    ASSERT_FALSE(MG_Pipe::MGPipeHandleIsNull(c));
+
+    // THE PUBLISHED STATE: attribute 0 fetches from A, attribute 1 from B, attribute 2 from A
+    // again (the dedupe), attribute 3 is a client-memory array (null Res, nothing to ensure).
+    MG_Pipe::MGPipeApplierState& st = MG_Pipe::MGPipeApplier();
+    const MG_Pipe::MGPipeApplierState saved = st;
+    st.VertexBufferStart = 0;
+    st.VertexBufferCount = 4;
+    for (Uint32 i = 0; i < 4; ++i) {
+        st.VertexBuffers[i] = MG_Pipe::MGPVertexBuffer{};
+        st.VertexBuffers[i].BindingIndex = i;
+    }
+    st.VertexBuffers[0].Res = a;
+    st.VertexBuffers[1].Res = b;
+    st.VertexBuffers[2].Res = a;
+    st.VertexBuffers[3].Res = MG_Pipe::kMGPipeNullHandle;
+
+    // THE FRONTEND, MOVED ON: every enabled attribute now points at C, and nothing was
+    // re-emitted. A walk that read GetAllAttributes() answers {C}. The VAO is BOUND IN A REAL
+    // CONTEXT rather than free-standing, because that is the only shape in which the revert
+    // this case exists to catch - MGB_CTX->GetBoundVertexArray()->GetAllAttributes() - has
+    // anything to read at all; a free-standing object would make the revert crash instead of
+    // disagree, which is a red for the wrong reason.
+    UniquePtr<GLContext> previousContext = Move(MG_State::pGLContext);
+    MG_State::pGLContext = MakeUnique<GLContext>();
+    MG_State::pGLContext->CreateVertexArrayObject(1);
+    MG_State::pGLContext->BindVertexArray(1);
+    const SharedPtr<VertexArrayObject> vao = MG_State::pGLContext->GetBoundVertexArray();
+    ASSERT_NE(vao, nullptr);
+    for (Uint i = 0; i < 4; ++i) {
+        vao->SetAttributeFormat(i, 2, DataType::Float32, false, 8, 0, false, false, 8);
+        vao->BindAttributeBuffer(i, bufferC);
+        vao->EnableAttribute(i);
+    }
+
+    BufferImpl::DrawVertexBufferRequest requests[VertexArrayObject::MAX_VERTEX_ATTRIBS];
+    const Uint count = BufferImpl::ResolveDrawVertexBuffersFromRecord(
+        st, requests, VertexArrayObject::MAX_VERTEX_ATTRIBS);
+
+    ASSERT_EQ(count, 2u)
+        << "the walk did not resolve st.VertexBuffers[Start..+Count): two DISTINCT handles are "
+           "named there (A twice and B), plus one client-memory array with no store to ensure";
+    EXPECT_EQ(requests[0].Res, a)
+        << "the first buffer is not st.VertexBuffers[0].Res. If it is the frontend VAO's C, the "
+           "walk went back to GetAllAttributes() and §5.1's substitution is reverted";
+    EXPECT_EQ(requests[1].Res, b) << "the second buffer is not st.VertexBuffers[1].Res";
+    EXPECT_EQ(requests[0].BindingIndex, 0u);
+    EXPECT_EQ(requests[1].BindingIndex, 1u);
+    for (Uint i = 0; i < count; ++i) {
+        EXPECT_NE(requests[i].Res, c)
+            << "the walk ensured the buffer the FRONTEND VAO points at, which is the object a "
+               "run-ahead client has already moved on from";
+    }
+
+    st = saved;
+    MG_State::pGLContext.reset();
+    MG_State::pGLContext = Move(previousContext);
+    MG_Pipe::MGPipeSlots().Free(MG_Pipe::MGPipeKind::Buffer, a);
+    MG_Pipe::MGPipeSlots().Free(MG_Pipe::MGPipeKind::Buffer, b);
+    MG_Pipe::MGPipeSlots().Free(MG_Pipe::MGPipeKind::Buffer, c);
+#endif
+}
+
+// Red-once (3), the index half. The claim has TWO parts and the second is what this package
+// added: the handle comes from st.IndexBuffer.Res, and IndexBufferSerial comes with it - the
+// legacy and push-monolith arms re-read the VAO's element slot on every indexed draw and so see
+// a rebind for free, while this arm reads nothing and needs the serial in the key
+// (ResolvedDrawBuffers::iboSerial). A rebind of the SAME buffer still moves the serial, which is
+// exactly the case an identity-only compare would call a hit.
+TEST(DirectGLESVertexInputDraw, TheIndexArmTakesItsBufferAndItsSerialFromTheRecord) {
+    using namespace MobileGL;
+    using namespace MobileGL::MG_Backend::DirectGLES;
+    using namespace MobileGL::MG_State::GLState;
+#if !MOBILEGL_BUILD_DISAGGREGATED
+    GTEST_SKIP() << "the record arm of the index-buffer sync is compiled only under "
+                    "MOBILEGL_BUILD_DISAGGREGATED";
+#else
+    auto published = MakeShared<BufferObject>(0u);
+    auto rebound = MakeShared<BufferObject>(0u);
+    const MG_Pipe::MGPipeHandle publishedHandle =
+        MG_Pipe::MGPipeSlots().Acquire(MG_Pipe::MGPipeKind::Buffer, published->GetLifetimeId());
+    ASSERT_FALSE(MG_Pipe::MGPipeHandleIsNull(publishedHandle));
+
+    MG_Pipe::MGPipeApplierState& st = MG_Pipe::MGPipeApplier();
+    const MG_Pipe::MGPipeApplierState saved = st;
+    st.IndexBuffer = MG_Pipe::MGPIndexBuffer{};
+    st.IndexBuffer.Res = publishedHandle;
+    st.IndexBufferSerial = 11;
+
+    // The frontend's element slot has moved to another buffer with nothing emitted, in a real
+    // context for the reason the case above gives.
+    UniquePtr<GLContext> previousContext = Move(MG_State::pGLContext);
+    MG_State::pGLContext = MakeUnique<GLContext>();
+    MG_State::pGLContext->CreateVertexArrayObject(1);
+    MG_State::pGLContext->BindVertexArray(1);
+    const SharedPtr<VertexArrayObject> vao = MG_State::pGLContext->GetBoundVertexArray();
+    ASSERT_NE(vao, nullptr);
+    vao->GetIndexBufferBindingSlot().Bind(rebound);
+
+    BufferImpl::DrawIndexBufferRequest request = BufferImpl::ResolveDrawIndexBufferFromRecord(st);
+    EXPECT_EQ(request.Res, publishedHandle)
+        << "the index arm did not read st.IndexBuffer.Res; if it answered the VAO's element "
+           "slot it is reading a binding the client has already changed";
+    EXPECT_EQ(request.Serial, 11u) << "IndexBufferSerial did not travel with the handle";
+
+    // The same buffer re-bound: the handle is unchanged and ONLY the serial says so.
+    st.IndexBufferSerial = 12;
+    request = BufferImpl::ResolveDrawIndexBufferFromRecord(st);
+    EXPECT_EQ(request.Res, publishedHandle);
+    EXPECT_EQ(request.Serial, 12u)
+        << "a re-emitted set_index_buffer on the SAME handle is invisible to this arm without "
+           "the serial, and the memo would read clean over it";
+
+    st = saved;
+    MG_State::pGLContext.reset();
+    MG_State::pGLContext = Move(previousContext);
+    MG_Pipe::MGPipeSlots().Free(MG_Pipe::MGPipeKind::Buffer, publishedHandle);
+#endif
 }
 
 #else
@@ -5103,4 +5423,125 @@ TEST(DirectGLESBufferDrawProbe, UnderSplitTheRecordAloneAnswersTheLiveHostMapQue
 TEST(DirectGLESBufferDrawProbe, ACapsMaskWithoutTheResourceFamilyEmitsNothingAndCountsTheRefusal) {
     GTEST_SKIP() << "the handle-keyed resource table is compiled only under MOBILEGL_PIPE_PUSH";
 }
+// P5e (vi): G2/G14's skip twins for the two record-arm cases above.
+TEST(DirectGLESVertexInputDraw, TheAttributeWalkTakesItsBuffersFromTheRecordNotTheFrontendVao) {
+    GTEST_SKIP() << "the record arm of the attribute walk is compiled only under MOBILEGL_PIPE_PUSH";
+}
+TEST(DirectGLESVertexInputDraw, TheIndexArmTakesItsBufferAndItsSerialFromTheRecord) {
+    GTEST_SKIP() << "the record arm of the index-buffer sync is compiled only under MOBILEGL_PIPE_PUSH";
+}
 #endif // MOBILEGL_PIPE_PUSH
+
+// P12 (on-screen server window): A SERVER SESSION ENDS IN A PROCESS THAT OUTLIVES IT.
+//
+// The in-process display server (the display Activity's process) runs its sessions one after
+// another in ONE process, and each new client mints its handles from the same {slot, gen} space
+// again. The twin tables are process globals, so the twins the previous session built - naming ids
+// of the context its backend destroyed - answered for the next session's objects: on the device
+// the second on-screen OpenRA replay linked no program (ssim 0.00004) and the third crashed inside
+// Adreno's glDrawElements; on llvmpipe the second replay failed the same way. The server backend's
+// destruction under a transport - the end of a session - now drops every twin (without a driver
+// call), and monolith keeps its twins. Red once: remove the DropEveryTwinForEndedServerSession
+// call from ~BackendObject_DirectGLES and the first half of this case fails at every kind.
+#if MOBILEGL_BUILD_DISAGGREGATED
+TEST(EsprytServerSession, TheServerBackendsDestructionDropsEveryTwinTheSessionBuilt) {
+    using namespace MobileGL;
+    namespace GL = MG_Backend::DirectGLES;
+    const auto previousTransport = MG_Config::Transport;
+    const MG_Pipe::MGPipeHandle program{7u, 3u};
+    const MG_Pipe::MGPipeHandle texture{4u, 2u};
+    const MG_Pipe::MGPipeHandle buffer{5u, 1u};
+    // A session's twins: LIVE entries at the generations its client minted. A null twin object is
+    // enough for the program and texture kinds - what the next session trips over is the live
+    // entry itself (its generation, and the driver id a real twin would carry).
+    const auto populate = [&] {
+        ASSERT_NE(GL::PrgramImpl::g_backendProgramObjects.GetOrCreateByHandle(program), nullptr);
+        ASSERT_NE(GL::TextureImpl::g_backendTextureObjects.GetOrCreateByHandle(texture), nullptr);
+        GL::BufferImpl::g_backendBufferResources.GetOrCreate(buffer) =
+            MakeShared<GL::BufferImpl::GLESBufferResource>();
+        ASSERT_EQ(GL::PrgramImpl::g_backendProgramObjects.LiveGenAt(program.Slot), 3u);
+        ASSERT_EQ(GL::TextureImpl::g_backendTextureObjects.LiveGenAt(texture.Slot), 2u);
+        ASSERT_NE(GL::BufferImpl::g_backendBufferResources.FindByHandle(buffer), nullptr);
+    };
+
+    // Under a transport this backend is the SERVER's: its destruction ends the session.
+    MG_Config::Transport = MG_Config::TransportMode::Spawn;
+    populate();
+    { GL::BackendObject_DirectGLES serverBackend; }
+    EXPECT_EQ(GL::PrgramImpl::g_backendProgramObjects.LiveGenAt(program.Slot), 0u)
+        << "the ended session's program twin is still live: the next session's client mints {7, 0} "
+           "and is refused as ProtocolCorruption, or adopts a program of the destroyed context";
+    EXPECT_EQ(GL::TextureImpl::g_backendTextureObjects.LiveGenAt(texture.Slot), 0u)
+        << "the ended session's texture twin is still live";
+    EXPECT_EQ(GL::BufferImpl::g_backendBufferResources.FindByHandle(buffer), nullptr)
+        << "the ended session's buffer twin is still live";
+    // The next session starts from empty tables: its first handle at that slot is a fresh twin.
+    MG_Pipe::MGPipeHandle nextSession{7u, 0u};
+    auto* fresh = GL::PrgramImpl::g_backendProgramObjects.GetOrCreateByHandle(nextSession);
+    ASSERT_NE(fresh, nullptr);
+    EXPECT_EQ(*fresh, nullptr);
+
+    // Monolith keeps its twins: its backend is not a session's, and nothing here changed for it.
+    GL::PrgramImpl::g_backendProgramObjects = {};
+    MG_Config::Transport = MG_Config::TransportMode::Monolith;
+    populate();
+    { GL::BackendObject_DirectGLES monolithBackend; }
+    EXPECT_EQ(GL::PrgramImpl::g_backendProgramObjects.LiveGenAt(program.Slot), 3u);
+    EXPECT_EQ(GL::TextureImpl::g_backendTextureObjects.LiveGenAt(texture.Slot), 2u);
+    EXPECT_NE(GL::BufferImpl::g_backendBufferResources.FindByHandle(buffer), nullptr);
+
+    GL::PrgramImpl::g_backendProgramObjects = {};
+    GL::TextureImpl::g_backendTextureObjects = {};
+    GL::BufferImpl::g_backendBufferResources = {};
+    MG_Config::Transport = previousTransport;
+}
+
+// P12 review fix (major): THE UNIT SHADOWS GO WITH THE TWINS THEY POINT AT. A texture / sampler twin
+// scrubs itself out of g_boundTexturesCache / g_boundSamplersCache in its destructor, except under
+// InProcessTeardown() - which answers true for every twin the session end drops. The shadows then
+// held raw pointers to freed twins, and the next session's twin allocated at a recycled address read
+// "already bound" and skipped its glBindTexture / glBindSampler on the new context: its uploads went
+// to texture 0 and it rendered black. The shadow entries here stand for the ended session's binds (the
+// addresses are never dereferenced), and the active-unit shadow for its last glActiveTexture. Red with
+// the three resets in DropEveryTwinForEndedServerSession deleted: every expectation below fails.
+TEST(EsprytServerSession, TheServerBackendsDestructionEmptiesTheTextureAndSamplerUnitShadows) {
+    using namespace MobileGL;
+    namespace GL = MG_Backend::DirectGLES;
+    const auto previousTransport = MG_Config::Transport;
+    const auto previousTextures = GL::TextureImpl::g_boundTexturesCache;
+    const auto previousSamplers = GL::SamplerImpl::g_boundSamplersCache;
+    const auto previousUnit = GL::TextureImpl::g_activeTextureUnit;
+    alignas(64) static unsigned char endedTexture[64];
+    alignas(64) static unsigned char endedSampler[64];
+    const auto texture2DSlot = static_cast<SizeT>(TextureTarget::Texture2D);
+
+    MG_Config::Transport = MG_Config::TransportMode::Spawn;
+    GL::TextureImpl::g_boundTexturesCache[0][texture2DSlot] =
+        reinterpret_cast<GL::TextureImpl::BackendTextureObject*>(endedTexture);
+    GL::TextureImpl::g_boundTexturesCache[3][texture2DSlot] =
+        reinterpret_cast<GL::TextureImpl::BackendTextureObject*>(endedTexture);
+    GL::SamplerImpl::g_boundSamplersCache[3] = reinterpret_cast<GL::SamplerImpl::BackendSamplerObject*>(endedSampler);
+    GL::TextureImpl::g_activeTextureUnit = 3;
+    { GL::BackendObject_DirectGLES serverBackend; }
+    EXPECT_EQ(GL::TextureImpl::g_boundTexturesCache[0][texture2DSlot], nullptr)
+        << "unit 0's texture shadow still names the ended session's twin: a twin recycled at that address "
+           "skips its glBindTexture and the next session's upload lands on texture 0";
+    EXPECT_EQ(GL::TextureImpl::g_boundTexturesCache[3][texture2DSlot], nullptr);
+    EXPECT_EQ(GL::SamplerImpl::g_boundSamplersCache[3], nullptr)
+        << "unit 3's sampler shadow still names the ended session's sampler twin";
+    EXPECT_EQ(GL::TextureImpl::g_activeTextureUnit, 0u)
+        << "the new context's active unit is GL_TEXTURE0, and a shadow saying 3 skips glActiveTexture(3)";
+
+    GL::TextureImpl::g_boundTexturesCache = previousTextures;
+    GL::SamplerImpl::g_boundSamplersCache = previousSamplers;
+    GL::TextureImpl::g_activeTextureUnit = previousUnit;
+    MG_Config::Transport = previousTransport;
+}
+#else
+TEST(EsprytServerSession, TheServerBackendsDestructionDropsEveryTwinTheSessionBuilt) {
+    GTEST_SKIP() << "a server backend exists only in the split build (MOBILEGL_BUILD_DISAGGREGATED)";
+}
+TEST(EsprytServerSession, TheServerBackendsDestructionEmptiesTheTextureAndSamplerUnitShadows) {
+    GTEST_SKIP() << "a server backend exists only in the split build (MOBILEGL_BUILD_DISAGGREGATED)";
+}
+#endif

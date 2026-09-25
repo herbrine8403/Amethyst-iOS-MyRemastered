@@ -48,6 +48,39 @@
 
 namespace MobileGL::MG_Remote::Server {
 
+    // P5e (gl, ID-111): DOES THIS SERVER PUBLISH kCapRunAheadApply? Asked of the server's OWN
+    // CallMask and not of a build constant - that bit IS the sentence "the client may run ahead
+    // of this apply", and Magma never sets it (MGPipeRunAheadCapBitsFor returns kCapNone for
+    // every backend but DirectGLES, ID-90). A session with no CallMask yet answers false: no
+    // client can have latched run-ahead against a snapshot that was never published.
+    //
+    // PUBLIC because the red-once has to be able to say "the session I built lacks bit 10" in
+    // its own words rather than inferring it from the stamp it is testing (ID-102's rule: the
+    // action under test is the probe itself).
+    Bool MGPipeServerPublishesRunAhead();
+
+    // ---- the barriered stamp, AS A PURE FUNCTION (ID-111) ---------------------------------
+    //
+    // ApplyOne stamps "is the client parked behind this record" before anything can ask
+    // (CONTRACT-P5E §2.1 / §4.4). Until the P5e integration commit the answer is `true` for
+    // every record whatever the wire says, because the client still blocks after each one
+    // (ID-103) - but the day the constant flips, the answer must ALSO ask whether this server
+    // published the run-ahead bit at all. It is `wireSaysBarriered` only when BOTH halves of
+    // the run-ahead arm are true; Magma publishes no bit 10, so a Magma server keeps stamping
+    // `true` and its lockstep client keeps being safe. Without the second conjunct a Magma
+    // server would stamp every draw_vbo / blit / clear / launch_grid UNBARRIERED (they are all
+    // kWaitNone) while its client is still parked, and CountBarrierPull aborts unconditionally
+    // on an unbarriered pull - Magma dies on its first draw, no knob involved.
+    //
+    // IT IS A PURE FUNCTION for MGPipeRunAheadCapBitsFor's reason: "Magma never runs ahead" is
+    // then something a unit case can hold AT THE POST-FLIP VALUE of the constant, rather than a
+    // claim that first becomes testable on the day the integration commit throws the switch.
+    constexpr Bool MGPipeApplierStampsBarriered(Bool clientWaitRuleLanded,
+                                                Bool serverPublishesRunAhead,
+                                                Bool wireSaysBarriered) {
+        return (clientWaitRuleLanded && serverPublishesRunAhead) ? wireSaysBarriered : true;
+    }
+
     // Writes answers into SEG_REPLY at seq % slots, stamping the seq back into the slot header
     // so a wrong-slot read is detectable rather than plausible (table 0's slot header row:
     // {Uint64 Seq; Int32 Status; Uint32 Size;}).
@@ -56,6 +89,7 @@ namespace MobileGL::MG_Remote::Server {
         ReplyPool() = default;
         ReplyPool(void* base, Uint64 sizeBytes, Uint32 slotCount, Uint32 slotBytes);
 
+        void SetLink(Transport::ILink* link) { m_link = link; }
         void PostReply(Uint64 seq, Int32 status, const void* bytes, Uint64 size) override;
 
         // A reply larger than one slot is Fatal rather than chunked: P5's only large answer is
@@ -64,6 +98,7 @@ namespace MobileGL::MG_Remote::Server {
         Uint32 SlotBytes() const;
 
     private:
+        Transport::ILink* m_link = nullptr;
         Uint8* m_base = nullptr;
         Uint64 m_size = 0;
         Uint32 m_slots = 0;
@@ -101,6 +136,7 @@ namespace MobileGL::MG_Remote::Server {
         // The server's private backend. Null until ServerLoop::CreateBackend has run, and a
         // verb that arrives before then declines by name rather than dereferencing.
         void SetBackend(MG_Backend::BackendObject* backend);
+        void SetMaxReplyBytes(Uint64 bytes) { m_maxReplyBytes = bytes; }
 
         Bool OnFenceCreate(const MG_Pipe::MGPHandleOnly&) override;
         Bool OnFenceDestroy(const MG_Pipe::MGPHandleOnly&) override;
@@ -108,11 +144,22 @@ namespace MobileGL::MG_Remote::Server {
         Bool OnFenceWait(const MG_Pipe::MGPFenceWait&, Uint32&) override;
         Bool OnFenceWaitServer(const MG_Pipe::MGPFenceWait&) override;
         void ReleaseFences();
+        Bool OnQueryCreate(const MG_Pipe::MGPQueryDesc&) override;
+        Bool OnQueryBegin(const MG_Pipe::MGPQueryDesc&) override;
+        Bool OnQueryEnd(const MG_Pipe::MGPQueryDesc&) override;
+        Bool OnQueryCounter(const MG_Pipe::MGPQueryDesc&) override;
+        Bool OnQueryAvailable(const MG_Pipe::MGPHandleOnly&, Uint32&) override;
+        Bool OnQueryResult(const MG_Pipe::MGPQueryResultRequest&, Wire::QueryResultReply&) override;
+        Bool OnQueryDestroy(const MG_Pipe::MGPHandleOnly&) override;
+        Bool OnQueryTimestamp(const MG_Pipe::MGPTimestampRequest&, Int64&) override;
+        void ReleaseQueries();
         Bool OnClear(const MG_Pipe::MGPClear& clear) override;
         Bool OnBlit(const MG_Pipe::MGPBlit& blit) override;
         Bool OnPresent(const MG_Pipe::MGPPresent& present) override;
         Bool OnReadPixels(const MG_Pipe::MGPReadbackInfo& info, Uint64 seq,
                           Wire::ReplySink* replies) override;
+        Bool OnGetTextureImage(const MG_Pipe::MGPReadbackInfo& info, Uint64 seq,
+                               Wire::ReplySink* replies) override;
         Bool OnDrawVbo(const MG_Pipe::MGPDrawInfo& info, const MG_Pipe::MGPDrawRange* ranges,
                        const MG_Pipe::MGHostSpan* userIndices,
                        const MG_Pipe::MGPDrawIndirect* indirect) override;
@@ -146,6 +193,7 @@ namespace MobileGL::MG_Remote::Server {
         Bool OnPauseStreamOutput(const MG_Pipe::MGPStreamOutputControl& control) override;
         Bool OnResumeStreamOutput(const MG_Pipe::MGPStreamOutputControl& control) override;
         Bool OnBindStreamOutput(const MG_Pipe::MGPStreamOutputBind& bind) override;
+        Bool OnDeleteStreamOutput(const MG_Pipe::MGPStreamOutputBind& object) override;
         Bool OnPatchParameter(const MG_Pipe::MGPPatchParameter& patch) override;
         Bool OnGenerateMipmap(const MG_Pipe::MGPMipPlan& plan) override;
         Bool OnCopyFramebufferToTexture(const MG_Pipe::MGPCopyFromFramebuffer& copy) override;
@@ -240,6 +288,18 @@ namespace MobileGL::MG_Remote::Server {
         };
         FenceEntry& FindFence(MG_Pipe::MGPipeHandle handle);
         UnorderedMap<Uint32, FenceEntry> m_fences;
+        struct QueryEntry {
+            Uint32 Gen = 0;
+            Uint32 Kind = 0;
+            Bool Live = false;
+            Bool Active = false;
+            MG_Backend::BackendQueryHandle Native = nullptr;
+            MG_Backend::BackendSyncHandle Completion = nullptr;
+        };
+        QueryEntry& FindQuery(MG_Pipe::MGPipeHandle handle);
+        void EndNativeQuery(QueryEntry& entry);
+        Bool QueryGpuComplete(QueryEntry& entry, Bool wait);
+        UnorderedMap<Uint32, QueryEntry> m_queries;
         MG_Backend::BackendObject* m_backend = nullptr;
         Uint64 m_clears = 0;
         Uint64 m_draws = 0;
@@ -269,6 +329,8 @@ namespace MobileGL::MG_Remote::Server {
         // ReadPixels writes into a caller buffer, so one staging vector per session sits
         // between them. Grown, never shrunk, and never handed out past the call.
         Vector<Uint8> m_readbackScratch;
+        // Server-declared LinkTerms.maxReplyBytes, copied from the attached server link.
+        Uint64 m_maxReplyBytes = 0;
         // P5b d1: the multi-draw arrays the glMultiDraw* slots take, rebuilt from the ranges
         // per record (rule C: bounded by NumDraws, owned here, never handed out past the call),
         // and the last-record witness above.
@@ -293,6 +355,7 @@ namespace MobileGL::MG_Remote::Server {
         // CALLED ON THE APPLY THREAD, ONCE, BEFORE THE FIRST RECORD. PipeWireDecoder is "not
         // thread safe: one decoder on the apply thread, by construction", and its constructor
         // installs the process-wide apply hook.
+        void Attach(Transport::ILink* link, MG_Backend::BackendObject* backend);
         void Attach(Transport::RingControl* control, MG_Backend::BackendObject* backend);
         void Detach();
         Bool Attached() const;

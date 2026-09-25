@@ -54,26 +54,207 @@ namespace MobileGL::MG_Pipe {
     namespace {
         Uint64 g_residualPulls = 0;
 
+#if MOBILEGL_PIPE_VERIFY
+        // ---- P7 wave 3 (V1): negative control B's SERVER half ----------------------------
+        //
+        // MOBILEGL_PIPE_POISON_OMIT withholds the STAMP of one (verb, field) pair, and until a
+        // verify build first ran on the split arm it was only ever read by the client's filler
+        // (MG_Impl/Pipe/PipeFill.cpp's ParsePoisonOmissionKnob). On the split arm that is not
+        // where the stamp the backend reads comes from: the stamp below re-stamps every field
+        // the verb's class can answer out of applied records, so it restamped the very field
+        // the client had withheld and the control went GREEN - measured, both backends, the
+        // child's glGenerateMipmap returned and the process exited 0 with
+        // GenerateMipmap:GetActiveTextureUnit omitted. The knob means "this verb's stamp of this
+        // field was never written", and under a transport the stamp that answers the backend is
+        // this one, so this one honours it too.
+        //
+        // PARSED HERE, NOT SHARED WITH THE CLIENT'S PARSER, because this file is in the server
+        // library and MG_Impl is not. A malformed value is the client's Fatal{PipeVerifyBadKnob}
+        // (it parses first, at the first fill of the process); this side simply does not arm.
+        // VERIFY BUILDS ONLY: the knob belongs to the verify harness, and a push build's stamp
+        // stays the branch-free fill the P5d profile asked for.
+        struct ServerPoisonOmission {
+            Bool Parsed = false;
+            String Value;
+            Bool Armed = false;
+            MGPipeVerb Verb = MGPipeVerb::kVerbCount;
+            MGPipeInputField Field = MGPipeInputField::kFieldCount;
+        };
+        ServerPoisonOmission g_serverOmission;
+
+        const ServerPoisonOmission& ServerOmission() {
+            const String& knob = MG_Config::Features.PipePoisonOmit;
+            if (g_serverOmission.Parsed && knob.size() == g_serverOmission.Value.size() &&
+                (knob.empty() || knob == g_serverOmission.Value)) {
+                return g_serverOmission;
+            }
+            g_serverOmission = ServerPoisonOmission{};
+            g_serverOmission.Parsed = true;
+            g_serverOmission.Value = knob;
+            const auto colon = knob.find(':');
+            if (colon == String::npos || colon == 0 || colon + 1 >= knob.size()) return g_serverOmission;
+            const auto verb = MGPipeFindVerb(knob.substr(0, colon).c_str());
+            const auto field = MGPipeFindInputField(knob.substr(colon + 1).c_str());
+            if (!verb || !field) return g_serverOmission;
+            g_serverOmission.Armed = true;
+            g_serverOmission.Verb = *verb;
+            g_serverOmission.Field = *field;
+            return g_serverOmission;
+        }
+
+        Bool ServerOmitsStamp(MGPipeVerb verb, MGPipeInputField field) {
+            const ServerPoisonOmission& omission = ServerOmission();
+            return omission.Armed && omission.Verb == verb && omission.Field == field;
+        }
+#endif // MOBILEGL_PIPE_VERIFY
+
         // The strict arm of R-7.3. Same first line as the ordinary poison Fatal, so every
         // existing filter on Fatal{UnmigratedPipeInput still matches, plus the class and the
         // phase that retires it - a strict abort that did not say which phase owes the answer
         // would leave the reader exactly where the gate found them.
-        [[noreturn]] void StrictBarrierPullFatal(MGPipeInputField field, MGPipeVerb verb) {
+        // P5e (ra): `why` is the second half of the marker, because the lane's allowlist step
+        // reads this line and the two reasons mean different things to it. "MOBILEGL_IPC_
+        // STRICT_ERRORS=1" is the operator asking for a real, ordered value to be loud;
+        // "UNBARRIERED" is the value not existing (§3.3). The `<field>@<verb>` prefix and the
+        // Fatal{UnmigratedPipeInput tag are unchanged, so every filter written since P5c still
+        // matches.
+        [[noreturn]] void StrictBarrierPullFatal(MGPipeInputField field, MGPipeVerb verb,
+                                                 const char* why) {
             const SizeT index = static_cast<SizeT>(field);
-            MGLOG_F("MGPipe: Fatal{UnmigratedPipeInput, \"%s@%s\"} [BARRIER-PULLED, "
-                    "MOBILEGL_IPC_STRICT_ERRORS=1, retires in %s]",
-                    kMGPipeInputFieldNames[index], MGPipeVerbName(verb), kMGPipeFieldRetiringPhase[index]);
+            MGLOG_F("MGPipe: Fatal{UnmigratedPipeInput, \"%s@%s\"} [BARRIER-PULLED, %s, "
+                    "retires in %s]",
+                    kMGPipeInputFieldNames[index], MGPipeVerbName(verb), why,
+                    kMGPipeFieldRetiringPhase[index]);
             std::abort();
+        }
+
+        // P5e (gl), ID-117: THE ADMITTED MARKER, AND WHY IT IS ONLY THE TAG THAT CHANGED.
+        //
+        // `<field>@<verb>` and the `[BARRIER-PULLED, …, retires in <phase>]` tail are IDENTICAL
+        // to the Fatal above; the leading tag is `Admitted{` instead of `Fatal{`. Every filter
+        // written since P5c matches `Fatal{UnmigratedPipeInput`, so all of them keep meaning
+        // exactly "red" and none of them has to learn a new grammar to keep meaning it. A reader
+        // grepping for the pair still finds it, and the lane can ratchet on both sets with one
+        // regex per tag (ID-119's two-sided ratchet).
+        //
+        // THE DEDUPE IS NOT TIDINESS. An 852-draw Minecraft frame reaches an admitted readback
+        // row once per draw; without this, one frame writes 852 identical lines, the log file is
+        // the size of the run and the marker census cannot be read at all. So it is once per
+        // (field, verb) per process, which is the granularity the allowlist is written in.
+        //
+        // A PLAIN ARRAY, NOT AN ATOMIC, and that is the file's existing rule rather than a
+        // shortcut: CountBarrierPull is reachable only after the server stamped a verb boundary,
+        // which happens on the apply thread inside PipeApplier::ApplyOne, and g_residualPulls
+        // beside it is a plain Uint64 for the same reason. A racing writer here would at worst
+        // log a duplicate line, never lose one.
+        void AdmittedBarrierPullOnce(MGPipeInputField field, MGPipeVerb verb, Bool escalated) {
+            const SizeT fieldIndex = static_cast<SizeT>(field);
+            const SizeT verbIndex = static_cast<SizeT>(verb);
+            if (fieldIndex >= kMGPipeInputFieldCount || verbIndex >= kMGPipeVerbCount) return;
+            static Uint64 seen[(kMGPipeVerbCount * kMGPipeInputFieldCount + 63) / 64] = {};
+            const SizeT bit = verbIndex * kMGPipeInputFieldCount + fieldIndex;
+            const Uint64 mask = Uint64{1} << (bit % 64);
+            if ((seen[bit / 64] & mask) != 0) return;
+            seen[bit / 64] |= mask;
+            // P5e (gl), ID-128: WHICH DISJUNCT ADMITTED IT, in the slot the grammar already has
+            // for the reason. `ADMITTED` means the generated table said so, and the lane can
+            // check that against `--print-admitted`. `ADMITTED-ESCALATED` means the table did
+            // NOT and the record was barriered by an escalation the table cannot see, which is a
+            // RUNTIME fact about that record's payload - so the lane must not look for it in a
+            // static list. Saying which is what keeps the lane's comparison exact instead of
+            // widening the list with every pair that could ever escalate.
+            MGLOG_W("MGPipe: Admitted{UnmigratedPipeInput, \"%s@%s\"} [BARRIER-PULLED, %s, "
+                    "retires in %s]",
+                    kMGPipeInputFieldNames[fieldIndex], MGPipeVerbName(verb),
+                    escalated ? "ADMITTED-ESCALATED" : "ADMITTED",
+                    kMGPipeFieldRetiringPhase[fieldIndex]);
         }
 
         // One place decides what a BARRIER-PULLED read does, so the field accessors and the
         // seven sticky forwards cannot drift apart on it.
+        //
+        // ---- P5e (ra), CONTRACT-P5E §3.3: THE DETECTOR IS UNCONDITIONAL UNDER AN UNBARRIERED
+        // RECORD, AND THAT IS WHAT MAKES THE STRICT LANE A GATE -------------------------------
+        //
+        // The knob exists because under LOCKSTEP a pulled row is a real, ordered, fresh value:
+        // the client filled it and then parked, so "count it and carry on" is an honest
+        // measurement of remaining debt and MOBILEGL_IPC_STRICT_ERRORS is the operator asking
+        // for the debt to be loud instead. None of that survives run-ahead. With the client
+        // running ahead of this apply, the row was either never filled for this verb (§3.1
+        // skips the fill) or is being overwritten by a verb two frames later - so the value is
+        // torn or stale BY CONSTRUCTION and there is nothing for a counter to count. A
+        // "count it" arm here would be a wrong picture with a number beside it.
+        //
+        // P5e (gl), ID-119: THE OLD PIN HERE - "rsp is 0 on unbarriered records" - WAS VACUOUS
+        // AND HAS BEEN WITHDRAWN. The unbarriered arm below is [[noreturn]] and runs BEFORE
+        // ++g_residualPulls, so an unbarriered pull can never reach the counter whatever this
+        // function is written to do; the sentence was true of every possible implementation and
+        // therefore checked nothing. What rsp actually counts is BARRIERED pulls, and under the
+        // strict knob it counts exactly the ADMITTED ones, because every other barriered pull
+        // aborts two lines down. That is the form CONTRACT-P5E §7 now states and the lane checks.
+        //
+        // ---- P5e (gl), ID-117: AN ADMITTED PULL IS LOUD, NOT FATAL ---------------------------
+        //
+        // Before this, strict aborted on EVERY barrier-pulled read, admitted or not - which made
+        // the CI's allowlist comparison unreachable code (the run's rc != 0 exits first) and made
+        // "hard green" impossible with the knob as written. So there is a third state, and the
+        // two existing ones are untouched:
+        //
+        //   unbarriered            -> Fatal, no knob. The value is torn by construction.
+        //   barriered, unadmitted  -> Fatal under strict. A debt no phase has taken.
+        //   barriered, admitted    -> ONE MGLOG_W per (field, verb), and the entry completes.
+        //
+        // "Admitted" has three disjuncts and the third is a runtime one (ID-128): the generated
+        // table answers the first two, and the record's own escalation flag answers the third.
+        //
+        // An admitted pull is a debt this phase deliberately leaves standing: the field's row is
+        // BARRIER_PULLED, the verb's op is statically barriered so the client really is parked
+        // behind the record, and the field is inside the verb's own may-read mask - so the value
+        // is real, ordered and fresh, exactly ruling 4's "barriered records keep P5C semantics".
+        // MGPipeBarrierPullAdmitted is generated from those three tables (ID-116); there is no
+        // list here to drift.
         void CountBarrierPull(MGPipeInputField field, MGPipeVerb verb) {
+            // P5f (f1), P5F-WIRE-COMPLETENESS.md §4: UNDER THE DUAL-BLOCK REHEARSAL EVERY
+            // BARRIER-PULLED READ IS A NAMED FATAL, unconditionally - ahead of the barriered
+            // question, ahead of the strict knob, ahead of the counter. The server block has no
+            // residual fill to answer from, so the value the read would return is not "torn"
+            // or "stale" but ABSENT: the field's stamp was withdrawn by the server's own verb
+            // boundary and nothing on this side of the role split ever writes it. Letting the
+            // read proceed would hand the backend default storage - or, for the O-class rows
+            // with no null check, an empty SharedPtr to dereference - which is an UNNAMED
+            // crash exactly where the rehearsal exists to produce a named one. The red is the
+            // census (Harness/dualblock-expected-fatals.txt), so the marker keeps the strict
+            // grammar with the knob's own name as the reason.
+            // D10: rides MGPipeBlocksAreDistinct() - under spawn the two blocks are distinct
+            // whatever the rehearsal knob says, and a barrier pull across a real process
+            // boundary is exactly the thing this Fatal exists to name.
+            if (MGPipeBlocksAreDistinct()) {
+                StrictBarrierPullFatal(field, verb, "MOBILEGL_IPC_ROLE_SPLIT_STATE=1");
+            }
+            if (!MGPipeApplierCurrentRecordIsBarriered()) {
+                StrictBarrierPullFatal(field, verb, "UNBARRIERED, the client did not fill it");
+            }
             ++g_residualPulls;
             if (MG_Util::PipeStats::Enabled()) {
                 MG_Util::PipeStats::AddCalls(MG_Util::PipeStats::CallClass::ResidualPulls, 1);
             }
-            if (MG_Config::Ipc.StrictErrors) StrictBarrierPullFatal(field, verb);
+            if (MG_Config::Ipc.StrictErrors) {
+                // THE THIRD DISJUNCT (P5e gl, ID-128), and it has to be asked at RUNTIME because
+                // it is a fact about this record's payload rather than about its opcode. The
+                // static table admits a pair when the verb's op waits (disjunct 1) or when the
+                // field's retiring phase is not this phase (disjunct 2); an escalated record is
+                // one the client parks behind for a reason only the payload knows - an open
+                // transform-feedback span, or a draw carrying client vertex arrays. Both are
+                // outside this phase by ruling (§5.7, ID-82), and the client-array read site
+                // aborts by its own name if it is ever applied unbarriered, so the pull is legal
+                // and P5e is not the phase that owes it.
+                const Bool statically = MGPipeBarrierPullAdmitted(field, verb);
+                const Bool escalated = MGPipeApplierCurrentRecordIsBarrieredByEscalation();
+                if (!statically && !escalated) {
+                    StrictBarrierPullFatal(field, verb, "MOBILEGL_IPC_STRICT_ERRORS=1");
+                }
+                AdmittedBarrierPullOnce(field, verb, !statically);
+            }
         }
 
         // The verb's OWN may-read table (FillPoints.def, kMGPipeClassFieldMask). The stamp
@@ -150,10 +331,126 @@ namespace MobileGL::MG_Pipe {
         static void SetServerStamped(PipeInputs& inputs, Bool stamped) {
             inputs.m_serverStampedVerb = stamped;
         }
+        // P5f (f1): the server block's identity half of the stamp door (CONTRACT-P5E §3.2).
+        // The client's SetIdentity lives in MG_Impl's MGPipeFillAccess and writes the CLIENT
+        // block now; this one is how the server block learns which served context it describes
+        // without MG_Impl being in the process at all.
+        static void SetIdentity(PipeInputs& inputs, Bool live, const void* identity) {
+            inputs.m_live = live;
+            inputs.m_contextIdentity = identity;
+        }
     };
+
+    // ---- P5f (f1): the dual-block rehearsal's selection functions (PipeInputs.h) -----------
+    //
+    // MGPipeRoleSplitRehearsalActive is deliberately NOT latched: it is two global loads, asked once per
+    // verb on the fill side and once per verb boundary on the stamp side, and a latch is a
+    // second thing a test that flips the knob mid-process would have to know about.
+    Bool MGPipeRoleSplitRehearsalActive() {
+        return MG_Config::Ipc.RoleSplitState &&
+               MG_Config::Transport != MG_Config::TransportMode::Monolith;
+    }
+
+#if MOBILEGL_BUILD_DISAGGREGATED
+    // ---- D1c's predicates (CONTRACT-P6 3.2) -------------------------------------------------
+    namespace {
+        // Set once by ServerMain, before any GL work. A spawn server is the server for the whole
+        // life of the process; there is no thread in it that is not.
+        Bool g_serverProcessRole = false;
+        // MG_Remote's "is the calling thread inside the applier". Null until a session installs
+        // it, which is the honest answer for a process that has no applier.
+        Bool (*g_applyThreadProbe)() = nullptr;
+        Bool g_sessionLive = false;
+    } // namespace
+
+    void MGPipeSetServerProcessRole(Bool isServerProcess) { g_serverProcessRole = isServerProcess; }
+    void MGPipeSetApplyThreadProbe(Bool (*probe)()) { g_applyThreadProbe = probe; }
+    void MGPipeSetSessionLive(Bool live) { g_sessionLive = live; }
+
+    Bool MGPipeServerArm() {
+        // THE PROCESS FACT FIRST, and it short-circuits: in a spawn server every thread is a
+        // server thread, and asking the probe would be asking MG_Remote a question it answers
+        // only about the applier.
+        if (g_serverProcessRole) return true;
+        return g_applyThreadProbe != nullptr && g_applyThreadProbe();
+    }
+
+    Bool MGPipeSessionLive() { return g_sessionLive; }
+
+    Bool MGPipeBlocksAreDistinct() {
+        // TWO DIFFERENT REASONS, ONE ANSWER. The rehearsal makes two blocks in one process;
+        // spawn makes them two blocks in two ADDRESS SPACES, where no knob is involved and the
+        // distinctness is a fact about the machine. The guards that used to ask only the first
+        // question were therefore disarmed in the one shape where the answer matters most - a
+        // spawn server's block is never the client's, whatever MOBILEGL_IPC_ROLE_SPLIT_STATE
+        // says.
+        return MGPipeRoleSplitRehearsalActive() ||
+               MG_Config::Transport == MG_Config::TransportMode::Spawn;
+    }
+#endif // MOBILEGL_BUILD_DISAGGREGATED
+
+    PipeInputs& MGPipeClientInputs() {
+        return MGPipeRoleSplitRehearsalActive() ? gPipeInputsClientBlock : gPipeInputs;
+    }
+
+    void MGPipeClientClearVerbBoundary() {
+        MGPipeStampAccess::SetServerStamped(MGPipeClientInputs(), false);
+    }
+
+    namespace { Bool g_serverContextLive = false; }
+
+    void MGPipeServerSetContextLive(Bool live) {
+        g_serverContextLive = live;
+        MGPipeServerBlockNoteIdentity();
+    }
+
+    Bool MGPipeServerContextIsLive() { return g_serverContextLive; }
+
+#if MOBILEGL_BUILD_DISAGGREGATED
+    namespace { const void* g_serverOwnedWindow = nullptr; }
+
+    void MGPipeServerSetOwnedWindow(const void* window) { g_serverOwnedWindow = window; }
+
+    const void* MGPipeServerOwnedWindow() { return g_serverOwnedWindow; }
+#endif
+
+    void MGPipeServerBlockNoteIdentity() {
+        // D10: THE WIDER PREDICATE, and the narrow one was a latent crash rather than a missing
+        // optimisation. Gated on the REHEARSAL, this early-returned for the whole life of a
+        // spawn server - because that knob is off by default and nothing in the spawn shape
+        // turns it on - so the server's gPipeInputs.ContextIdentity() stayed nullptr forever.
+        // DirectGLES' fb-slot memo compares that identity FIRST and with no generation, so a
+        // nullptr against its own nullptr initialiser reads as a CACHE HIT and hands out a slot
+        // that was never filled. `st` lands the named Fatal at that site; this is the gate that
+        // stops it being reachable in the first place.
+        if (!MGPipeBlocksAreDistinct()) return;
+        // The server cannot name the client's GLContext - under a real transport it is in
+        // another process - so the identity the server block carries is the server's OWN
+        // served-context clock: MGPipeApplierContextSerial moves exactly when the served
+        // context does (MGPipeApplierReset), which is all the backends' per-context memo keys
+        // ask of an identity. The odd-encoding keeps the token non-null at serial 0: a null
+        // identity reads as a hit against DirectGLES' zero-initialised fb-slot memo cache and
+        // hands out a null slot - an unnamed crash where the rehearsal exists to produce a
+        // named one.
+        const Uint64 serial = MGPipeApplierContextSerial();
+        MGPipeStampAccess::SetIdentity(gPipeInputs, g_serverContextLive,
+                                       reinterpret_cast<const void*>(static_cast<std::uintptr_t>(
+                                           (serial << 1) | Uint64{1})));
+    }
 
     void MGPipeServerStampVerbBoundary(MGPipeVerb verb) {
         PipeInputs& inputs = gPipeInputs;
+        // P5e (gl), ID-115: THE POSITIVE CONTROL'S ONLY HONEST SIGNAL, and it belongs HERE
+        // because this is the line the whole strict mechanism hangs off. The poison, rsp and
+        // the BARRIER-PULLED verdict are all reachable only after this stamp, and the monolith
+        // arm never stamps at all - so "the strict lane is green" and "strict was never armed"
+        // were observationally identical, which is how a lane whose seven passing entries
+        // included no record-carrying split GL scenario read as rigour. Behind Enabled(), which
+        // is the file's rule for counters (`rsp` beside it does the same) and keeps the stamp a
+        // table lookup and a branch-free fill when stats are off.
+        if (MG_Util::PipeStats::Enabled()) {
+            MG_Util::PipeStats::AddCalls(MG_Util::PipeStats::CallClass::ServerVerbBoundaries, 1);
+        }
         MGPipeFilledState& filled = MGPipeStampAccess::Filled(inputs);
         MGPipeStampAccess::SetVerb(inputs, verb);
         // Starts at 1 for MGPipeValidateForVerb's reason: FilledGen == 0 is "never filled" on
@@ -180,7 +477,21 @@ namespace MobileGL::MG_Pipe {
             const Uint64 bit = (answerable.Words[i / 64] >> (i % 64)) & Uint64{1};
             filled.FilledGen[i] = serial & (Uint64{0} - bit);
         }
+#if MOBILEGL_PIPE_VERIFY
+        // Negative control B's server half (ServerPoisonOmission above): the one withheld pair.
+        {
+            const ServerPoisonOmission& omission = ServerOmission();
+            if (omission.Armed && omission.Verb == verb) {
+                filled.FilledGen[static_cast<SizeT>(omission.Field)] = 0;
+            }
+        }
+#endif
         MGPipeStampAccess::SetServerStamped(inputs, true);
+        // P5f (f1): the server block's identity rides the stamp (CONTRACT-P5E §3.2's
+        // "SetIdentity moves to ApplyOne" - the stamp is the per-verb half of ApplyOne, and
+        // refreshing here rather than once at Attach keeps the token in step with
+        // MGPipeApplierContextSerial across a context switch). A no-op with the rehearsal off.
+        MGPipeServerBlockNoteIdentity();
     }
 
     void MGPipeServerClearVerbBoundary() { MGPipeStampAccess::SetServerStamped(gPipeInputs, false); }
@@ -198,6 +509,12 @@ namespace MobileGL::MG_Pipe {
         // AND A READ OUTSIDE THE VERB'S OWN CLASS IS STILL FATAL even for a BARRIER-PULLED
         // field: the value it would be answered with was never copied for this verb, so
         // counting it would trade a loud staleness for a quiet one.
+#if MOBILEGL_PIPE_VERIFY
+        // An injected omission is reported as what it models - a stamp nobody wrote, the
+        // client filler's own Fatal{UnmigratedPipeInput, "<Field>@<Verb>"} - and never as the
+        // RoleViolation below, which would blame the wire for a withdrawal the control made.
+        if (serverStamped && ServerOmitsStamp(verb, field)) MGPipeInputPoisonFatalForVerb(field, verb);
+#endif
         if (!serverStamped ||
             kMGPipeFieldOwnership[static_cast<SizeT>(field)] != MGPipeFieldOwnership::kBarrierPulled ||
             !FieldIsInVerbClass(field, verb)) {
@@ -253,7 +570,11 @@ namespace MobileGL::MG_Pipe {
         // PipeInputs.h's F-class block), so freshness can never reach them and neither can the
         // stamp's withdrawal. This is the only thing that puts them in `rsp`.
         if (!gPipeInputs.ServerStampedVerb()) return;
-        CountBarrierPull(field, gPipeInputs.CurrentVerb());
+        const auto ownership = MGPipeFieldOwnershipOf(field);
+        if (ownership == MGPipeFieldOwnership::kFatal)
+            MGPipeInputPoisonFatalForVerb(field, gPipeInputs.CurrentVerb());
+        if (ownership == MGPipeFieldOwnership::kBarrierPulled)
+            CountBarrierPull(field, gPipeInputs.CurrentVerb());
     }
 #endif // MOBILEGL_BUILD_DISAGGREGATED
 

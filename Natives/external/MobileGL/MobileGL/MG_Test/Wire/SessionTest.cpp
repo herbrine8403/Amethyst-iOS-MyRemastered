@@ -146,7 +146,7 @@ TEST(SessionTest, SessionSegmentsAreRealSharedMemoryAndNotAHeapAllocation) {
     ASSERT_NE(segments.EventControl(), nullptr);
     EXPECT_EQ(segments.CmdControl()->ringGeneration.load(), 1u);
     EXPECT_EQ(segments.EventControl()->ringGeneration.load(), 1u);
-    EXPECT_EQ(segments.CmdControl()->appliedSeq.load(), 0u);
+    EXPECT_EQ(segments.CmdControl()->Progress.appliedSeq.load(), 0u);
     segments.Close();
     EXPECT_FALSE(segments.Valid());
 }
@@ -415,7 +415,7 @@ TEST(SessionTest, TwoThreadsMoveTwentyThousandRecordsAndAgreeOnEveryOne) {
     EXPECT_EQ(session.Control().submittedSeq.load(), static_cast<std::uint64_t>(kRecords));
     // The whole point: the two sides' sequence spaces are identical after ten wraps' worth of
     // fillers. A side that counted a kRecPad would land here off by the number of wraps.
-    EXPECT_EQ(session.Control().appliedSeq.load(), static_cast<std::uint64_t>(kRecords));
+    EXPECT_EQ(session.Control().Progress.appliedSeq.load(), static_cast<std::uint64_t>(kRecords));
     EXPECT_EQ(session.consumer.AppliedSeq(), static_cast<std::uint64_t>(kRecords));
     EXPECT_TRUE(RingCursorsValid(session.Control(), RingCursorSet::Cmd,
                                  session.serverSegments.CmdRingCapacity()));
@@ -440,7 +440,7 @@ TEST(SessionTest, SubmittedSeqIsThePublishersAndIsPurelyDiagnostic) {
         EXPECT_EQ(session.Control().submittedSeq.load(), seq);
         // It says nothing about what has been APPLIED, which is the distinction a waiter that
         // picked the wrong watermark would lose.
-        EXPECT_EQ(session.Control().appliedSeq.load(), 0u);
+        EXPECT_EQ(session.Control().Progress.appliedSeq.load(), 0u);
     }
 }
 
@@ -462,7 +462,7 @@ TEST(SessionTest, AppliedSeqAdvancesExactlyOncePerRecordAndIsNeverBatched) {
 
     std::uint64_t applied = 0;
     while (session.consumer.ApplyOne([&](const RingRecordView&) { ++applied; })) {
-        EXPECT_EQ(session.Control().appliedSeq.load(), applied)
+        EXPECT_EQ(session.Control().Progress.appliedSeq.load(), applied)
             << "appliedSeq did not move with the record; a barrier waiter would be blocked on "
                "work that already ran";
         EXPECT_EQ(session.consumer.AppliedSeq(), applied);
@@ -483,14 +483,14 @@ TEST(SessionTest, RetiredSeqMayTrailTheApplyButCanNeverOvertakeIt) {
     session.producer.PublishAndNotify(3);
     while (session.consumer.ApplyOne([](const RingRecordView&) {})) {
     }
-    ASSERT_EQ(session.Control().appliedSeq.load(), 3u);
+    ASSERT_EQ(session.Control().Progress.appliedSeq.load(), 3u);
 
     // Trailing is legal and is what "late" means.
     Watermark::AdvanceRetired(session.Control(), 1);
-    EXPECT_EQ(session.Control().retiredSeq.load(), 1u);
+    EXPECT_EQ(session.Control().Progress.retiredSeq.load(), 1u);
     // Running ahead is not: clamped to what has actually been applied.
     Watermark::AdvanceRetired(session.Control(), 99);
-    EXPECT_EQ(session.Control().retiredSeq.load(), 3u);
+    EXPECT_EQ(session.Control().Progress.retiredSeq.load(), 3u);
     // Going BACKWARDS is Fatal, not clamped - see AWatermarkThatMovesBackwardsIsFatal below.
 }
 
@@ -507,16 +507,16 @@ TEST(SessionTest, CompletedFrameSerialIsTheServersAndIsIndependentOfAppliedSeq) 
     session.producer.PublishAndNotify(5);
     while (session.consumer.ApplyOne([](const RingRecordView&) {})) {
     }
-    EXPECT_EQ(session.Control().appliedSeq.load(), 5u);
+    EXPECT_EQ(session.Control().Progress.appliedSeq.load(), 5u);
     // Five records applied, no frame completed: the two are not the same number and nothing
     // may derive one from the other.
-    EXPECT_EQ(session.Control().completedFrameSerial.load(), 0u);
+    EXPECT_EQ(session.Control().Progress.completedFrameSerial.load(), 0u);
 
     Watermark::AdvanceCompletedFrame(session.Control(), 2);
-    EXPECT_EQ(session.Control().completedFrameSerial.load(), 2u);
+    EXPECT_EQ(session.Control().Progress.completedFrameSerial.load(), 2u);
     // Republishing the SAME serial is legal and is what a lazy publisher does.
     Watermark::AdvanceCompletedFrame(session.Control(), 2);
-    EXPECT_EQ(session.Control().completedFrameSerial.load(), 2u);
+    EXPECT_EQ(session.Control().Progress.completedFrameSerial.load(), 2u);
 }
 
 // presentAckSerial: the only back-pressure that bounds LATENCY rather than bytes. A client
@@ -546,8 +546,124 @@ TEST(SessionTest, PresentAckSerialIsWaitedOnWithGreaterOrEqualAndWakesThroughThe
     throttled.join();
     EXPECT_TRUE(released.load());
     EXPECT_EQ(result.load(), SessionWait::Reached);
-    EXPECT_EQ(session->Control().presentAckSerial.load(), 7u);
+    EXPECT_EQ(session->Control().Progress.presentAckSerial.load(), 7u);
     EXPECT_EQ(session->Control().producerParked.load(), 0u);
+}
+
+// ---------------------------------------------------------------------------
+// P5e (ra) - SEG_EVENT flow control (MG_Remote/CONTRACT-P5E.md §2.6)
+// ---------------------------------------------------------------------------
+//
+// THE DEADLOCK THE CONTRACT ARGUES AWAY HAS TWO HALVES AND THIS IS THE FIRST. A run-ahead
+// server that cannot Reserve on SEG_EVENT stops producing and therefore stops applying, so
+// appliedSeq stops moving - and the client parked on appliedSeq is holding the only drain
+// there is. A waiter that could ONLY be woken by the watermark would wait for a number nobody
+// is going to publish.
+//
+// Red-once: point the case at WaitForApplied instead of WaitForAppliedOrEventBacklog and the
+// join below never returns - the 5 s deadline fires and the wait reads TimedOut.
+TEST(SessionTest, AFullEventRingWakesAClientParkedOnAppliedSeq) {
+    auto session = std::make_shared<SessionFixture>();
+    ASSERT_TRUE(session->Build(TestSizes()));
+
+    std::atomic<bool> released{false};
+    std::atomic<SessionWait> result{SessionWait::TimedOut};
+    std::thread parked([session, &released, &result] {
+        result.store(session->producer.WaitForAppliedOrEventBacklog(4, 5000));
+        released.store(true, std::memory_order_release);
+    });
+
+    while (session->Control().producerParked.load() == 0 && !released.load()) {
+        std::this_thread::yield();
+    }
+    // NOT the watermark. The server latches "SEG_EVENT is full and I stopped" and rings; the
+    // client's business is to drain, not to conclude that its record was applied.
+    session->Control().eventRingFull.store(1, std::memory_order_release);
+    session->consumer.NotifyClient();
+
+    parked.join();
+    EXPECT_TRUE(released.load());
+    EXPECT_EQ(result.load(), SessionWait::Reached);
+    // AND THE WATERMARK IS UNTOUCHED, which is what makes the caller's re-read the right way
+    // to tell the two wakeups apart: a third SessionWait value would have turned every
+    // existing `== Reached` site into a bug.
+    EXPECT_EQ(session->Control().Progress.appliedSeq.load(), 0u);
+    EXPECT_TRUE(session->producer.EventRingIsFull());
+}
+
+// The same for the present credit, because a credit-paced client parks there for a whole frame
+// at a time and is the likeliest waiter to be holding the drain when the ring fills.
+TEST(SessionTest, AFullEventRingWakesAClientParkedOnThePresentCredit) {
+    auto session = std::make_shared<SessionFixture>();
+    ASSERT_TRUE(session->Build(TestSizes()));
+
+    std::atomic<bool> released{false};
+    std::atomic<SessionWait> result{SessionWait::TimedOut};
+    std::thread parked([session, &released, &result] {
+        result.store(session->producer.WaitForPresentAckOrEventBacklog(2, 5000));
+        released.store(true, std::memory_order_release);
+    });
+
+    while (session->Control().producerParked.load() == 0 && !released.load()) {
+        std::this_thread::yield();
+    }
+    session->Control().eventRingFull.store(1, std::memory_order_release);
+    session->consumer.NotifyClient();
+
+    parked.join();
+    EXPECT_TRUE(released.load());
+    EXPECT_EQ(result.load(), SessionWait::Reached);
+    EXPECT_EQ(session->Control().Progress.presentAckSerial.load(), 0u);
+}
+
+// THE SECOND HALF: the drain that empties the ring must RING, not merely clear. A cleared flag
+// with no bell is the lost wakeup the forward direction's publish-then-ring order exists to
+// prevent, and the server parked on this flag is inside a producer that cannot return without
+// placing its event.
+//
+// THE BELL IS COUNTED RATHER THAN WAITED ON, and that is the difference between a test and a
+// coincidence: a real doorbell REMEMBERS a notify delivered while nobody was parked and can
+// return from a park for reasons of its own, so a thread that happened to wake proves nothing
+// about who rang. This one records every Notify().
+//
+// Red-once: drop the NotifyIfParked from EventRingConsumer::Drained() and `rings` stays 0.
+namespace {
+    struct CountingBell : Doorbell {
+        std::atomic<std::uint64_t> rings{0};
+        void Notify() override { rings.fetch_add(1, std::memory_order_relaxed); }
+        bool Park(std::uint32_t) override { return false; }
+        void Reset() override {}
+    };
+} // namespace
+
+TEST(SessionTest, DrainingAFullEventRingClearsTheLatchAndRingsTheServer) {
+    auto session = std::make_shared<SessionFixture>();
+    ASSERT_TRUE(session->Build(TestSizes()));
+
+    CountingBell serverBell;
+    // The bell the CLIENT rings is the one the SERVER parks on - which is which is the
+    // session's knowledge and not the transport's (contract §3.9), so the fixture spells the
+    // pair the same way ClientSession::Start does.
+    session->eventIn.SetServerDoorbell(&serverBell);
+
+    // A drain with the latch DOWN is the steady state - every wait exit drains - and it must
+    // not ring: a store to a shared cache line per drain is what the doorbell design exists to
+    // avoid (Doorbell.h's bidirectional argument).
+    session->eventIn.Drained();
+    EXPECT_EQ(serverBell.rings.load(), 0u);
+
+    // Now the server is parked on the latch, which is what the flag means.
+    session->Control().eventRingFull.store(1, std::memory_order_release);
+    session->Control().consumerParked.store(1, std::memory_order_release);
+    session->eventIn.Drained();
+
+    EXPECT_EQ(session->Control().eventRingFull.load(), 0u);
+    EXPECT_EQ(serverBell.rings.load(), 1u);
+
+    // ONE-SHOT: the latch is down again, so the next drain is silent. Without the exchange -
+    // a plain store plus a read - a steady stream of drains would ring every time.
+    session->eventIn.Drained();
+    EXPECT_EQ(serverBell.rings.load(), 1u);
 }
 
 // ---------------------------------------------------------------------------
@@ -611,7 +727,7 @@ TEST(SessionTest, AWrapFillerDoesNotAdvanceTheSessionsAppliedSeq) {
     EXPECT_EQ(applied, emitted);
     // The session's watermark - the number the barrier's waiter and every reply read use - has
     // to be the record count, with the fillers' bytes invisible to it.
-    EXPECT_EQ(session.Control().appliedSeq.load(), emitted);
+    EXPECT_EQ(session.Control().Progress.appliedSeq.load(), emitted);
 }
 
 // ---------------------------------------------------------------------------
@@ -998,7 +1114,7 @@ TEST(SessionTestDeath, AWatermarkThatMovesBackwardsIsFatalRatherThanIgnored) {
     alignas(4096) RingControl control{};
     InitRingControl(control);
     Watermark::AdvanceApplied(control, 10);
-    ASSERT_EQ(control.appliedSeq.load(), 10u);
+    ASSERT_EQ(control.Progress.appliedSeq.load(), 10u);
     EXPECT_DEATH(Watermark::AdvanceApplied(control, 9),
                  "Fatal\\{ProtocolCorruption, \"watermark\"\\} appliedSeq moved backwards, 10 -> 9");
 }
@@ -1027,16 +1143,16 @@ TEST(SessionTest, TheInprocPeerGetsItsOwnMappingOfTheSameSharedMemory) {
     // visible through the other, exactly as it is across two processes under spawn.
     EXPECT_EQ(peer.AnnouncedSize(SessionSegmentSlot::Cmd),
               owner.AnnouncedSize(SessionSegmentSlot::Cmd));
-    owner.CmdControl()->appliedSeq.store(4242, std::memory_order_release);
-    EXPECT_EQ(peer.CmdControl()->appliedSeq.load(std::memory_order_acquire), 4242u);
-    peer.CmdControl()->presentAckSerial.store(77, std::memory_order_release);
-    EXPECT_EQ(owner.CmdControl()->presentAckSerial.load(std::memory_order_acquire), 77u);
+    owner.CmdControl()->Progress.appliedSeq.store(4242, std::memory_order_release);
+    EXPECT_EQ(peer.CmdControl()->Progress.appliedSeq.load(std::memory_order_acquire), 4242u);
+    peer.CmdControl()->Progress.presentAckSerial.store(77, std::memory_order_release);
+    EXPECT_EQ(owner.CmdControl()->Progress.presentAckSerial.load(std::memory_order_acquire), 77u);
 
     peer.Close();
     // The owner is untouched by the peer's teardown - there is no shared ownership left whose
     // Close order has to be got right by hand.
     EXPECT_TRUE(owner.Valid());
-    EXPECT_EQ(owner.CmdControl()->appliedSeq.load(), 4242u);
+    EXPECT_EQ(owner.CmdControl()->Progress.appliedSeq.load(), 4242u);
     owner.Close();
 }
 
@@ -1073,7 +1189,7 @@ TEST(SessionTest, ABorrowedSlotIsNotHandedBackUntilItIsReleased) {
     ASSERT_EQ(seen, 3);
     ASSERT_TRUE(sawBorrow) << "the producer dropped kRecBorrowSlot, so this case proved nothing";
 
-    EXPECT_EQ(session.Control().appliedSeq.load(), 3u);
+    EXPECT_EQ(session.Control().Progress.appliedSeq.load(), 3u);
     session.consumer.RetireThrough(session.consumer.AppliedSeq());
 
     // The reclaim point stops AT the borrowed record: only the first record's bytes came back.
@@ -1262,7 +1378,7 @@ TEST(SessionTest, TheStageCursorTripleStaysDeadAcrossAWholeSession) {
     EXPECT_EQ(session.Control().stageRetiredTail.load(), 0u);
     // retiredSeq is the watermark w1's allocator reclaims behind, and it is a SEQUENCE - not one
     // of the three byte cursors above.
-    EXPECT_GT(session.Control().retiredSeq.load(), 0u);
+    EXPECT_GT(session.Control().Progress.retiredSeq.load(), 0u);
 }
 
 // The kVarTail/kRecPad collision, made harmless. Those two are bit 2 of two different flag spaces,
@@ -1316,7 +1432,7 @@ TEST(SessionTest, ARecordWearingThePadBitIsDeliveredRatherThanEatenAsAFiller) {
     EXPECT_EQ(seenKind, 7);
     EXPECT_NE(seenFlags & kRecPad, 0u)
         << "the bit arrives intact: the kind check narrows the SKIP, it does not scrub the bit";
-    EXPECT_EQ(session.Control().appliedSeq.load(), 1u);
+    EXPECT_EQ(session.Control().Progress.appliedSeq.load(), 1u);
 
     // The opposite control, so that "delivered" cannot be satisfied by not skipping anything:
     // a header wearing kRecPad whose kind IS kRingPadRecordKind is a genuine wrap filler, still
@@ -1332,7 +1448,7 @@ TEST(SessionTest, ARecordWearingThePadBitIsDeliveredRatherThanEatenAsAFiller) {
     }
     EXPECT_EQ(seen, 1) << "a genuine filler was delivered as a record: Pop's skip was removed, "
                           "not narrowed";
-    EXPECT_EQ(session.Control().appliedSeq.load(), 1u) << "a filler advanced appliedSeq (R-9)";
+    EXPECT_EQ(session.Control().Progress.appliedSeq.load(), 1u) << "a filler advanced appliedSeq (R-9)";
 }
 
 // The kHostSpan/kRecBorrowSlot collision, made loud. P5 implements no borrowed slots and is ruled

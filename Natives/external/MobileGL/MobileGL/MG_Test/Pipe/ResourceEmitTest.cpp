@@ -34,6 +34,7 @@
 // between the pull and the push trees.
 
 #include <gtest/gtest.h>
+#include <MG_Util/Debug/Log.h>
 
 #include <cstring>
 #include <filesystem>
@@ -68,6 +69,14 @@
 #include <MG_Impl/Pipe/VertexInputEmit.h>
 #include <MG_Pipe/PipeApply.h>
 #include <MG_State/GLState/Core.h>
+#if MOBILEGL_BUILD_DISAGGREGATED
+// The two arms a split-only case has to raise: the caps mirror that the client's liveness gates
+// read instead of the server's op table (R-8), and the stage chunk the content walks are capped
+// with.
+#include <MG_Remote/CapsCodec.h>
+#include <MG_Remote/Client/CapsMirror.h>
+#include <MG_Remote/Client/GpuWritePending.h>
+#endif
 
 #include <vector>
 #endif
@@ -87,10 +96,10 @@ namespace {
     }
 
     std::string ReadLog() {
-        std::ifstream in(g_logPath, std::ios::binary);
-        std::ostringstream ss;
-        ss << in.rdbuf();
-        return ss.str();
+        // BOTH ROLES' LOGS (P6). A death test asserts that the CHILD said something; which
+        // role's thread said it is not what these cases are about, and refusals raised on the
+        // apply thread are written under the SERVER role by construction.
+        return MobileGL::MG_Util::Debug::ReadRoleLogs(g_logPath.c_str());
     }
 
     // The op table is INSTALLED BY A BACKEND, at its own bring-up, and uninstalled at its
@@ -1329,6 +1338,164 @@ namespace {
 #endif
     }
 
+    // ------------------------------------------------------------------------------------
+    // P7 wave 3 (CONTRACT-P7 §6): the respecify SCOPE pin, relaxed and still falsifiable.
+    //
+    // The pin used to say "no path in this phase may set a per-level scope on the descriptor",
+    // which stopped being true the day Wire_Escape_ResourceRespecify started writing the
+    // carrier: under split EVERY per-level glTexImage*D arrives with it set, and the pin fired
+    // on the server apply thread during bring-up, before one verify case could arm. It is now
+    // "a producer of a per-level scope must COVER the range it declares", and these two cases
+    // are the positive and the negative the contract asks for.
+    //
+    // A TEXTURE, NOT A BUFFER, and ScopedResourceOps with it: the scope is a texture concept,
+    // and every non-buffer row is refused with RefusedNoConsumer unless a backend table is
+    // registered - so without the scope this case would not reach the pin at all.
+    //
+    // The helpers are MOBILEGL_PIPE_PUSH-only, like the applier they read: a pull build compiles
+    // these two cases as skips (gate G2 keeps the names in every build), and MGPipeApplier() is
+    // not declared there.
+#if MOBILEGL_PIPE_PUSH
+    MGPResourceDesc Tex2DDesc(MGPipeHandle res, Uint32 extent, Uint32 levels, Uint32 glName) {
+        MGPResourceDesc desc{};
+        desc.Resource = res;
+        desc.Target = static_cast<Uint8>(MGPipeResourceTarget::Tex2D);
+        desc.InternalFormat = 1;
+        desc.Width = extent;
+        desc.Height = extent;
+        desc.Depth = 1;
+        desc.ArrayLayers = 1;
+        desc.Levels = levels;
+        desc.Samples = 1;
+        desc.GlNameForDiag = glName;
+        return desc;
+    }
+
+    // The packed (resource target, upload target) pair a Tex2D level's records carry. 0x0102 -
+    // and it is the very number the split bring-up's Fatal printed, which is how this case is
+    // known to be about the same shape.
+    const Uint16 kTex2DUpload = MGPipePackSubDataTarget(
+        static_cast<Uint32>(MGPipeResourceTarget::Tex2D),
+        static_cast<Uint32>(TextureUploadTarget::Texture2D));
+
+    MGPSubData TextureWrite(MGPipeHandle res, Uint16 uploadTarget, Uint16 level, Uint32 extent) {
+        MGPSubData record{};
+        record.Res = res;
+        record.Target = uploadTarget;
+        record.Level = level;
+        record.UnionBox = MGPBox{0, 0, 0, extent, extent, 1};
+        record.LevelWidth = extent;
+        record.LevelHeight = extent;
+        record.LevelDepth = 1;
+        return record;
+    }
+
+    Bool HasPendingUpload(Uint32 slot, Uint16 uploadTarget, Uint16 level) {
+        for (const auto& entry : MGPipeApplier().TextureResources[slot].PendingUploads) {
+            if (entry.UploadTarget == uploadTarget && entry.Level == level) return true;
+        }
+        return false;
+    }
+#endif // MOBILEGL_PIPE_PUSH
+
+    // THE POSITIVE. A per-level producer that covers its declared range is accepted, and the
+    // accumulated texels of every OTHER level survive it - which is the thing the pin was
+    // standing in front of, checked rather than asserted.
+    TEST(ResourceEmit, APerLevelRespecifyCoveringItsDeclaredRangeKeepsTheOtherLevelsTexels) {
+#if !MOBILEGL_PIPE_PUSH
+        GTEST_SKIP() << "MOBILEGL_PIPE_PUSH is off: there is no applier in this build";
+#else
+        ApplierGuard guard;
+        ScopedResourceOps consumer;
+
+        const MGPipeHandle res{12, 1};
+        ASSERT_TRUE(MGPipeApplyResourceCreate(Tex2DDesc(res, 4, 2, 91)));
+
+        // Two levels with texels the server owes. The canonical sequence the pending set
+        // exists for: level 0 emitted, nothing uploaded yet, then level 1 redefined.
+        const Uint8 texels[64] = {};
+        ASSERT_TRUE(MGPipeApplyResourceSubData(TextureWrite(res, kTex2DUpload, 0, 4), texels, nullptr));
+        ASSERT_TRUE(MGPipeApplyResourceSubData(TextureWrite(res, kTex2DUpload, 1, 2), texels, nullptr));
+        ASSERT_TRUE(HasPendingUpload(res.Slot, kTex2DUpload, 0));
+        ASSERT_TRUE(HasPendingUpload(res.Slot, kTex2DUpload, 1));
+
+        // The split shape, both halves in agreement: the carrier says (kTex2DUpload, 1) and the
+        // trailing pointer the codec rebuilt from it says the same.
+        MGPResourceDesc perLevel = Tex2DDesc(res, 4, 2, 91);
+        MGPipeSetRespecifiedLevel(perLevel, kTex2DUpload, 1, 2, 2, 1);
+        ASSERT_FALSE(MGPipeRespecifyIsWholeResource(perLevel));
+        const MGPRespecifiedLevel covered = MGPipeMakeRespecifiedLevel(kTex2DUpload, 1, 2, 2, 1);
+        EXPECT_TRUE(MGPipeApplyResourceRespecify(perLevel, nullptr, &covered));
+
+        EXPECT_TRUE(HasPendingUpload(res.Slot, kTex2DUpload, 0))
+            << "a per-level respecify may not eat the levels it did not redefine";
+        EXPECT_FALSE(HasPendingUpload(res.Slot, kTex2DUpload, 1))
+            << "the level the call DID redefine has a new coordinate system, so its box goes";
+        EXPECT_EQ(ReadLog().find("PipeRespecifyScope"), std::string::npos)
+            << "the relaxed pin must be silent on a producer that covers its declaration";
+#endif
+    }
+
+    // THE NEGATIVE, and it is the whole reason the pin is relaxed rather than deleted. A
+    // producer that DECLARES a range and does not cover it is still refused by name: a null
+    // pointer takes the whole-resource arm and eats every other level's texels, and a pointer
+    // naming a different pair erases the wrong key and keeps the one the client stopped owing.
+    // Neither is visible as anything but missing pixels one frame later.
+    TEST(ResourceEmit, APerLevelRespecifyThatDoesNotCoverItsDeclaredRangeIsRefusedByName) {
+#if !MOBILEGL_PIPE_PUSH
+        GTEST_SKIP() << "MOBILEGL_PIPE_PUSH is off: there is no applier in this build";
+#elif !MOBILEGL_PIPE_VERIFY
+        // MOBILEGL_PIPE_VERIFY alone, NOT `POISON || VERIFY`, for PinNoLiveHostWrites' reason
+        // above: PinRespecifyScopeCoversItsDeclaration is compiled under `#if
+        // MOBILEGL_PIPE_VERIFY` only, so in a plain split build the wire genuinely is compiled
+        // out and this case must skip rather than expect a death that cannot happen.
+        GTEST_SKIP() << "Fatal{PipeRespecifyScope} is a MOBILEGL_PIPE_VERIFY wire and is compiled out here";
+#elif !MGTEST_HAVE_FORK
+        GTEST_SKIP() << "no fork on this platform; the wire's verdict is std::abort()";
+#else
+        ApplierGuard guard;
+        ScopedResourceOps consumer;
+
+        const MGPipeHandle res{13, 2};
+        ASSERT_TRUE(MGPipeApplyResourceCreate(Tex2DDesc(res, 4, 2, 92)));
+
+        struct Drive {
+            const char* What;
+            bool HasPointer;
+            Uint16 PointerTarget;
+            Uint16 PointerLevel;
+            const char* Wanted;
+        };
+        // Declared: (kTex2DUpload, 1). Covered: nothing, the wrong level, the wrong face.
+        const Drive drives[] = {
+            {"a null pointer", false, 0, 0, "covers NOTHING (target=0, level=0)"},
+            {"the wrong level", true, kTex2DUpload, 0, "covers (target=258, level=0)"},
+            {"the wrong upload target", true, static_cast<Uint16>(kTex2DUpload + 0x0100u), 1,
+             "covers (target=514, level=1)"},
+        };
+        for (const Drive& drive : drives) {
+            const ChildResult child = RunInChild([&res, &drive]() {
+                MGPResourceDesc perLevel = Tex2DDesc(res, 4, 2, 92);
+                MGPipeSetRespecifiedLevel(perLevel, kTex2DUpload, 1, 2, 2, 1);
+                const MGPRespecifiedLevel named = MGPipeMakeRespecifiedLevel(drive.PointerTarget, drive.PointerLevel, 2, 2, 1);
+                MGPipeApplyResourceRespecify(perLevel, nullptr,
+                                             drive.HasPointer ? &named : nullptr);
+            });
+            EXPECT_TRUE(DiedOfAbort(child))
+                << drive.What << ": " << DescribeStatus(child) << "; log: " << child.Log;
+            const std::string named =
+                "Fatal{PipeRespecifyScope} resource_respecify {slot=13, gen=2}";
+            EXPECT_NE(child.Log.find(named), std::string::npos)
+                << drive.What << ": wanted \"" << named << "\"; log: " << child.Log;
+            EXPECT_NE(child.Log.find("declares a per-level respecify scope (target=258, level=1)"),
+                      std::string::npos)
+                << drive.What << ": the refusal must print the DECLARED range; log: " << child.Log;
+            EXPECT_NE(child.Log.find(drive.Wanted), std::string::npos)
+                << drive.What << ": wanted \"" << drive.Wanted << "\"; log: " << child.Log;
+        }
+#endif
+    }
+
     // M-D. The slot is the one number in the family that reaches an ALLOCATOR, so it is
     // policed like every other: a slot outside the table's bound is Fatal{ProtocolCorruption}
     // and never a resize. Removing the bound turns this case into a multi-gigabyte allocation.
@@ -1522,7 +1689,7 @@ namespace {
         MGPipeApplySetSamplerViews(viewSet, viewTail);
         MGPipeApplyBindSamplerStates(stateSet, stateTail);
         MGPipeApplySetShaderImages(imageSet, imageTail);
-        MGPipeApplyCreateShaderState(program, &link, &spirv);
+        MGPipeApplyCreateShaderState(program, &link, &spirv, nullptr);
         MGPipeApplyBindShaderState(csoHandle);
         MGPipeApplySetDrawProgram(csoHandle);
         MGPipeApplySetDispatchProgram(csoHandle);
@@ -1583,7 +1750,7 @@ namespace {
             MGPipeApplySetSamplerViews(viewSet, viewTail);
             MGPipeApplyBindSamplerStates(stateSet, stateTail);
             MGPipeApplySetShaderImages(imageSet, imageTail);
-            MGPipeApplyCreateShaderState(program, &link, &spirv);
+            MGPipeApplyCreateShaderState(program, &link, &spirv, nullptr);
             MGPipeApplyBindShaderState(csoHandle);
             MGPipeApplySetDrawProgram(csoHandle);
             MGPipeApplySetDispatchProgram(csoHandle);
@@ -2070,6 +2237,182 @@ namespace {
         EXPECT_FALSE(MGPipeForEachSubDataRecordRange(kMGPipeSubDataMaxRecordOffset - kSegment,
                                                      kSegment * 4, collect, kSegment));
         EXPECT_TRUE(pieces.empty());
+    }
+
+    // THE SPLIT AT THE CAP THE EMITTER REALLY USES. The case above drives the walk at a
+    // transport-shaped constant; this one drives it at MGPipeStageChunkBytes' own clamp, which
+    // is what PipeFill.cpp's two content walks pass - because the record's own 2^32-1 bound is
+    // not the one a real upload meets first. One piece's bytes are staged WHOLE in SEG_STAGE, a
+    // linear arena, and a blob larger than that arena is Fatal{RingOverrun, "SEG_STAGE"} at the
+    // encoder rather than a split (PipeWireCodec.cpp:856-864); measured on the CI traces, where
+    // a 128 MiB arena's whole-buffer follow-up against a 32 MiB segment aborted there.
+    //
+    // A UNIT PROCESS HAS NO SESSION, so the live answer is 0 - "nothing to fit, keep the
+    // record's own bound" - and that is asserted here as its own property rather than assumed
+    // away. What makes the split reachable in a real lane is the clamp, and the clamp is a pure
+    // function of the segment's size, which is what the walk below is driven at.
+    TEST(ResourceEmit, AWideBufferSubDataSplitsAtTheStageChunkBytes) {
+#if !MOBILEGL_PIPE_PUSH
+        GTEST_SKIP() << "MOBILEGL_PIPE_PUSH is off: there is no applier in this build";
+#elif !MOBILEGL_BUILD_DISAGGREGATED
+        GTEST_SKIP() << "there is no stage segment to size a content chunk against without the "
+                        "transport built in";
+#else
+        EXPECT_EQ(MG_Remote::Client::MGPipeStageChunkBytes(), 0u)
+            << "a unit process has no ClientSession, so the emitter must keep the record's own "
+               "bound rather than invent a cap";
+        EXPECT_EQ(MG_Remote::Client::MGPipeStageChunkBytesFor(0), 0u);
+
+        // SessionRings.h:89's default segment, and the three shapes the clamp has to get right:
+        // an ordinary arena, a segment below the floor, and a segment equal to it.
+        constexpr Uint64 kStage = 32ull * 1024ull * 1024ull;
+        constexpr Uint64 kChunk = kStage / 4;
+        EXPECT_EQ(MG_Remote::Client::MGPipeStageChunkBytesFor(kStage), kChunk);
+        EXPECT_EQ(MG_Remote::Client::MGPipeStageChunkBytesFor(4096), 4096u);
+        // The floor may NEVER lift the cap above the arena itself: a 4096-byte cap over a 1 KiB
+        // segment would stage the very blob the encoder refuses.
+        EXPECT_EQ(MG_Remote::Client::MGPipeStageChunkBytesFor(1024), 1024u);
+
+        std::vector<std::pair<Uint64, Uint64>> pieces;
+        const auto collect = [&](Uint64 at, Uint64 length) { pieces.emplace_back(at, length); };
+        const auto checkCoverage = [&](Uint64 whole, Uint64 cap) {
+            EXPECT_GE(pieces.size(), 4u) << "a range of " << whole << " bytes was not cut at a "
+                                         << cap << " byte cap";
+            Uint64 covered = 0;
+            Uint64 expectedAt = 0;
+            for (const auto& piece : pieces) {
+                EXPECT_EQ(piece.first, expectedAt) << "the pieces are not contiguous and ascending";
+                EXPECT_LE(piece.second, cap) << "a piece is bigger than the stage chunk";
+                EXPECT_GT(piece.second, 0u);
+                covered += piece.second;
+                expectedAt += piece.second;
+                // And every piece the walk produced has to be encodable by the record builder -
+                // a piece the box refuses is a record the applier's bounds gate would abort on.
+                MGPSubData record{};
+                EXPECT_TRUE(MGPipeBuildSubDataRecord(MGPipeHandle{1, 1}, piece.first, piece.second,
+                                                     record, /*verbatimShadow=*/true))
+                    << "a piece the splitter produced does not fit one record";
+                EXPECT_EQ(MGPipeSubDataBufferOffset(record), piece.first);
+                EXPECT_EQ(MGPipeSubDataBufferSize(record), piece.second);
+            }
+            EXPECT_EQ(covered, whole) << "the split covered the range more or less than exactly once";
+        };
+
+        // Three chunks and a remainder: the smallest range that says the cap is being honoured
+        // rather than the record's own bound - and at that bound the same range is ONE record,
+        // so what cuts it below is the stage chunk and nothing else.
+        constexpr Uint64 kThreeChunks = kChunk * 3 + 7;
+        pieces.clear();
+        ASSERT_TRUE(MGPipeForEachSubDataRecordRange(0, kThreeChunks, collect));
+        ASSERT_EQ(pieces.size(), 1u);
+        pieces.clear();
+        ASSERT_TRUE(MGPipeForEachSubDataRecordRange(0, kThreeChunks, collect, kChunk));
+        checkCoverage(kThreeChunks, kChunk);
+
+        // AND THE SHAPE THE TRACE PRODUCED: a whole 128 MiB arena - the size
+        // BufferObject::TryAdoptLargeStorage maps persistently - against the default 32 MiB
+        // segment. Sixteen pieces, every one of them smaller than the arena it is staged in.
+        constexpr Uint64 kArena = 128ull * 1024ull * 1024ull;
+        pieces.clear();
+        ASSERT_TRUE(MGPipeForEachSubDataRecordRange(0, kArena, collect, kChunk));
+        EXPECT_EQ(pieces.size(), kArena / kChunk);
+        checkCoverage(kArena, kChunk);
+
+        // A range that starts at a non-zero offset splits from there, as the plain-cap case
+        // above pins: the first piece is not special.
+        pieces.clear();
+        ASSERT_TRUE(MGPipeForEachSubDataRecordRange(1024, kChunk + 1, collect, kChunk));
+        ASSERT_EQ(pieces.size(), 2u);
+        EXPECT_EQ(pieces[0].first, 1024u);
+        EXPECT_EQ(pieces[0].second, kChunk);
+        EXPECT_EQ(pieces[1].first, 1024u + kChunk);
+        EXPECT_EQ(pieces[1].second, 1u);
+#endif
+    }
+
+    // glBufferData(target, 0, NULL, usage): THE STORE IS DEFINED BY ITS SIZE ALONE. That is not
+    // the orphaning idiom - the store exists and it is empty - so the respecify must define it
+    // on the applier and carry no bytes, and the client's shadow cannot be asked whether there
+    // are bytes to carry: MappedData() answers a NON-NULL pointer for a zero-byte store
+    // (PipeResource.h:140-143 reserves one byte whatever the size). Reading it alone is what
+    // sent this call down the split arm's respecify(nullptr)-plus-follow-up shape, whose walk
+    // emits NOTHING for a zero-length range (ResourceTracker.h:253), so the self-check that
+    // exists to prove the content followed aborted by name:
+    //     Fatal{InitialBytesNotCarried, "resource_respecify"} ... 0 bytes
+    // measured on the first glBufferData(target, 0, NULL, ...) of the bsl-esc-menu trace.
+    //
+    // WHAT THIS PINS, ALL THREE IN ONE DRIVE: the call does not abort; the applier still receives
+    // the descriptor that DEFINES the empty store (Width == 0 && HasDefinedContent == 1); and NOT
+    // ONE resource_subdata record follows it, because there are no bytes to carry. The last is
+    // the direction a careless "never emit a follow-up" fix would also satisfy, which is exactly
+    // why the middle observation is here too.
+    //
+    // THE DRIVE RUNS IN A CHILD, because the defect's verdict is std::abort() and a case that
+    // aborts its own binary reports nothing. The child's three observations come back through a
+    // probe file rather than through gtest, whose state a forked child must not be trusted with.
+    TEST(ResourceEmit, AZeroByteRespecifyDefinesTheStoreAndCarriesNoContent) {
+#if !MOBILEGL_PIPE_PUSH
+        GTEST_SKIP() << "MOBILEGL_PIPE_PUSH is off: there is no applier in this build";
+#elif !MOBILEGL_BUILD_DISAGGREGATED
+        GTEST_SKIP() << "the arm that reads MappedData() as 'bytes to carry' is the split one; "
+                        "without the transport the respecify has no follow-up to get wrong";
+#elif !MGTEST_HAVE_FORK
+        GTEST_SKIP() << "no fork on this platform; the defect's verdict is std::abort()";
+#else
+        const std::string probePath = g_logPath + ".zerobyte-probe";
+        std::error_code ec;
+        std::filesystem::remove(probePath, ec);
+        std::fflush(nullptr);
+        const pid_t pid = ::fork();
+        ASSERT_GE(pid, 0);
+        if (pid == 0) {
+            PushArm arm;
+            // The transport is what puts this call on the split arm at all, and R-8's second
+            // half is the caps mirror: under split the resource family's liveness gate reads the
+            // mirror rather than the server's op table, and a placeholder mirror consumes
+            // nothing - so without this the create never goes out and there is no record for the
+            // respecify to land in.
+            MG_Config::Transport = MG_Config::TransportMode::InProcess;
+            MG_Pipe::MGPCaps caps{};
+            caps.CallMask = MG_Remote::MGCapsConsumerBits(MG_Pipe::kMGPipeSubsystemResources);
+            MG_Remote::Client::CapsMirrorInstance().Adopt(caps, MG_Backend::FormatCapabilityCache{},
+                                                          MobileGL::RendererInfo{}, String{},
+                                                          BackendType::DirectGLES);
+            // The spy IS the applier's consumer here, so "no resource_subdata followed" is
+            // counted rather than inferred from a missing log line.
+            g_spy = SpyState{};
+            MG_Pipe::MGPipeSetResourceOps(&kSpyOps);
+
+            const SharedPtr<BufferObject> owner = MakeBuffer(1);
+            owner->Respecify(0, nullptr);
+
+            String observed = "no-handle";
+            const MGPipeHandle res = MGPipeResourceTrackerInstance().Find(*owner);
+            if (!MGPipeHandleIsNull(res) && MGPipeApplier().Resources.size() > static_cast<SizeT>(res.Slot)) {
+                const MGPipeResourceRecord& record = MGPipeApplier().Resources[res.Slot];
+                observed = "live=" + std::to_string(record.Live ? 1 : 0) +
+                           " width=" + std::to_string(record.Desc.Width) +
+                           " defined=" + std::to_string(record.Desc.HasDefinedContent) +
+                           " subdatas=" + std::to_string(g_spy.SubDatas);
+            }
+            std::ofstream out(probePath, std::ios::binary);
+            out << observed;
+            out.close();
+            ::_exit(0);
+        }
+        int status = 0;
+        ASSERT_EQ(::waitpid(pid, &status, 0), pid);
+        const ChildResult child{status, ReadLog()};
+        ASSERT_FALSE(DiedOfAbort(child))
+            << "a zero-byte respecify aborted - the split arm carried an empty shadow as initial "
+               "content and the follow-up emitted nothing: "
+            << DescribeStatus(child) << "; log: " << child.Log;
+        std::ifstream in(probePath, std::ios::binary);
+        std::ostringstream probe;
+        probe << in.rdbuf();
+        EXPECT_EQ(probe.str(), "live=1 width=0 defined=1 subdatas=0")
+            << "the child observed \"" << probe.str() << "\"; log: " << child.Log;
+#endif
     }
 
     // B-C2 FROM THE CLIENT'S SIDE, with a real BufferObject rather than a synthetic handle.

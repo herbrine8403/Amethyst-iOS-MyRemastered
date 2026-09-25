@@ -25,6 +25,15 @@
 //                              perturbed before the entry compare, so a comparator that works must
 //                              report Fatal{PipeVerifyDiffer, "<Field>@<Verb>"}. A comparator that
 //                              compares nothing stays quiet and this case goes red.
+//   CorruptedFieldIsReportedOnTheServerRead
+//                            - the same control aimed at the OTHER comparator (P7 wave 3, V1).
+//                              The entry compare runs on the client thread at a verb boundary; the
+//                              compare-at-read hook runs on the server's apply thread at every
+//                              backend read, and until this case existed nothing could tell a hook
+//                              that had stopped comparing from a hook with nothing to say. It
+//                              reads the SERVER role's half of the log, because with the knob
+//                              armed the client reports the same field and a union search would be
+//                              satisfied by the arm that is not under test.
 //
 // The observable is the library's own log, because MG_Config is not reachable from this module
 // (on Android it links the SHIPPING libMobileGL.so, built -fvisibility=hidden) and the arming
@@ -57,6 +66,7 @@
 #include <iterator>
 #include <string>
 
+#include "../Harness/PipeStatsWindow.h"
 #include "../Harness/HeadlessGL.h"
 #include "../Harness/ScenarioFixture.h"
 
@@ -101,33 +111,51 @@ void main() { o_color = vec4(0.25, 0.5, 0.75, 1.0); }
             return value != nullptr && *value != '\0';
         }
 
+        // The number of LINES in `text` that carry `needle` and `where=read`: one per backend read
+        // the compare-at-read hook reported for that field and verb (ReportDivergence is a single
+        // MGLOG_F, so a report never spans lines and two reports never share one).
+        std::size_t CountReadReports(const std::string& text, const std::string& needle) {
+            std::size_t count = 0;
+            std::size_t pos = 0;
+            while (pos < text.size()) {
+                const std::size_t eol = text.find('\n', pos);
+                const std::string line =
+                    text.substr(pos, eol == std::string::npos ? std::string::npos : eol - pos);
+                if (line.find(needle) != std::string::npos && line.find("where=read") != std::string::npos) {
+                    ++count;
+                }
+                if (eol == std::string::npos) break;
+                pos = eol + 1;
+            }
+            return count;
+        }
+
         class PipeVerifyArmingScenario : public ScenarioTest {
         protected:
             // The library log this process is writing, or an empty path when none was configured.
             static std::filesystem::path LibraryLogPath() {
-                const char* path = std::getenv("MOBILEGL_LOG_FILE_PATH");
-                return (path != nullptr && *path != '\0') ? std::filesystem::path(path)
-                                                          : std::filesystem::path();
+                // P6: the path is a BASE NAME and the library writes one log per role; PipeStatsWindow
+            // derives the suffix, so the rule lives in one place.
+            return std::filesystem::path(MGITest::PipeStatsWindow::LibraryLogPath());
             }
 
-            static std::uintmax_t LibraryLogSize() {
-                std::error_code ec;
-                const std::filesystem::path path = LibraryLogPath();
-                if (path.empty()) return 0;
-                const std::uintmax_t size = std::filesystem::file_size(path, ec);
-                return ec ? 0 : size;
+            // ONE MARK PER ROLE. The library writes a log per role, so "how long is the log
+            // right now" is two numbers; a single scalar applied to the concatenation would slide
+            // by whatever the other role wrote in between and start the read mid-line.
+            static MGITest::PipeStatsWindow::LogMark LibraryLogMark() {
+                return MGITest::PipeStatsWindow::MarkLaneLog();
             }
 
-            static std::string LibraryLogSince(std::uintmax_t offset) {
-                const std::filesystem::path path = LibraryLogPath();
-                if (path.empty()) return {};
-                std::ifstream file(path, std::ios::binary);
-                if (!file.good()) return {};
-                file.seekg(static_cast<std::streamoff>(offset));
-                return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+            // BOTH ROLES. The arming diagnostics this case looks for are emitted by the
+            // BACKEND, and under inproc the backend runs on the apply thread - the server role -
+            // so the line lands in the server's log. Reading only the client's found nothing and
+            // reported the emulation unarmed, which accused the product of a defect the reader
+            // had invented.
+            static std::string LibraryLogSince(const MGITest::PipeStatsWindow::LogMark& mark) {
+                return MGITest::PipeStatsWindow::ReadLaneLogSince(mark);
             }
 
-            static std::string LibraryLog() { return LibraryLogSince(0); }
+            static std::string LibraryLog() { return MGITest::PipeStatsWindow::ReadLaneLog(); }
 
             // One frame that crosses several verb boundaries: a clear (kClear), a draw (kDraw) and
             // a readback (kReadback). Three of the nine fill classes, so an entry compare that only
@@ -200,7 +228,7 @@ void main() { o_color = vec4(0.25, 0.5, 0.75, 1.0); }
                                 "backwards; the VerifyCorrupted. lane owns that half";
             }
 
-            const std::uintmax_t before = LibraryLogSize();
+            const MGITest::PipeStatsWindow::LogMark before = LibraryLogMark();
             ASSERT_NO_FATAL_FAILURE(DrawOneFrame());
             EXPECT_EQ(FirstGLError(), 0u);
 
@@ -251,7 +279,7 @@ void main() { o_color = vec4(0.25, 0.5, 0.75, 1.0); }
             }
 
             const std::string knob = std::getenv("MOBILEGL_PIPE_VERIFY_CORRUPT");
-            const std::uintmax_t before = LibraryLogSize();
+            const MGITest::PipeStatsWindow::LogMark before = LibraryLogMark();
             ASSERT_NO_FATAL_FAILURE(DrawOneFrame());
 
             const std::string appended = LibraryLogSince(before);
@@ -263,6 +291,108 @@ void main() { o_color = vec4(0.25, 0.5, 0.75, 1.0); }
                    "means the comparator is not comparing - and every green entry in this lane is "
                    "green for no reason. Log appended by this case:\n"
                 << appended;
+        }
+
+        // NEGATIVE CONTROL A ON THE OTHER ARM (P7 wave 3, V1): the COMPARE-AT-READ hook, on the
+        // SERVER's apply thread, inside the ID-49 neutral pack window.
+        //
+        // WHY THE CASE ABOVE DOES NOT COVER IT. MOBILEGL_PIPE_VERIFY_CORRUPT used to perturb only
+        // EntryCompare's snapshot, so every red it could produce came from the CLIENT thread at a
+        // verb boundary and said `where=entry`. The hook that runs on every backend read - the
+        // whole of the split lane's per-read work, and the only comparator the server's apply
+        // thread ever runs - had no falsifier: a hook that had stopped comparing looked exactly
+        // like a hook with nothing to report, and the lane would have been just as green.
+        //
+        // WHY THIS FIELD AND THIS VERB. GetPixelStoreParameters@ReadPixels is where the hook does
+        // its one piece of ARM-SPECIFIC reasoning (PipeFill.cpp's
+        // ServerReadsInsideTheNeutralPackWindow): the applier reads the backend with the neutral
+        // pack, so inside that window the oracle for the pack half is the neutral pack rather than
+        // the live context. A control aimed anywhere else would leave exactly that branch unproven.
+        //
+        // THE SERVER HALF, NOT THE UNION. With this knob armed the client's own entry compare
+        // reports `GetPixelStoreParameters@...` too, in the client's log, so a whole-lane search
+        // would be satisfied without the server having run anything at all. The assertion below
+        // reads the server role's half and nothing else.
+        //
+        // MOBILEGL_PIPE_VERIFY_FATAL=0, for CorruptedFieldIsReported's reason and one more: the
+        // client's entry compare on the ReadPixels verb fires FIRST (kReadback's fill mask carries
+        // this field, FillPoints.def), so with FATAL at its default the process would abort before
+        // the server ever reached the read.
+        TEST_F(PipeVerifyArmingScenario, CorruptedFieldIsReportedOnTheServerRead) {
+            if (!Ready()) return;
+
+            constexpr const char* kPackField = "GetPixelStoreParameters";
+            const char* knob = std::getenv("MOBILEGL_PIPE_VERIFY_CORRUPT");
+            if (knob == nullptr || std::string(knob) != kPackField) {
+                GTEST_SKIP() << "this case is the compare-at-read hook's negative control and needs "
+                                "MOBILEGL_PIPE_VERIFY_CORRUPT=" << kPackField << " for the whole "
+                                "process, which is what the VerifySplitReadCorrupted. ctest entries "
+                                "set; no other field is read by the server inside a window whose "
+                                "oracle the hook rewrites";
+            }
+            if (AmbientQuirkFromEnvironment("MOBILEGL_PIPE_VERIFY") != AmbientQuirk::On) {
+                GTEST_SKIP() << "MOBILEGL_PIPE_VERIFY_CORRUPT is set but MOBILEGL_PIPE_VERIFY is not, so "
+                                "the comparator is dormant and there is nothing to corrupt";
+            }
+            if (LibraryLogPath().empty()) {
+                GTEST_SKIP() << "MOBILEGL_LOG_FILE_PATH is not set, so the library has nowhere to report "
+                                "the divergence; the VerifySplitReadCorrupted. ctest entries set both";
+            }
+            if (MGITest::PipeStatsWindow::ServerLibraryLogPath().empty()) {
+                GTEST_SKIP() << "this build writes no server-role log, so there is no half in which the "
+                                "server's own report could be told apart from the client's; the hook's "
+                                "read arm is registered on the split (inproc) lane only";
+            }
+
+            const MGITest::PipeStatsWindow::LogMark before = LibraryLogMark();
+            ASSERT_NO_FATAL_FAILURE(DrawOneFrame());
+
+            const std::string server = MGITest::PipeStatsWindow::ReadServerLogSince(before);
+            const std::string expected =
+                std::string(kDifferPrefix) + ", \"" + kPackField + "@ReadPixels\"";
+            const std::size_t at = server.find(expected);
+            ASSERT_NE(at, std::string::npos)
+                << "MOBILEGL_PIPE_VERIFY_CORRUPT=" << kPackField << " perturbs the hook's ORACLE at "
+                   "every backend read of that field, and the server's read_pixels reads it under "
+                   "the server's own stamp - so the server role's log had to carry " << expected
+                << ", ...}. It carried nothing: either the compare-at-read hook is not running on "
+                   "the apply thread, or the neutral-pack window swallowed the perturbation, and "
+                   "in both cases every per-read green in this lane is green for no reason. Server "
+                   "half of the log appended by this case:\n"
+                << server;
+
+            const std::size_t eol = server.find('\n', at);
+            const std::string line =
+                server.substr(at, eol == std::string::npos ? std::string::npos : eol - at);
+            EXPECT_NE(line.find("where=read"), std::string::npos)
+                << "the server half reported the corrupted field, but not from the compare-at-read "
+                   "arm - `where=` says which comparator spoke, and only `read` is this case's "
+                   "subject. Line:\n"
+                << line;
+
+            // TWO REPORTS, NOT ONE (V1 fix round 2) - the count is what makes BOTH perturbation
+            // blocks in the hook load-bearing. The server reads this field twice inside the
+            // ReadPixels window, and both reads sit inside the hook's neutral-pack branch:
+            // PipeApplier::read_pixels saves the application's pack BEFORE it installs the neutral
+            // one, and the backend's ReadPixels reads the field AFTER. The hook's first perturbation
+            // is what turns the saved-pack read red (past the first compare, the application's
+            // pack against the neutral oracle differs on its own); only the perturbation re-applied
+            // after the window's overwrite can turn the post-install read red, because there the
+            // stored value IS the neutral pack. A control satisfied by ONE line is satisfied by
+            // either block alone and so falsified neither. Measured at landing the server half
+            // carries 3 (DirectGLES: the saved-pack read and TWO post-install reads) / 2
+            // (DirectVulkan: one of each). Removing the re-applied block drops both backends to
+            // 1; removing the first block drops DirectVulkan to 1 and leaves DirectGLES at 2, so
+            // the first block's falsifier is the DirectVulkan entry - which is why the CI step
+            // runs both backends and needs both.
+            const std::size_t reads = CountReadReports(server, expected);
+            EXPECT_GE(reads, std::size_t{2})
+                << "the server half carries " << reads << " `where=read` report(s) for " << expected
+                << ", ...}. The server reads that field twice inside the ReadPixels window (the "
+                   "applier's saved-pack read and the backend's post-install read) and the hook "
+                   "perturbs the oracle once per read, so fewer than two means one perturbation has "
+                   "stopped reaching its read. Server half of the log appended by this case:\n"
+                << server;
         }
 
     } // namespace

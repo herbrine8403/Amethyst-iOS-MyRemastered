@@ -87,6 +87,12 @@ expect FAILED "the knob leaves the selection green"          -- run_split green
 expect FAILED "the baseline is already red"                  -- run_split red-baseline
 # P5 is complete: losing the runtime implementation must no longer disarm the gate.
 expect FAILED "every split entry skipped (implementation lost)" -- run_split all-skipped
+expect FAILED "E1 missing boundary probes"                  -- run_split e1-empty
+expect FAILED "E1 own baseline is already red"               -- run_split e1-red-baseline
+expect FAILED "E1 restored boundary remains red"             -- run_split e1-restore-red
+expect FAILED "E1 record never reaches the peer"             -- run_split e1-no-peer
+expect FAILED "E1 observed no real emission"                 -- run_split e1-no-emit
+expect FAILED "E1 incorrectly waits every record"            -- run_split e1-waitall
 
 echo
 echo "=== the retrace lane's pull-library control (scripts/ci/retrace_pull_library_control.sh)"
@@ -110,6 +116,15 @@ expect FAILED "red without the transport-resolution message" -- run_retrace retr
 # The real thing - and note the stub emits it CMake-wrapped across two lines, which a line-oriented
 # grep for the literal sentence would miss.
 expect PASSED "run_trace_case.cmake's own sentence, wrapped" -- run_retrace retrace-evidence
+# The sentence a pull library ACTUALLY gets since P6's log rename: it wrote the unsuffixed
+# mobilegl.log, the runner reads mobilegl.client.log, and the no-log check fires before the marker
+# search. The control accepted only the marker sentence until B3's fix round 2, and was red on
+# every real pull-library run (measured on the B3 package tree).
+expect PASSED "the no-client-log sentence a pull library gets"  -- run_retrace retrace-evidence-nolog
+# Both sentences again as `ctest -V` really prints them, with "1: " on every line: folded
+# naively that is "never 1: reported resolving it", and the control used to red on it.
+expect PASSED "the marker sentence under ctest -V's N: prefix" -- run_retrace retrace-evidence-prefixed
+expect PASSED "the no-log sentence under ctest -V's N: prefix" -- run_retrace retrace-evidence-nolog-prefixed
 # The pull library replaying green is the failure this control exists to catch.
 expect FAILED "a pull library passed the split retrace"      -- run_retrace retrace-green
 

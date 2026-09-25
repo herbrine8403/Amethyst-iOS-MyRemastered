@@ -1,14 +1,14 @@
 #!/bin/bash
 # EXIT GATE E1's NEGATIVE CONTROL and EXIT GATE E3(a)'s.
 #
-# This file is the body of .github/workflows/test.yml's "Negative controls - the verb barrier and
-# the persistent-map push must be load-bearing" step. It lives in the repository rather than inline
-# in the workflow for one reason: a workflow `run:` block cannot be executed anywhere except on a
-# runner, so the logic below was unreviewable and untestable until it ran in CI - and when the
-# wave-1 cross-family review claimed it was broken, confirming the claim needed a hand-made copy of
-# these lines with their inputs stubbed (wave1-codex-verify.md 8). A copy is not the thing. The
-# smoke test at scripts/ci/control_smoke_test.sh now runs THIS file, so the lines CI executes and
-# the lines the smoke test proves are the same lines.
+# This file is the body of .github/workflows/test.yml's "Negative controls (barrier, map push)"
+# step, which requires the verb barrier and the persistent-map push to be load-bearing. It lives in
+# the repository rather than inline in the workflow for one reason: a workflow `run:` block cannot
+# be executed anywhere except on a runner, so the logic below was unreviewable and untestable until
+# it ran in CI - and when the wave-1 cross-family review claimed it was broken, confirming the
+# claim needed a hand-made copy of these lines with their inputs stubbed (wave1-codex-verify.md 8).
+# A copy is not the thing. The smoke test at scripts/ci/control_smoke_test.sh now runs THIS file,
+# so the lines CI executes and the lines the smoke test proves are the same lines.
 #
 # WHAT THE REVIEW FOUND (ID-46 finding 8, CONFIRMED by execution; ID-48 assigns it here).
 # The previous version accepted ANY non-zero ctest exit as "the knob is load-bearing". A timeout, a
@@ -33,8 +33,10 @@
 # CONTROL", "is the E3(a) NEGATIVE CONTROL"), and it is tempting to grep for that. It is not
 # evidence: it is written at config load, by every process in the run, whatever happens next. A
 # setup abort would carry it too. It proves the knob was READ, never that the knob caused the red.
-# Only the failing case's own diagnostic does that. ID-53 gives each Split entry a private
-# library log: E1 reads its Fatal there; E3(a) reads the scenario assertion in ctest output.
+# Only the failing case's own diagnostic does that. E1 now observes deterministic transport
+# waits in dedicated CPU tests; E3(a) retains its scenario assertion and private library log.
+# P5e ID-122: ordinary run-ahead draws need not fail with VERB_BARRIER=0, and the old
+# overlap Fatal cannot fire with the default BATCH_WAITS=1. Pixel failures are not E1 evidence.
 #
 # Usage:  split_negative_controls.sh [--self-test]
 #   CTEST          ctest binary                       (default: ctest)
@@ -111,10 +113,16 @@ fi
 # Fatal is quoted", joint-v1.md 3) and ID-65 assigned the missing line here. With it, E3(a) no
 # longer rests on a pixel assertion alone: the red must carry the scenario's own diagnostic AND
 # the library's own statement that the push was disabled, from the entry's private file.
+# The optional 5th positional is a ctest -E EXCLUSION, applied to every ctest invocation this
+# function makes. It exists because ctest -R is POSIX ERE: there is no negative lookahead, so a
+# selection that must say "these, except that one" cannot say it in -R alone. E1 below is the
+# case that forced it (ID-122).
 run_control() {
-  name="$1"; filter="$2"; evidence="$3"; private_evidence="$4"; shift 4
+  name="$1"; filter="$2"; evidence="$3"; private_evidence="$4"; exclude="${5:-}"; shift 5
+  if [ -n "${exclude}" ]; then EX=(-E "${exclude}"); else EX=(); fi
+  export SPLIT_LOG_EXCLUDE="${exclude}"
 
-  matched=$("${CTEST}" -N -L integration-split -R "${filter}" | grep -cE '^ *Test *#[0-9]+:')
+  matched=$("${CTEST}" -N -L integration-split -R "${filter}" "${EX[@]}" | grep -cE '^ *Test *#[0-9]+:')
   if [ "${matched}" -lt 1 ]; then
     echo "::error::${name} selected ${matched} tests; its filter no longer matches anything"
     exit 1
@@ -128,25 +136,19 @@ run_control() {
   out="${CONTROL_TMPDIR}/control-output.txt"
   result="${CONTROL_TMPDIR}/control.xml"
   rm -f "${result}"
-  env "$@" "${CTEST}" --output-on-failure -L integration-split -R "${filter}" --no-tests=error --output-junit "${result}" > "${out}" 2>&1
+  env "$@" "${CTEST}" --output-on-failure -L integration-split -R "${filter}" "${EX[@]}" --no-tests=error --output-junit "${result}" > "${out}" 2>&1
   control_rc=$?
   cat "${out}"
 
   # Inspect JUnit before exit status or private Fatal: a skipped pre-flight can carry both.
-  label='E3(a)'
-  [ "${evidence}" != private-barrier-fatal ] || label=E1
-  python3 "${log_helper}" results "${manifest}" "${filter}" "${result}" "${label}" || exit 1
+  python3 "${log_helper}" results "${manifest}" "${filter}" "${result}" 'E3(a)' || exit 1
 
   if [ "${control_rc}" -eq 0 ]; then
     echo "::error::${name} left ${matched} split entries GREEN, so the knob it turns is not load-bearing and the gate it controls proves nothing."
     exit 1
   fi
 
-  # E1's MGLOG_F sink is the private file, never ctest's status or transcript.
-  if [ "${evidence}" = "private-barrier-fatal" ]; then
-    python3 "${log_helper}" evidence "${manifest}" "${filter}" \
-      'Fatal\{BarrierViolation, "[A-Za-z_][A-Za-z_0-9]*"\}' || exit 1
-  elif ! python3 "${log_helper}" assertion "${manifest}" "${filter}" "${result}" "${evidence}"; then
+  if ! python3 "${log_helper}" assertion "${manifest}" "${filter}" "${result}" "${evidence}"; then
     echo "::error::${name} FAILED: red lacks its persistent-map push diagnostic. Required: ${evidence}"
     exit 1
   fi
@@ -162,15 +164,15 @@ run_control() {
   echo "${name} turned ${matched} selected entries red, and the red carries the scenario's own diagnostic, as it must"
 }
 
-# E1: c1 ClientSession::EmitAndWait emits MGLOG_F Fatal{BarrierViolation, "<slot>"}.
-# This asserts an observed overlap with the applier, which is timing-dependent.
-# Without that Fatal in a fresh selected file E1 fails; pixel/status fallbacks do not count.
-# Keep the ID-53-approved SmallRing selection as well as the default lane.
-run_control "negative control E1 (MOBILEGL_IPC_VERB_BARRIER=0)" \
-  'DirectGLES\.Split\.(SmallRing\.)?(Triangle|ClearThenReadPixels)' \
-  'private-barrier-fatal' \
-  '' \
-  MOBILEGL_IPC_VERB_BARRIER=0
+# E1: the default arm must actually park for a kWaitApplied record and for a
+# kWaitNone record whose server has no run-ahead cap. Removing the verb barrier
+# must fail those exact return-before-apply assertions. A third positive case
+# proves that a cap-authorized kWaitNone record does not wait. The peer releases
+# on an observed Park or on the client's return, not on a sleep or pixel race.
+# The helper demands green baseline, two named reds, and green restoration;
+# skipped/missing cases, timeouts and unrelated failures never count as evidence.
+python3 "$(dirname "$0")/wait_boundary_negative_control.py" \
+  --ctest "${CTEST}" --out "${CONTROL_TMPDIR}/e1" || exit 1
 
 # E3(a): PersistentMapTracker::PushBlocksFor stops at blockBytes == 0 - deliberately, because 0
 # is the negative control and not "unlimited". Two independent halves are now required:
@@ -186,4 +188,5 @@ run_control "negative control E3(a) (MOBILEGL_IPC_PERSISTENT_BLOCK_KB=0)" \
   'DirectGLES\.Split\.(SmallRing\.)?PersistentCoherentMapScenario\.(TwoWritesThroughTheCoherentPointerEachReachTheirOwnDraw|AWriteAfterAFrameBoundaryReachesTheNextFramesDraw)$' \
   "the SECOND write through the same mapping, announced by nothing|frame 1's write through the SAME mapping, after a Present" \
   'MGPipe: persistent-map push disabled - MOBILEGL_IPC_PERSISTENT_BLOCK_KB=0' \
+  '' \
   MOBILEGL_IPC_PERSISTENT_BLOCK_KB=0

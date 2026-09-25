@@ -391,7 +391,7 @@ namespace MobileGL::MG_Remote::Transport {
         }
 
         void AdvanceApplied(RingControl& control, std::uint64_t seq) {
-            AdvanceMonotonic(control.appliedSeq, seq, "appliedSeq");
+            AdvanceMonotonic(control.Progress.appliedSeq, seq, "appliedSeq");
         }
 
         void AdvanceRetired(RingControl& control, std::uint64_t seq) {
@@ -399,16 +399,16 @@ namespace MobileGL::MG_Remote::Transport {
             // reclaims behind it, so a retire ahead of the apply hands live bytes
             // back to the producer. Clamped rather than refused, because a
             // caller that retires "everything applied" is the normal shape.
-            const std::uint64_t applied = control.appliedSeq.load(std::memory_order_acquire);
-            AdvanceMonotonic(control.retiredSeq, seq > applied ? applied : seq, "retiredSeq");
+            const std::uint64_t applied = control.Progress.appliedSeq.load(std::memory_order_acquire);
+            AdvanceMonotonic(control.Progress.retiredSeq, seq > applied ? applied : seq, "retiredSeq");
         }
 
         void AdvanceCompletedFrame(RingControl& control, std::uint64_t serial) {
-            AdvanceMonotonic(control.completedFrameSerial, serial, "completedFrameSerial");
+            AdvanceMonotonic(control.Progress.completedFrameSerial, serial, "completedFrameSerial");
         }
 
         void AdvancePresentAck(RingControl& control, std::uint64_t serial) {
-            AdvanceMonotonic(control.presentAckSerial, serial, "presentAckSerial");
+            AdvanceMonotonic(control.Progress.presentAckSerial, serial, "presentAckSerial");
         }
 
     } // namespace Watermark
@@ -416,6 +416,11 @@ namespace MobileGL::MG_Remote::Transport {
     // -----------------------------------------------------------------------
     // SessionProducer
     // -----------------------------------------------------------------------
+
+    void SessionProducer::Attach(ILink& link, std::uint32_t spinUs) {
+        Attach(link.Memory().CmdControl(), &link.CommandsOut(), &link.ConsumerBell(), &link.ProducerBell(), spinUs);
+        SetLink(link.Capabilities().PublishIsDelivery ? nullptr : &link);
+    }
 
     void SessionProducer::Attach(RingControl* control, RingProducer* cmd, Doorbell* peerBell,
                                  Doorbell* selfBell, std::uint32_t spinUs) {
@@ -432,6 +437,7 @@ namespace MobileGL::MG_Remote::Transport {
         m_peerBell = nullptr;
         m_selfBell = nullptr;
         m_lastPublishedSeq = 0;
+        m_link = nullptr;
     }
 
     void SessionProducer::PublishAndNotify(std::uint64_t submittedSeq) {
@@ -469,6 +475,7 @@ namespace MobileGL::MG_Remote::Transport {
         // COUNTED BEFORE THE WAIT AND ONLY WHEN ONE REALLY HAPPENS - after the two refusals
         // above, which answer TimedOut without ever reaching the bell. See Waits()/Parks() in
         // the header for why the pair is the reading and either number alone is not.
+        if (m_link && m_link->Flush() != MOBILEGL_OK) return SessionWait::ShutDown;
         m_waits.fetch_add(1, std::memory_order_relaxed);
         // &m_parks is the OTHER half of the pair, and it is passed rather than read off the
         // bell: the bell is this endpoint's and the encoder waits on it too, so its own
@@ -488,7 +495,7 @@ namespace MobileGL::MG_Remote::Transport {
             return SessionWait::TimedOut;
         }
         RingControl* control = m_control;
-        return Park([control, seq] { return Watermark::Reached(control->appliedSeq, seq); },
+        return Park([control, seq] { return Watermark::Reached(control->Progress.appliedSeq, seq); },
                     timeoutMs);
     }
 
@@ -497,8 +504,42 @@ namespace MobileGL::MG_Remote::Transport {
             return SessionWait::TimedOut;
         }
         RingControl* control = m_control;
-        return Park([control, serial] { return Watermark::Reached(control->presentAckSerial, serial); },
+        return Park([control, serial] { return Watermark::Reached(control->Progress.presentAckSerial, serial); },
                     timeoutMs);
+    }
+
+    // P5e (ra), CONTRACT-P5E §2.6. Two predicates, one OR each, and the caller decides which
+    // of the two happened by reading the watermark it actually cares about.
+    bool SessionProducer::EventRingIsFull() const {
+        return m_control != nullptr && m_control->eventRingFull.load(std::memory_order_acquire) != 0;
+    }
+
+    SessionWait SessionProducer::WaitForAppliedOrEventBacklog(std::uint64_t seq,
+                                                              std::uint32_t timeoutMs) {
+        if (!Valid()) {
+            return SessionWait::TimedOut;
+        }
+        RingControl* control = m_control;
+        return Park(
+            [control, seq] {
+                return Watermark::Reached(control->Progress.appliedSeq, seq) ||
+                       control->eventRingFull.load(std::memory_order_acquire) != 0;
+            },
+            timeoutMs);
+    }
+
+    SessionWait SessionProducer::WaitForPresentAckOrEventBacklog(std::uint64_t serial,
+                                                                 std::uint32_t timeoutMs) {
+        if (!Valid()) {
+            return SessionWait::TimedOut;
+        }
+        RingControl* control = m_control;
+        return Park(
+            [control, serial] {
+                return Watermark::Reached(control->Progress.presentAckSerial, serial) ||
+                       control->eventRingFull.load(std::memory_order_acquire) != 0;
+            },
+            timeoutMs);
     }
 
     SessionWait SessionProducer::WaitForCmdSpace(std::uint64_t bytes, std::uint32_t timeoutMs) {
@@ -513,6 +554,11 @@ namespace MobileGL::MG_Remote::Transport {
     // SessionConsumer
     // -----------------------------------------------------------------------
 
+    void SessionConsumer::Attach(ILink& link, std::uint32_t spinUs) {
+        Attach(link.Memory().CmdControl(), &link.CommandsIn(), &link.ProducerBell(), &link.ConsumerBell(), spinUs);
+        SetLink(link.Capabilities().PublishIsDelivery ? nullptr : &link);
+    }
+
     void SessionConsumer::Attach(RingControl* control, RingConsumer* cmd, Doorbell* peerBell,
                                  Doorbell* selfBell, std::uint32_t spinUs) {
         m_control = control;
@@ -520,7 +566,7 @@ namespace MobileGL::MG_Remote::Transport {
         m_peerBell = peerBell;
         m_selfBell = selfBell;
         m_spinUs = spinUs;
-        m_appliedSeq = control == nullptr ? 0 : control->appliedSeq.load(std::memory_order_acquire);
+        m_appliedSeq = control == nullptr ? 0 : control->Progress.appliedSeq.load(std::memory_order_acquire);
         m_retirableCursor = cmd == nullptr ? 0 : cmd->LocalTail();
         m_borrowHeld = false;
     }
@@ -532,6 +578,7 @@ namespace MobileGL::MG_Remote::Transport {
         m_selfBell = nullptr;
         m_retirableCursor = 0;
         m_borrowHeld = false;
+        m_link = nullptr;
     }
 
     SessionWait SessionConsumer::WaitForWork(std::uint32_t timeoutMs) {
@@ -540,6 +587,7 @@ namespace MobileGL::MG_Remote::Transport {
         }
         RingControl* control = m_control;
         RingConsumer* cmd = m_cmd;
+        if (m_link && m_link->FlushProgress() != MOBILEGL_OK) return SessionWait::ShutDown;
         const bool woke = m_selfBell->Wait(
             control->consumerParked,
             [control, cmd] {
@@ -613,6 +661,7 @@ namespace MobileGL::MG_Remote::Transport {
     }
 
     void SessionConsumer::NotifyClient() {
+        if (m_link) m_link->ProgressChanged();
         if (m_control != nullptr && m_peerBell != nullptr) {
             NotifyIfParked(*m_peerBell, m_control->producerParked);
         }
@@ -637,23 +686,20 @@ namespace MobileGL::MG_Remote::Transport {
         };
         mix(inputs.DynamicParamsSize);
         mix(inputs.CapsSize);
-        mix(inputs.FunctionTableSize);
+        mix(inputs.MemberLayout);
+        mix(inputs.CatalogueLayout);
+        mix(inputs.RenderStateLayout);
         mix(inputs.FormatCapabilityTargets);
         mix(inputs.FormatCapabilityFormats);
         mix(inputs.FormatCapabilitiesCodecVersion);
         mix(inputs.RendererInfoCodecVersion);
+        mix(inputs.ProgramArtifactsCodecVersion);
+        mix(inputs.ProgramArtifactsSchema);
         mix(inputs.OpCount);
+        mix(inputs.ControlSchemaRevision);
         mix(inputs.AbiVersion);
-        // A presence marker before the bytes, so that "no stamp" (nullptr) and
-        // "an empty stamp" ("") are different inputs rather than the same
-        // absence of bytes.
-        mix(inputs.BuildStamp != nullptr ? 1u : 0u);
-        if (inputs.BuildStamp != nullptr) {
-            for (const char* c = inputs.BuildStamp; *c != '\0'; ++c) {
-                hash ^= static_cast<std::uint64_t>(static_cast<unsigned char>(*c));
-                hash *= 1099511628211ull;
-            }
-        }
+        mix(inputs.PointerBits);
+        mix(inputs.LittleEndian);
         // 0 is reserved for "not stated": a peer that forgot to fill the field
         // must not accidentally agree with one that did.
         return hash == 0 ? 1ull : hash;

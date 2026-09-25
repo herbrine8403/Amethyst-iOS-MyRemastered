@@ -138,6 +138,8 @@ namespace MobileGL::MG_Remote::Transport {
         // Creates and maps all four, initialises BOTH control pages (SEG_CMD's
         // and SEG_EVENT's), and books the mapping in `role`'s ledger.
         MobileGLResult Create(const SessionSegmentSizes& sizes, MemoryRole role);
+        // Private, identically addressed mirrors for the stream data plane.
+        MobileGLResult CreatePrivate(const SessionSegmentSizes& sizes, MemoryRole role);
 
         // The inproc peer's view of the owner's four segments, booked under the
         // OTHER role. It does NOT re-init the control pages - there is one shared
@@ -158,6 +160,24 @@ namespace MobileGL::MG_Remote::Transport {
         // Windows has no Adopt (ShmSegment::Adopt is POSIX-only; the section name
         // travels in SegmentRef instead), so there it still aliases and says so.
         MobileGLResult AttachInProcess(SessionSegments& owner, MemoryRole role);
+
+        // P6 `sm`: the spawn client's half. The four descriptors arrived over
+        // SCM_RIGHTS and this side adopts and maps them.
+        //
+        // IT IS THE SAME THREE CALLS AttachInProcess ALREADY MAKES - Adopt, then
+        // Map, per slot - because that was the point of writing the inproc attach
+        // as dup+Adopt+Map rather than as an alias (see the comment above it).
+        // The fstat size check inside Adopt, the alignment, the peer lifetime and
+        // the ledger booking have all been exercised on every inproc run since
+        // P5; what is new here is only where the fd came from.
+        //
+        // OWNERSHIP: on success this object owns all four descriptors and closes
+        // them in Close(). On failure it closes none of them - the caller still
+        // owns what it received and is the only one that can report which slot
+        // failed, so a half-consuming failure path would lose descriptors in the
+        // one situation where the diagnostic matters.
+        MobileGLResult AdoptFromDescriptors(const int fds[4], const std::uint64_t sizes[4],
+                                            std::uint32_t replySlotCount, MemoryRole role);
 
         void Close();
         bool Valid() const { return m_valid; }
@@ -192,6 +212,8 @@ namespace MobileGL::MG_Remote::Transport {
     private:
         void DeriveViews();
 
+        void* m_private[4] = {};
+        std::uint64_t m_privateSizes[4] = {};
         ShmSegment m_owned[4]; // empty on an attached (peer) view
         ShmSegment* m_segments[4] = {nullptr, nullptr, nullptr, nullptr};
 
@@ -296,9 +318,11 @@ namespace MobileGL::MG_Remote::Transport {
         // stageHead with nothing advancing the two tails, so FreeBytes() would
         // fall to zero the first time the head lapped the capacity and never
         // recover: a guaranteed hang, not a slow path.
+        void Attach(ILink& link, std::uint32_t spinUs);
         void Attach(RingControl* control, RingProducer* cmd, Doorbell* peerBell, Doorbell* selfBell,
                     std::uint32_t spinUs);
         void Detach();
+        void SetLink(ILink* link) { m_link = link; }
         bool Valid() const { return m_control != nullptr && m_cmd != nullptr; }
 
         // Publish the command ring's head, record submittedSeq, THEN ring - in
@@ -325,12 +349,29 @@ namespace MobileGL::MG_Remote::Transport {
         SessionWait WaitForApplied(std::uint64_t seq, std::uint32_t timeoutMs);
         // Present throttle.
         SessionWait WaitForPresentAck(std::uint64_t serial, std::uint32_t timeoutMs);
+
+        // ---- P5e (ra), CONTRACT-P5E §2.6: the same two waits, PLUS the event ring ---------
+        //
+        // A parked client must be wakeable by a server that ran out of SEG_EVENT, or the
+        // flow-control deadlock is one burst wide: the server stops producing, so it stops
+        // applying, so appliedSeq never reaches the seq this waiter is parked on, so the ring
+        // is never drained. Both predicates therefore break on `eventRingFull` as well, and
+        // the CALLER re-reads the watermark to find out which of the two woke it - a third
+        // SessionWait value would have made every existing `== Reached` site a bug.
+        //
+        // The old entry points above are unchanged and keep their callers: teardown's
+        // WaitForApplied has no ring to drain and must not learn about one.
+        SessionWait WaitForAppliedOrEventBacklog(std::uint64_t seq, std::uint32_t timeoutMs);
+        SessionWait WaitForPresentAckOrEventBacklog(std::uint64_t serial, std::uint32_t timeoutMs);
+        // True when the peer latched "SEG_EVENT is full and I stopped producing".
+        bool EventRingIsFull() const;
         // Back-pressure when Reserve returned nullptr. NEVER call this when
         // FreeBytes() is already >= the record: Ring.h:226-233 - a nullptr with
         // enough free bytes can only mean "too big, chunk", and waiting on it
         // stalls forever.
         SessionWait WaitForCmdSpace(std::uint64_t bytes, std::uint32_t timeoutMs);
 
+        LinkProgress* Progress() const { return m_control ? &m_control->Progress : nullptr; }
         RingControl* Control() const { return m_control; }
         RingProducer* Cmd() const { return m_cmd; }
         Doorbell* PeerDoorbell() const { return m_peerBell; }
@@ -364,6 +405,7 @@ namespace MobileGL::MG_Remote::Transport {
         template <class Ready>
         SessionWait Park(Ready&& ready, std::uint32_t timeoutMs);
 
+        ILink* m_link = nullptr;
         RingControl* m_control = nullptr;
         RingProducer* m_cmd = nullptr;
         Doorbell* m_peerBell = nullptr;
@@ -386,9 +428,11 @@ namespace MobileGL::MG_Remote::Transport {
     public:
         SessionConsumer() = default;
 
+        void Attach(ILink& link, std::uint32_t spinUs);
         void Attach(RingControl* control, RingConsumer* cmd, Doorbell* peerBell, Doorbell* selfBell,
                     std::uint32_t spinUs);
         void Detach();
+        void SetLink(ILink* link) { m_link = link; }
         bool Valid() const { return m_control != nullptr && m_cmd != nullptr; }
 
         // Park until a record is waiting, the session is shut down, or the
@@ -486,6 +530,7 @@ namespace MobileGL::MG_Remote::Transport {
         // How many kRecBorrowSlot records this consumer has seen. Non-zero in P5
         // is a finding, not a statistic.
         std::uint64_t BorrowedRecordsSeen() const { return m_borrowedSeen; }
+        LinkProgress* Progress() const { return m_control ? &m_control->Progress : nullptr; }
         RingControl* Control() const { return m_control; }
         RingConsumer* Cmd() const { return m_cmd; }
         Doorbell* PeerDoorbell() const { return m_peerBell; }
@@ -493,6 +538,7 @@ namespace MobileGL::MG_Remote::Transport {
         std::uint32_t SpinUs() const { return m_spinUs; }
 
     private:
+        ILink* m_link = nullptr;
         RingControl* m_control = nullptr;
         RingConsumer* m_cmd = nullptr;
         Doorbell* m_peerBell = nullptr;
@@ -509,43 +555,29 @@ namespace MobileGL::MG_Remote::Transport {
     };
 
     // -----------------------------------------------------------------------
-    // The ABI fingerprint's mixer - THE ONE IMPLEMENTATION.
-    //
-    // CapsCodec.cpp's CapsAbiFingerprint(), the value both handshakes compare,
-    // is exactly MixAbiFingerprint(CapsAbiFingerprintInputs()). It lives under
-    // Transport/ so that it can be tested without the GL frontend's umbrella
-    // header, and it takes its inputs as a struct so that the SAME function the
-    // handshake calls can be driven with one field perturbed at a time.
-    //
-    // The wave-1 review (ID-46 finding 6) found the previous shape - a
-    // five-argument mixer here and a SEPARATE hand-rolled FNV loop in
-    // CapsCodec.cpp - had exactly one caller of this function: the sensitivity
-    // test. Production never called it, so replacing CapsAbiFingerprint() with
-    // `return 1;` left every fingerprint test green and both peers agreeing on
-    // nothing. Now there is one mixer, the sensitivity case starts from the
-    // production entry point, and that perturbation turns it red.
+    // P6.5 wire fingerprint: one mixer, driven by compiler-derived layout facts.
+    // CapsCodec supplies generated member/catalogue digests; build identity and
+    // negotiated window sizes do not participate in wire compatibility.
     // -----------------------------------------------------------------------
+    // Wire facts only. Segment geometry and build identity are negotiated separately.
     struct AbiFingerprintInputs {
-        // The three struct shapes table 0's ABI-agreement row names.
         std::uint64_t DynamicParamsSize = 0;
         std::uint64_t CapsSize = 0;
-        std::uint64_t FunctionTableSize = 0;
-        // The caps blob's own geometry and the two blob codecs' versions: the
-        // format-capability table's extents and the codec version stamps.
+        std::uint64_t MemberLayout = 0;
+        std::uint64_t CatalogueLayout = 0;
+        std::uint64_t RenderStateLayout = 0;
         std::uint64_t FormatCapabilityTargets = 0;
         std::uint64_t FormatCapabilityFormats = 0;
         std::uint64_t FormatCapabilitiesCodecVersion = 0;
         std::uint64_t RendererInfoCodecVersion = 0;
-        // The catalogue's length (ID-33): a peer with one more opcode is a
-        // different wire even if every struct kept its size.
+        std::uint64_t ProgramArtifactsCodecVersion = 0;
+        std::uint64_t ProgramArtifactsSchema = 0;
         std::uint64_t OpCount = 0;
-        // MOBILEGL_ABI_VERSION(major, minor): a protocol change that left every
-        // struct the same size, which nothing above can see.
+        // MOBILEGL_PROTOCOL_CONTROL_REVISION (mg_protocol_base.h): the control schema's shape.
+        std::uint64_t ControlSchemaRevision = 0;
         std::uint32_t AbiVersion = 0;
-        // GIT_COMMIT_HASH_SHORT: two builds of the same sizes can still disagree
-        // about a FIELD ORDER, which no sizeof can see. nullptr and "" are
-        // distinct inputs and neither equals a real stamp.
-        const char* BuildStamp = nullptr;
+        std::uint32_t PointerBits = 0;
+        std::uint32_t LittleEndian = 0;
     };
 
     // FNV-1a over every field above, in declaration order. Never 0: that value is

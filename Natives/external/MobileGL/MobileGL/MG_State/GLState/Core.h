@@ -251,6 +251,15 @@ namespace MobileGL {
                 Uint64 GetAnyBufferChangeGeneration() const {
                     return m_bufferState.GetAnyBufferChangeGeneration();
                 }
+                // P5e (sb): the per-target INDEXED BINDING POINT generation, which is what dirty
+                // bits 15/16/17 shutter on now. See BufferState::NoteBindPointChanged for why
+                // the content aggregate above could not answer the question.
+                void NoteBufferBindPointChanged(BufferTarget target) {
+                    m_bufferState.NoteBindPointChanged(target);
+                }
+                Uint64 GetBufferBindPointGeneration(BufferTarget target) const {
+                    return m_bufferState.GetBindPointGeneration(target);
+                }
                 // The sixth aggregate lives here rather than on a state container because
                 // the values it guards do too (m_currentVertexAttributes).
                 void NoteVertexAttribDefaultChanged() { ++m_anyVertexAttribDefaultGeneration; }
@@ -522,6 +531,9 @@ namespace MobileGL {
                 // Never returns 0 - the counter starts at 1 so a zero-initialised memo slot cannot
                 // be mistaken for a live object.
                 Uint64 GetBoundTransformFeedbackLifetimeId() const { return m_boundTransformFeedbackLifetimeId; }
+#if MOBILEGL_BUILD_DISAGGREGATED
+                Uint64 GetTransformFeedbackLifetimeId(Uint index) const;
+#endif
                 // Whether the object carrying this identity still has an OPEN capture span - one
                 // that glBeginTransformFeedback started and glEndTransformFeedback has not closed,
                 // paused or not. A backend that hands out a bounded set of per-object slots must

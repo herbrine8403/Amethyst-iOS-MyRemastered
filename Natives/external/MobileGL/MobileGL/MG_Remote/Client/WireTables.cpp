@@ -29,6 +29,7 @@
 // before every `set_dynamic_state` - hundreds of times a frame, and each one a real record.
 
 #include "WireTables.h"
+#include <MG_Remote/FatalFunnel.h>
 
 #if MOBILEGL_BUILD_DISAGGREGATED
 
@@ -43,7 +44,11 @@
 // is legal under rule E (CONTRACT-P5C.md §5.2).
 #include <MG_Impl/Pipe/SlotAllocator.h>
 #include <MG_State/GLState/ProgramState/ProgramArtifactsCodec.h>
+#include <MG_State/GLState/StateObjectDeathNotice.h>
 #include <MG_Util/Debug/Log.h>
+// P5e (pg): ID-87 asks this package for bytes-per-link measured rather than argued, and the
+// archive's byte count exists exactly once - here, where it is serialised.
+#include <MG_Util/Metrics/PipeStats.h>
 
 #include <atomic>
 #include <cstdlib>
@@ -58,7 +63,7 @@ namespace MobileGL::MG_Remote::Client {
     // apply thread running the server's own backend - the EGL bring-up, InitCapabilities,
     // the applier - reaches these very emitters. A record published there would be waited
     // for by the thread that is supposed to apply it: `Fatal{BarrierTimeout,
-    // "ResourceRespecify"}` from `mgl-srv-apply`, thirty seconds into bring-up, which is
+    // "ResourceRespecify"}` from `mgl-srv-apply` one barrier budget into bring-up, which is
     // exactly how this was found.
     //
     // THE ANSWER IS NOT "SUPPRESS THE RECORD" - it is "run the server's own code", because
@@ -110,11 +115,12 @@ namespace MobileGL::MG_Remote::Client {
             RequireClientTablesInstalled(row);
             ClientSession* session = ClientSession::Active();
             if (session == nullptr) {
-                MGLOG_F("MGPipe: Fatal{NoClientSession, \"%s\"} - the client wire tables are "
+                // @Ph-declined (ID-P7-1): returns ClientSession& and runs in the CLIENT - no
+                // session to hand back, no peer bytes, and the latch is a server-session idea.
+                SessionFail(MGFatalFamily::NoClientSession, "MGPipe: Fatal{NoClientSession, \"%s\"} - the client wire tables are "
                         "installed but no ClientSession is active. A row may not fall through to "
                         "a driver this role does not have",
                         row);
-                std::abort();
             }
             return *session;
         }
@@ -126,12 +132,11 @@ namespace MobileGL::MG_Remote::Client {
         MG_Pipe::MGPBlobRef StageRequired(ClientSession& session, const char* row,
                                           const void* bytes, Uint64 count) {
             if (bytes == nullptr || count == 0) {
-                MGLOG_F("MGPipe: Fatal{BlobMissing, \"%s\"} - the row's decoder requires a "
+                SessionFail(MGFatalFamily::BlobMissing, "MGPipe: Fatal{BlobMissing, \"%s\"} - the row's decoder requires a "
                         "declared blob and the call site handed over %llu bytes at %p. Under "
                         "monolith the companion pointer carries them; under split they have to "
                         "be staged, and there is nothing to stage",
                         row, static_cast<unsigned long long>(count), bytes);
-                std::abort();
             }
             return session.Encoder().StageBytes(bytes, count);
         }
@@ -222,6 +227,11 @@ namespace MobileGL::MG_Remote::Client {
         MGP_WIRE_TAIL(SetSamplerViews, MGPSamplerViews, MGPBoundView)
         MGP_WIRE_TAIL(BindSamplerStates, MGPSamplerStates, MGPipeHandle)
         MGP_WIRE_TAIL(SetShaderImages, MGPShaderImages, MGPImageView)
+        // P5e (sb, CONTRACT-P5E.md §5.6): the indexed buffer binding points, one record per
+        // class. The generic tail wrapper carries the FIRST tail only, which is the whole of
+        // the record on Espryt - the optional MGHostSpan tail exists for kCapNeedsHostUboBytes
+        // and that bit is 0 for the whole of P5.
+        MGP_WIRE_TAIL(SetShaderBuffers, MGPShaderBuffers, MGPBufferRange)
         MGP_WIRE_TAIL(SetVertexAttribDefaults, MGPVertexAttribDefaults, MGPAttribValue)
 
 #undef MGP_WIRE_PLAIN
@@ -290,7 +300,8 @@ namespace MobileGL::MG_Remote::Client {
             const Uint64 seq = session.EmitAndWait(MGPWireOp::ResourceReadback, payload,
                                                    sizeof(*payload), nullptr, 0, nullptr, 0,
                                                    &status);
-            reply->Id = seq;
+            // Cancellation has no wire ordinal; retain the caller's nonzero local ticket.
+            if (seq != Wire::kInvalidSeq) reply->Id = seq;
             MG_Pipe::MGPipePostReply(*reply, status, 0);
             ++g_emitted;
         }
@@ -310,7 +321,8 @@ namespace MobileGL::MG_Remote::Client {
             const Uint64 seq = session.EmitAndWait(MGPWireOp::ResourceCreate, payload,
                                                    sizeof(*payload), nullptr, 0, nullptr, 0,
                                                    &status);
-            reply->Id = seq;
+            // Cancellation has no wire ordinal; retain the caller's nonzero local ticket.
+            if (seq != Wire::kInvalidSeq) reply->Id = seq;
             MG_Pipe::MGPipePostReply(*reply, status, status == 0 ? 1u : 0u);
             ++g_emitted;
             if (status == 1) ++g_declined;
@@ -323,7 +335,8 @@ namespace MobileGL::MG_Remote::Client {
             const Uint64 seq = session.EmitAndWait(MGPWireOp::SetTextureParams, payload,
                                                    sizeof(*payload), nullptr, 0, nullptr, 0,
                                                    &status);
-            reply->Id = seq;
+            // Cancellation has no wire ordinal; retain the caller's nonzero local ticket.
+            if (seq != Wire::kInvalidSeq) reply->Id = seq;
             MG_Pipe::MGPipePostReply(*reply, status, status == 0 ? 1u : 0u);
             ++g_emitted;
             if (status == 1) ++g_declined;
@@ -340,15 +353,36 @@ namespace MobileGL::MG_Remote::Client {
             ClientSession& session = RequireSession("ResourceSubData");
             MG_Pipe::MGPSubData record = *payload;
             record.Blob = StageOptional(session, blobBytes, blobByteCount);
+            // P5e (ra, CONTRACT-P5E §2.5 / ruling 15): the BUFFER half does not want its
+            // answer, and MGPipeSubDataWantsItsReply is the one place that decides - the same
+            // function the route reads, so the two halves of this call cannot disagree about
+            // whether a wait is owed. Under run-ahead the record is published and this thread
+            // returns; the persistent-map push (PersistentMapTracker's 64 KB blocks) stops
+            // being a hidden round trip per block, which is the single biggest wait left on
+            // the steady path that is not a draw.
+            //
+            // THE ANSWER IS ACCEPT-BY-CONSTRUCTION, AND THAT IS HONEST HERE AND NOWHERE ELSE:
+            // the only caller discards it (PipeFill.cpp's MGPipeEmitResourceSubData), so
+            // "accepted" is not a re-derivation of a server decision - it is the absence of a
+            // question. The server still posts the real answer into the slot; nothing reads
+            // it, which ReplySlot.h:16, 105 makes legal. A row whose acceptance a caller USES
+            // may never take this path - R-5 has not moved.
+            const Bool wantReply = MG_Pipe::MGPipeSubDataWantsItsReply(record);
             Int32 status = 0;
-            const Uint64 seq = session.EmitAndWait(
-                MGPWireOp::ResourceSubData, &record, sizeof(record), varTail,
-                static_cast<Uint64>(varTailCount) * sizeof(MG_Pipe::MGPSubRegion), nullptr, 0,
-                &status);
-            reply->Id = seq;
-            MG_Pipe::MGPipePostReply(*reply, status, status == 0 ? 1u : 0u);
-            ++g_emitted;
-            if (status == 1) ++g_declined;
+            const Wire::WireTail tail{varTail, static_cast<Uint64>(varTailCount) *
+                                                   sizeof(MG_Pipe::MGPSubRegion)};
+            const Uint64 seq = session.EmitAndWaitTails(
+                MGPWireOp::ResourceSubData, &record, sizeof(record),
+                varTail != nullptr ? &tail : nullptr, varTail != nullptr ? 1u : 0u, nullptr, 0,
+                &status, nullptr, wantReply);
+            // Cancellation has no wire ordinal; retain the caller's nonzero local ticket.
+            if (seq != Wire::kInvalidSeq) reply->Id = seq;
+            const Int32 postedStatus = (seq == Wire::kInvalidSeq || status == Wire::ReplySink::kStatusDeclined)
+                                           ? Wire::ReplySink::kStatusDeclined
+                                           : wantReply ? status : Wire::ReplySink::kStatusOk;
+            MG_Pipe::MGPipePostReply(*reply, postedStatus, postedStatus == Wire::ReplySink::kStatusOk ? 1u : 0u);
+            if (seq != Wire::kInvalidSeq) ++g_emitted;
+            if (postedStatus == Wire::ReplySink::kStatusDeclined) ++g_declined;
         }
 
         void Wire_BufferSubDataResident(const MG_Pipe::MGPSubData* payload, const void* blobBytes,
@@ -383,20 +417,23 @@ namespace MobileGL::MG_Remote::Client {
             }
             ClientSession& session = RequireSession("ResourceRespecify");
             if (initialBytes != nullptr) {
-                MGLOG_F("MGPipe: Fatal{UncarriedInitialBytes, \"resource_respecify\"} - a call "
+                SessionFail(MGFatalFamily::UncarriedInitialBytes, "MGPipe: Fatal{UncarriedInitialBytes, \"resource_respecify\"} - a call "
                         "site handed initial content to a split respecify. R-13.3 rules that "
                         "initialBytes never crosses and that the content follows as "
                         "resource_subdata; a caller that still passes it has bytes nothing will "
                         "carry");
-                std::abort();
             }
-            // The scope rides in the descriptor's own pads (CONTRACT-P5 table 1 row 19b, LANDED)
-            // and is written only through MGPipeSetRespecifiedLevel - three fields are one
-            // value, and an open-coded writer that forgets the presence byte says "level 0 of
-            // upload target 0" where it meant "the whole resource".
+            // Scope and exact mutable mip extent travel together through the descriptor helper.
+            // It temporarily reuses BufOffset/BufSize on non-buffer image targets; the server
+            // checks and clears that carrier before persisting the resource descriptor.
             MG_Pipe::MGPResourceDesc record = *desc;
             if (level != nullptr) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+                MG_Pipe::MGPipeSetRespecifiedLevel(record, level->UploadTarget, level->Level,
+                                                   level->Width, level->Height, level->Depth);
+#else
                 MG_Pipe::MGPipeSetRespecifiedLevel(record, level->UploadTarget, level->Level);
+#endif
             } else {
                 MG_Pipe::MGPipeClearRespecifiedLevel(record);
             }
@@ -412,10 +449,9 @@ namespace MobileGL::MG_Remote::Client {
             // - the generated acceptance rows through MGPipeTakeReplyBool, and now these two
             // escapes - answers ERROR with the same named Fatal.
             if (status == 2) {
-                MGLOG_F("MGPipe: Fatal{ReplyError, \"resource_respecify\"} - the row answered "
+                SessionFail(MGFatalFamily::ReplyError, "MGPipe: Fatal{ReplyError, \"resource_respecify\"} - the row answered "
                         "ERROR, which is not an acceptance answer; folding it into accepted or "
                         "refused would make a transport fault look like a resource decision");
-                std::abort();
             }
             if (status == 1) ++g_declined;
             return status == 0;
@@ -459,22 +495,20 @@ namespace MobileGL::MG_Remote::Client {
             // the generated acceptance rows obey: status 2 is a transport fault, and returning
             // nullptr for it would make it indistinguishable from R-6's legitimate decline.
             if (status == 2) {
-                MGLOG_F("MGPipe: Fatal{ReplyError, \"map_persistent\"} - the row answered ERROR, "
+                SessionFail(MGFatalFamily::ReplyError, "MGPipe: Fatal{ReplyError, \"map_persistent\"} - the row answered ERROR, "
                         "which is not an acceptance answer; a transport fault is not a resource "
                         "decision and may not be folded into the decline R-6 predicts");
-                std::abort();
             }
             if (status == 1) ++g_declined;
             // NOT "always nullptr": the answer is READ. R-6 says the server declines, and the
             // day it stops declining this returns what it actually said rather than what the
             // ruling predicted.
             if (status == 0) {
-                MGLOG_F("MGPipe: Fatal{UnexpectedMapAccept, \"map_persistent\"} - the server "
+                SessionFail(MGFatalFamily::UnexpectedMapAccept, "MGPipe: Fatal{UnexpectedMapAccept, \"map_persistent\"} - the server "
                         "accepted a persistent map under split. R-6 makes the split answer a "
                         "constant decline because there is no way to hand a host pointer across "
                         "a process boundary in P5; a pointer arriving here is one this client "
                         "cannot dereference");
-                std::abort();
             }
             return nullptr;
         }
@@ -487,35 +521,112 @@ namespace MobileGL::MG_Remote::Client {
         // Spirv[i] is Fatal on the far side rather than ignored.
         void Wire_Escape_CreateShaderState(const MG_Pipe::MGPProgramDesc* desc,
                                            const MG_State::GLState::LinkArtifacts* link,
-                                           const MG_State::GLState::SpirvArtifacts* spirv) {
+                                           const MG_State::GLState::SpirvArtifacts* spirv,
+                                           const Uint32* linkedStages, Uint32 linkedStageCount) {
             if (RunsAsTheServerRole()) {
-                MG_Pipe::MGPipeMonolithEscapes().CreateShaderState(desc, link, spirv);
+                MG_Pipe::MGPipeMonolithEscapes().CreateShaderState(desc, link, spirv, linkedStages,
+                                                                   linkedStageCount);
                 return;
             }
             ClientSession& session = RequireSession("CreateShaderState");
             if (link == nullptr || spirv == nullptr) {
-                MGLOG_F("MGPipe: Fatal{ArtefactsMissing, \"create_shader_state\"} - the record's "
+                SessionFail(MGFatalFamily::ArtefactsMissing, "MGPipe: Fatal{ArtefactsMissing, \"create_shader_state\"} - the record's "
                         "two typed companions are null. Under monolith the applier reads the "
                         "modules out of spirv->generatedSpirv; under split there is nothing to "
                         "serialise, and emitting the record anyway would create a CSO with no "
                         "code");
-                std::abort();
             }
-            // EncodeProgramArtifacts APPENDS and never fails - everything it walks is owned
+            // EncodeProgramArchive APPENDS and never fails - everything it walks is owned
             // plain data - so an empty archive means the two structs themselves were empty,
             // which is a linked program with no artefacts and is not a codec question.
+            //
+            // P5e (pg): THE FRAMED form, so the record's own copy on the far side can pair each
+            // module with its stage. The bare EncodeProgramArtifacts is still what the verify
+            // build's round-trip pin uses; this is the one that crosses.
             Vector<Uint8> archive;
-            MG_State::GLState::EncodeProgramArtifacts(*link, *spirv, archive);
+            Vector<Uint32> stages(linkedStages, linkedStages + linkedStageCount);
+            MG_State::GLState::EncodeProgramArchive(*link, *spirv, stages, archive);
+            if (MG_Util::PipeStats::Enabled()) {
+                // ID-87's measurement, taken where the bytes actually exist rather than
+                // estimated: one sample per link, so the steady-state cost is (links this
+                // frame) x (bytes per link) and both halves are countable from the stats line.
+                MG_Util::PipeStats::AddBytes(MG_Util::PipeStats::ByteClass::CsoBlobBytes,
+                                             static_cast<Uint64>(archive.size()));
+            }
             if (archive.empty()) {
-                MGLOG_F("MGPipe: Fatal{ArchiveEmpty, \"create_shader_state\"} - the program's "
+                SessionFail(MGFatalFamily::ArchiveEmpty, "MGPipe: Fatal{ArchiveEmpty, \"create_shader_state\"} - the program's "
                         "artefacts serialised to nothing");
-                std::abort();
             }
             MG_Pipe::MGPProgramDesc record = *desc;
             for (Uint32 i = 0; i < 6; ++i) record.Spirv[i] = MG_Pipe::MGPBlobRef{};
             record.Reflection = session.Encoder().StageBytes(archive.data(), archive.size());
             session.EmitAndWait(MGPWireOp::CreateShaderState, &record, sizeof(record), nullptr, 0,
                                 nullptr, 0, nullptr);
+            ++g_emitted;
+        }
+
+        // set_program_bindings (P5e, pg). THE FIFTH ESCAPE, for PipeRoute.h's reason: three
+        // tails in three index spaces plus a parallel name array, which no generated
+        // (payload, varTail, varTailCount) row can express.
+        //
+        // THE NAMES ARE STAGED ONE BY ONE and each element's own MGHostSpan names its run, so
+        // the third tail is self-describing the way set_storage_block_binding's single name
+        // already is. Staged rather than packed into one run with offsets, because the honesty
+        // pass the decoder runs is per span and a packed run would have to be re-split there
+        // against arithmetic nothing on the wire declares.
+        void Wire_Escape_SetProgramBindings(const MG_Pipe::MGPProgramBindings* hdr,
+                                            const Int32* blockBindings,
+                                            const MG_Pipe::MGPProgramSamplerUnit* samplerUnits,
+                                            const MG_Pipe::MGPProgramStorageOverride* storageOverrides,
+                                            const char* const* storageOverrideNames) {
+            if (RunsAsTheServerRole()) {
+                MG_Pipe::MGPipeMonolithEscapes().SetProgramBindings(hdr, blockBindings, samplerUnits,
+                                                                    storageOverrides,
+                                                                    storageOverrideNames);
+                return;
+            }
+            ClientSession& session = RequireSession("SetProgramBindings");
+            MG_Pipe::MGPProgramBindings record = *hdr;
+
+            // The override tail is COPIED before it is emitted, because the span is the one
+            // field the client must write after the caller is done with it - the same reason
+            // MGP_WIRE_BLOB copies its payload.
+            Vector<MG_Pipe::MGPProgramStorageOverride> overrides;
+            overrides.reserve(record.StorageOverrideCount);
+            for (Uint32 i = 0; i < record.StorageOverrideCount; ++i) {
+                MG_Pipe::MGPProgramStorageOverride entry = storageOverrides[i];
+                const char* const name = storageOverrideNames[i];
+                // Size = strlen + 1: THE NUL TRAVELS, exactly as set_storage_block_binding's
+                // name does (contract table 0's block-name row), and the decoder refuses a run
+                // whose last byte is not NUL.
+                const Uint64 nameBytes = static_cast<Uint64>(std::strlen(name)) + 1ull;
+                const MG_Pipe::MGPBlobRef staged = session.Encoder().StageBytes(name, nameBytes);
+                // A HOST SPAN AND NOT A BLOBREF, which is what the row's kHostSpan flag means:
+                // the same run, described in the shape the decoder's honesty pass reads. Ptr
+                // stays null - rule B, "the encoder writes nullptr and names SEG_STAGE" - so
+                // the name is unreachable on a second process except through the segment table,
+                // which is the whole point of the flag.
+                entry.Name = MG_Pipe::MGHostSpan{};
+                entry.Name.Ptr = nullptr;
+                entry.Name.Seg = staged.Seg;
+                entry.Name.Offset = staged.Offset;
+                entry.Name.Size = staged.Size;
+                overrides.push_back(entry);
+            }
+
+            const Wire::WireTail tails[3] = {
+                {blockBindings, static_cast<Uint64>(record.BlockBindingCount) * sizeof(Int32)},
+                {samplerUnits, static_cast<Uint64>(record.SamplerUnitCount) *
+                                   sizeof(MG_Pipe::MGPProgramSamplerUnit)},
+                {overrides.empty() ? nullptr : overrides.data(),
+                 static_cast<Uint64>(record.StorageOverrideCount) *
+                     sizeof(MG_Pipe::MGPProgramStorageOverride)},
+            };
+            // ALWAYS THREE, even when a count is 0 - the decoder derives the third tail's
+            // offset from the first two, so declaring fewer would put the same bytes somewhere
+            // else (PipeWireCodec.cpp's layout arm says this from the other side).
+            session.EmitAndWaitTails(MGPWireOp::SetProgramBindings, &record, sizeof(record), tails, 3,
+                                     nullptr, 0, nullptr);
             ++g_emitted;
         }
 
@@ -609,14 +720,68 @@ namespace MobileGL::MG_Remote::Client {
 
     void RequireClientTablesInstalled(const char* row) {
         if (g_clientTablesUninstalled.load(std::memory_order_acquire)) {
-            MGLOG_F("MGPipe: Fatal{ClientTablesUninstalled, \"%s\"} - the client tables are "
+            SessionFail(MGFatalFamily::ClientTablesUninstalled, "MGPipe: Fatal{ClientTablesUninstalled, \"%s\"} - the client tables are "
                     "being torn down; refusing before session or ring access", row);
-            std::abort();
         }
+    }
+
+    namespace {
+        void WireStateObjectDestroyed(MG_Pipe::MGPipeKind kind, Uint64 lifetimeId) {
+            (void)EmitObjectDeathRecord(kind, lifetimeId);
+        }
+
+        const MG_State::GLState::StateObjectDeathOps kClientStateObjectDeathOps = {
+            .OnDestroyed = &WireStateObjectDestroyed,
+        };
     }
 
     void InstallClientWireTables() {
         using namespace MG_Pipe;
+
+        // DirectGLES normally installs this notice while creating its handle
+        // backend. An independent client never creates that backend: without a
+        // client emitter, NotifyAndFree silently drops object_death before
+        // freeing the slot. Keep inproc's existing backend dispatcher, and give
+        // the remote client the same wire delivery without a local twin table.
+        //
+        // P7 PACKAGE L: THE BACKEND TEST IS GONE, AND ITS ABSENCE IS THE POINT. P6.5 wrote
+        // `ActiveBackendType == DirectGLES` because DirectGLES was the only backend with a
+        // two-process lane, so the condition read as "the case this can happen in" rather than
+        // as a policy. Under a Magma spawn or tcp client it is a silent hole of exactly the
+        // shape P6.5 closed for Espryt: CtWireScenario's two death cases would report
+        // ObjectDeaths=0 and PASS NOTHING, because no notice was ever installed and
+        // NotifyAndFree would drop every object_death before freeing the slot - a green that
+        // means "the mechanism is absent". MEASURED on this tree: with the install site
+        // disabled, both DirectGLES spawn death cases red on CtWireScenario.cpp:187/:246 with
+        // `Expected: (afterCounters.deaths) > (deathsBefore), actual: 0 vs 0`.
+        //
+        // THE REMAINING TWO CONDITIONS STILL CARRY P6.5's INTENT, both halves of it:
+        //   * Transport == Spawn: this is the REMOTE client, the one with no local twin table.
+        //     Under inproc the server role is a thread in this process and its backend's own
+        //     dispatcher is the right one.
+        //   * GetStateObjectDeathOps() == nullptr: whoever installed first keeps the notice.
+        //     That is what "keep inproc's existing backend dispatcher" meant, and it is also
+        //     what keeps this from stomping a backend that installs ops of its own later.
+        //
+        // MAGMA NOW HAS A DEATH TABLE OF ITS OWN (P7 wave 2 package C, CONTRACT-P7 §5.5:
+        // DirectVulkan.cpp's g_magmaStateObjectDeathOps), and the two installs do NOT race,
+        // which is worth stating because the global is a bare last-writer-wins pointer with
+        // no stacking. They cannot meet: Magma's is installed from
+        // BackendObject_DirectVulkan::Initialize(), i.e. only in a process that OWNS a
+        // DirectVulkan backend, and the arm here runs only under `Transport == Spawn`, which
+        // is by construction the process that owns NO backend at all (InitSplitRoles builds a
+        // BackendObject_Remote there). So the spawn client keeps this emitter, the inproc and
+        // server-side roles keep Magma's, and `GetStateObjectDeathOps() == nullptr` below
+        // keeps meaning what P6.5 meant by it.
+        //
+        // MEASURED, both directions (package C's red-once): with Magma's install
+        // short-circuited, the two CtWireScenario death cases red on the INPROC arm alone
+        // (`deaths` 0 vs 0) and stay green on spawn and tcp - which is exactly the split of
+        // responsibility this comment claims.
+        if (MG_Config::Transport == MG_Config::TransportMode::Spawn &&
+            MG_State::GLState::GetStateObjectDeathOps() == nullptr) {
+            MG_State::GLState::SetStateObjectDeathOps(&kClientStateObjectDeathOps);
+        }
 
         // A fresh install means the routed tables are live again: a Start after a previous
         // session's Stop clears the teardown-refusal flag so its own routed calls are not
@@ -649,6 +814,7 @@ namespace MobileGL::MG_Remote::Client {
         gMGPipeContext.SetSamplerViews = &Wire_SetSamplerViews;
         gMGPipeContext.BindSamplerStates = &Wire_BindSamplerStates;
         gMGPipeContext.SetShaderImages = &Wire_SetShaderImages;
+        gMGPipeContext.SetShaderBuffers = &Wire_SetShaderBuffers;
         gMGPipeContext.SetGlobalConstants = &Wire_SetGlobalConstants;
         gMGPipeContext.SetVertexAttribDefaults = &Wire_SetVertexAttribDefaults;
         gMGPipeContext.SetPixelPackState = &Wire_SetPixelPackState;
@@ -664,6 +830,7 @@ namespace MobileGL::MG_Remote::Client {
         gMGPipeRouteEscapes.ResourceFlushRange = &Wire_Escape_ResourceFlushRange;
         gMGPipeRouteEscapes.MapPersistent = &Wire_Escape_MapPersistent;
         gMGPipeRouteEscapes.CreateShaderState = &Wire_Escape_CreateShaderState;
+        gMGPipeRouteEscapes.SetProgramBindings = &Wire_Escape_SetProgramBindings;
 
         MGPipeNoteInstalledArm(MGPipeRouteArm::kClientWire);
     }
@@ -679,6 +846,9 @@ namespace MobileGL::MG_Remote::Client {
         // is complete, by ReinstallMonolithAfterTeardown, for the at-exit deletes that reach a
         // process with no session at all. Idempotent: safe to call when nothing was installed.
         g_clientTablesUninstalled.store(true, std::memory_order_release);
+        if (MG_State::GLState::GetStateObjectDeathOps() == &kClientStateObjectDeathOps) {
+            MG_State::GLState::SetStateObjectDeathOps(nullptr);
+        }
     }
 
     void ReinstallMonolithAfterTeardown() {

@@ -20,6 +20,14 @@
 #if MOBILEGL_BUILD_DISAGGREGATED
 #include <Config.h>
 #include <MG_Remote/Server/ServerLoop.h>
+#include <MG_Pipe/PipeApply.h>
+#if MOBILEGL_PIPE_PUSH
+// P7 wave 2 package C (CONTRACT-P7 §5.5): Magma's own death-notice table. Both headers are
+// push-only and reached here for the same reason DirectGLES/Managers.cpp reaches them - the
+// notice is declared by the frontend and answered by whichever backend is running.
+#include <MG_Remote/Client/WireTables.h>
+#include <MG_State/GLState/StateObjectDeathNotice.h>
+#endif
 #endif
 #include <atomic>
 #include <bit>
@@ -31,6 +39,16 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     UniquePtr<VulkanRenderer>& pVulkanRenderer = *new UniquePtr<VulkanRenderer>();
 
     namespace {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        void RejectWireLegacyBuffer() {
+            if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+                MGLOG_F("MGPipe: Fatal{RoleViolation, \"buffer-legacy-arm\"} (Magma P7 buffer consumer)");
+                std::abort();
+            }
+        }
+#else
+        inline void RejectWireLegacyBuffer() {}
+#endif
         // Generation of the live VulkanRenderer instance, mirroring
         // DirectGLES's g_syncContextGeneration. BackendObject_DirectVulkan
         // bumps it (BumpRendererGeneration) wherever pVulkanRenderer is reset
@@ -44,6 +62,66 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         std::atomic<Uint64> g_rendererGeneration{1};
     } // namespace
 
+#if MOBILEGL_BUILD_DISAGGREGATED && MOBILEGL_PIPE_PUSH
+    namespace {
+        // P7 wave 2 package C, CONTRACT-P7 §5.5: MAGMA'S MIRROR OF g_glesStateObjectDeathOps
+        // (DirectGLES/Managers.cpp:335), and the one arm of that table Magma has any work in.
+        //
+        // WHAT THE NOTICE IS FOR HERE, and it is not what it is for on Espryt. Espryt's arm
+        // destroys a BACKEND TWIN keyed by lifetime id; Magma keeps no such twin - its two
+        // client-minted kinds (VertexElementsCso, Buffer) are keyed on {slot, gen} by
+        // MagmaPipeIdentityTables and every other kind is still reached from its frontend
+        // object. So the switch Espryt runs under `#else` has nothing to do on this backend
+        // and this table is exactly the EMIT arm: with a transport up and off the apply
+        // thread, the death crosses as the `object_death` record
+        // (MG_Remote::Client::EmitObjectDeathRecord, CONTRACT-P5C §5.2).
+        //
+        // WHY THAT MATTERS, measured rather than argued (package L's probe,
+        // notes/p7/magma-two-process-first-run.md §6): under SPAWN the client process has no
+        // DirectVulkan backend at all, so InstallClientWireTables' own emitter already
+        // answered the notice and CtWireScenario's two death cases PASSED. Under INPROC the
+        // server role's backend is a thread of this process, Transport is Split rather than
+        // Spawn, and WireTables' install condition deliberately stands aside for "the
+        // backend's own dispatcher" - which on Magma did not exist. Both cases therefore
+        // FAILED on inproc with `deaths` stuck at 0. This table is that dispatcher.
+        //
+        // FRAMEBUFFER IS WHY THE GAP WAS NOT MERELY COSMETIC. The client-side SLOT is freed
+        // backend-neutrally by P4a's per-kind helpers (MG_Impl/Pipe/PipeFill.cpp's
+        // NotifyAndFree frees whatever the notice does), so PipeSlotPeek never saw a leak.
+        // What leaked was the SERVER's twin: a framebuffer has NO wire delete opcode at all
+        // (BRIEF-P4A D-I2), so `object_death` is its only death delivery, and without a
+        // consumer here the server's record stayed Live for the life of the session.
+        void OnMagmaFrontendStateObjectDestroyed(MG_Pipe::MGPipeKind kind, Uint64 lifetimeId) {
+            // Monolith has no record to emit and no server twin to tell.
+            if (MG_Config::Transport == MG_Config::TransportMode::Monolith) return;
+            // Raised ON the apply thread: the server role destroying a frontend object it
+            // created itself (Magma's hidden blit / depth-mipmap resources). The client's
+            // allocator is a client-thread surface (CONTRACT-P5C §3.1) and EmitObjectDeathRecord
+            // probes it, so this arm stays silent exactly as Espryt's does.
+            if (MG_Remote::Server::ServerLoop::OnApplyThread()) return;
+            (void)MG_Remote::Client::EmitObjectDeathRecord(kind, lifetimeId);
+        }
+
+        const MG_State::GLState::StateObjectDeathOps g_magmaStateObjectDeathOps = {
+            .OnDestroyed = OnMagmaFrontendStateObjectDestroyed,
+        };
+    } // namespace
+
+    void InstallStateObjectDeathOps() {
+        // Installed from BackendObject_DirectVulkan::Initialize(), i.e. step 1 of
+        // InitServerRoleCommon (ServerLoop::CreateBackend calls Initialize), which is before
+        // the client session starts and therefore before any frontend object can die.
+        // Unconditional, exactly as Espryt's ResolveEsprytSlotTablesArm is: only one backend
+        // is live at a time, and InstallClientWireTables' own "whoever installed first keeps
+        // the notice" guard is what keeps the remote client from stomping this.
+        MG_State::GLState::SetStateObjectDeathOps(&g_magmaStateObjectDeathOps);
+    }
+
+    Bool StateObjectDeathOpsInstalled() {
+        return MG_State::GLState::GetStateObjectDeathOps() == &g_magmaStateObjectDeathOps;
+    }
+#endif // MOBILEGL_BUILD_DISAGGREGATED && MOBILEGL_PIPE_PUSH
+
     Uint64 GetRendererGeneration() {
         return g_rendererGeneration.load(std::memory_order_acquire);
     }
@@ -53,6 +131,21 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     }
 
     namespace {
+#if !MOBILEGL_BUILD_DISAGGREGATED
+        // P7 wave 2 package C, OQ-8: THE PULL BUILD'S HALF, VERBATIM. A disaggregated build
+        // answers GetShaderStorageBlock{Index,Binding} out of LinkArtifacts::storageBlocks
+        // instead (see those functions below), which retires this whole cache - the map, the
+        // SPIRV-Reflect rebuild, the teardown clear and the rehash hazard. It cannot be
+        // retired HERE because the archive member it reads is itself disaggregated-only, for
+        // G1: one more Vector in LinkArtifacts moves the pull build's .text, which is pinned
+        // byte-for-byte at 0xa52203.
+        //
+        // NOTHING OUTSIDE THIS FILE READS ANY OF IT (measured: BufferVariableResource,
+        // bufferVariables, activeVariables and StorageBlockResource have no reference anywhere
+        // else in the tree, and `dataSize` is written and never read - GL_BUFFER_VARIABLE and
+        // GL_ACTIVE_VARIABLES are answered by MG_Impl/GLImpl/Program/ProgramInterface.cpp out
+        // of glslang's own reflection, which is a different index space). So the two arms
+        // below differ in exactly the two functions their callers use, and in nothing else.
         struct BufferVariableResource {
             String name;
             GLuint blockIndex = 0;
@@ -84,6 +177,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             Vector<StorageBlockResource> storageBlocks;
             Vector<BufferVariableResource> bufferVariables;
         };
+#endif // !MOBILEGL_BUILD_DISAGGREGATED
 
         struct DrawElementsIndirectCommand {
             Uint32 count = 0;
@@ -100,12 +194,14 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             Uint32 baseInstance = 0;
         };
 
+#if !MOBILEGL_BUILD_DISAGGREGATED
         // Keyed by GL program name so the freed-name reuse in IndexGenerator bounds the
         // map at the peak-simultaneous-program high-water mark; each slot's ownership is
         // checked against the program's lifetime id before it is served (see
         // GetProgramResourceCache). Cleared wholesale at EGL teardown via
         // ClearProgramResourceCaches.
         UnorderedMap<GLuint, ProgramResourceCache> g_programResourceCaches;
+#endif
 
         void ClearReadPixelsOutput(GLsizei width, GLsizei height, GLenum format, GLenum type, void* pixels) {
             if (!pixels || width <= 0 || height <= 0) {
@@ -120,6 +216,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             }
         }
 
+#if !MOBILEGL_BUILD_DISAGGREGATED
         String NormalizeDescriptorName(const SpvReflectDescriptorBinding& binding) {
             const char* rawName = binding.name;
             if (binding.type_description != nullptr && binding.type_description->type_name != nullptr) {
@@ -270,6 +367,69 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             }
             return cache;
         }
+#endif // !MOBILEGL_BUILD_DISAGGREGATED
+
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // The verb's handles identify server stores. Readback orders GPU-produced
+        // command/count bytes before CPU tier expansion; never inspect a client binding.
+        void DrawWireIndirect(GLenum mode, GLenum type, const void* indirect, GLsizei drawcount,
+                              GLsizei stride, Bool indexed, Bool counted = false, GLintptr countOffset = 0) {
+            if (drawcount <= 0) return;
+            auto& buffers = pVulkanRenderer->GetWireBufferManager();
+            const auto& state = MG_Pipe::MGPipeApplier();
+            if (counted) {
+                Uint32 count = 0;
+                if (countOffset < 0 || !buffers.ReadWireBuffer(state.VerbIndirectParameterBuffer,
+                        static_cast<Uint64>(countOffset), sizeof(count), &count)) return;
+                drawcount = static_cast<GLsizei>(std::min<Uint32>(count, static_cast<Uint32>(drawcount)));
+                if (!drawcount) return;
+            }
+            const SizeT commandSize = indexed ? sizeof(DrawElementsIndirectCommand) : sizeof(DrawArraysIndirectCommand);
+            if (stride == 0) stride = static_cast<GLsizei>(commandSize);
+            if (stride < static_cast<GLsizei>(commandSize)) return;
+            const Uint64 byteCount = static_cast<Uint64>(stride) * (drawcount - 1) + commandSize;
+            if (byteCount > std::numeric_limits<SizeT>::max()) return;
+            Vector<Uint8> bytes(static_cast<SizeT>(byteCount));
+            if (!buffers.ReadWireBuffer(state.VerbIndirectBuffer, reinterpret_cast<Uint64>(indirect),
+                    byteCount, bytes.data())) return;
+            if (indexed) {
+                const SizeT indexSize = MG_Util::GetGLTypeSize(type);
+                if (indexSize != 1 && indexSize != 2 && indexSize != 4) return;
+                Vector<DrawIndexedCmdParam> params(static_cast<SizeT>(drawcount));
+                MultiDrawIndexedCmd payload{};
+                payload.mode = mode;
+                payload.indexBufferView.indexType = type;
+                payload.drawCount = static_cast<Uint32>(drawcount);
+                payload.pParams = params.data();
+                for (GLsizei i = 0; i < drawcount; ++i) {
+                    DrawElementsIndirectCommand command{};
+                    Memcpy(&command, bytes.data() + static_cast<SizeT>(i) * stride, sizeof(command));
+                    params[i] = {command.count, command.instanceCount, command.firstIndex,
+                                 command.baseVertex, std::bit_cast<Int32>(command.baseInstance)};
+                    const Uint64 end = (static_cast<Uint64>(command.firstIndex) + command.count) * indexSize;
+                    if (end > std::numeric_limits<SizeT>::max()) return;
+                    payload.indexBufferView.indexByteSize = std::max<SizeT>(payload.indexBufferView.indexByteSize,
+                                                                          static_cast<SizeT>(end));
+                }
+                pVulkanRenderer->MultiDrawElements(payload);
+            } else {
+                Vector<DrawCmdParam> params(static_cast<SizeT>(drawcount));
+                for (GLsizei i = 0; i < drawcount; ++i) {
+                    DrawArraysIndirectCommand command{};
+                    Memcpy(&command, bytes.data() + static_cast<SizeT>(i) * stride, sizeof(command));
+                    params[i].vertexCount = command.count;
+                    params[i].instanceCount = command.instanceCount;
+                    params[i].firstVertex = command.first;
+                    params[i].firstInstance = command.baseInstance;
+                }
+                MultiDrawCmd payload{};
+                payload.mode = mode;
+                payload.drawCount = static_cast<Uint32>(drawcount);
+                payload.pParams = params.data();
+                pVulkanRenderer->MultiDrawArrays(payload);
+            }
+        }
+#endif
 
         MG_State::GLState::ProgramObject* TryGetDirectVulkanProgram(GLuint program) {
             if (!MGB_CTX->ValidateProgramName(program)) {
@@ -283,6 +443,13 @@ namespace MobileGL::MG_Backend::DirectVulkan {
             auto drawBuffer = MGB_CTX->GetBufferBindingSlot(BufferTarget::DrawIndirect).GetBoundObject();
             if (drawBuffer) {
                 drawBuffer->SyncPersistentMappedRange();
+                // A command block a compute shader wrote is the case this whole shape exists
+                // for, and every caller here reads the words on the CPU - the per-command
+                // expansion, the baseInstance the shader emulation is fed, and the fetch
+                // range a client-memory vertex array's upload is bounded by. Reconciling the
+                // shadow first is what keeps those readings the real ones (a no-op unless a
+                // GPU write is pending).
+                drawBuffer->SyncGpuWrites();
                 const SizeT commandOffset = reinterpret_cast<SizeT>(indirect);
                 if (drawBuffer->MappedData() == nullptr || commandOffset + requiredBytes > drawBuffer->GetSize()) {
                     MGLOG_E_ONCE("%s skipped: invalid GL_DRAW_INDIRECT_BUFFER binding or range", label);
@@ -301,6 +468,67 @@ namespace MobileGL::MG_Backend::DirectVulkan {
 
     } // namespace
 
+#if MOBILEGL_BUILD_DISAGGREGATED
+    // P7 wave 2 package C, OQ-8 (CONTRACT-P7 §5.3): THE MONOLITH CONSUMER READS THE ARCHIVE
+    // TOO, so one published list serves both of this backend's arms.
+    //
+    // THE TWO ARMS BELOW ARE NOT TWO ANSWERS. ProgramTest's
+    // TheArchivesStorageBlockOrderIsTheOneSpirvReflectProduces runs the OLD arm's algorithm -
+    // SPIRV-Reflect over the real modules, sorted and deduplicated exactly as
+    // GetProgramResourceCache does it - over a multi-stage program with an arrayed SSBO and an
+    // atomic-counter block, and asserts element-for-element equality with what the archive
+    // published. That equivalence is what makes an #if here a build-time SELECTION rather than
+    // a behavioural fork, and it is the reason the case exists.
+    //
+    // WHY AN #if AT ALL, AND WHAT IT COSTS. LinkArtifacts::storageBlocks is
+    // MOBILEGL_BUILD_DISAGGREGATED-only, because one more Vector member changes the struct's
+    // size, its implicit destructor and its move constructor in the PULL build whose .text G1
+    // pins byte-for-byte (0xa52203). So the pull build keeps `g_programResourceCaches`, the
+    // SPIRV-Reflect rebuild and `ClearProgramResourceCaches`, verbatim; only this build drops
+    // them - and with them the rehash hazard the ordering comment below the block-binding
+    // setter documents. Retiring the pull half is the day the member stops needing its guard,
+    // which is a G1/P13 decision and not a wave-2 one; recorded in notes/p7/magma-c.md.
+    void ClearProgramResourceCaches() {
+        // Nothing to clear: there is no cache in this build. Kept as an entry point so
+        // BackendObject_DirectVulkan's two EGL-teardown call sites stay statement for
+        // statement what they are in the pull build.
+    }
+
+    GLuint GetShaderStorageBlockIndex(const MG_State::GLState::ProgramObject& program, const String& name) {
+        const auto& blocks = program.GetLinkReflection().storageBlocks;
+        const auto find = [&blocks](const String& key) {
+            return std::find_if(blocks.begin(), blocks.end(),
+                [&](const MG_State::GLState::StorageBlockReflection& block) { return block.name == key; });
+        };
+        auto it = find(name);
+        if (it == blocks.end()) {
+            // Archive names are normalised, so an arrayed block that GL enumerates per element
+            // - "B[0]", "B[1]" - is one entry here, spelled "B". Same second chance the cache
+            // gave, for the same callers.
+            const auto bracket = name.rfind('[');
+            if (bracket == String::npos || name.empty() || name.back() != ']') return GL_INVALID_INDEX;
+            it = find(name.substr(0, bracket));
+            if (it == blocks.end()) return GL_INVALID_INDEX;
+        }
+        return static_cast<GLuint>(std::distance(blocks.begin(), it));
+    }
+
+    GLuint GetShaderStorageBlockBinding(const MG_State::GLState::ProgramObject& program, GLuint blockIndex) {
+        const auto& blocks = program.GetLinkReflection().storageBlocks;
+        if (blockIndex >= blocks.size()) {
+            return 0;
+        }
+        // THE OVERRIDE IS APPLIED ON READ, where the cache used to apply it on rebuild and
+        // patch it in place on rebind. Same answer by a shorter route: the program is the
+        // authoritative record of a rebound block (it is what GL_BUFFER_BINDING reports), the
+        // archive carries the DECLARED binding only, and asking the program here means a
+        // rebind can no longer be lost to a cache rebuild that happened to race a state-version
+        // bump.
+        const Int rebound = program.GetShaderStorageBlockBindingOverride(blocks[blockIndex].name);
+        if (rebound >= 0) return static_cast<GLuint>(rebound);
+        return blocks[blockIndex].binding;
+    }
+#else
     void ClearProgramResourceCaches() {
         // Called from EGL teardown while the backend's m_eglStateMutex is held; GL
         // calls are serialized in this codebase (contexts migrate threads but never
@@ -336,6 +564,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         }
         return cache.storageBlocks[blockIndex].binding;
     }
+#endif
 
     void ClearBufferfi(GLenum buffer, GLint drawbuffer, GLfloat depth, GLint stencil) {
         MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::ClearBufferfi called with null VulkanRenderer");
@@ -390,11 +619,23 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     }
 
     void MultiDrawElementsIndirect(GLenum mode, GLenum type, const void* indirect, GLsizei drawcount, GLsizei stride) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+            DrawWireIndirect(mode, type, indirect, drawcount, stride, true);
+            return;
+        }
+#endif
         MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::MultiDrawElementsIndirect called with null VulkanRenderer");
         MOBILEGL_ASSERT(MGB_CTX_LIVE, "DirectVulkan::MultiDrawElementsIndirect called with null GL context");
         pVulkanRenderer->MultiDrawElementsIndirect(mode, type, indirect, drawcount, stride);
     }
     void MultiDrawArraysIndirect(GLenum mode, const void* indirect, GLsizei drawcount, GLsizei stride) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+            DrawWireIndirect(mode, 0, indirect, drawcount, stride, false);
+            return;
+        }
+#endif
         MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::MultiDrawArraysIndirect called with null VulkanRenderer");
         MOBILEGL_ASSERT(MGB_CTX_LIVE, "DirectVulkan::MultiDrawArraysIndirect called with null GL context");
 
@@ -446,12 +687,24 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     }
     void MultiDrawElementsIndirectCount(GLenum mode, GLenum type, const void* indirect, GLintptr drawcount,
                                         GLsizei maxdrawcount, GLsizei stride) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+            DrawWireIndirect(mode, type, indirect, maxdrawcount, stride, true, true, drawcount);
+            return;
+        }
+#endif
         MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::MultiDrawElementsIndirectCount called with null VulkanRenderer");
         MOBILEGL_ASSERT(MGB_CTX_LIVE, "DirectVulkan::MultiDrawElementsIndirectCount called with null GL context");
         pVulkanRenderer->MultiDrawElementsIndirectCount(mode, type, indirect, drawcount, maxdrawcount, stride);
     }
     void MultiDrawArraysIndirectCount(GLenum mode, const void* indirect, GLintptr drawcount,
                                       GLsizei maxdrawcount, GLsizei stride) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+            DrawWireIndirect(mode, 0, indirect, maxdrawcount, stride, false, true, drawcount);
+            return;
+        }
+#endif
         MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::MultiDrawArraysIndirectCount called with null VulkanRenderer");
         MOBILEGL_ASSERT(MGB_CTX_LIVE, "DirectVulkan::MultiDrawArraysIndirectCount called with null GL context");
 
@@ -524,6 +777,12 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         DrawElementsInstancedBaseVertexBaseInstance(mode, count, type, indices, instancecount, 0, 0);
     }
     void DrawElementsIndirect(GLenum mode, GLenum type, const void* indirect) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+            DrawWireIndirect(mode, type, indirect, 1, 0, true);
+            return;
+        }
+#endif
         MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::DrawElementsIndirect called with null VulkanRenderer");
         MOBILEGL_ASSERT(MGB_CTX_LIVE, "DirectVulkan::DrawElementsIndirect called with null GL context");
 
@@ -583,6 +842,12 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         DrawArraysInstancedBaseInstance(mode, first, count, instancecount, 0);
     }
     void DrawArraysIndirect(GLenum mode, const void* indirect) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+            DrawWireIndirect(mode, 0, indirect, 1, 0, false);
+            return;
+        }
+#endif
         MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::DrawArraysIndirect called with null VulkanRenderer");
         MOBILEGL_ASSERT(MGB_CTX_LIVE, "DirectVulkan::DrawArraysIndirect called with null GL context");
 
@@ -651,6 +916,16 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     }
 
     void DispatchComputeIndirect(GLintptr indirect) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+            Uint32 groups[3]{};
+            if (indirect >= 0 && pVulkanRenderer->GetWireBufferManager().ReadWireBuffer(
+                    MG_Pipe::MGPipeApplier().VerbDispatchIndirectBuffer,
+                    static_cast<Uint64>(indirect), sizeof(groups), groups))
+                pVulkanRenderer->DispatchCompute(groups[0], groups[1], groups[2]);
+            return;
+        }
+#endif
         MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::DispatchComputeIndirect called with null VulkanRenderer");
         MOBILEGL_ASSERT(MGB_CTX_LIVE, "DirectVulkan::DispatchComputeIndirect called with null GL context");
         pVulkanRenderer->DispatchComputeIndirect(indirect);
@@ -712,6 +987,25 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     }
 
     void ShaderStorageBlockBinding(GLuint program, const GLchar* storageBlockName, GLuint storageBlockBinding) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+            auto& state = MG_Pipe::MGPipeApplier();
+            const auto handle = state.VerbStorageBlockProgram;
+            if (handle.Slot >= state.ShaderCsos.size() || !state.ShaderCsos[handle.Slot].Live ||
+                state.ShaderCsos[handle.Slot].Gen != handle.Gen || !storageBlockName) {
+                MGLOG_F("MGPipe: Fatal{UnmigratedVerb, \"Magma:storage-block-program-record\"}");
+                std::abort();
+            }
+            auto& record = state.ShaderCsos[handle.Slot];
+            auto found = std::find_if(record.StorageOverrides.begin(), record.StorageOverrides.end(),
+                [&](const auto& entry) { return entry.Name == storageBlockName; });
+            if (found == record.StorageOverrides.end())
+                record.StorageOverrides.push_back({storageBlockName, static_cast<Int32>(storageBlockBinding)});
+            else found->Binding = static_cast<Int32>(storageBlockBinding);
+            ++record.BindingsSerial;
+            return;
+        }
+#endif
         auto* programObject = TryGetDirectVulkanProgram(program);
         if (!programObject || storageBlockName == nullptr) return;
         const Int maxBindings =
@@ -737,6 +1031,27 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                 MakeUnique<GenericErrorInfo>("DirectVulkan", __func__, "Shader storage binding is out of range."));
             return;
         }
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // P7 wave 2 package C, OQ-8: NOTHING LEFT TO PATCH, and the hazard goes with it.
+        //
+        // The frontend has already recorded the new binding on the program, and that record is
+        // now what GetShaderStorageBlockBinding reads (it asks
+        // GetShaderStorageBlockBindingOverride on every call, over an IMMUTABLE archive list).
+        // What stood here was the other half of a mutable cache: resolve the index, take a
+        // reference into g_programResourceCaches and patch `binding` in place so an
+        // already-built entry need not be thrown away.
+        //
+        // THE HAZARD THAT CAME WITH IT IS GONE TOO, and it is worth naming because it was a
+        // real crash rather than a theoretical one: GetShaderStorageBlockIndex re-entered
+        // GetProgramResourceCache, which indexes an OPEN-ADDRESSED map and can therefore
+        // insert, and a rehash moves entries - so a reference taken before that call dangled.
+        // Binding one program's storage block while another program's entry was still absent
+        // from the cache was a reproducible segfault (ProgramPipelineScenario's two
+        // storage-block cases, in one process). The ordering above was the fix; having no
+        // cache is the retirement. The pull build below keeps both.
+        (void)storageBlockBinding;
+    }
+#else
         // The frontend already validated that the name denotes an active block, and has
         // already recorded the new binding on the program - which is what reseeds this cache
         // whenever it is rebuilt. Writing the entry here as well keeps an ALREADY-BUILT cache
@@ -755,6 +1070,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         if (blockIndex >= cache.storageBlocks.size()) return;
         cache.storageBlocks[blockIndex].binding = storageBlockBinding;
     }
+#endif
     void ReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, void* pixels) {
         MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::ReadPixels called with null VulkanRenderer");
         MOBILEGL_ASSERT(MGB_CTX_LIVE, "DirectVulkan::ReadPixels called with null GL context");
@@ -797,6 +1113,30 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     // memory) into uint32 values with the loop-closing first index appended.
     static Bool BuildClosedLineLoopIndices(GLsizei count, GLenum type, const void* indices,
                                            Vector<Uint32>& outIndices) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
+            const SizeT width = MG_Util::GetGLTypeSize(type);
+            if ((width != 1 && width != 2 && width != 4) || count < 2) return false;
+            const auto& bound = MG_Pipe::MGPipeApplier().IndexBuffer;
+            Vector<Uint8> owned;
+            const Uint8* bytes = static_cast<const Uint8*>(indices);
+            if (!MG_Pipe::MGPipeHandleIsNull(bound.Res)) {
+                owned.resize(static_cast<SizeT>(count) * width);
+                const Uint64 offset = bound.Offset + reinterpret_cast<Uint64>(indices);
+                if (offset < bound.Offset || !pVulkanRenderer->GetWireBufferManager().ReadWireBuffer(
+                        bound.Res, offset, owned.size(), owned.data())) return false;
+                bytes = owned.data();
+            }
+            if (!bytes) return false;
+            outIndices.resize(static_cast<SizeT>(count) + 1);
+            for (GLsizei i = 0; i < count; ++i) {
+                outIndices[i] = 0;
+                Memcpy(&outIndices[i], bytes + static_cast<SizeT>(i) * width, width);
+            }
+            outIndices[count] = outIndices[0];
+            return true;
+        }
+#endif
         const SizeT indexSize = MG_Util::GetGLTypeSize(type);
         if (indexSize == 0 || count < 2) {
             return false;
@@ -876,6 +1216,30 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         payload.params.indexCount = count;
         payload.params.instanceCount = 1;
 
+        // A CLIENT-MEMORY VERTEX ARRAY'S upload is bounded by a scan of this draw's index bytes,
+        // and those bytes may be shader-written: the scan reconciles the element buffer's shadow,
+        // which WAITS for the GPU. A wait in the middle of the draw's own recording flushes the
+        // batch that command buffer belongs to - the handle SetupDraw is holding goes stale, and
+        // the next vkCmd* records into a command buffer that is no longer the frame's. Reconciling
+        // HERE, before SetupDraw starts recording, keeps the wait out of the recording.
+        if (MG_Config::Transport == MG_Config::TransportMode::Monolith) {
+            const auto& currentVAO = MGB_CTX->GetBoundVertexArray();
+            Bool clientArray = false;
+            if (currentVAO) {
+                for (const auto& attribute : currentVAO->GetAllAttributes()) {
+                    if (attribute.Enabled && !attribute.Buffer) {
+                        clientArray = true;
+                        break;
+                    }
+                }
+            }
+            if (clientArray) {
+                if (const auto& elementBuffer = currentVAO->GetIndexBufferBindingSlot().GetBoundObject()) {
+                    elementBuffer->SyncGpuWrites();
+                }
+            }
+        }
+
         pVulkanRenderer->DrawElements(payload);
     }
 
@@ -912,6 +1276,7 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     // vkCmdDrawIndexed all carry natively.
     static void MultiDrawElementsImpl(GLenum mode, const GLsizei* count, GLenum type, const GLvoid* const* indices,
                                       GLsizei drawcount, const GLint* basevertex) {
+
         if (drawcount <= 0) {
             return;
         }
@@ -926,8 +1291,15 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         // MultiDrawIndexedCmd left the client-memory shape addressing a view whose byte
         // offset is a hardcoded 0, so UploadAndBindIndexBuffer saw a null client pointer,
         // declined the whole batch and painted nothing.)
+#if MOBILEGL_BUILD_DISAGGREGATED
+        const Bool noIndexBuffer = MG_Config::Transport != MG_Config::TransportMode::Monolith
+            ? MG_Pipe::MGPipeHandleIsNull(MG_Pipe::MGPipeApplier().IndexBuffer.Res)
+            : MGB_CTX->GetBoundVertexArray()->GetIndexBufferBindingSlot().GetBoundObject() == nullptr;
+        if (noIndexBuffer) {
+#else
         const auto& vao = *MGB_CTX->GetBoundVertexArray();
         if (vao.GetIndexBufferBindingSlot().GetBoundObject() == nullptr) {
+#endif
             for (GLsizei i = 0; i < drawcount; ++i) {
                 if (count[i] <= 0) {
                     continue;
@@ -1157,6 +1529,11 @@ namespace MobileGL::MG_Backend::DirectVulkan {
     } // namespace
 
     Bool IsTimerQuerySupported() {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // The first caps snapshot is sent during the transport handshake,
+        // before eglMakeCurrent creates the server's Vulkan renderer.
+        if (MG_Config::Transport != MG_Config::TransportMode::Monolith && !pVulkanRenderer) return false;
+#endif
         MOBILEGL_ASSERT(pVulkanRenderer, "DirectVulkan::IsTimerQuerySupported called with null VulkanRenderer");
         return pVulkanRenderer->IsTimerQuerySupported();
     }
@@ -1252,7 +1629,11 @@ namespace MobileGL::MG_Backend::DirectVulkan {
                 return false;
             }
             if (query->kind == VulkanTimerQuery::Kind::XfbGenerated &&
-                !query->pausedPrimitivesCountedByGpu && MGB_CTX_LIVE) {
+                !query->pausedPrimitivesCountedByGpu &&
+#if MOBILEGL_BUILD_DISAGGREGATED
+                MG_Config::Transport == MG_Config::TransportMode::Monolith &&
+#endif
+                MGB_CTX_LIVE) {
                 primitives += MGB_CTX->GetTransformFeedbackPausedPrimitiveCounter() -
                               query->pausedPrimitiveSnapshot;
             }
@@ -1300,6 +1681,9 @@ namespace MobileGL::MG_Backend::DirectVulkan {
         query->kind = generated ? VulkanTimerQuery::Kind::XfbGenerated : VulkanTimerQuery::Kind::XfbWritten;
         query->rendererGeneration = GetRendererGeneration();
         query->pausedPrimitiveSnapshot =
+#if MOBILEGL_BUILD_DISAGGREGATED
+            MG_Config::Transport == MG_Config::TransportMode::Monolith &&
+#endif
             MGB_CTX_LIVE ? MGB_CTX->GetTransformFeedbackPausedPrimitiveCounter() : 0;
         // Read AFTER StartXfbQueryCapture, which is where a failed reroute-pool creation
         // disarms: the answer is then what this span will actually do for every draw.

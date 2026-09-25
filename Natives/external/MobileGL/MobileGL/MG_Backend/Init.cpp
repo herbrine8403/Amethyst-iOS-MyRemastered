@@ -15,6 +15,7 @@
 #include <MG_Pipe/MGPipe.h>
 #include <MG_Pipe/PipeApply.h>
 #include <MG_Remote/Client/ClientSession.h>
+#include <MG_Remote/FatalFunnel.h> // InstallPipeSessionFailHook, installed at step 0 below
 #include <MG_Remote/Server/ServerLoop.h>
 #include <MG_Remote/Server/ServerSession.h>
 #endif
@@ -29,6 +30,8 @@
 // needs no factory and no weak symbol.
 #include <MG_Remote/Client/BackendObject_Remote.h>
 #endif
+
+#include "ServerRole.h"
 
 namespace MobileGL::MG_Backend {
     void LogBackendInfo() {
@@ -95,13 +98,18 @@ namespace MobileGL::MG_Backend {
         // server into a run-ahead one, because the failure mode is not a slow frame - it is
         // the apply thread reading client memory that has already moved, which renders wrong
         // rather than aborting.
-        constexpr Bool kMGPipeP5eRunAheadReady = false;
+        constexpr Bool kMGPipeP5eRunAheadReady = true;
+        constexpr Bool kMGPipeMagmaRunAheadReady = true;
 
+        // The Magma transport now owns buffer stores and consumes their vertex,
+        // index and shader binding records. Both backends publish the resource
+        // family only alongside a real op table (checked below). This does not
+        // itself establish run-ahead readiness: that has its separate gate below.
         Uint64 ConsumedSubsystemsFor(BackendType type) {
             switch (type) {
-            case BackendType::DirectGLES: return MG_Pipe::kMGPipeSubsystemsMigratedAtP4a;
+            case BackendType::DirectGLES: return MG_Pipe::kMGPipeSubsystemsMigratedAtP5e;
             case BackendType::DirectVulkan:
-                return MG_Pipe::kMGPipeSubsystemsMigratedAtP4a & ~MG_Pipe::kMGPipeSubsystemResources;
+                return MG_Pipe::kMGPipeSubsystemsMigratedAtP4a | MG_Pipe::kMGPipeSubsystemBufferBindings;
             default: return 0;
             }
         }
@@ -143,8 +151,22 @@ namespace MobileGL::MG_Backend {
         // The single hook (ARCHITECTURE.md:29). Returns false when the split could not be
         // brought up, and the caller then REFUSES TO CONTINUE rather than falling back to the
         // switch below - a fallback here is "the split lane ran monolith and went green".
-        Bool InitSplitRoles() {
+        // Steps 1 and 2 of the split bring-up: the server role's private backend
+        // object and the two CallMask halves. EXTRACTED so the spawn server
+        // process runs the SAME code the inproc server role runs - a second copy
+        // is how the two roles end up disagreeing about a capability bit that
+        // only one of them ever computes. ServerMain calls this and then does
+        // its own Accept; InitSplitRoles calls it and then starts the client.
+        Bool InitServerRoleCommon() {
             using namespace MobileGL::MG_Remote;
+
+            // 0. the Magma wire funnels' route to Session::Fail (P7 wave 0). FIRST, before
+            //    CreateBackend can reach a wire arm: a hook installed after the first death it
+            //    was meant to catch is a hook that does nothing on the only run that mattered.
+            //    Here rather than in ServerMain because BOTH server roles pass through this
+            //    function - the inproc role and the spawn/TCP session child - and a per-transport
+            //    install is how one of the two ends up without it.
+            InstallPipeSessionFailHook();
 
             // 1. the SERVER role's private backend object, on the app thread, with no GL and no
             //    EGL. The context is created and made current later, on mgl-srv-apply, when the
@@ -182,23 +204,86 @@ namespace MobileGL::MG_Backend {
                 serverBackend->GetBackendFunctions().GL.EndTransformFeedback != nullptr) {
                 capBits |= MG_Pipe::kCapBackendOwnsXfbCapture;
             }
-            // P5e (CONTRACT-P5E.md §1, §6): kCapRunAheadApply, THE DIRECTGLES ARM AND ONLY IT.
+            if (const auto* backend = loop.Backend()) {
+                const auto& gl = backend->GetBackendFunctions().GL;
+                // The query owner publishes only complete native query/reply paths.
+                // Timer hardware support is refreshed when caps are published after
+                // make-current; no CPU primitive-accounting preference is advertised.
+                if (gl.IsQueryResultAvailable && gl.GetQueryResult64 && gl.DeleteBackendQuery &&
+                    gl.FenceSync && gl.ClientWaitSync && gl.DeleteSync) {
+                    if (gl.BeginXfbPrimitivesQuery && gl.EndXfbPrimitivesQuery)
+                        capBits |= MG_Pipe::kCapXfbPrimitivesQuery;
+                    if (gl.BeginOcclusionQuery && gl.EndOcclusionQuery)
+                        capBits |= MG_Pipe::kCapOcclusionQuery;
+                    if (gl.IsTimerQuerySupported && gl.BeginTimeElapsedQuery &&
+                        gl.EndTimeElapsedQuery && gl.QueryCounterTimestamp)
+                        capBits |= MG_Pipe::kCapTimerQuery;
+                }
+            }
+            // P7 wave 2 package C, OQ-10 (CONTRACT-P7 §5.4): kCapResidentSubData, PUBLISHED
+            // OFF THE SERVER'S OWN WIRE RESOURCE TABLE AND NOTHING ELSE.
             //
-            // Magma is deliberately absent and is not an omission: it keeps the lockstep for
-            // the whole of P5e, its four apply-thread allocator sites are real debt P7 retires,
-            // and MGPipeApplierCurrentRecordIsBarriered() answers true for every record on a
-            // server that does not publish this bit - which is exactly what keeps those probes
-            // and its BARRIER_PULLED reads inside P5C's semantics and its rsp accounting
-            // honest. Publishing the bit here for DirectVulkan would turn accounted pulls into
-            // torn ones, so MagmaPipeIdentityTest pins its absence.
+            // The question the bit answers is the one BufferObject::LandBytesIntoResidentStore
+            // asks before it chooses between emitting `buffer_subdata_resident` (opcode 49) and
+            // falling back to the ordered in-place host memcpy: "does the side that will APPLY
+            // this record implement the resident arm at all?" Under a transport the client has
+            // no op table to probe - MGPipeResourceOpsHaveSubDataResident says so in as many
+            // words (MG_Impl/Pipe/PipeFill.cpp) and reads this bit instead - and until now
+            // nothing ever set it, so the answer was permanently "no" and BOTH backends fell
+            // back to the memcpy while both of them in fact register a SubDataResident arm
+            // (DirectGLES Managers.cpp's g_glesResourceOps, Magma VkBufferManager.cpp's
+            // g_vulkanWireResourceOps). Magma's implementation was dead code on the wire.
             //
-            // The Espryt arm is gated on kMGPipeP5eRunAheadReady, which is false until the
-            // integration commit: the bit is what ARMS the client, so every package before it
-            // lands inert.
-            capBits |= MG_Pipe::MGPipeRunAheadCapBitsFor(MG_Config::ActiveBackendType,
-                                                         kMGPipeP5eRunAheadReady);
+            // BY THE TABLE, NEVER BY THE BACKEND ENUM, and that is ID-39's lesson rather than a
+            // style preference: a mask is a statement about THIS backend's registered table, so
+            // a bit derived from `ActiveBackendType == ...` would keep claiming the capability
+            // for a build, a flavour or a future backend whose table does not carry the arm -
+            // which is exactly how 66 uploads were lost to a consumer bit that nobody could
+            // have honoured. `g_resourceOpsAtStep2` is the pointer this function just pinned,
+            // and step 5 already refuses a run where that pointer was swapped underneath us, so
+            // reading the arm off it means the published bit and the table that has to answer
+            // for it cannot come apart.
+            if (g_resourceOpsAtStep2 != nullptr && g_resourceOpsAtStep2->SubDataResident != nullptr) {
+                capBits |= MG_Pipe::kCapResidentSubData;
+            }
+            // Each backend has an independent implementation-readiness gate.
+            // The runtime RunAhead knob can decline the feature, never create it.
+            const Bool runAheadReady = MG_Config::ActiveBackendType == BackendType::DirectVulkan
+                ? kMGPipeMagmaRunAheadReady : kMGPipeP5eRunAheadReady;
+            capBits |= MG_Pipe::MGPipeRunAheadCapBitsFor(MG_Config::ActiveBackendType, runAheadReady);
             session.SetCapabilityBits(capBits);
             session.SetBackend(loop.Backend());
+            return true;
+        }
+
+        // The single hook (ARCHITECTURE.md:29) for the INPROC shape: both roles in
+        // this process. The spawn shape runs InitServerRoleCommon in the child and
+        // the client half here.
+        Bool InitSplitRoles() {
+            using namespace MobileGL::MG_Remote;
+
+            // SPAWN: THE SERVER ROLE IS NOT IN THIS PROCESS. Steps 1 and 2 -
+            // the backend and the two CallMask halves - happen in the server,
+            // which ran InitServerRoleForSpawn before it accepted us. Running
+            // them here as well would build a second BackendObject in the one
+            // process that must not have one, and would publish a capability
+            // mask computed from the WRONG backend's function table.
+            if (MG_Config::Transport == MG_Config::TransportMode::Spawn) {
+                const MobileGLResult started = Client::ClientSessionInstance().StartSpawned();
+                if (started != MOBILEGL_OK) {
+                    MGLOG_E("MG_Remote: the spawn session failed to start (rc=%d); MobileGL will "
+                            "NOT fall back to monolith - a lane named split that ran monolith is "
+                            "the one failure this phase is built to make impossible",
+                            static_cast<int>(started));
+                    return false;
+                }
+                pActiveBackendObject = MakeUnique<MG_Remote::Client::BackendObject_Remote>();
+                return true;
+            }
+
+            if (!InitServerRoleCommon()) {
+                return false;
+            }
 
             // 3. the handshake, the four segments, and - at its end - the apply thread.
             const MobileGLResult started =
@@ -217,11 +302,81 @@ namespace MobileGL::MG_Backend {
             pActiveBackendObject = MakeUnique<MG_Remote::Client::BackendObject_Remote>();
             return true;
         }
+
+        // F1 (P7 wave 2). THE WHOLE SPLIT ARM OF Init(), AS ONE BODY, so it can run from
+        // either of the two places that may reach it - MobileGL::Initialize's early hook,
+        // before MG_State::Init(), and Init() itself for a direct caller such as a unit
+        // fixture - without a second copy. Two copies of a bring-up order is how the two
+        // orders come to differ on the day one of them is wrong.
+        Bool g_splitBackendBroughtUp = false;
+
+        void InitSplitBackend() {
+            g_splitBackendBroughtUp = true;
+            if (!InitSplitRoles()) {
+                // NOT a fallback to the switch. pActiveBackendObject stays null and the next GL
+                // call fails loudly, which is the only honest outcome: the operator asked for a
+                // transport this process could not bring up.
+                pActiveBackendObject = nullptr;
+                return;
+            }
+            Bool remoteResult = InitSpecificBackendLibs();
+            if (!remoteResult) {
+                MGLOG_W("Failed to initialize MobileGL backend libraries for the remote object");
+                return;
+            }
+            // P6: BOTH CHECKS BELOW ARE STATEMENTS ABOUT THE SERVER'S PROCESS, and under
+            // spawn that is not this one. Their own wording says so - "a mask is a
+            // statement about THIS BACKEND", "the table the SERVER'S BACKEND registered at
+            // step 1" - and in a spawn client there is no backend and never was a table, so
+            // MGPipeGetResourceOps() is null by construction and the first check fires on a
+            // correct session. It did, on the first spawn retrace ever run.
+            //
+            // The checks are NOT weakened: the server runs the step-2 one itself, inside
+            // InitServerRoleForSpawn, against its own freshly registered table - which is the
+            // process where the question has an answer. What is lost under spawn is the
+            // step-5 re-run's ability to catch a table REPLACED between accept and here, and
+            // that is a question about one address space; it cannot be asked across two.
+            if (MG_Config::Transport != MG_Config::TransportMode::Spawn) {
+            // m-6, re-worded per review v2 N-8. The honesty cross-check runs a SECOND time, now
+            // that step 4's pActiveBackendObject (the client's BackendObject_Remote) exists and
+            // its Initialize() has run inside InitSpecificBackendLibs. What the re-run CAN catch
+            // is a table that was REMOVED between step 2 and here (the claim would then be a lie
+            // again). What it cannot catch - and its first comment claimed it could - is a client
+            // object that REGISTERED a table of its own: that leaves "is a table registered"
+            // true. Only the pointer tells those apart, so the table is compared against the one
+            // step 2 saw and a swap is refused by name: the applier would otherwise dispatch the
+            // server's resource records into the CLIENT object's table under its feet.
+            AssertConsumerMaskIsHonest(ConsumedSubsystemsFor(MG_Config::ActiveBackendType));
+            if (MG_Pipe::MGPipeGetResourceOps() != g_resourceOpsAtStep2) {
+                MGLOG_F("MGPipe: Fatal{ConsumerMaskLie, \"resource ops table replaced\"} - the "
+                        "resource op table MGPipeGetResourceOps() answers with is not the one the "
+                        "server's backend registered at step 1 (%p now, %p then). Something between "
+                        "ServerSession::Accept and the client object's Initialize() registered its "
+                        "own table, and the applier would dispatch every resource record into it. A "
+                        "mask is a statement about the server's backend, and so is the table",
+                        static_cast<const void*>(MG_Pipe::MGPipeGetResourceOps()),
+                        static_cast<const void*>(g_resourceOpsAtStep2));
+                std::abort();
+            }
+            }
+            LogBackendInfo();
+        }
     } // namespace
 #endif
 
 #if MOBILEGL_BUILD_DISAGGREGATED
+    // F1 (P7 wave 2). See BackendObjects.h for why this exists and MobileGL/Init.cpp for the
+    // defect the order closes.
+    Bool InitSplitRolesBeforeState() {
+        if (MG_Config::Transport == MG_Config::TransportMode::Monolith) return false;
+        InitSplitBackend();
+        return true;
+    }
+#endif
+
+#if MOBILEGL_BUILD_DISAGGREGATED
     void ShutdownSplitRoles() {
+        g_splitBackendBroughtUp = false;
         if (MG_Config::Transport == MG_Config::TransportMode::Monolith) return;
         // ClientSession::Stop IS table 3's whole order and it is idempotent: publish and wait
         // for the server to drain (bounded - a lost record must be a red lane, not a hung
@@ -245,6 +400,19 @@ namespace MobileGL::MG_Backend {
     }
 #endif
 
+#if MOBILEGL_BUILD_DISAGGREGATED
+    // The spawn server's entry into the SAME bring-up the inproc server role
+    // runs (ServerRole.h). A thin forwarder on purpose: the body stays in the
+    // anonymous namespace beside InitSplitRoles so the two cannot drift.
+    //
+    // THE WHOLE FUNCTION IS INSIDE THE GUARD, not just its body. A version with
+    // the guard inside still DEFINES the symbol in a pull build, and G1 caught
+    // it: 2 symbols added, 1 removed, .text +16 bytes. The pull build's identity
+    // is byte-for-byte, and "it returns false there" is not the same as "it is
+    // not there".
+    Bool InitServerRoleForSpawn() { return InitServerRoleCommon(); }
+#endif
+
     void Init() {
         MGLOG_D("Initializing MobileGL Backend...");
 
@@ -253,40 +421,14 @@ namespace MobileGL::MG_Backend {
         // is a `constexpr Monolith` (Config.h) and this whole statement is discarded, so the
         // pull build gains no symbol, no branch and no byte - which is what G1 measures.
         if (MG_Config::Transport != MG_Config::TransportMode::Monolith) {
-            if (!InitSplitRoles()) {
-                // NOT a fallback to the switch. pActiveBackendObject stays null and the next GL
-                // call fails loudly, which is the only honest outcome: the operator asked for a
-                // transport this process could not bring up.
-                pActiveBackendObject = nullptr;
-                return;
-            }
-            Bool remoteResult = InitSpecificBackendLibs();
-            if (!remoteResult) {
-                MGLOG_W("Failed to initialize MobileGL backend libraries for the remote object");
-                return;
-            }
-            // m-6, re-worded per review v2 N-8. The honesty cross-check runs a SECOND time, now
-            // that step 4's pActiveBackendObject (the client's BackendObject_Remote) exists and
-            // its Initialize() has run inside InitSpecificBackendLibs. What the re-run CAN catch
-            // is a table that was REMOVED between step 2 and here (the claim would then be a lie
-            // again). What it cannot catch - and its first comment claimed it could - is a client
-            // object that REGISTERED a table of its own: that leaves "is a table registered"
-            // true. Only the pointer tells those apart, so the table is compared against the one
-            // step 2 saw and a swap is refused by name: the applier would otherwise dispatch the
-            // server's resource records into the CLIENT object's table under its feet.
-            AssertConsumerMaskIsHonest(ConsumedSubsystemsFor(MG_Config::ActiveBackendType));
-            if (MG_Pipe::MGPipeGetResourceOps() != g_resourceOpsAtStep2) {
-                MGLOG_F("MGPipe: Fatal{ConsumerMaskLie, \"resource ops table replaced\"} - the "
-                        "resource op table MGPipeGetResourceOps() answers with is not the one the "
-                        "server's backend registered at step 1 (%p now, %p then). Something between "
-                        "ServerSession::Accept and the client object's Initialize() registered its "
-                        "own table, and the applier would dispatch every resource record into it. A "
-                        "mask is a statement about the server's backend, and so is the table",
-                        static_cast<const void*>(MG_Pipe::MGPipeGetResourceOps()),
-                        static_cast<const void*>(g_resourceOpsAtStep2));
-                std::abort();
-            }
-            LogBackendInfo();
+            // F1: MobileGL::Initialize now brings the split roles up BEFORE MG_State::Init(),
+            // through InitSplitRolesBeforeState() below, so by the time Init() is reached on
+            // that path the work is done. A DIRECT caller - a unit fixture that calls
+            // MG_Backend::Init() itself - still gets the whole bring-up here. The flag rather
+            // than `pActiveBackendObject == nullptr`, because a bring-up that FAILED leaves
+            // that pointer null too and retrying it would refuse at CreateBackend's
+            // m_backend != nullptr guard with a second, misleading line.
+            if (!g_splitBackendBroughtUp) InitSplitBackend();
             return;
         }
 #endif

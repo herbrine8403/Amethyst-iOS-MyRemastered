@@ -171,6 +171,17 @@ namespace MobileGL::MG_Remote::Transport {
         // bell that cannot die.
         virtual bool Dead() const { return false; }
 
+        // P6 `dl`: DEAD AND DEAD-BECAUSE-THE-PEER-DIED ARE NOT THE SAME FACT, and only the
+        // second one is a device loss. Dead() is also true after an ORDERLY teardown -
+        // CondVarDoorbell::Kill() is how Stop() wakes a parked applier, and the barrier reports
+        // SessionWait::ShutDown for that too. Latching device-lost from Dead() would therefore
+        // arm it on every clean exit.
+        //
+        // This says the peer HUNG UP: a descriptor whose far end only the peer held reported
+        // hangup. Nothing this side did can produce it. False for every doorbell that has no
+        // peer process, which is what makes the whole latch a no-op under inproc and monolith.
+        virtual bool PeerHungUp() const { return false; }
+
         // How many Wait() calls on this bell exhausted their spin budget and
         // really blocked. THE WAIT LEDGER'S RAW READING: the pair (waits, parks)
         // is what says whether the spin budget is sized for the workload, and it
@@ -249,7 +260,7 @@ namespace MobileGL::MG_Remote::Transport {
             // caller asked for is no longer charged against its timeout, so the
             // total is bounded by `timeoutMs + the spin budget` rather than by
             // `timeoutMs`. spinUs is 50 by default and the timeouts that reach
-            // here are milliseconds (the verb barrier's 30 s, the drain's bound),
+            // here are milliseconds (the verb barrier's budget, the drain's bound),
             // so the drift is under a part in a thousand - and erring LONG is the
             // safe direction for a deadline whose expiry is reported as a timeout.
             const auto deadline = timeoutMs == kWaitForever
@@ -397,14 +408,51 @@ namespace MobileGL::MG_Remote::Transport {
         // When `ownsFd` the descriptor is closed with this object. `code` is
         // the byte written by Notify.
         SocketDoorbell(int fd, std::uint8_t code, bool ownsFd);
+
+        // P6: PARK AND NOTIFY ON DIFFERENT DESCRIPTORS.
+        //
+        // The single-fd form above is the cross-process one: send() on this end
+        // is delivered to the PEER's end, so the peer's own SocketDoorbell is
+        // what receives it. That is correct, and it is also why the single-fd
+        // form cannot wake ITSELF - and the server needs exactly that, because
+        // its control pump posts into the apply thread's mailbox and must ring
+        // the bell that thread is parked on. Under inproc CondVarDoorbell has no
+        // such split: notify and wait are the same object.
+        //
+        // So: `parkFd` is polled, `notifyFd` is written. For a socketpair where
+        // this side holds both ends they are [0] and [1], and a peer that must
+        // also be able to ring it gets a DUP of [1]. `parkFd` may be -1 for a
+        // bell this side only ever RINGS - Park then returns immediately, which
+        // is the honest answer for an object that was never a waiter.
+        SocketDoorbell(int parkFd, int notifyFd, std::uint8_t code, bool ownsFds);
         ~SocketDoorbell() override;
 
         void Notify() override;
         bool Park(std::uint32_t timeoutMs) override;
         void Reset() override;
-        bool Dead() const override { return m_dead; }
+        bool Dead() const override { return m_dead.load(std::memory_order_acquire); }
+        bool PeerHungUp() const override { return m_peerHungUp.load(std::memory_order_acquire); }
 
         int Fd() const { return m_fd; }
+
+        // P6 `dl` (CONTRACT-P6 D5c). THE DESCRIPTOR THAT ANSWERS "IS THE PEER STILL THERE",
+        // which for this object can never be the one it parks on.
+        //
+        // The client parks on clientBell[0] and rings ITSELF through clientBell[1], so it holds
+        // BOTH ends of that socketpair. EOF arrives only when every writer closes and the client
+        // is one of them, so that descriptor cannot hang up no matter what happens to the server.
+        // A bell that can wake itself is a bell that cannot hear a death. Measured: a server that
+        // died on its first Clear left the client waiting out the full 120 s barrier and
+        // reporting Fatal{BarrierTimeout} - the wrong diagnosis, two minutes late.
+        //
+        // The witness is a descriptor whose FAR END ONLY THE PEER HOLDS - in practice the control
+        // socket. It is NOT OWNED here and is NEVER READ FROM: Park adds it to the poll set with
+        // `events` asking for hangup ALONE, so a control reply sitting unread in its queue cannot
+        // wake the bell and cannot be consumed from under SocketTransport's reassembler. What it
+        // contributes is exactly one fact, and only once: the peer is gone.
+        //
+        // -1 disables it, which is what every bell that has no peer socket uses.
+        void SetDeathWitness(int fd) { m_witnessFd = fd; }
 
     private:
         // Consumes every queued wakeup byte and returns how many. Latches
@@ -413,10 +461,18 @@ namespace MobileGL::MG_Remote::Transport {
         // afterwards.
         std::uint64_t Drain();
 
-        int m_fd;
+        int m_fd;       // polled
+        int m_notifyFd; // written; equals m_fd in the single-fd (cross-process) form
+        int m_witnessFd = -1; // polled for hangup only; NOT owned, NEVER read
+        // Set ONLY by the witness branch of Park, never by Kill or by our own EOF. See
+        // Doorbell::PeerHungUp for why the distinction is the whole design.
+        std::atomic<bool> m_peerHungUp{false};
         std::uint8_t m_code;
         bool m_ownsFd;
-        bool m_dead = false;
+        // ATOMIC BECAUSE THE LATCH READS IT ACROSS THREADS. Park() runs on whichever thread is
+        // waiting; the device-lost latch is consulted from the GL thread and from
+        // glGetGraphicsResetStatus. It was a plain bool while Dead() had no cross-thread reader.
+        std::atomic<bool> m_dead{false};
     };
 #endif
 

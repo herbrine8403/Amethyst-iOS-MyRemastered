@@ -1,8 +1,8 @@
 #!/bin/bash
 # THE RETRACE-SPLIT LANE'S NEGATIVE CONTROL: a PULL library must red this split retrace.
 #
-# This file is the body of .github/workflows/test.yml's "Negative control - the PULL library must
-# red this split retrace" step, extracted for the reason given at the top of
+# This file is the body of .github/workflows/test.yml's "Negative control (pull library)" step in
+# the retrace-split job, extracted for the reason given at the top of
 # scripts/ci/split_negative_controls.sh: a `run:` block is unreviewable and untestable off a
 # runner, and scripts/ci/control_smoke_test.sh now runs THIS file rather than a hand-made copy.
 #
@@ -49,9 +49,35 @@ PULL_LIBRARY="${PULL_LIBRARY:?PULL_LIBRARY must name the pull build libMobileGL.
 FROZEN_LIBRARY="${FROZEN_LIBRARY:?FROZEN_LIBRARY must name the path the cases have baked in}"
 mkdir -p "${CONTROL_TMPDIR}"
 
-# run_trace_case.cmake's own sentence for "this library never resolved the transport". Anchored on
-# the distinctive clause rather than on the whole paragraph, which carries substituted paths.
-EVIDENCE='never reported resolving it'
+# run_trace_case.cmake's own sentences for "this library never resolved the transport", one per
+# line (grep -F takes its patterns newline-separated). Anchored on the distinctive clause rather
+# than on the whole paragraph, which carries substituted paths.
+#
+# TWO SENTENCES SINCE P6's LOG RENAME, and the second is the one a pull library actually gets.
+# A pull build has one log role and writes MOBILEGL_LOG_FILE_PATH unchanged - output/mobilegl.log
+# (MG_Util/Debug/Log.h, the pull arm of RoleLogPath) - while the disaggregated build's readers,
+# run_trace_case.cmake among them, read output/mobilegl.client.log. So the pull library never
+# reaches the marker search that says "never reported resolving it": the runner stops one check
+# earlier, at "the run wrote no <client log>, so there is no evidence the transport ever
+# resolved". Both are the transport-identity assertion refusing the same library for the same
+# reason (a pull build has no split log for the marker to be in); neither is a loader failure, a
+# missing fixture, a timeout or an SSIM drop, which are the reds hole 2 below exists to refuse.
+# MEASURED on the B3 package tree with the real ctest and the real pull library: with only the
+# first sentence here, the control exited 1 through hole 2 on every pull-library run - the step
+# had been red for no product reason since the rename. scripts/ci/testdata/stub_ctest.sh's
+# retrace-evidence-nolog mode reproduces the shape.
+EVIDENCE='never reported resolving it
+no evidence the transport ever resolved'
+# EVERY LINE OF EVIDENCE IS A PATTERN, SO AN EMPTY LINE IS A PATTERN THAT MATCHES EVERYTHING. A
+# trailing newline, or a blank line between the two sentences, would turn hole 2's check below
+# into "any red will do". The smoke test's "red without the transport-resolution message" case
+# would catch that (22/23), but only once somebody ran it; this refuses it here, before the
+# selection is counted or the library is swapped.
+case "${EVIDENCE}" in
+  *$'\n\n'*|*$'\n'|$'\n'*)
+    echo "::error::EVIDENCE carries an empty grep -F pattern (a blank line or a leading/trailing newline), which would match every failure"
+    exit 1;;
+esac
 
 selector="^MobileGLTraceReplay\.${CASE}\.${BACKEND}$"
 
@@ -105,7 +131,12 @@ if [ "${remote_count}" -ne 0 ]; then
 fi
 
 out="${CONTROL_TMPDIR}/retrace-control-output.txt"
-export MOBILEGL_TRANSPORT=inproc
+# THE TRANSPORT COMES FROM THE JOB, not from this file. retrace-split is a matrix over
+# {backend, case, transport} as of P6, and a control that hard-coded `inproc` would have gone on
+# proving something about the OTHER arm while the spawn arm ran unguarded. Default inproc so a
+# caller that sets nothing behaves exactly as before.
+transport="${SPLIT_TRANSPORT:-inproc}"
+export MOBILEGL_TRANSPORT="${transport}"
 "${CTEST}" -V --no-tests=error --timeout 10800 -R "${selector}" > "${out}" 2>&1
 control_rc=$?
 cat "${out}"
@@ -124,8 +155,11 @@ fi
 # width: "never reported resolving it" arrives split over two lines with a two-space continuation
 # indent, and a line-oriented grep for the literal finds nothing. That is not hypothetical - it is
 # the shape the stub reproduces in scripts/ci/testdata/stub_ctest.sh.
-if ! tr -s '[:space:]' ' ' < "${out}" | grep -qF "${EVIDENCE}"; then
-  echo "::error::the split retrace went red (ctest exit ${control_rc}) with the pull library in place, but the failure never says the library did not resolve the transport - run_trace_case.cmake's \"${EVIDENCE}\" is absent from the output. A loader failure, a missing fixture, a timeout or an SSIM drop all land here, and none of them establishes that the transport-identity assertion is what caught the pull library. Only 'non-zero ctest' used to be checked (ID-46 finding 8b)."
+# `ctest -V` ALSO PREFIXES EVERY OUTPUT LINE WITH "<test number>: ", continuation lines included,
+# so without stripping it first the folded text reads "never 1: reported resolving it" and the
+# control reds on the very sentence it is looking for (the *-prefixed stub modes).
+if ! sed -E 's/^[0-9]+: //' "${out}" | tr -s '[:space:]' ' ' | grep -qF "${EVIDENCE}"; then
+  echo "::error::the split retrace went red (ctest exit ${control_rc}) with the pull library in place, but the failure never says the library did not resolve the transport - neither of run_trace_case.cmake's sentences (\"${EVIDENCE//$'\n'/\" / \"}\") is in the output. A loader failure, a missing fixture, a timeout or an SSIM drop all land here, and none of them establishes that the transport-identity assertion is what caught the pull library. Only 'non-zero ctest' used to be checked (ID-46 finding 8b)."
   exit 1
 fi
 

@@ -185,14 +185,60 @@ if (MSVC)
 endif()
 
 # Generate MGGitHash.h
+#
+# RESULT_VARIABLE, WHICH THIS CALL DID NOT HAVE (CONTRACT-P6 4.2). Without it a failed
+# `git rev-parse` yields "" and nothing says so. Verified live: building this worktree from WSL
+# produces an EMPTY hash, because the worktree's `.git` is a file holding a WINDOWS path that
+# WSL's git cannot resolve - so two builds from different commits got IDENTICAL ABI
+# fingerprints and the stamp silently stopped doing its documented job.
 execute_process(
     COMMAND git rev-parse HEAD
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     OUTPUT_VARIABLE GIT_COMMIT_HASH_FULL
     OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE MOBILEGL_GIT_STAMP_RESULT
+    ERROR_QUIET
 )
 
 string(SUBSTRING "${GIT_COMMIT_HASH_FULL}" 0 7 GIT_COMMIT_HASH_SHORT)
+
+# --- the BUILD STAMP, and why it is a second pair rather than a fix to the first -------------
+#
+# GIT_COMMIT_HASH_SHORT MAY NOT MOVE. It is baked into glGetString(GL_VERSION)
+# (MG_Impl/GLImpl/Getter/GL_Getter.cpp), so redefining it changes an APPLICATION-VISIBLE GL
+# string and the pull build's .rodata - a behaviour leak and a G1 break at once. The handshake
+# gets its own pair instead, consumed only by the ABI fingerprint, which no pull build compiles.
+#
+# PRESENT IS A FIRST-CLASS INPUT, not the emptiness of VALUE. "this build has no stamp" and
+# "this build's stamp is the empty string" are different claims, and a fingerprint that could
+# not tell them apart is how two unrelated builds agreed in the first place.
+#
+# -DMOBILEGL_BUILD_STAMP=<anything> (or the environment variable) overrides, because a tree git
+# cannot read is not always a tree whose commit is unknown - CI has ${GITHUB_SHA} in hand.
+set(MOBILEGL_BUILD_STAMP "" CACHE STRING "Explicit ABI-fingerprint build stamp when git cannot be read")
+set(MOBILEGL_BUILD_STAMP_VALUE "")
+if(NOT "${MOBILEGL_BUILD_STAMP}" STREQUAL "")
+    set(MOBILEGL_BUILD_STAMP_VALUE "${MOBILEGL_BUILD_STAMP}")
+elseif(NOT "$ENV{MOBILEGL_BUILD_STAMP}" STREQUAL "")
+    set(MOBILEGL_BUILD_STAMP_VALUE "$ENV{MOBILEGL_BUILD_STAMP}")
+elseif(MOBILEGL_GIT_STAMP_RESULT EQUAL 0 AND NOT "${GIT_COMMIT_HASH_FULL}" STREQUAL "")
+    set(MOBILEGL_BUILD_STAMP_VALUE "${GIT_COMMIT_HASH_FULL}")
+endif()
+
+if("${MOBILEGL_BUILD_STAMP_VALUE}" STREQUAL "")
+    set(MOBILEGL_BUILD_STAMP_PRESENT 0)
+    # A WARNING AND NOT A FATAL: a build with no stamp is still a usable build, it just cannot
+    # prove that a peer was built from the same tree. Saying so once at configure time is the
+    # difference between a known limitation and the silent one 4.2 found.
+    message(WARNING
+        "MobileGL: no build stamp. `git rev-parse HEAD` failed (result "
+        "'${MOBILEGL_GIT_STAMP_RESULT}') and MOBILEGL_BUILD_STAMP was not set, so the ABI "
+        "fingerprint cannot distinguish two builds of the same sizes from different commits - "
+        "which is exactly what a stale MOBILEGL_IPC_SERVER_PATH looks like. Pass "
+        "-DMOBILEGL_BUILD_STAMP=<commit> to restore it.")
+else()
+    set(MOBILEGL_BUILD_STAMP_PRESENT 1)
+endif()
 
 configure_file(
     ${CMAKE_SOURCE_DIR}/MobileGL/MG_Util/Miscellany/MGGitHash.h.in
@@ -546,6 +592,9 @@ endif()
 if (MOBILEGL_BUILD_DISAGGREGATED)
     message(STATUS "MobileGL: disaggregated transport ON, appending MG_Remote sources")
     list(APPEND SOURCE_FILES
+        MobileGL/MG_Remote/Transport/ShmLink.cpp
+        MobileGL/MG_Remote/Transport/LinkMetrics.cpp
+        MobileGL/MG_Remote/Transport/StreamLink.cpp
         MobileGL/MG_Remote/Transport/Ring.cpp
         MobileGL/MG_Remote/Transport/Doorbell.cpp
         MobileGL/MG_Remote/Transport/ShmSegment.cpp
@@ -556,6 +605,8 @@ if (MOBILEGL_BUILD_DISAGGREGATED)
         MobileGL/MG_Remote/Transport/ShmSegmentWin32.cpp
         MobileGL/MG_Remote/Transport/FdPassing.cpp
         MobileGL/MG_Remote/Transport/InProcessTransport.cpp
+        MobileGL/MG_Remote/Transport/SocketTransport.cpp
+        MobileGL/MG_Remote/Transport/ControlInbox.cpp
         # Keeps MG_Util/Debug/Log.h - and through it the GL frontend's
         # umbrella header - out of the header-only wire code (WireLog.h).
         MobileGL/MG_Remote/Transport/WireLog.cpp
@@ -574,6 +625,9 @@ if (MOBILEGL_BUILD_DISAGGREGATED)
         # emitter that returns quietly is how a split lane runs monolith and
         # goes green (ARCHITECTURE.md 10.3).
         MobileGL/MG_Remote/CapsCodec.cpp
+        # P6 dl: the one place a session dies - Session::Fail's funnel (Fatal-family aware,
+        # publishes SessionFault, one telemetry point).
+        MobileGL/MG_Remote/FatalFunnel.cpp
         MobileGL/MG_Remote/Wire/PipeWireCodec.cpp
         MobileGL/MG_Remote/Client/ClientSession.cpp
         MobileGL/MG_Remote/Client/EmitTables.cpp
@@ -595,6 +649,21 @@ if (MOBILEGL_BUILD_DISAGGREGATED)
         MobileGL/MG_Remote/Server/ServerSession.cpp
         MobileGL/MG_Remote/Server/PipeApplier.cpp
         MobileGL/MG_Remote/Server/ServerLoop.cpp
+        MobileGL/MG_Remote/Server/ServerMain.cpp
+        MobileGL/MG_Remote/Server/ServerSpawn.cpp
+        # P5f fc: the value frame that replaced the control mailbox's function-pointer payload,
+        # and its codec against protocol.fbs's SurfaceOp/SurfaceReply (the spawn arm's seam).
+        MobileGL/MG_Remote/Server/SurfaceControlFrame.cpp
+        MobileGL/MG_Remote/Protocol/SurfaceOpCodec.cpp
+        # P12 (on-screen server window): the process-wide holder of the server's own window
+        # (the display Activity's SurfaceView on Android; nobody installs one on the host, so a
+        # ServerOwned request is refused by name there).
+        MobileGL/MG_Remote/Server/ServerDisplay.cpp
+        # P7 gate 5 (g5-msprobe): the Magma wire arm's two multisample depth/stencil resolve
+        # arms and the probe that measures the first against the second, shared by the
+        # renderer's bring-up and the Vulkan POST. Wire-only - the monolith records neither arm -
+        # so it stays out of the pull build (gate G1).
+        MobileGL/MG_Backend/DirectVulkan/Renderer/WireDepthResolveProbe.cpp
     )
 endif()
 
@@ -612,6 +681,14 @@ if (ANDROID)
         MobileGL/MG_Util/SelfTest/DriverPostJni.cpp
         MobileGL/MG_Util/SelfTest/DriverBenchJni.cpp
     )
+    if (MOBILEGL_BUILD_DISAGGREGATED)
+        # P12 (on-screen server window): the trace APK's MobileGLDisplayActivity - the in-process
+        # display server's thread, its SurfaceView's ANativeWindow in and out of ServerDisplay, and
+        # the geometry up-call. Split build only: nothing else has an in-process server to drive.
+        list(APPEND SOURCE_FILES
+            MobileGL/MG_Remote/Server/DisplayServerJni.cpp
+        )
+    endif()
 endif()
 
 if (WIN32)
@@ -919,20 +996,89 @@ endif()
 # Off by default and ANDROID-only, so no shipping configuration builds it. The
 # trace flavour of the plugin APK turns it on (android-plugin/build.gradle).
 # ---------------------------------------------------------------------------
-if (ANDROID AND MOBILEGL_BUILD_SERVER_SPIKE)
+# ---------------------------------------------------------------------------
+# P6 `sm`: the REAL server image. Unlike MOBILEGL_BUILD_SERVER_SPIKE below - the
+# P0 spike, which links no MobileGL library and exists only to prove the Android
+# delivery chain - this one links the library and runs mobilegl_server_main.
+#
+# ARCHITECTURE.md:496 called for a ~30-line stub that dlopen's libMobileGL.so and
+# dlsym's the entry point, so one shared library serves both roles. On a desktop
+# configure we link it directly instead: there is no APK packaging rule to satisfy
+# and a direct link is what makes an undefined symbol a BUILD error rather than a
+# runtime dlsym failure in a child whose stderr is /dev/null.
+#
+# Android keeps the lib*.so naming and the nativeLibraryDir output the spike
+# proved is the only exec-able location in an APK.
+if (MOBILEGL_BUILD_DISAGGREGATED AND NOT WIN32)
     add_executable(MobileGLServer
+        ${CMAKE_CURRENT_SOURCE_DIR}/MobileGL/MG_Remote/Server/ServerEntry.cpp)
+
+    target_include_directories(MobileGLServer PRIVATE
+        ${MOBILEGL_INCLUDE_DIR})
+
+    target_link_libraries(MobileGLServer PRIVATE ${CMAKE_PROJECT_NAME})
+
+    set_target_properties(MobileGLServer PROPERTIES
+        POSITION_INDEPENDENT_CODE ON)
+    target_compile_options(MobileGLServer PRIVATE -fPIE)
+    target_link_options(MobileGLServer PRIVATE -pie)
+
+    # $ORIGIN, OR THE SERVER CANNOT START AT ALL ON ANDROID.
+    #
+    # This executable links libMobileGL.so, and it is EXEC'd rather than dlopen'd - so it gets a
+    # fresh linker namespace with the default search path, not the app's. An APK's lib/<abi>/ is
+    # not on that path, and the failure is the bluntest one there is:
+    #
+    #   F linker: CANNOT LINK EXECUTABLE ".../lib/arm64/libMobileGLServer.so":
+    #             library "libMobileGL.so" not found: needed by main executable
+    #
+    # It cost a device run to find because it is invisible on desktop: CMake gives build-tree
+    # targets an absolute RPATH automatically, so the WSL server resolved its dependency through a
+    # path that does not exist on a phone. $ORIGIN says "beside me", which is true in the APK, true
+    # in the build tree, and true wherever somebody copies the pair - and it is what makes a
+    # deployment that is NOT a build tree work at all, which the end state is.
+    # THE PROPERTIES, NOT target_link_options. A raw `-Wl,-rpath,$ORIGIN` reaches the generator
+    # unquoted and the SHELL expands $ORIGIN to nothing - measured on device, where the linker
+    # said `normalize_path - invalid input: "$"` and then failed to find libMobileGL.so anyway.
+    # BUILD_RPATH / INSTALL_RPATH are the supported spelling and CMake escapes them correctly.
+    set_target_properties(MobileGLServer PROPERTIES
+        BUILD_RPATH "$ORIGIN"
+        INSTALL_RPATH "$ORIGIN"
+        BUILD_WITH_INSTALL_RPATH TRUE)
+
+    if (ANDROID)
+        # An APK's only exec-able install location is lib/<abi>/, and the packager
+        # only puts a file there if it is named lib*.so. P0 spike A proved this
+        # works from the app's own untrusted_app domain on two devices.
+        set_target_properties(MobileGLServer PROPERTIES
+            PREFIX "lib" SUFFIX ".so" OUTPUT_NAME "MobileGLServer")
+        if (CMAKE_LIBRARY_OUTPUT_DIRECTORY)
+            set_target_properties(MobileGLServer PROPERTIES
+                RUNTIME_OUTPUT_DIRECTORY "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
+        endif()
+    else()
+        # Desktop: the name the dladdr fallback looks for beside libMobileGL.so.
+        set_target_properties(MobileGLServer PROPERTIES
+            PREFIX "lib" SUFFIX ".so" OUTPUT_NAME "MobileGLServer"
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+    endif()
+endif()
+
+if (ANDROID AND MOBILEGL_BUILD_SERVER_SPIKE)
+    # Renamed by P6 sm: the real server took the name it had been holding.
+    add_executable(MobileGLServerSpike
         ${CMAKE_CURRENT_SOURCE_DIR}/tools/spikes/server_stub/main.cpp)
 
     # An executable that is named like a shared library still has to be a real
     # PIE executable: Android has refused non-PIE executables since API 21, and
     # the name alone does not change what the loader demands of the file.
-    set_target_properties(MobileGLServer PROPERTIES
+    set_target_properties(MobileGLServerSpike PROPERTIES
         PREFIX "lib"
         SUFFIX ".so"
-        OUTPUT_NAME "MobileGLServer"
+        OUTPUT_NAME "MobileGLServerSpike"
         POSITION_INDEPENDENT_CODE ON)
-    target_compile_options(MobileGLServer PRIVATE -fPIE)
-    target_link_options(MobileGLServer PRIVATE -pie)
+    target_compile_options(MobileGLServerSpike PRIVATE -fPIE)
+    target_link_options(MobileGLServerSpike PRIVATE -pie)
 
     # AGP packages what the external native build drops into the per-ABI output
     # directory, and it selects by the .so extension. CMake puts executables in
@@ -940,7 +1086,7 @@ if (ANDROID AND MOBILEGL_BUILD_SERVER_SPIKE)
     # CMAKE_LIBRARY_OUTPUT_DIRECTORY, so point this target's runtime output at
     # the library directory when the generator gave us one.
     if (CMAKE_LIBRARY_OUTPUT_DIRECTORY)
-        set_target_properties(MobileGLServer PROPERTIES
+        set_target_properties(MobileGLServerSpike PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
     endif()
 endif()

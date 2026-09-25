@@ -29,18 +29,64 @@
 
 #pragma once
 
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
 #include <string>
 
+#if MOBILEGL_BUILD_DISAGGREGATED
+extern "C" void MGPipeSyncPeerLog();
+#endif
+
 namespace MGITest::PipeStatsWindow {
 
-    // The lane's private log path, or empty when the lane configured none.
-    inline std::string LibraryLogPath() {
-        const char* path = std::getenv("MOBILEGL_LOG_FILE_PATH");
-        return (path != nullptr && *path != '\0') ? std::string(path) : std::string();
+    // P6: MOBILEGL_LOG_FILE_PATH IS A BASE NAME, NOT A FILE. The library writes one log per
+    // ROLE - `<stem>.client<ext>` and `<stem>.server<ext>` - because under inproc both roles are
+    // threads of one process and a single file made every per-side assertion a search.
+    //
+    // THE RULE IS COPIED HERE AND IT HAS TO BE, which is worth stating because the obvious fix is
+    // to call the library's own MG_Util::Debug::RoleLogPath and delete this. That does not link:
+    // this module links the SHIPPING libMobileGL.so, built -fvisibility=hidden, and the role-path
+    // helpers are `t` (local) in it - only MG_Test, which links the static archive, may call them.
+    //
+    // SO THE COPY IS FLAVOUR-AWARE INSTEAD. That is the part the first copy got wrong: it derived
+    // `.client` in BOTH flavours, while the pull build has one role and writes
+    // MOBILEGL_LOG_FILE_PATH unchanged. In the verify lane it therefore opened a file that never
+    // existed and every reader reported "the library never logged" - a product failure that had
+    // not happened. Keep this `#if` and Log.cpp's RoleLogPath in step.
+    inline std::string RoleLogPath(const char* roleSuffix) {
+        const char* base = std::getenv("MOBILEGL_LOG_FILE_PATH");
+        if (base == nullptr || *base == '\0') return {};
+#if MOBILEGL_BUILD_DISAGGREGATED
+        std::string path(base);
+        const std::string::size_type slash = path.find_last_of("/\\");
+        const std::string::size_type dot = path.find_last_of('.');
+        if (dot == std::string::npos || (slash != std::string::npos && dot < slash)) {
+            return path + "." + roleSuffix;
+        }
+        return path.substr(0, dot) + "." + roleSuffix + path.substr(dot);
+#else
+        (void)roleSuffix;
+        return std::string(base);
+#endif
+    }
+
+    // The lane's private CLIENT log path, or empty when the lane configured none. In the pull
+    // build this IS the whole log.
+    inline std::string LibraryLogPath() { return RoleLogPath("client"); }
+
+    // The server role's half, or EMPTY when this build has no separate server half. Empty rather
+    // than "the same path again": every caller below concatenates the two, and a pull build that
+    // named one file twice would show each line twice - which reads as a doubled counter or a
+    // repeated diagnostic rather than as a path mistake.
+    inline std::string ServerLibraryLogPath() {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        return RoleLogPath("server");
+#else
+        return {};
+#endif
     }
 
     inline std::string ReadWholeFile(const std::string& path) {
@@ -48,6 +94,71 @@ namespace MGITest::PipeStatsWindow {
         std::ifstream file(path, std::ios::binary);
         if (!file.good()) return {};
         return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    }
+
+    inline std::string ReadFileSince(const std::string& path, std::uintmax_t offset) {
+        if (path.empty()) return {};
+        std::ifstream file(path, std::ios::binary);
+        if (!file.good()) return {};
+        file.seekg(static_cast<std::streamoff>(offset));
+        return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    }
+
+    // A "the log is this long right now" snapshot, ONE OFFSET PER ROLE.
+    //
+    // The scenarios that assert on arming take a mark before the workload and read what was
+    // appended after it, so that only bytes this case caused can satisfy - or refute - the claim.
+    // The roles are separate files, so this cannot be one scalar: a single offset applied to the
+    // concatenation would slide by however much the OTHER role happened to write, and the read
+    // would start mid-line in the wrong file.
+    struct LogMark {
+        std::uintmax_t client = 0;
+        std::uintmax_t server = 0;
+    };
+
+    inline std::uintmax_t FileSizeOrZero(const std::string& path) {
+        if (path.empty()) return 0;
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
+        if (!file.good()) return 0;
+        const std::streamoff size = file.tellg();
+        return size < 0 ? 0 : static_cast<std::uintmax_t>(size);
+    }
+
+    inline LogMark MarkLaneLog() {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        MGPipeSyncPeerLog();
+#endif
+        return LogMark{FileSizeOrZero(LibraryLogPath()), FileSizeOrZero(ServerLibraryLogPath())};
+    }
+
+    // BOTH ROLES, and for the arming diagnostics the SERVER's is the one that matters. Those lines
+    // are emitted by the BACKEND - "demoted to an ordinary varying", the reroute and emulation
+    // banners - and under inproc the backend runs on the apply thread, which is the server role.
+    // Reading only the client's half finds nothing and reports "the emulation is not armed",
+    // which is the most expensive possible way to be wrong: it accuses the product of a defect
+    // that the reader itself invented.
+    inline std::string ReadLaneLogSince(const LogMark& mark) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        MGPipeSyncPeerLog();
+#endif
+        return ReadFileSince(LibraryLogPath(), mark.client)
+               + ReadFileSince(ServerLibraryLogPath(), mark.server);
+    }
+
+    inline std::string ReadLaneLog() { return ReadLaneLogSince(LogMark{}); }
+
+    // THE SERVER HALF ALONE, for a claim whose whole content is WHICH ROLE said it. The
+    // concatenation above answers "did anyone report this", which is the right question for a
+    // diagnostic that could honestly come from either side; it is the wrong question for a
+    // control that exists to prove the SERVER's apply thread still runs the comparator, because
+    // the client's own entry compare reports the same field on the same verb and would satisfy a
+    // union search all by itself. Empty in a pull build (there is no server half), which a caller
+    // must read as "could not look" rather than as "the server said nothing".
+    inline std::string ReadServerLogSince(const LogMark& mark) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        MGPipeSyncPeerLog();
+#endif
+        return ReadFileSince(ServerLibraryLogPath(), mark.server);
     }
 
     // The last summary line in the log, verbatim. `found` is false when the library never emitted
@@ -70,7 +181,72 @@ namespace MGITest::PipeStatsWindow {
         return window;
     }
 
-    inline Window LastFromLaneLog() { return Last(ReadWholeFile(LibraryLogPath())); }
+    // BOTH ROLES, and the server's is where the numbers are. The `draws` / `vbs` counters
+    // increment in the backend's PrepareForDraw, which runs on the APPLY THREAD - the server
+    // role - so under inproc split the summary line lands in the server's log. Reading only the
+    // client's would find the "counters ON" banner (client-side) but no window, which reads as
+    // "the stats channel never reached the process". Concatenated, Last() takes whichever role
+    // emitted the final summary.
+    inline Window LastFromLaneLog() {
+        return Last(ReadLaneLog());
+    }
+
+    // ---- ONE ROLE AT A TIME, and P3b/P4b wave 2-D package D2 is why it had to exist -----------
+    //
+    // LastFromLaneLog() concatenates and takes the LAST window, which is the right answer for a
+    // counter only ONE role ever increments. It is the wrong answer for a claim that compares two
+    // roles' readings of the SAME records - TextureUploadShape's `tex[emit=]` (the server's) and
+    // `ctu=` (the client's) - because under SPAWN and TCP the two roles are two PROCESSES with two
+    // independent sets of counters. The client's line then carries `ctu=N tex[emit=0]` and the
+    // server's carries `ctu=0 tex[emit=N]`, and whichever line happens to be last answers BOTH
+    // questions with one role's numbers. The comparison silently becomes `N == 0` or `0 == N`.
+    //
+    // Under INPROC it happens to work either way - one process, one set of atomic counters, two
+    // log FILES - and that is exactly why this had to be written against the spawn shape rather
+    // than discovered by reading the inproc lane.
+    //
+    // Both return `found == false` where that role has no log (the pull build has no server half;
+    // a lane that configured no MOBILEGL_LOG_FILE_PATH has neither), which a caller must treat as
+    // "could not look" rather than as a zero.
+    inline Window LastFromClientLog() {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        MGPipeSyncPeerLog();
+#endif
+        return Last(ReadWholeFile(LibraryLogPath()));
+    }
+
+    inline Window LastFromServerLog() {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        MGPipeSyncPeerLog();
+#endif
+        return Last(ReadWholeFile(ServerLibraryLogPath()));
+    }
+
+    // ...AND SINCE A MARK, which is the form a counted window actually wants.
+    //
+    // The two above take the LAST summary line in the role's whole log, and that is one shutdown
+    // away from being the wrong line: the server writes a final, EMPTY window at teardown
+    // (frames=N window=0 draws=0, every counter zero), so a reader that runs after it - or that
+    // is slowed down enough for it to land first - reads four zeroes and reports them as the
+    // workload's shape. It has not bitten yet only because the scenarios read before teardown.
+    //
+    // Marking the log before the counted workload and reading only what was appended after
+    // removes the race entirely: with MOBILEGL_PIPE_STATS_PERIOD=1 the one eglSwapBuffers that
+    // closes the window emits exactly one line into that span, so "the last line since the mark"
+    // is that line and cannot be a later one.
+    inline Window LastFromClientLogSince(const LogMark& mark) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        MGPipeSyncPeerLog();
+#endif
+        return Last(ReadFileSince(LibraryLogPath(), mark.client));
+    }
+
+    inline Window LastFromServerLogSince(const LogMark& mark) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        MGPipeSyncPeerLog();
+#endif
+        return Last(ReadFileSince(ServerLibraryLogPath(), mark.server));
+    }
 
     // One counter out of that line, by its short name ("mpr", "draws", "csom"), or -1 when the
     // line does not carry it. The search includes the SEPARATOR before the name and the `=` after

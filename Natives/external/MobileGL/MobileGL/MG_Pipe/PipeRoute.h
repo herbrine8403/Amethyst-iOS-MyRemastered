@@ -144,6 +144,16 @@ namespace MobileGL::MG_Pipe {
     //                      `EncodeProgramArtifacts` on the monolith path, which `PipeApply.h`
     //                      explicitly promises it is not ("zero serialisation cost on the
     //                      monolith path").
+    //   SetProgramBindings THREE tails in three index spaces plus a PARALLEL NAME ARRAY
+    //                      (P5e, MG_Remote/CONTRACT-P5E.md §1/§5.5). One `varTail` +
+    //                      `varTailCount` pair cannot express three runs at all, and the
+    //                      fourth argument is not a run: the storage-override key is a
+    //                      `MGHostSpan` on the wire and a plain `const char*` under monolith,
+    //                      so the applier takes the resolved names beside the tail rather
+    //                      than resolving segments itself (rule C - a span retires with the
+    //                      record that named it, and the applier copies the bytes it keeps).
+    //                      The generated `gMGPipeContext.SetProgramBindings` row therefore
+    //                      STAYS NULL, which is what PipeCatalogueTest already pins.
     //
     // OVERTURN CONDITIONS, one per row: give `MGPResourceDesc` and `MGPFlushRange` a blobref
     // (overturns R-13.2/R-13.3, and c0 owns `MGPipeTypes.h`); give `MGPHandleOnly` a size
@@ -154,9 +164,19 @@ namespace MobileGL::MG_Pipe {
                                   const MGPRespecifiedLevel* level);
         void (*ResourceFlushRange)(const MGPFlushRange* record, const void* bytes);
         void* (*MapPersistent)(const MGPHandleOnly* handle, Uint64 size, const void* seedBytes);
+        // P5e (pg) grew this row by the STAGE LIST, and it belongs on the route rather than in
+        // the two structs: `SpirvArtifacts::generatedSpirv` is one module per shader object and
+        // the stage of each lives in `ProgramObject::m_linkedShaderSnapshot`, which is GL-thread
+        // state and not an artifact. The client arm frames it in front of the archive; the
+        // monolith arm ignores it, because its twin reads the snapshot directly.
         void (*CreateShaderState)(const MGPProgramDesc* desc,
                                   const MG_State::GLState::LinkArtifacts* link,
-                                  const MG_State::GLState::SpirvArtifacts* spirv);
+                                  const MG_State::GLState::SpirvArtifacts* spirv,
+                                  const Uint32* linkedStages, Uint32 linkedStageCount);
+        void (*SetProgramBindings)(const MGPProgramBindings* hdr, const Int32* blockBindings,
+                                   const MGPProgramSamplerUnit* samplerUnits,
+                                   const MGPProgramStorageOverride* storageOverrides,
+                                   const char* const* storageOverrideNames);
     };
     inline MGPipeRouteEscapes gMGPipeRouteEscapes{};
 
@@ -175,7 +195,7 @@ namespace MobileGL::MG_Pipe {
     // reaches the very same `MG_Impl/Pipe` emitters the client does, and a wire emitter there
     // publishes a record and then waits for the apply thread to apply it. That thread IS the
     // apply thread, so it waits for itself: `Fatal{BarrierTimeout, "ResourceRespecify"}`,
-    // logged by `mgl-srv-apply`, thirty seconds after bring-up starts.
+    // logged by `mgl-srv-apply` one barrier budget after bring-up starts.
     //
     // So the client emitters ask "am I the server role right now?" and, if so, run the
     // monolith adapter - which is exactly what `PipeWireCodec` already does on the decode side
@@ -267,12 +287,45 @@ namespace MobileGL::MG_Pipe {
     }
 
     // ---- resources ---------------------------------------------------------------------
+
+    // P5e (ra), CONTRACT-P5E §2.5 / ruling 15 (ID-93): DOES THIS SUB-DATA RECORD WANT ITS
+    // ANSWER? One predicate, two callers - this route and the wire emit table - because the
+    // route cannot pass a flag through the thunk (the call table's signature is the
+    // catalogue's) and two hand-written copies of "is this the buffer half" is exactly the
+    // drift that would make the client wait for an answer the emitter told the server not to
+    // bother with, or read a slot that was never posted.
+    //
+    // THE BUFFER HALF DOES NOT: its Bool is discarded at the only call site there is
+    // (MGPipeEmitResourceSubData), and because the row carries kReplySlot the client used to
+    // wait for it anyway - one full round trip per 64 KB persistent-map block, whose answer
+    // nobody looked at. THE TEXTURE HALF DOES: DrainTextureSubData clears the level's dirty
+    // flag on an ACCEPTED reply, so its answer is load-bearing (D-D5; making that half
+    // fire-and-forget is a trailing item, not this package's).
+    //
+    // The test is MGPSubData::Target == kMGPipeResourceTargetBuffer, whole field, which is the
+    // invariant MGPipeTypes.h asserts beside the packer and which the applier's own
+    // SubDataNamesABuffer already reads.
+    inline Bool MGPipeSubDataWantsItsReply(const MGPSubData& record) {
+        return record.Target != kMGPipeResourceTargetBuffer;
+    }
+
     inline Bool MGPipeRouteResourceSubData(const MGPSubData& record, const void* bytes,
                                            Uint64 byteCount,
                                            const MGPSubRegion* regions = nullptr) {
+        // THE SLOT IS STILL MINTED AND STILL TAKEN, even for the buffer half. The row keeps
+        // kReplySlot on the wire, the server still posts, and the mailbox's "every minted slot
+        // is taken" rule is what the next row's ReplyOverrun Fatal is looking for - so the
+        // half that does not WAIT still has to collect. What changes is that under run-ahead
+        // the emit table publishes and returns, and the answer it collects is the emitter's
+        // accept-by-construction rather than the server's.
         MGPReplySlot reply = MGPipeMintReplySlot();
         MGP_ResourceSubData(&record, bytes, byteCount, regions, record.RegionCount, &reply);
-        return MGPipeTakeReplyBool(reply, "resource_subdata");
+        const Bool accepted = MGPipeTakeReplyBool(reply, "resource_subdata");
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // A cancelled wire upload is declined even when no server reply was requested.
+        if (MGPipeInstalledArm() == MGPipeRouteArm::kClientWire) return accepted;
+#endif
+        return MGPipeSubDataWantsItsReply(record) ? accepted : true;
     }
     inline void MGPipeRouteBufferSubDataResident(const MGPSubData& record, const void* bytes,
                                                  Uint64 byteCount) {
@@ -381,11 +434,24 @@ namespace MobileGL::MG_Pipe {
         MGP_SetShaderImages(&hdr, tail, hdr.Count);
     }
 
+    // ---- indexed buffer binding points (P5e, sb) ----------------------------------------
+    //
+    // ONE ROUTE FOR THREE RECORDS: the class is a FIELD, not an opcode, so Uniform,
+    // ShaderStorage and AtomicCounter all come through here and the applier keys on hdr.Class.
+    // The second var-tail (MGHostSpan[HostSpanCount], D-B8) is never present on Espryt -
+    // kCapNeedsHostUboBytes is 0 for the whole of P5 - so this wrapper states one tail, and the
+    // codec's honesty pass is the guard that says so out loud if a backend ever asks for the
+    // other one.
+    inline void MGPipeRouteSetShaderBuffers(const MGPShaderBuffers& hdr, const MGPBufferRange* tail) {
+        MGP_SetShaderBuffers(&hdr, tail, hdr.Count);
+    }
+
     // ---- programs ----------------------------------------------------------------------
     inline void MGPipeRouteCreateShaderState(const MGPProgramDesc& desc,
                                              const MG_State::GLState::LinkArtifacts* link,
-                                             const MG_State::GLState::SpirvArtifacts* spirv) {
-        gMGPipeRouteEscapes.CreateShaderState(&desc, link, spirv);
+                                             const MG_State::GLState::SpirvArtifacts* spirv,
+                                             const Uint32* linkedStages, Uint32 linkedStageCount) {
+        gMGPipeRouteEscapes.CreateShaderState(&desc, link, spirv, linkedStages, linkedStageCount);
     }
     inline void MGPipeRouteBindShaderState(const MGPHandleOnly& handle) {
         MGP_BindShaderState(&handle);
@@ -402,6 +468,18 @@ namespace MobileGL::MG_Pipe {
     inline void MGPipeRouteSetGlobalConstants(const MGPGlobalConstants& record, const void* bytes,
                                               Uint64 byteCount) {
         MGP_SetGlobalConstants(&record, bytes, byteCount);
+    }
+    // P5e (pg), opcode 80. The fifth escape; see MGPipeRouteEscapes above for why this row has
+    // no generated shape. `storageOverrideNames` is index-aligned with `storageOverrides` and
+    // is what the applier copies into the record - the MGHostSpan inside each override element
+    // describes where the name lives on the WIRE and is resolved by the decoder, never here.
+    inline void MGPipeRouteSetProgramBindings(const MGPProgramBindings& hdr,
+                                              const Int32* blockBindings,
+                                              const MGPProgramSamplerUnit* samplerUnits,
+                                              const MGPProgramStorageOverride* storageOverrides,
+                                              const char* const* storageOverrideNames) {
+        gMGPipeRouteEscapes.SetProgramBindings(&hdr, blockBindings, samplerUnits, storageOverrides,
+                                               storageOverrideNames);
     }
 
 } // namespace MobileGL::MG_Pipe

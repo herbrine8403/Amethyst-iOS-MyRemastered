@@ -19,6 +19,9 @@
 
 #if MOBILEGL_PIPE_PUSH
 #include <Config.h>
+// P5e (sb): the binding-point shutter cases drive the REAL glBindBufferBase entry point,
+// because the claim they make is about what a frontend mutator publishes.
+#include <MG_Impl/GLImpl/Buffer/GL_Buffer.h>
 #include <MG_Impl/Pipe/CsoCache.h>
 #include <MG_Impl/Pipe/PipeFill.h>
 #include <MG_Impl/Pipe/SetHashSuppressor.h>
@@ -77,6 +80,7 @@ namespace {
     X(TrackerWalk, TheIndexBufferBitFiresWhenTheSlotVersionWrapsOntoADifferentBuffer) \
     X(TrackerWalk, ABaseInstanceSurvivesTheFirstWalkOnAFreshContext) \
     X(TrackerWalk, ASamplerBindAloneFiresTheSamplerStateBit) \
+    X(TrackerWalk, ARedundantDefaultBindStillPublishesAGrowingSamplerWindow) \
     X(TrackerWalk, ARestagedProgramPipelineFiresTheProgramBits) \
     X(TrackerWalk, ARelinkOfAStageProgramFiresTheProgramBits) \
     X(TrackerWalk, UseProgramZeroLeavesTheBoundPipelineDrivingTheProgramBits) \
@@ -85,11 +89,14 @@ namespace {
     X(TrackerWalk, AProgramSwitchAloneFiresTheSamplerViewBit) \
     X(TrackerWalk, ATextureParameterAloneFiresTheSamplerViewBit) \
     X(TrackerWalk, AProgramSwitchBetweenEqualImageUnitCountersFiresTheShaderImageBit) \
+    X(TrackerWalk, ARebindOfOneUniformPointToADifferentBufferFiresTheConstBufferBit) \
+    X(TrackerWalk, TheBindingPointBitsDoNotFireOnAnUnrelatedBufferWrite) \
     X(TrackerAttribPayload, AFloatWriteCarriesTheFloatBitsAndNamesItsClass) \
     X(TrackerAttribPayload, AnIntWriteCarriesTheIntWordsAndNamesItsClass) \
     X(TrackerAttribPayload, AUintWriteCarriesTheUintWordsAndNamesItsClass) \
     X(TrackerAttribPayload, TheSameNumbersWrittenThroughADifferentClassAreADifferentValue) \
     X(TrackerShippedEmitter, ABlendToggleThroughTheValidatePointMintsTwoCsos) \
+    X(TrackerShippedEmitter, CollidingVaoShuttersStillPublishTheCurrentElementsAndBufferWindow) \
     X(TrackerShippedEmitter, TheSteadyStateThroughTheValidatePointEmitsNothing) \
     X(TrackerShippedEmitter, APushedAttributeDefaultTheApplierCannotReproduceIsRepaired) \
     X(TrackerShippedEmitter, AViewportThroughTheValidatePointMintsNoCso) \
@@ -579,6 +586,76 @@ namespace {
     //
     // THIS IS THE ONE CASE THE OLD SHUTTER COULD NOT PASS, which is why it is here rather
     // than in the narrowing commit's prose.
+    // ---- P5e (sb): the indexed binding points, bits 15/16/17 -------------------------
+    //
+    // THE RED-ONCE FOR THE SHUTTER REWRITE (CONTRACT-P5E.md §5.6, brief red-once (b)). Until
+    // P5e all three bits shuttered on the buffer CONTENT aggregate, and glBindBufferBase moves
+    // a binding point through a returned reference - BindingSlotRange1D::Bind, which advances
+    // the slot's own Uint16 version - so this sequence fired NOTHING. Harmless while nothing
+    // was emitted for the bits; an under-fire the moment set_shader_buffers is, because the
+    // server would go on binding the first buffer. Same defect class as P4a's glBindSampler
+    // hole, closed the same way: the shutter reads the generation the mutator moves.
+    //
+    // The action under test is the BIND ITSELF, through the real GL entry point, because the
+    // claim is about what a frontend mutator publishes and not about what a generation does
+    // once bumped (ID-102).
+    TEST_F(TrackerWalk, ARebindOfOneUniformPointToADifferentBufferFiresTheConstBufferBit) {
+        GLuint a = 0;
+        GLuint b = 0;
+        MG_Impl::GLImpl::GenBuffers(1, &a);
+        MG_Impl::GLImpl::GenBuffers(1, &b);
+
+        MG_Impl::GLImpl::BindBufferBase(GL_UNIFORM_BUFFER, 1, a);
+        Walk();
+        Walk();
+        ASSERT_EQ(m_tracker.LastDirty() & MGPipeDirtyBit(MGPipeDirty::NewConstBuffers), 0u)
+            << "the steady state must be quiet before the interesting half of this case";
+
+        // The same point, a different buffer. Nothing about any buffer's CONTENTS moved.
+        MG_Impl::GLImpl::BindBufferBase(GL_UNIFORM_BUFFER, 1, b);
+        Walk();
+        EXPECT_NE(m_tracker.LastDirty() & MGPipeDirtyBit(MGPipeDirty::NewConstBuffers), 0u)
+            << "NEW_CONST_BUFFERS did not fire when a uniform binding point moved onto another "
+               "buffer - the emitted window would still name the first one";
+        // And the unbind, which is the case a shutter may least afford to miss: it leaves the
+        // high-water mark where it was, so nothing but the generation can carry it.
+        Walk();
+        ASSERT_EQ(m_tracker.LastDirty() & MGPipeDirtyBit(MGPipeDirty::NewConstBuffers), 0u);
+        MG_Impl::GLImpl::BindBufferBase(GL_UNIFORM_BUFFER, 1, 0);
+        Walk();
+        EXPECT_NE(m_tracker.LastDirty() & MGPipeDirtyBit(MGPipeDirty::NewConstBuffers), 0u)
+            << "NEW_CONST_BUFFERS did not fire for an unbind";
+        m_cache.Reset();
+    }
+
+    // The other half of the rewrite, and the reason it is a narrowing rather than a swap: the
+    // content aggregate LEFT all three bits, so a glBufferSubData into an unrelated buffer no
+    // longer republishes every binding-point set in the context. Whether the BYTES behind a
+    // bound buffer moved is the resource family's question, answered server-side by the
+    // resource record's own Serial; what these records carry is {handle, offset, size}.
+    TEST_F(TrackerWalk, TheBindingPointBitsDoNotFireOnAnUnrelatedBufferWrite) {
+        GLuint bound = 0;
+        MG_Impl::GLImpl::GenBuffers(1, &bound);
+        MG_Impl::GLImpl::BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, bound);
+        Walk();
+        Walk();
+        const Uint32 family = MGPipeDirtyBit(MGPipeDirty::NewConstBuffers) |
+                              MGPipeDirtyBit(MGPipeDirty::NewShaderBuffers) |
+                              MGPipeDirtyBit(MGPipeDirty::NewSoTargets);
+        ASSERT_EQ(m_tracker.LastDirty() & family, 0u)
+            << "the steady state must be quiet before the interesting half of this case";
+
+        const SharedPtr<MG_State::GLState::BufferObject> unrelated = Ctx().CreateBufferObject(64);
+        unrelated->Respecify(4096, nullptr);
+        Array<Uint8, 16> bytes{};
+        unrelated->UploadSubData(DataPtr{bytes.data(), bytes.size()}, 0);
+        ASSERT_NE(Ctx().GetAnyBufferChangeGeneration(), 0u) << "the buffer aggregate did move";
+        Walk();
+        EXPECT_EQ(m_tracker.LastDirty() & family, 0u)
+            << "a write to a buffer bound to no binding point republished the binding-point sets";
+        m_cache.Reset();
+    }
+
     TEST_F(TrackerWalk, TheIndexBufferBitDoesNotFireOnAnUnrelatedBufferWrite) {
         const SharedPtr<MG_State::GLState::BufferObject> indices = Ctx().CreateBufferObject(1);
         indices->Respecify(64, nullptr);
@@ -706,6 +783,18 @@ namespace {
             << "the view set is re-resolved on a sampler bind too - completeness depends on the "
                "effective sampler - and that half was already right";
         EXPECT_EQ(Walk(), 0u) << "the widened shutter fires forever";
+    }
+
+    TEST_F(TrackerWalk, ARedundantDefaultBindStillPublishesAGrowingSamplerWindow) {
+        Walk();
+        ASSERT_EQ(Walk(), 0u);
+        const Uint64 generation = Ctx().GetTextureBindGeneration();
+        Ctx().NoteTextureUnitTouched(7, false);
+        ASSERT_EQ(Ctx().GetTextureBindGeneration(), generation);
+        const Uint32 dirty = Walk();
+        EXPECT_NE(dirty & MGPipeDirtyBit(MGPipeDirty::NewSamplerViews), 0u);
+        EXPECT_NE(dirty & MGPipeDirtyBit(MGPipeDirty::NewSamplers), 0u);
+        EXPECT_EQ(Walk(), 0u);
     }
 
     // BITS 6/7/8 UNDER A SEPARABLE PROGRAM PIPELINE. GetCurrentProgram() is null for the whole
@@ -988,6 +1077,86 @@ namespace {
         Uint64 m_savedPush = 0;
         UniquePtr<GLContext> m_previous;
     };
+
+    TEST_F(TrackerShippedEmitter, CollidingVaoShuttersStillPublishTheCurrentElementsAndBufferWindow) {
+        MG_Config::Features.PipePush = kMGPipeSubsystemsMigratedAtP2 | kMGPipeSubsystemResources |
+                                       kMGPipeSubsystemVertexInput;
+        using MG_State::GLState::VertexArrayObject;
+        const SharedPtr<VertexArrayObject> a = Ctx().CreateVertexArrayObject(1);
+        const SharedPtr<VertexArrayObject> b = Ctx().CreateVertexArrayObject(2);
+        const auto buffer = Ctx().CreateBufferObject(1);
+        buffer->Respecify(256, nullptr);
+        for (Uint location : {0u, 1u}) {
+            a->SetAttributeFormat(location, location == 0 ? 3 : 2, DataType::Float32, false, 20,
+                                  location == 0 ? 0 : 12, false);
+            a->BindAttributeBuffer(location, buffer);
+            a->EnableAttribute(location);
+        }
+        b->SetAttributeFormat(0, 3, DataType::Float32, false, 12, 0, false);
+        b->BindAttributeBuffer(0, buffer);
+        b->EnableAttribute(0);
+
+        // Preserve the old collision independently of how production later mixes
+        // shutters. These ordinary small counter pairs really collide, rather
+        // than requiring a probabilistic 64-bit hash collision search.
+        constexpr Uint64 kCombine = 0x9e3779b97f4a7c15ull;
+        const auto oldMix = [](Uint64 identity, Uint64 version) {
+            return identity ^ (version + kCombine + (identity << 6) + (identity >> 2));
+        };
+        ASSERT_EQ(oldMix(1, 64), oldMix(2, 1));
+        ASSERT_EQ(oldMix(174, 37), oldMix(48, 8026)); // observed on Redmi while switching world draws
+        Uint32 versionA = 0, versionB = 0;
+        const Uint32 firstA = a->GetConfigVersion() + 64;
+        const Uint32 firstB = b->GetConfigVersion() + 1;
+        for (Uint32 candidate = firstA; candidate < firstA + 4096; ++candidate) {
+            const Uint64 hash = oldMix(a->GetLifetimeId(), candidate);
+            const Uint64 other = (hash ^ b->GetLifetimeId()) - kCombine -
+                                  (b->GetLifetimeId() << 6) - (b->GetLifetimeId() >> 2);
+            if (other < firstB || other >= firstB + 4096) continue;
+            versionA = candidate;
+            versionB = static_cast<Uint32>(other);
+            break;
+        }
+        ASSERT_NE(versionA, 0u) << "could not construct a bounded collision for these real VAO identities";
+        const auto advanceConfig = [](VertexArrayObject& vao, Uint32 version) {
+            // Change a disabled attribute, leaving the enabled 0/1 versus 0
+            // windows intact. No private lifetime/version field is overwritten.
+            while (vao.GetConfigVersion() < version) {
+                vao.SetAttributeFormat(31, 4, DataType::Float32, !vao.GetAttribute(31).Normalized,
+                                       16, 0, false);
+            }
+        };
+        advanceConfig(*a, versionA);
+        Ctx().BindVertexArray(1);
+        Draw();
+        const MGPipeHandle handleA = MGPipeApplier().BoundVertexElements;
+        ASSERT_FALSE(MGPipeHandleIsNull(handleA));
+        ASSERT_EQ(MGPipeApplier().VertexBufferCount, 2u);
+        ASSERT_TRUE(MGPipeApplier().VertexElementsCsos[handleA.Slot].Attributes[1].Enabled);
+
+        // Mutating B after A's draw moves the attribute aggregate. Before the
+        // repair this publishes B's Count=1 buffer set, but the colliding CSO
+        // shutter leaves A bound with attribute 1 still enabled: the phone's
+        // exact "buffer-window location=1 window=0+1" mismatch.
+        advanceConfig(*b, versionB);
+        ASSERT_EQ(oldMix(a->GetLifetimeId(), a->GetConfigVersion()),
+                  oldMix(b->GetLifetimeId(), b->GetConfigVersion()));
+        Ctx().BindVertexArray(2);
+        Draw();
+        const MGPipeHandle handleB = MGPipeApplier().BoundVertexElements;
+        ASSERT_FALSE(MGPipeHandleIsNull(handleB));
+        EXPECT_NE(handleB, handleA) << "a VAO identity change must publish its vertex-elements binding";
+        EXPECT_EQ(MGPipeApplier().VertexBufferCount, 1u);
+        EXPECT_FALSE(MGPipeApplier().VertexElementsCsos[handleB.Slot].Attributes[1].Enabled);
+
+        // Switching back moves no attribute aggregate: the exact identity pair
+        // must also re-open the buffer-family shutter, restoring Count=2.
+        Ctx().BindVertexArray(1);
+        Draw();
+        EXPECT_EQ(MGPipeApplier().BoundVertexElements, handleA);
+        EXPECT_EQ(MGPipeApplier().VertexBufferCount, 2u);
+        EXPECT_TRUE(MGPipeApplier().VertexElementsCsos[handleA.Slot].Attributes[1].Enabled);
+    }
 
     TEST_F(TrackerShippedEmitter, ABlendToggleThroughTheValidatePointMintsTwoCsos) {
         constexpr int kToggles = 16;

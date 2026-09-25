@@ -70,6 +70,25 @@ namespace MGITest {
         unsigned int totalVerbSlots = 0;
         // The encoder's highest produced record ordinal, or 0 when there is no session.
         unsigned long long emitSeq = 0;
+        // Real session state/watermarks. Only the client thread reads this snapshot;
+        // the scheduling observer below reads producerParked separately.
+        bool runAheadArmed = false;
+        // P7 wave 2 package C, OQ-10 (CONTRACT-P7 §5.4): kCapResidentSubData, as the CLIENT's
+        // caps mirror received it. This is the wire-level half of the bit's proof - the unit
+        // pair asserts that the SERVER derives it from its own resource table, and this says
+        // the client got what the server published, which is the only thing the frontend's
+        // MGPipeResourceOpsHaveSubDataResident can read under a transport.
+        //
+        // FALSE where the peek cannot look, like every field here, so a reader must have
+        // passed SplitRuntimeSkipReason() first: "no mirror" and "the bit was withheld" are
+        // the same false and completely different facts.
+        bool residentSubDataCap = false;
+        unsigned int presentCredit = 0;
+        unsigned long long appliedSeq = 0;
+        unsigned long long retiredSeq = 0;
+        unsigned long long presentAckSerial = 0;
+        unsigned long long presentCreditWaits = 0;
+
 
         // ---- the wire producer's ledger, for exit gates E3(e) and R-10's proof obligation ---
         //
@@ -78,8 +97,9 @@ namespace MGITest {
         // ring and 0 wraps in a process whose ring never filled are the same number and
         // completely different facts.
         //
-        // maxRecordBytes / maxRecordBytesCap: R-10 says P5 does no chunking and must prove it
-        // needs none. The cap is RingProducer::MaxRecordBytes() == MOBILEGL_IPC_RING_MB / 2,
+        // maxRecordBytes / maxRecordBytesCap: R-10's bound on a record's OWN bytes - the
+        // content rows cut their blobs at the stage chunk budget, nothing cuts the record. The
+        // cap is RingProducer::MaxRecordBytes() == MOBILEGL_IPC_RING_MB / 2,
         // read from the ring this process actually got rather than recomputed from the
         // environment.
         //
@@ -104,6 +124,18 @@ namespace MGITest {
     SplitRuntimeState PeekSplitRuntime();
     // Scheduling-only perturbation; never changes a watermark or counter.
     void DelaySplitRetirementForTesting(bool enabled);
+    // Holds the existing before-retire scheduling hook once, after a real drain
+    // batch. Never writes sequence numbers, caps, pixel state or production data.
+    // A two-second fail-safe releases a lockstep negative control without hanging.
+    bool ArmSplitApplyHoldForTesting();
+    bool WaitForSplitApplyHoldForTesting(unsigned int timeoutMs = 1000);
+    bool SplitApplyHoldIsActiveForTesting();
+    void ReleaseSplitApplyHoldForTesting();
+    bool SplitProducerIsParkedForTesting();
+    // Observe completion for assertions about an emitted frame; does not emit a
+    // GL command or change the production wait rule.
+    bool WaitForSplitAppliedForTesting(unsigned long long seq, unsigned int timeoutMs = 5000);
+
 
     // Empty when this process is a real split run that can be asserted about; otherwise the
     // reason to GTEST_SKIP() with, naming the first fact that is not true and the package that

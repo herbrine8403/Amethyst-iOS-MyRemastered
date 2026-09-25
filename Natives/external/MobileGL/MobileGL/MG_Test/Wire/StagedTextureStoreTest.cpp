@@ -22,6 +22,7 @@
 // staged bytes" a checked fact rather than a design intention.
 
 #include <Config.h>
+#include <MG_Util/Debug/Log.h>
 #include <MG_Backend/DirectGLES/Managers.h>
 #include <MG_Pipe/PipeApply.h>
 #include <MG_Remote/Server/StagedTextureStore.h>
@@ -51,9 +52,10 @@ namespace {
     std::string g_logPath;
 
     std::string ReadLog() {
-        std::ifstream in(g_logPath, std::ios::binary);
-        if (!in) return {};
-        return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        // BOTH ROLES' LOGS (P6). A death test asserts that the CHILD said something; which
+        // role's thread said it is not what these cases are about, and refusals raised on the
+        // apply thread are written under the SERVER role by construction.
+        return MobileGL::MG_Util::Debug::ReadRoleLogs(g_logPath.c_str());
     }
 
     unsigned ProcessId() {
@@ -73,6 +75,17 @@ namespace {
         return handle;
     }
 
+    // PH-4: resource_subdata lands only in a level a respecify DECLARED - the emitter's
+    // glTexImage*D always sends one before the bytes. The production cases below used to adopt
+    // into a level nothing had declared, which PH-4 refuses by name
+    // (Fatal{ProtocolCorruption, "StagedTextureStore.LevelExtent"}), so each now declares level 0
+    // of the Texture2D upload target at its 4x4x1 extent through the real applier entry point.
+    void DeclareTex2DLevel0(const MG_Pipe::MGPResourceDesc& desc, Uint32 width, Uint32 height) {
+        const MG_Pipe::MGPRespecifiedLevel level = MG_Pipe::MGPipeMakeRespecifiedLevel(
+            MG_Pipe::MGPipePackSubDataTarget(desc.Target, kTex2DTarget), 0, width, height, 1);
+        ASSERT_TRUE(MG_Pipe::MGPipeApplyResourceRespecify(desc, nullptr, &level));
+    }
+
 } // namespace
 
 // =====================================================================================
@@ -90,6 +103,7 @@ TEST(StagedTextureStoreTest, TheSplitArmCopiesAndSurvivesTheSourceBeingPoisoned)
 
     Vector<Uint8> staged(64, 0xAB);
     const IntVec3 extent{4, 4, 1};
+    splitStore.NoteLevelDefined(key, kTex2DTarget, 0, extent);
     const Uint8* splitBase = splitStore.Adopt(key, kTex2DTarget, 0, extent, staged.data(), staged.size());
     const Uint8* monolithBase =
         monolithStore.Adopt(key, kTex2DTarget, 0, extent, staged.data(), staged.size());
@@ -146,6 +160,91 @@ TEST(StagedTextureStoreTest, DefinednessIsTrackedAndAnExtentMoveDropsTheBytes) {
     EXPECT_EQ(store.LevelExtentOrUndefined(key, kTex2DTarget, 0), IntVec3(8, 8, 1));
 }
 
+TEST(StagedTextureStoreTest, AMutableNoncanonicalLevelKeepsItsExactDeclaredExtentAndBound) {
+    Server::StagedTextureStore store(/*copies=*/true);
+    const Uint64 key = Server::StagedTextureStore::KeyForHandle(TestHandle(41, 1));
+    const IntVec3 noncanonical{3, 2, 1};
+
+    store.NoteLevelDefined(key, kTex2DTarget, 2, noncanonical,
+                           static_cast<Uint8>(MG_Pipe::MGPipeResourceTarget::Tex2D),
+                           static_cast<Uint32>(TextureInternalFormat::RGBA8));
+    EXPECT_TRUE(store.IsLevelDefined(key, kTex2DTarget, 2));
+    EXPECT_EQ(store.LevelExtentOrUndefined(key, kTex2DTarget, 2), noncanonical)
+        << "a null-data mutable mip lost the exact extent accepted by resource_respecify";
+    EXPECT_EQ(store.LevelDeclaredByteBound(key, kTex2DTarget, 2), 24u);
+    EXPECT_FALSE(store.IsCovered(key, kTex2DTarget, 2));
+}
+
+// AN EMPTY LEVEL IS A DEFINITION (P7 gate 5). glTexImage1D(width 0) / glTexImage2D(0 x 0) are
+// legal GL and dEQP's state reset issues them after every case; the frontend reports the level's
+// exact extent as {0,1,1} / {0,0,1}. The store must take it as a definition that REPLACES the
+// level (the old run and its coverage go), answer the exact empty extent, and give it no byte
+// bound - never a session Fatal. A negative component (a carrier word past INT_MAX) stays one.
+TEST(StagedTextureStoreTest, AnEmptyLevelIsADefinitionWithNoByteBound) {
+    Server::StagedTextureStore store(/*copies=*/true);
+    const Uint64 key = Server::StagedTextureStore::KeyForHandle(TestHandle(42, 1));
+    constexpr Uint16 kTex1DTarget = static_cast<Uint16>(TextureUploadTarget::Texture1D);
+    const auto tex1D = static_cast<Uint8>(MG_Pipe::MGPipeResourceTarget::Tex1D);
+    const auto rgba8 = static_cast<Uint32>(TextureInternalFormat::RGBA8);
+
+    store.NoteLevelDefined(key, kTex1DTarget, 0, IntVec3{4, 1, 1}, tex1D, rgba8);
+    Vector<Uint8> bytes(16, 0x5A);
+    store.Adopt(key, kTex1DTarget, 0, IntVec3{4, 1, 1}, bytes.data(), bytes.size());
+    ASSERT_TRUE(store.IsCovered(key, kTex1DTarget, 0));
+
+    store.NoteLevelDefined(key, kTex1DTarget, 0, IntVec3{0, 1, 1}, tex1D, rgba8);
+    EXPECT_TRUE(store.IsLevelDefined(key, kTex1DTarget, 0)) << "an empty level still exists";
+    EXPECT_EQ(store.LevelExtentOrUndefined(key, kTex1DTarget, 0), IntVec3(0, 1, 1))
+        << "the store must answer the frontend's own exact extent for an empty level";
+    EXPECT_EQ(store.LevelDeclaredByteBound(key, kTex1DTarget, 0), 0u) << "an empty level has no texels";
+    EXPECT_EQ(store.LevelByteSize(key, kTex1DTarget, 0), 0u) << "the 4-texel run belongs to the old level";
+    EXPECT_FALSE(store.IsCovered(key, kTex1DTarget, 0));
+
+    // And back: the next non-empty definition takes its own bytes as usual.
+    store.NoteLevelDefined(key, kTex1DTarget, 0, IntVec3{2, 1, 1}, tex1D, rgba8);
+    Vector<Uint8> smaller(8, 0x3C);
+    store.Adopt(key, kTex1DTarget, 0, IntVec3{2, 1, 1}, smaller.data(), smaller.size());
+    EXPECT_TRUE(store.IsCovered(key, kTex1DTarget, 0));
+    EXPECT_EQ(store.LevelDeclaredByteBound(key, kTex1DTarget, 0), 8u);
+
+    // The 2D and 3D spellings of the same reset.
+    const Uint64 key2D = Server::StagedTextureStore::KeyForHandle(TestHandle(43, 1));
+    store.NoteLevelDefined(key2D, kTex2DTarget, 0, IntVec3{0, 0, 1},
+                           static_cast<Uint8>(MG_Pipe::MGPipeResourceTarget::Tex2D), rgba8);
+    EXPECT_EQ(store.LevelExtentOrUndefined(key2D, kTex2DTarget, 0), IntVec3(0, 0, 1));
+    const Uint64 key3D = Server::StagedTextureStore::KeyForHandle(TestHandle(44, 1));
+    constexpr Uint16 kTex3DTarget = static_cast<Uint16>(TextureUploadTarget::Texture3D);
+    store.NoteLevelDefined(key3D, kTex3DTarget, 0, IntVec3{0, 0, 0},
+                           static_cast<Uint8>(MG_Pipe::MGPipeResourceTarget::Tex3D), rgba8);
+    EXPECT_TRUE(store.IsLevelDefined(key3D, kTex3DTarget, 0));
+    EXPECT_EQ(store.LevelDeclaredByteBound(key3D, kTex3DTarget, 0), 0u);
+}
+
+// The wire half of the same rule: the carrier's only noncanonical shape is a depth word past
+// 32 bits. A zero component is an empty level, which the store above takes.
+TEST(StagedTextureStoreTest, AZeroExtentCarrierIsCanonicalAndAHighDepthWordIsNot) {
+    MG_Pipe::MGPResourceDesc desc{};
+    desc.Target = static_cast<Uint8>(MG_Pipe::MGPipeResourceTarget::Tex1D);
+    MG_Pipe::MGPipeSetRespecifiedLevel(desc, kTex2DTarget, 0, 0, 1, 1);
+    EXPECT_TRUE(MG_Pipe::MGPipeRespecifiedExtentCarrierIsCanonical(desc))
+        << "glTexImage1D(width 0) is legal GL; its carrier must not be refused";
+    MG_Pipe::MGPipeSetRespecifiedLevel(desc, kTex2DTarget, 0, 0, 0, 0);
+    EXPECT_TRUE(MG_Pipe::MGPipeRespecifiedExtentCarrierIsCanonical(desc));
+    desc.BufSize |= (Uint64{1} << 32);
+    EXPECT_FALSE(MG_Pipe::MGPipeRespecifiedExtentCarrierIsCanonical(desc));
+}
+
+TEST(StagedTextureStoreTest, MultisampleAndTextureBufferTargetsCannotAcceptStagedTexelBytes) {
+    EXPECT_FALSE(Server::StagedTextureTargetSupportsSubData(
+        static_cast<Uint8>(MG_Pipe::MGPipeResourceTarget::Tex2DMS)));
+    EXPECT_FALSE(Server::StagedTextureTargetSupportsSubData(
+        static_cast<Uint8>(MG_Pipe::MGPipeResourceTarget::Tex2DMSArray)));
+    EXPECT_FALSE(Server::StagedTextureTargetSupportsSubData(
+        static_cast<Uint8>(MG_Pipe::MGPipeResourceTarget::TexBuffer)));
+    EXPECT_TRUE(Server::StagedTextureTargetSupportsSubData(
+        static_cast<Uint8>(MG_Pipe::MGPipeResourceTarget::Tex2D)));
+}
+
 // Keys are independent, ResetLevels drops one resource's whole chain, Drop one key and
 // DropAll every one - the three events the contract names (respecify, destroy, context death)
 // each have their call site, and these are the answers those call sites rely on.
@@ -153,11 +252,15 @@ TEST(StagedTextureStoreTest, ResetDropAndDropAllForgetExactlyWhatTheyName) {
     Server::StagedTextureStore store(/*copies=*/true);
     const Uint64 a = Server::StagedTextureStore::KeyForHandle(TestHandle(5, 1));
     const Uint64 b = Server::StagedTextureStore::KeyForHandle(TestHandle(6, 1));
-    Vector<Uint8> bytes(16, 0x22);
+    Vector<Uint8> bytes4x4(64, 0x22);
+    Vector<Uint8> bytes2x2(16, 0x22);
 
-    store.Adopt(a, kTex2DTarget, 0, IntVec3{4, 4, 1}, bytes.data(), bytes.size());
-    store.Adopt(a, kTex2DTarget, 1, IntVec3{2, 2, 1}, bytes.data(), bytes.size());
-    store.Adopt(b, kTex2DTarget, 0, IntVec3{4, 4, 1}, bytes.data(), bytes.size());
+    store.NoteLevelDefined(a, kTex2DTarget, 0, IntVec3{4, 4, 1});
+    store.Adopt(a, kTex2DTarget, 0, IntVec3{4, 4, 1}, bytes4x4.data(), bytes4x4.size());
+    store.NoteLevelDefined(a, kTex2DTarget, 1, IntVec3{2, 2, 1});
+    store.Adopt(a, kTex2DTarget, 1, IntVec3{2, 2, 1}, bytes2x2.data(), bytes2x2.size());
+    store.NoteLevelDefined(b, kTex2DTarget, 0, IntVec3{4, 4, 1});
+    store.Adopt(b, kTex2DTarget, 0, IntVec3{4, 4, 1}, bytes4x4.data(), bytes4x4.size());
     ASSERT_EQ(store.TrackedResources(), 2u);
     ASSERT_EQ(store.TrackedLevelCount(a), 2u);
 
@@ -165,7 +268,8 @@ TEST(StagedTextureStoreTest, ResetDropAndDropAllForgetExactlyWhatTheyName) {
     EXPECT_FALSE(store.HasShadow(a)) << "a whole-resource respecify forgets every level";
     EXPECT_TRUE(store.IsCovered(b, kTex2DTarget, 0));
 
-    store.Adopt(a, kTex2DTarget, 0, IntVec3{4, 4, 1}, bytes.data(), bytes.size());
+    store.NoteLevelDefined(a, kTex2DTarget, 0, IntVec3{4, 4, 1});
+    store.Adopt(a, kTex2DTarget, 0, IntVec3{4, 4, 1}, bytes4x4.data(), bytes4x4.size());
     store.Drop(a);
     EXPECT_EQ(store.TrackedResources(), 1u);
     EXPECT_TRUE(store.IsCovered(b, kTex2DTarget, 0));
@@ -228,6 +332,164 @@ TEST(StagedTextureStoreTest, TheMipExtentDerivationKeepsArrayLayersFixed) {
               IntVec3(1, 1, 1)) << "shrinking clamps at 1, never 0";
 }
 
+// ==================== fix A2: one level, several staged runs ====================
+//
+// ONE RECORD'S BLOB IS STAGED WHOLE IN SEG_STAGE, so a level shadow larger than the segment's
+// chunk budget is cut by the CLIENT into whole-width slabs, one resource_subdata each
+// (TextureEmit.h's MGPipeForEachTextureSlab). The server's half of that is here: place each run
+// where its record says and answer "covered" only once the level is whole. All the runs of one
+// level arrive in ONE apply batch (one verb), so nothing reads between them in production; what a
+// case can assert is what the readers would see at each instant, and that is what these do.
+TEST(StagedTextureStoreTest, StageChunkRunsAssembleTheLevelImageAndAGapIsNotCovered) {
+    Server::StagedTextureStore store(/*copies=*/true);
+    Server::StagedTextureStore monolithStore(/*copies=*/false);
+    const Uint64 key = Server::StagedTextureStore::KeyForHandle(TestHandle(11, 1));
+    // A 4x4 level of four bytes per texel - 64 bytes - cut into two 32-byte runs.
+    const IntVec3 extent{4, 4, 1};
+    Vector<Uint8> lower(32, 0x33);
+    Vector<Uint8> upper(32, 0x77);
+
+    store.NoteLevelDefined(key, kTex2DTarget, 0, extent);
+    // THE SECOND RUN FIRST, deliberately: coverage is a SET and the placement comes from the
+    // record, so the order the pieces land in cannot matter.
+    EXPECT_EQ(monolithStore.AdoptRun(key, kTex2DTarget, 0, extent, 32, upper.data(), upper.size()),
+              nullptr);
+    EXPECT_EQ(monolithStore.TrackedResources(), 0u);
+    store.AdoptRun(key, kTex2DTarget, 0, extent, 32, upper.data(), upper.size());
+    EXPECT_TRUE(store.IsLevelDefined(key, kTex2DTarget, 0));
+    EXPECT_EQ(store.LevelByteSize(key, kTex2DTarget, 0), 64u) << "the image grew to the run's end";
+    EXPECT_FALSE(store.IsCovered(key, kTex2DTarget, 0))
+        << "half a level read as covered, so a sync would take zeroes for the missing half";
+    EXPECT_EQ(store.LevelCoveredRunCount(key, kTex2DTarget, 0), 1u);
+
+    store.AdoptRun(key, kTex2DTarget, 0, extent, 0, lower.data(), lower.size());
+    EXPECT_TRUE(store.IsCovered(key, kTex2DTarget, 0));
+    EXPECT_EQ(store.LevelCoveredRunCount(key, kTex2DTarget, 0), 1u)
+        << "two adjacent runs must merge into one covered range";
+    const Uint8* base = store.RequireLevelBytes(key, kTex2DTarget, 0, "unit_stage_chunk_runs");
+    ASSERT_NE(base, nullptr);
+    for (SizeT i = 0; i < 32; ++i) EXPECT_EQ(base[i], 0x33) << "byte " << i << " of the lower run";
+    for (SizeT i = 32; i < 64; ++i) EXPECT_EQ(base[i], 0x77) << "byte " << i << " of the upper run";
+
+    // w1's retired-stage poison, at the store's own scope: the COPY is what answers the readers.
+    std::fill(lower.begin(), lower.end(), Uint8{0xDD});
+    std::fill(upper.begin(), upper.end(), Uint8{0xDD});
+    EXPECT_EQ(base[0], 0x33);
+    EXPECT_EQ(base[63], 0x77);
+
+    // AND A GAP IS NOT COVERAGE: it is the missing-piece case, which is the one thing the covered
+    // set exists to make visible instead of papered over.
+    const Uint64 holed = Server::StagedTextureStore::KeyForHandle(TestHandle(12, 1));
+    store.NoteLevelDefined(holed, kTex2DTarget, 0, extent);
+    Vector<Uint8> part(16, 0x11);
+    store.AdoptRun(holed, kTex2DTarget, 0, extent, 0, part.data(), part.size());
+    store.AdoptRun(holed, kTex2DTarget, 0, extent, 32, upper.data(), upper.size());
+    EXPECT_EQ(store.LevelCoveredRunCount(holed, kTex2DTarget, 0), 2u)
+        << "two runs with a 16-byte gap merged into one";
+    EXPECT_FALSE(store.IsCovered(holed, kTex2DTarget, 0)) << "a span across the gap reads covered";
+    // A short leading run is not a complete level even if its current high-water mark ends at
+    // that run. The store checks coverage against the server-derived byte bound, not its prefix.
+    const Uint64 leading = Server::StagedTextureStore::KeyForHandle(TestHandle(14, 1));
+    store.NoteLevelDefined(leading, kTex2DTarget, 0, IntVec3{4, 4, 1});
+    store.AdoptRun(leading, kTex2DTarget, 0, IntVec3{4, 4, 1}, 0, part.data(), part.size());
+    EXPECT_FALSE(store.IsCovered(leading, kTex2DTarget, 0))
+        << "the leading prefix must not stand in for the declared level";
+    EXPECT_EQ(store.LevelByteSize(leading, kTex2DTarget, 0), 16u);
+    // Filling the gap merges all three into one run: adjacency, not proximity, is the rule.
+    store.AdoptRun(holed, kTex2DTarget, 0, extent, 16, part.data(), part.size());
+    EXPECT_EQ(store.LevelCoveredRunCount(holed, kTex2DTarget, 0), 1u);
+    EXPECT_TRUE(store.IsCovered(holed, kTex2DTarget, 0));
+
+    // An extent move redefines the coordinate system, so the assembled runs go with it - the same
+    // rule the whole-level adoption has always been held to.
+    store.NoteLevelDefined(key, kTex2DTarget, 0, IntVec3{8, 8, 1});
+    EXPECT_FALSE(store.IsCovered(key, kTex2DTarget, 0));
+    EXPECT_EQ(store.LevelCoveredRunCount(key, kTex2DTarget, 0), 0u);
+    EXPECT_EQ(store.LevelByteSize(key, kTex2DTarget, 0), 0u);
+}
+
+#if MOBILEGL_BUILD_DISAGGREGATED
+// B4's rule under PH-4's declared extents: a level redefined at a new extent (the respecify's
+// NoteLevelDefined, which every run now needs before it lands) starts with no coverage, so the
+// first run of the new definition cannot be completed by the old definition's bytes. A run that
+// still carries the old extent is StagedTextureStore.LevelExtent's refusal (ServerSpawnTest's
+// raw-peer control), so the new-extent runs are the only ones that can land here.
+TEST(StagedTextureStoreTest, AdoptRunExtentMoveDoesNotInheritOldCoverage) {
+    Server::StagedTextureStore store(/*copies=*/true);
+    const Uint64 key = Server::StagedTextureStore::KeyForHandle(TestHandle(15, 1));
+    Vector<Uint8> oldRun(64, 0x44);  // the whole 4x4 RGBA8 level
+    Vector<Uint8> newRun(64, 0x99);  // the upper half of the 8x4 RGBA8 level
+    store.NoteLevelDefined(key, kTex2DTarget, 0, IntVec3{4, 4, 1});
+    store.AdoptRun(key, kTex2DTarget, 0, IntVec3{4, 4, 1}, 0, oldRun.data(), oldRun.size());
+    ASSERT_TRUE(store.IsCovered(key, kTex2DTarget, 0));
+    store.NoteLevelDefined(key, kTex2DTarget, 0, IntVec3{8, 4, 1});
+    ASSERT_EQ(store.LevelDeclaredByteBound(key, kTex2DTarget, 0), 128u);
+    store.AdoptRun(key, kTex2DTarget, 0, IntVec3{8, 4, 1}, 64, newRun.data(), newRun.size());
+    EXPECT_FALSE(store.IsCovered(key, kTex2DTarget, 0))
+        << "the old level's [0,64) run was mistaken for bytes of the new extent";
+    EXPECT_EQ(store.LevelCoveredRunCount(key, kTex2DTarget, 0), 1u);
+    Vector<Uint8> newLower(64, 0xAA);
+    store.AdoptRun(key, kTex2DTarget, 0, IntVec3{8, 4, 1}, 0, newLower.data(), newLower.size());
+    const Uint8* base = store.RequireLevelBytes(key, kTex2DTarget, 0, "unit_extent_move");
+    ASSERT_NE(base, nullptr);
+    EXPECT_EQ(base[0], 0xAAu);
+    EXPECT_EQ(base[64], 0x99u);
+}
+#endif
+
+// WHICH OF THE TWO STAGED-RUN SHAPES A RECORD CARRIES, read off the run's own LENGTH because the
+// wire layout is frozen and carries no field for it. The whole-level run (the shape this half has
+// always staged) is the level's complete shadow and begins at the level's first byte; a slab's run
+// is exactly the byte extent of its own box, so the box names where it goes. Getting this wrong
+// places a whole level's bytes at a dirty box's offset, or a slab's bytes at the level's base.
+TEST(StagedTextureStoreTest, TheRunImageOffsetIsReadOffTheRecordsOwnRunAndBox) {
+    // THE TRACE'S SLAB: 512x128 RGBA32F, slices 8..16 of a 33-slice level.
+    constexpr Uint64 kSliceStride = 512ull * 128ull * 16ull;
+    constexpr Uint64 kLevelBytes = kSliceStride * 33ull;
+    MG_Pipe::MGPSubData slab{};
+    slab.LevelWidth = 512;
+    slab.LevelHeight = 128;
+    slab.LevelDepth = 33;
+    slab.UnionBox = MG_Pipe::MGPBox{0, 0, 8, 512, 128, 8};
+    slab.RegionCount = 1;
+    slab.Blob.Size = 8ull * kSliceStride;
+    MG_Pipe::MGPSubRegion region{};
+    region.X = 0;
+    region.Y = 0;
+    region.Z = 8;
+    region.W = 512;
+    region.H = 128;
+    region.D = 8;
+    region.SrcRowStride = 512u * 16u;
+    region.SrcSliceStride = static_cast<Uint32>(kSliceStride);
+    EXPECT_EQ(Server::StagedTextureRunImageOffset(slab, &region), 8ull * kSliceStride);
+
+    // THE SAME FIELDS WITH A WHOLE-LEVEL RUN - only the length differs - is the whole-level shape,
+    // whose run begins at the level's first byte however the box describes the dirty texels.
+    MG_Pipe::MGPSubData whole = slab;
+    whole.UnionBox = MG_Pipe::MGPBox{16, 32, 0, 64, 32, 1};
+    whole.Blob.Size = kLevelBytes;
+    EXPECT_EQ(Server::StagedTextureRunImageOffset(whole, &region), 0u);
+
+    // A whole-level BOX over a whole-level RUN is the same answer by the other route: the box
+    // starts at the level's first byte, so "derived from the box" and "offset 0" agree.
+    whole.UnionBox = MG_Pipe::MGPBox{0, 0, 0, 512, 128, 33};
+    EXPECT_EQ(Server::StagedTextureRunImageOffset(whole, &region), 0u);
+
+    // THE NO-REGION SPELLING is the whole-level one by construction: RegionCount == 0 means the
+    // box is the whole story and the strides are 0 = tightly packed.
+    EXPECT_EQ(Server::StagedTextureRunImageOffset(slab, nullptr), 0u);
+    slab.RegionCount = 0;
+    EXPECT_EQ(Server::StagedTextureRunImageOffset(slab, &region), 0u);
+    slab.RegionCount = 1;
+
+    // A RUN SHORTER THAN ITS BOX'S EXTENT is neither shape. No emitter produces one, and the
+    // whole-level reading is the only one that cannot lose texels the record did carry.
+    MG_Pipe::MGPSubData shortRun = slab;
+    shortRun.Blob.Size = 8ull * kSliceStride - 16ull;
+    EXPECT_EQ(Server::StagedTextureRunImageOffset(shortRun, &region), 0u);
+}
+
 // The Fatal, and it asserts ITS OWN failure string rather than "the process died" -
 // ServerLoopTest.cpp:702-704's reason: a death test that only checks for a crash goes green
 // on any other abort in the same body. ONE death per case: the forked children of two
@@ -237,7 +499,8 @@ TEST(StagedTextureStoreTest, TheMipExtentDerivationKeepsArrayLayersFixed) {
 TEST(StagedTextureStoreTest, ATexelReadOutsideTheStagedCoverageIsFatalByName) {
     Server::StagedTextureStore store(/*copies=*/true);
     const Uint64 key = Server::StagedTextureStore::KeyForHandle(TestHandle(8, 1));
-    Vector<Uint8> bytes(16, 0x33);
+    Vector<Uint8> bytes(64, 0x33);
+    store.NoteLevelDefined(key, kTex2DTarget, 0, IntVec3{4, 4, 1});
     store.Adopt(key, kTex2DTarget, 0, IntVec3{4, 4, 1}, bytes.data(), bytes.size());
 
     // In coverage: no Fatal, asserted first so the death below cannot be a function that
@@ -272,6 +535,86 @@ TEST(StagedTextureStoreTest, AGpuGeneratedLevelHasNoBytesAndItsTexelReadIsFatalB
 }
 #endif
 
+// The same refusal for a level that arrived IN PIECES (fix A2): the sync reads the level image
+// whole, so a level with one piece missing is as unreadable as one that never arrived - and it is
+// the same named Fatal. ONE DEATH PER CASE, ServerLoopTest's ruling above.
+#if !defined(_WIN32)
+TEST(StagedTextureStoreTest, ALevelWithAPieceMissingIsRefusedAsAWholeLevelReadByName) {
+    Server::StagedTextureStore store(/*copies=*/true);
+    const Uint64 key = Server::StagedTextureStore::KeyForHandle(TestHandle(13, 1));
+    Vector<Uint8> part(16, 0x55);
+    Vector<Uint8> whole(64, 0x22);
+    store.NoteLevelDefined(key, kTex2DTarget, 0, IntVec3{4, 4, 1});
+    store.NoteLevelDefined(key, kTex2DTarget, 1, IntVec3{4, 4, 1});
+    // TWO RUNS WITH A HOLE BETWEEN THEM, which is what a missing piece looks like from here: the
+    // image's high-water mark is the level's size and the covered set does not reach across it.
+    store.AdoptRun(key, kTex2DTarget, 0, IntVec3{4, 4, 1}, 0, part.data(), part.size());
+    store.AdoptRun(key, kTex2DTarget, 0, IntVec3{4, 4, 1}, 32, part.data(), part.size());
+    ASSERT_FALSE(store.IsCovered(key, kTex2DTarget, 0));
+    ASSERT_EQ(store.LevelCoveredRunCount(key, kTex2DTarget, 0), 2u);
+    ASSERT_EQ(store.LevelByteSize(key, kTex2DTarget, 0), 48u);
+
+    // A DIFFERENT level of the same store, adopted whole, reads fine - asserted first so that the
+    // death below cannot be a function that aborts on everything.
+    store.AdoptRun(key, kTex2DTarget, 1, IntVec3{4, 4, 1}, 0, whole.data(), whole.size());
+    ASSERT_NE(store.RequireLevelBytes(key, kTex2DTarget, 1, "unit"), nullptr);
+
+    EXPECT_EXIT(store.RequireLevelBytes(key, kTex2DTarget, 0, "unit_missing_piece"),
+                ::testing::KilledBySignal(SIGABRT), ".*");
+    const std::string log = ReadLog();
+    EXPECT_NE(log.find("Fatal{StageSnapshotTooNarrow, \"unit_missing_piece\"}"), std::string::npos)
+        << "the abort happened but not for this rule's reason; the log says: " << log;
+}
+#endif
+
+// F2 LANE REPAIR, R8: TextureInternalFormat::R8 is enumerator 0, and PH-4's first draft read
+// `InternalFormat == 0` as "never declared" - so an R8 level a respecify HAD declared refused its
+// own upload as `StagedTextureStore.LevelExtent`. Red-once: put the `== 0` test back and the run
+// below dies by that name.
+TEST(StagedTextureStoreTest, AnR8LevelIsDeclaredAndTakesItsUpload) {
+    Server::StagedTextureStore store(/*copies=*/true);
+    const Uint64 key = Server::StagedTextureStore::KeyForHandle(TestHandle(15, 1));
+    store.NoteLevelDefined(key, kTex2DTarget, 0, IntVec3{4, 4, 1},
+                           static_cast<Uint8>(MG_Pipe::MGPipeResourceTarget::Tex2D),
+                           static_cast<Uint32>(TextureInternalFormat::R8));
+    ASSERT_EQ(store.LevelDeclaredByteBound(key, kTex2DTarget, 0), 16u) << "4x4 texels of one byte";
+    Vector<Uint8> texels(16, 0x3C);
+    store.AdoptRun(key, kTex2DTarget, 0, IntVec3{4, 4, 1}, 0, texels.data(), texels.size());
+    EXPECT_TRUE(store.IsCovered(key, kTex2DTarget, 0));
+    EXPECT_EQ(store.RequireLevelBytes(key, kTex2DTarget, 0, "unit_r8")[15], 0x3C);
+}
+
+// F2 LANE REPAIR, BYTELESS DECLARATIONS: a level whose format has no uncompressed size here
+// (TextureInternalFormat::Unknown - what the TextureView / TextureViewAlias / TextureUploadShape
+// split lanes declare) and an EMPTY level (glTexImage*D with a zero extent -
+// UnboundImageDescriptorScenario's incomplete default texture) are both legal DECLARATIONS: no
+// Fatal at the respecify, the level exists, and its byte bound is 0. A staged run into such a
+// level is then refused by its own name. Red-once: drop the LevelBound refusal and the same run
+// dies as `StagedTextureStore.CopyRunInto` instead (end 4 > bound 0), which the name check
+// below reads as red. ONE DEATH PER CASE, ServerLoopTest's ruling.
+#if !defined(_WIN32)
+TEST(StagedTextureStoreTest, ABytelessDeclaredLevelIsLegalAndRefusesARunByName) {
+    Server::StagedTextureStore store(/*copies=*/true);
+    const Uint64 key = Server::StagedTextureStore::KeyForHandle(TestHandle(16, 1));
+    const auto tex2D = static_cast<Uint8>(MG_Pipe::MGPipeResourceTarget::Tex2D);
+    store.NoteLevelDefined(key, kTex2DTarget, 0, IntVec3{1, 1, 1}, tex2D,
+                           static_cast<Uint32>(TextureInternalFormat::Unknown));
+    store.NoteLevelDefined(key, kTex2DTarget, 1, IntVec3{0, 0, 1}, tex2D,
+                           static_cast<Uint32>(TextureInternalFormat::RGBA8));
+    ASSERT_TRUE(store.IsLevelDefined(key, kTex2DTarget, 0));
+    ASSERT_TRUE(store.IsLevelDefined(key, kTex2DTarget, 1));
+    EXPECT_EQ(store.LevelDeclaredByteBound(key, kTex2DTarget, 0), 0u);
+    EXPECT_EQ(store.LevelDeclaredByteBound(key, kTex2DTarget, 1), 0u);
+
+    Vector<Uint8> texel(4, 0x5A);
+    EXPECT_EXIT(store.AdoptRun(key, kTex2DTarget, 0, IntVec3{1, 1, 1}, 0, texel.data(), texel.size()),
+                ::testing::KilledBySignal(SIGABRT), ".*");
+    const std::string log = ReadLog();
+    EXPECT_NE(log.find("Fatal{ProtocolCorruption, \"StagedTextureStore.LevelBound\"}"), std::string::npos)
+        << "the run died, but not as the byteless-level refusal; the log says: " << log;
+}
+#endif
+
 // =====================================================================================
 // The production wiring - E-P5c gate #2 at unit scope
 // =====================================================================================
@@ -298,11 +641,15 @@ TEST(StagedTextureProductionTest, TextureSubDataThroughTheRealOpsTableCopiesAndS
     MG_Pipe::MGPResourceDesc desc{};
     desc.Resource = res;
     desc.Target = static_cast<Uint8>(MG_Pipe::MGPipeResourceTarget::Tex2D);
+    // RGBA8: the 64 bytes below are 4x4 texels of four bytes, and PH-4 bounds the run by the
+    // declared level's w*h*d*bpp (a zero-initialised format is R8, one byte a texel).
+    desc.InternalFormat = static_cast<Uint32>(TextureInternalFormat::RGBA8);
     desc.Width = 4;
     desc.Height = 4;
     desc.Depth = 1;
     desc.Levels = 1;
     ASSERT_TRUE(MG_Pipe::MGPipeApplyResourceCreate(desc));
+    DeclareTex2DLevel0(desc, 4, 4);
 
     Vector<Uint8> src(64, 0xAB); // 4x4 texels, 4 bytes each
     MG_Pipe::MGPSubData rec{};
@@ -348,6 +695,228 @@ TEST(StagedTextureProductionTest, TextureSubDataThroughTheRealOpsTableCopiesAndS
     MG_Pipe::MGPipeApplyResourceDestroy(death);
     EXPECT_FALSE(store.HasShadow(key))
         << "a destroyed texture's staged levels must not answer for the slot's next owner";
+}
+
+TEST(StagedTextureProductionTest, HooklessTextureConsumerOwnsBytesAndScopedStorageLifetime) {
+    // A record-only texture consumer has no texture callbacks in the buffer ops table.
+    // The empty fixture table admits records without installing any adoption callback.
+    const MG_Pipe::MGPipeResourceOps emptyOps{};
+    struct RestoreOps {
+        const MG_Pipe::MGPipeResourceOps* Previous = MG_Pipe::MGPipeGetResourceOps();
+        ~RestoreOps() { MG_Pipe::MGPipeSetResourceOps(Previous); }
+    } restore;
+    MG_Pipe::MGPipeSetResourceOps(&emptyOps);
+    auto& store = Server::ServerStagedTexture();
+    const auto res = TestHandle(47, 2);
+    const auto key = Server::StagedTextureStore::KeyForHandle(res);
+    MG_Pipe::MGPResourceDesc desc{};
+    desc.Resource = res;
+    desc.Target = static_cast<Uint8>(MG_Pipe::MGPipeResourceTarget::Tex2D);
+    // RGBA8 for the 64-byte 4x4 upload below (PH-4's w*h*d*bpp bound; zero would be R8).
+    desc.InternalFormat = static_cast<Uint32>(TextureInternalFormat::RGBA8);
+    ASSERT_TRUE(MG_Pipe::MGPipeApplyResourceCreate(desc));
+    desc.Width = 4;
+    desc.Height = 4;
+    desc.Depth = 1;
+    desc.Levels = 3;
+    MG_Pipe::MGPRespecifiedLevel level = MG_Pipe::MGPipeMakeRespecifiedLevel(
+        MG_Pipe::MGPipePackSubDataTarget(desc.Target, kTex2DTarget), 0, 4, 4, 1);
+    ASSERT_TRUE(MG_Pipe::MGPipeApplyResourceRespecify(desc, nullptr, &level));
+    EXPECT_EQ(store.LevelExtentOrUndefined(key, kTex2DTarget, 0), IntVec3(4, 4, 1))
+        << "null-data glTexImage defines the level even though no upload follows";
+    EXPECT_FALSE(store.IsCovered(key, kTex2DTarget, 0));
+
+    Vector<Uint8> src(64, 0xAB);
+    MG_Pipe::MGPSubData upload{};
+    upload.Res = res;
+    upload.Target = level.UploadTarget;
+    upload.UnionBox = {0, 0, 0, 4, 4, 1};
+    upload.Blob.Size = src.size();
+    ASSERT_TRUE(MG_Pipe::MGPipeApplyResourceSubData(upload, src.data(), nullptr));
+    ASSERT_TRUE(store.IsCovered(key, kTex2DTarget, 0));
+    std::fill(src.begin(), src.end(), Uint8{0xDD});
+    EXPECT_EQ(store.RequireLevelBytes(key, kTex2DTarget, 0, "hookless_source_poison")[0], 0xAB);
+
+    // Defining another mip must retain bytes already accepted for the first mip. PH-4: the scope
+    // carries that mip's EXACT extent (TextureEmit.h reads it off the frontend's level), so level 1
+    // of a 4x4 base crosses as 2x2x1 rather than inheriting level 0's numbers.
+    level.Level = 1;
+    level.Width = 2;
+    level.Height = 2;
+    level.Depth = 1;
+    ASSERT_TRUE(MG_Pipe::MGPipeApplyResourceRespecify(desc, nullptr, &level));
+    EXPECT_EQ(store.LevelExtentOrUndefined(key, kTex2DTarget, 1), IntVec3(2, 2, 1));
+    EXPECT_TRUE(store.IsCovered(key, kTex2DTarget, 0));
+    desc.Width = 8;
+    desc.Height = 8;
+    desc.Immutable = 1;
+    ASSERT_TRUE(MG_Pipe::MGPipeApplyResourceRespecify(desc, nullptr, nullptr));
+    EXPECT_FALSE(store.IsCovered(key, kTex2DTarget, 0));
+    EXPECT_EQ(store.LevelExtentOrUndefined(key, kTex2DTarget, 0), IntVec3(8, 8, 1));
+    EXPECT_EQ(store.LevelExtentOrUndefined(key, kTex2DTarget, 2), IntVec3(2, 2, 1));
+    MG_Pipe::MGPHandleOnly death{};
+    death.Handle = res;
+    death.Kind = static_cast<Uint32>(MG_Pipe::MGPipeKind::Texture);
+    MG_Pipe::MGPipeApplyResourceDestroy(death);
+    EXPECT_FALSE(store.HasShadow(key));
+
+    // Context object release has the same ownership even without a backend hook.
+    desc.Resource = TestHandle(47, 3);
+    ASSERT_TRUE(MG_Pipe::MGPipeApplyResourceCreate(desc));
+    desc.Width = 16;
+    ASSERT_TRUE(MG_Pipe::MGPipeApplyResourceRespecify(desc, nullptr, nullptr));
+    const auto nextKey = Server::StagedTextureStore::KeyForHandle(desc.Resource);
+    ASSERT_TRUE(store.HasShadow(nextKey));
+    MG_Pipe::MGPipeApplierReleaseObjectRecords();
+    EXPECT_FALSE(store.HasShadow(nextKey));
+}
+
+// FIX A2's PRODUCTION WIRING, hookless arm: the two runs of ONE level cross the applier as two
+// records and reach the store through PipeApply.cpp's AdoptTextureWithoutBackendHook, which has no
+// backend hook to lean on. Each must land where its OWN box and carried strides say - the record is
+// the only place the placement exists. The second run is sent first so that a store that ignored
+// the box and grew the image from the front cannot pass.
+TEST(StagedTextureProductionTest, StageChunkRunsThroughTheHooklessApplierLandWhereTheirBoxesSay) {
+    // A record-only texture consumer has no texture callbacks in the buffer ops table, which is
+    // exactly the arm that takes the fallback rather than Ops_H_TextureSubData.
+    const MG_Pipe::MGPipeResourceOps emptyOps{};
+    struct RestoreOps {
+        const MG_Pipe::MGPipeResourceOps* Previous = MG_Pipe::MGPipeGetResourceOps();
+        ~RestoreOps() { MG_Pipe::MGPipeSetResourceOps(Previous); }
+    } restore;
+    MG_Pipe::MGPipeSetResourceOps(&emptyOps);
+
+    auto& store = Server::ServerStagedTexture();
+    const auto res = TestHandle(45, 1);
+    const auto key = Server::StagedTextureStore::KeyForHandle(res);
+    MG_Pipe::MGPResourceDesc desc{};
+    desc.Resource = res;
+    desc.Target = static_cast<Uint8>(MG_Pipe::MGPipeResourceTarget::Tex2D);
+    desc.InternalFormat = static_cast<Uint32>(TextureInternalFormat::RGBA8); // PH-4 bound: 4x4x4
+    desc.Width = 4;
+    desc.Height = 4;
+    desc.Depth = 1;
+    desc.Levels = 1;
+    ASSERT_TRUE(MG_Pipe::MGPipeApplyResourceCreate(desc));
+    DeclareTex2DLevel0(desc, 4, 4);
+
+    // A 4x4 RGBA8 level: 64 bytes, four bytes per texel, a 16-byte row pitch. The two runs are its
+    // upper and lower halves, 32 bytes each.
+    Vector<Uint8> upper(32, 0x77);
+    Vector<Uint8> lower(32, 0x33);
+    MG_Pipe::MGPSubData upperRecord{};
+    upperRecord.Res = res;
+    upperRecord.Target = MG_Pipe::MGPipePackSubDataTarget(
+        static_cast<Uint32>(MG_Pipe::MGPipeResourceTarget::Tex2D),
+        static_cast<Uint32>(TextureUploadTarget::Texture2D));
+    upperRecord.LevelWidth = 4;
+    upperRecord.LevelHeight = 4;
+    upperRecord.LevelDepth = 1;
+    upperRecord.UnionBox = MG_Pipe::MGPBox{0, 2, 0, 4, 2, 1};
+    upperRecord.RegionCount = 1;
+    upperRecord.Blob.Size = upper.size();
+    MG_Pipe::MGPSubRegion upperRegion{};
+    upperRegion.Y = 2;
+    upperRegion.W = 4;
+    upperRegion.H = 2;
+    upperRegion.D = 1;
+    upperRegion.SrcOffset = 0;
+    upperRegion.SrcRowStride = 16;
+    upperRegion.SrcSliceStride = 64;
+    ASSERT_TRUE(MG_Pipe::MGPipeApplyResourceSubData(upperRecord, upper.data(), &upperRegion));
+    EXPECT_EQ(store.LevelByteSize(key, kTex2DTarget, 0), 64u)
+        << "the image did not grow to the second half's end";
+    EXPECT_EQ(store.LevelCoveredRunCount(key, kTex2DTarget, 0), 1u);
+    EXPECT_FALSE(store.IsCovered(key, kTex2DTarget, 0)) << "only half the level has arrived";
+
+    MG_Pipe::MGPSubData lowerRecord = upperRecord;
+    lowerRecord.UnionBox = MG_Pipe::MGPBox{0, 0, 0, 4, 2, 1};
+    MG_Pipe::MGPSubRegion lowerRegion = upperRegion;
+    lowerRegion.Y = 0;
+    lowerRegion.SrcOffset = 0;
+    ASSERT_TRUE(MG_Pipe::MGPipeApplyResourceSubData(lowerRecord, lower.data(), &lowerRegion));
+    EXPECT_TRUE(store.IsCovered(key, kTex2DTarget, 0));
+    EXPECT_EQ(store.LevelCoveredRunCount(key, kTex2DTarget, 0), 1u)
+        << "the two halves did not merge into one covered range";
+    const Uint8* base = store.RequireLevelBytes(key, kTex2DTarget, 0, "unit_production_runs");
+    ASSERT_NE(base, nullptr);
+    for (SizeT i = 0; i < 32; ++i) EXPECT_EQ(base[i], 0x33) << "byte " << i << " of the lower run";
+    for (SizeT i = 32; i < 64; ++i) EXPECT_EQ(base[i], 0x77) << "byte " << i << " of the upper run";
+
+    MG_Pipe::MGPHandleOnly death{};
+    death.Handle = res;
+    death.Kind = static_cast<Uint32>(MG_Pipe::MGPipeKind::Texture);
+    MG_Pipe::MGPipeApplyResourceDestroy(death);
+    EXPECT_FALSE(store.HasShadow(key));
+}
+
+// THE SAME, through the REAL texture hook DirectGLES registers (Ops_H_TextureSubData), which is the
+// arm the shipped backend takes. Reverting the offset - passing 0, or adopting every run as if it
+// were the whole level - puts both halves at the front of the image and turns the byte checks below
+// red.
+TEST(StagedTextureProductionTest, StageChunkRunsThroughTheRealTextureHookLandWhereTheirBoxesSay) {
+    MG_Backend::DirectGLES::BufferImpl::RegisterBufferBackendOps();
+    const MG_Pipe::MGPipeResourceOps* ops = MG_Pipe::MGPipeGetResourceOps();
+    ASSERT_NE(ops, nullptr);
+    ASSERT_NE(ops->TextureSubData, nullptr);
+
+    auto& store = Server::ServerStagedTexture();
+    const auto res = TestHandle(46, 1);
+    const auto key = Server::StagedTextureStore::KeyForHandle(res);
+    MG_Pipe::MGPResourceDesc desc{};
+    desc.Resource = res;
+    desc.Target = static_cast<Uint8>(MG_Pipe::MGPipeResourceTarget::Tex2D);
+    desc.InternalFormat = static_cast<Uint32>(TextureInternalFormat::RGBA8); // PH-4 bound: 4x4x4
+    desc.Width = 4;
+    desc.Height = 4;
+    desc.Depth = 1;
+    desc.Levels = 1;
+    ASSERT_TRUE(MG_Pipe::MGPipeApplyResourceCreate(desc));
+    DeclareTex2DLevel0(desc, 4, 4);
+
+    Vector<Uint8> upper(32, 0x77);
+    Vector<Uint8> lower(32, 0x33);
+    MG_Pipe::MGPSubData upperRecord{};
+    upperRecord.Res = res;
+    upperRecord.Target = MG_Pipe::MGPipePackSubDataTarget(
+        static_cast<Uint32>(MG_Pipe::MGPipeResourceTarget::Tex2D),
+        static_cast<Uint32>(TextureUploadTarget::Texture2D));
+    upperRecord.LevelWidth = 4;
+    upperRecord.LevelHeight = 4;
+    upperRecord.LevelDepth = 1;
+    upperRecord.UnionBox = MG_Pipe::MGPBox{0, 2, 0, 4, 2, 1};
+    upperRecord.RegionCount = 1;
+    upperRecord.Blob.Size = upper.size();
+    MG_Pipe::MGPSubRegion upperRegion{};
+    upperRegion.Y = 2;
+    upperRegion.W = 4;
+    upperRegion.H = 2;
+    upperRegion.D = 1;
+    upperRegion.SrcRowStride = 16;
+    upperRegion.SrcSliceStride = 64;
+    // THE HOOK, not MGPipeApplyResourceSubData: the applier's own dispatch is what routes a
+    // texture record into Ops_H_TextureSubData, and that is the call site under test.
+    ops->TextureSubData(res, upperRecord, upper.data(), &upperRegion);
+    EXPECT_EQ(store.LevelByteSize(key, kTex2DTarget, 0), 64u);
+    EXPECT_EQ(store.LevelCoveredRunCount(key, kTex2DTarget, 0), 1u);
+    EXPECT_FALSE(store.IsCovered(key, kTex2DTarget, 0));
+
+    MG_Pipe::MGPSubData lowerRecord = upperRecord;
+    lowerRecord.UnionBox = MG_Pipe::MGPBox{0, 0, 0, 4, 2, 1};
+    MG_Pipe::MGPSubRegion lowerRegion = upperRegion;
+    lowerRegion.Y = 0;
+    ops->TextureSubData(res, lowerRecord, lower.data(), &lowerRegion);
+    EXPECT_TRUE(store.IsCovered(key, kTex2DTarget, 0));
+    const Uint8* base = store.RequireLevelBytes(key, kTex2DTarget, 0, "unit_hook_runs");
+    ASSERT_NE(base, nullptr);
+    for (SizeT i = 0; i < 32; ++i) EXPECT_EQ(base[i], 0x33) << "byte " << i << " of the lower run";
+    for (SizeT i = 32; i < 64; ++i) EXPECT_EQ(base[i], 0x77) << "byte " << i << " of the upper run";
+
+    MG_Pipe::MGPHandleOnly death{};
+    death.Handle = res;
+    death.Kind = static_cast<Uint32>(MG_Pipe::MGPipeKind::Texture);
+    MG_Pipe::MGPipeApplyResourceDestroy(death);
+    EXPECT_FALSE(store.HasShadow(key));
 }
 
 int main(int argc, char** argv) {

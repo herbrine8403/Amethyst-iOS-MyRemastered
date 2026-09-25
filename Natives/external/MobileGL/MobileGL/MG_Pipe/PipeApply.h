@@ -38,9 +38,16 @@
 // this header needs their NAMES and never their definitions; the forward declaration is the
 // whole coupling and the closure gate is what keeps it one. The verify build is the only
 // place the codec runs, and it runs from PipeApply.cpp.
+// P5e (pg) ADDS A THIRD NAME AND KEEPS THE RULE: ProgramArchive is what a SPLIT create carries
+// - the record's OWN copy of both structs plus the stage of each module - and the record holds
+// it through a SharedPtr, which needs no definition either (the deleter is captured where the
+// archive is constructed, in the decoder's TU). So the coupling is still three names and no
+// closure change, and MG_Backend, which does need the definition, includes
+// ProgramArtifactsCodec.h for it.
 namespace MobileGL::MG_State::GLState {
     struct LinkArtifacts;
     struct SpirvArtifacts;
+    struct ProgramArchive;
 } // namespace MobileGL::MG_State::GLState
 
 namespace MobileGL::MG_Pipe {
@@ -155,6 +162,9 @@ namespace MobileGL::MG_Pipe {
     // bounded by kMGPipeMaxResourceSlots and each grows only to its own dense high-water mark.
     inline constexpr Uint32 kMGPipeMaxResourceSlots = 1u << 20;
     inline constexpr Uint32 kMGPipeMaxVertexElementsSlots = 1u << 16;
+    // create_render_state records retain one 396-byte pipeline half each. Keep their
+    // slot-indexed table bounded independently so a peer cannot request a huge resize.
+    inline constexpr Uint32 kMGPipeMaxRenderStateCsoSlots = 1u << 16;
     // P4a's three, and the argument is written out for each because the records differ in
     // size. None is ever allocated by being named: the tables grow to the client's own dense
     // high-water mark and no further, so the bound costs nothing until a record is corrupt.
@@ -391,6 +401,28 @@ namespace MobileGL::MG_Pipe {
         Vector<Uint8> GlobalConstants;
         Uint64 GlobalConstantsSerial = 0;
         Uint64 Serial = 0;
+
+        // ---- P5e's server-owned archive (CONTRACT-P5E.md §5.5, gap G-A) --------------------
+        //
+        // FILLED BY PACKAGE pg, AND ONLY UNDER A TRANSPORT. This is the whole of rule F for
+        // this family: before P5e the record stored the DESCRIPTOR and the artefacts rode
+        // beside it as two companion pointers into the frontend's own ProgramObject, so every
+        // reflection question the program twin asked - forty accessors in SyncToBackend alone -
+        // was a read of client memory that `ProgramObject::Link()` REPLACES IN PLACE. Under
+        // run-ahead the client is already several records past the create, so those reads are
+        // torn or stale by construction and no amount of care at the read site can fix it.
+        //
+        // The client encodes the archive once per link (ProgramEmit.h -> SEG_STAGE), the
+        // decoder frames and deserialises it, and the record ADOPTS it here - a SharedPtr and
+        // not a Vector, because a program-pipeline composite and its stage programs are three
+        // records over one link's artefacts, and because the twin holds the pointer across the
+        // build it is running. It retires with the record, which is rule C: the staged run the
+        // bytes arrived in belongs to somebody else by the next frame.
+        //
+        // NULL UNDER MONOLITH, and that is the arm selection and not an omission (ruling 1):
+        // the push-monolith build keeps its frontend arms token for token, so its twin reads
+        // the frontend's archive as it always has and this pointer is never consulted.
+        SharedPtr<const MG_State::GLState::ProgramArchive> Archive;
 
         // ---- P5e's set_program_bindings tails (CONTRACT-P5E.md §1, §5.5) -------------------
         //
@@ -752,7 +784,14 @@ namespace MobileGL::MG_Pipe {
         // the backend's own GPU-write marking walk (DirectGLES.cpp's three MarkBufferGpuWritten
         // sites), which sb deletes under a transport because the client already owns the
         // GPU-write set and the server's walk is over client memory.
-        Uint32 ShaderBufferWritableMask[kMGPipeShaderBufferClassCount] = {0, 0, 0};
+        //
+        // THREE WORDS PER CLASS, NOT ONE (P5e, ID-104): the window is 84 points and c0e's
+        // single Uint32 could describe only the first 32 of them, so a storage buffer bound at
+        // point 32 or above read as read-only here while the record said nothing was wrong.
+        // Always through MGPipeShaderBufferMaskHas / ...Set (MGPipeTypes.h), which is the same
+        // arithmetic the payload's own mask goes through - one table, both sides.
+        Uint32 ShaderBufferWritableMask[kMGPipeShaderBufferClassCount]
+                                       [kMGPipeShaderBufferWritableMaskWords] = {};
         // ONE serial for all three classes, ++ on every applied record and ADVANCED (never
         // zeroed) by MGPipeApplierReset, for VertexBuffersSerial's reason - and the emitter's
         // latch resets with it, or the first emission after a make-current is suppressed as
@@ -810,8 +849,14 @@ namespace MobileGL::MG_Pipe {
         Bool VerbBlitNamedConsumed = false;
         // copy_framebuffer_to_texture's destination texture (MGPCopyFromFramebuffer::Dst).
         MGPipeHandle VerbCopyTexDst = kMGPipeNullHandle;
+        MGPipeHandle VerbStorageBlockProgram = kMGPipeNullHandle;
+        Uint64 BoundStreamOutputLifetimeId = 0;
+        Uint64 VerbDeleteStreamOutputLifetimeId = 0;
+        UnorderedMap<Uint64, MGPStreamOutputBegin> StreamOutputSpans;
         // generate_mipmap's texture (MGPMipPlan::Res).
         MGPipeHandle VerbMipRes = kMGPipeNullHandle;
+        Uint16 VerbMipBaseLevel = 0;
+        Uint16 VerbMipLevelCount = 0;
         // The current indirect draw's command buffer and (for the *Count forms) parameter
         // buffer (MGPDrawIndirect::Buffer / ParameterBuffer).
         MGPipeHandle VerbIndirectBuffer = kMGPipeNullHandle;
@@ -834,7 +879,10 @@ namespace MobileGL::MG_Pipe {
             VerbBlitDrawFbo = kMGPipeNullHandle;
             VerbBlitNamedConsumed = false;
             VerbCopyTexDst = kMGPipeNullHandle;
+            VerbStorageBlockProgram = kMGPipeNullHandle;
+            VerbDeleteStreamOutputLifetimeId = 0;
             VerbMipRes = kMGPipeNullHandle;
+            VerbMipBaseLevel = VerbMipLevelCount = 0;
             VerbIndirectBuffer = kMGPipeNullHandle;
             VerbIndirectParameterBuffer = kMGPipeNullHandle;
             VerbDispatchIndirectBuffer = kMGPipeNullHandle;
@@ -885,6 +933,14 @@ namespace MobileGL::MG_Pipe {
     // contract, not a condition somebody adds at a call site - because a fourth clause that only
     // one side computes is the same silent failure one level down.
     //
+    // THERE WAS AN ESCALATION (iii) AND IT WAS WITHDRAWN, which is worth a line here rather than
+    // only in the history: ID-133 barriered a plain multi-draw to legalise a pull in Espryt's
+    // indirect multi-draw tier, ID-136 retired the pull instead (MultiDraw.cpp's
+    // BoundDrawIndirectBufferId) and took the clause back out. The rule it leaves behind is the
+    // one to apply to the next candidate: ask WHICH ARM PAYS for an escalation, not which lane
+    // it turns green - (iii) was keyed on the only wire fact available and therefore charged the
+    // default tier for a read only two opt-in tiers made.
+    //
     // Escalation (ii) is a REFUSAL under run-ahead (§5.1), so on a run-ahead server it never
     // reaches the sink at all; it is here so the predicate is TOTAL and so the lockstep arm,
     // where such a draw is legal, gets the barrier it needs.
@@ -912,15 +968,51 @@ namespace MobileGL::MG_Pipe {
     // the call site (it is the line ra rebases onto); c0e owns the storage so both compile.
     void MGPipeApplierSetCurrentRecordBarriered(Bool barriered);
 
+    // ---- P5e (gl), ID-128: WAS THIS RECORD BARRIERED BY ESCALATION? ----------------------
+    //
+    // MGPipeBarriered is the static wait class PLUS two payload-derived escalations (ID-83): an
+    // open transform-feedback span makes every context verb inside it barriered, and a draw
+    // carrying client vertex arrays makes that draw barriered. "Escalated" is therefore exactly
+    //
+    //     MGPipeBarriered(op, payload, st) && MGPipeWaitClassFor(op) == kWaitNone
+    //
+    // and BOTH HALVES ARE ALREADY COMPUTED on every record - ApplyOne computes the predicate
+    // unconditionally for ID-103's reason and the static class is a table - so this is a bit
+    // carried beside the existing stamp rather than new plumbing.
+    //
+    // IT IS A SEPARATE FLAG AND NOT A REFINEMENT OF THE ONE ABOVE, because the two answer
+    // different questions. The stamp above answers "is the client parked behind this record",
+    // which the allocator guard and the frontend-keyed registry guard ask. This one answers "and
+    // was it parked for a reason the STATIC table cannot see", which only the strict knob asks -
+    // and it asks because the escalations happen exactly for XFB-active and client-array draws,
+    // both of which CONTRACT-P5E puts outside this phase (§5.7 and ID-82). A pull on such a
+    // record is a debt some later phase owes, not a migration P5e skipped.
+    //
+    // FALSE IS THE DEFAULT, which is the opposite of the stamp's default and deliberately so:
+    // "not escalated" is the answer that admits nothing, so a reader that runs before any writer
+    // is strict rather than lax.
+    Bool MGPipeApplierCurrentRecordIsBarrieredByEscalation();
+    void MGPipeApplierSetCurrentRecordBarrieredByEscalation(Bool escalated);
+
     // THE CLIENT'S HALF OF THE WAIT RULE IS NOT LANDED YET, AND THIS CONSTANT IS THAT FACT.
     // MGPipeBarriered above describes what the client WILL do; until package ra changes
     // EmitAndWaitTails the client still blocks after every record, so the answer the server
     // must stamp is `true` whatever the wire says - the two named exemption scopes (§4.4) are
     // legal exactly while the client is parked, and it is parked behind all of them today.
-    // Package ra flips this to true in the same commit that lands the wait rule; the sink's
-    // stamp then follows the predicate. Computing the predicate anyway (PipeApplier::ApplyOne)
-    // is deliberate: it keeps the function exercised on every record for the whole phase.
-    inline constexpr Bool kMGPipeP5eClientWaitRuleLanded = false;
+    // IT FLIPS WITH kMGPipeP5eRunAheadReady, IN THE INTEGRATION COMMIT, AND NOT WHEN ra LANDS
+    // (ra's amendment to ID-103's wording, which said "the same commit that lands the wait
+    // rule"). The argument ID-103 makes is about whether the CLIENT is parked, not about
+    // whether ra's code exists: RunAheadArmed() is a conjunction whose third term is the
+    // server's caps bit, so between ra landing and the caps bit being published the client
+    // still blocks after every record - and stamping `false` there would withdraw §4.4's
+    // exemptions from probes that client's own wait still makes safe, which is exactly the
+    // "refusal with no defect behind it" ID-103 refused. The two constants are therefore ONE
+    // switch with two spellings, and the integration commit throws both.
+    //
+    // Computing the predicate anyway (PipeApplier::ApplyOne) is deliberate: it keeps the
+    // function exercised on every record for the whole phase rather than first run on the day
+    // it starts deciding.
+    inline constexpr Bool kMGPipeP5eClientWaitRuleLanded = true;
 
     // P5c (rv): the two serials the PipeInputs texture-shutter accessors answer with under a
     // server-stamped verb (FieldOwnership.def, APPLIER_DERIVED). Free functions rather than
@@ -1049,7 +1141,32 @@ namespace MobileGL::MG_Pipe {
     struct MGPRespecifiedLevel {
         Uint16 UploadTarget = 0;
         Uint16 Level = 0;
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // P7 PH-4: mutable mip dimensions do not follow from the base descriptor. These fields
+        // are carried by the split resource_respecify record; the pull helper remains 4 bytes.
+        Uint32 Width = 0;
+        Uint32 Height = 0;
+        Uint32 Depth = 0;
+#endif
     };
+
+    inline MGPRespecifiedLevel MGPipeMakeRespecifiedLevel(Uint16 uploadTarget, Uint16 level,
+                                                          Uint32 width = 0, Uint32 height = 0,
+                                                          Uint32 depth = 0) {
+        MGPRespecifiedLevel value{};
+        value.UploadTarget = uploadTarget;
+        value.Level = level;
+#if MOBILEGL_BUILD_DISAGGREGATED
+        value.Width = width;
+        value.Height = height;
+        value.Depth = depth;
+#else
+        (void)width;
+        (void)height;
+        (void)depth;
+#endif
+        return value;
+    }
 
     // THE THREE ACCEPTANCE RETURNS, AND WHY ALL THREE (ID-18 M3, clientfb review M3). D-D5
     // step 1 says the client clears a level's dirty flags "for the levels whose record the
@@ -1324,9 +1441,20 @@ namespace MobileGL::MG_Pipe {
     // field-compares before storing, and a mismatch is Fatal{PipeVerifyDiffer, "program-archive"}.
     // Splitting this record for a transport whose ring caps one record at half its capacity is
     // P5's problem, not this entry point's.
+    //
+    // P5e (pg) ADDS THE FOURTH ARGUMENT AND DID NOT DEFAULT IT, for the reason PipeRoute.h
+    // gives about the three byte counts it also refused to default: a caller that HAS the
+    // archive and forgets to pass it would compile, and the failure would be a program twin
+    // reading the frontend's artefacts on the apply thread - silent, and exactly what this
+    // package exists to end. `archive` is null under monolith (the two companion pointers are
+    // the frontend's own and the handle arm is not taken there) and non-null under a
+    // transport, where `link` and `spirv` point INTO it: the record adopts it, so every later
+    // reflection read is of memory the server owns. A non-null archive whose Link/Spirv are
+    // not the two pointers passed beside it is a caller bug this entry point asserts on.
     void MGPipeApplyCreateShaderState(const MGPProgramDesc& desc,
                                       const MG_State::GLState::LinkArtifacts* link,
-                                      const MG_State::GLState::SpirvArtifacts* spirv);
+                                      const MG_State::GLState::SpirvArtifacts* spirv,
+                                      SharedPtr<const MG_State::GLState::ProgramArchive> archive);
     void MGPipeApplyBindShaderState(const MGPHandleOnly& handle);
     void MGPipeApplyDeleteShaderState(const MGPHandleOnly& handle);
     void MGPipeApplySetDrawProgram(const MGPHandleOnly& handle);

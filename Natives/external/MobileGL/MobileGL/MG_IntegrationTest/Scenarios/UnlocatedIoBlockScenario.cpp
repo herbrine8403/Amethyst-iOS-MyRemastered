@@ -49,6 +49,7 @@
 #include <string>
 #include <vector>
 
+#include "../Harness/PipeStatsWindow.h"
 #include "../Harness/HeadlessGL.h"
 #include "../Harness/ScenarioFixture.h"
 
@@ -354,31 +355,29 @@ void main()
             // configured. MOBILEGL_LOG_FILE_PATH is read at log-init, before anything this
             // fixture can reach, so the ctest entry sets it and this only reads it back.
             static std::filesystem::path LibraryLogPath() {
-                const char* path = std::getenv("MOBILEGL_LOG_FILE_PATH");
-                return (path != nullptr && *path != '\0') ? std::filesystem::path(path)
-                                                          : std::filesystem::path();
+                // P6: the path is a BASE NAME and the library writes one log per role; PipeStatsWindow
+            // derives the suffix, so the rule lives in one place.
+            return std::filesystem::path(MGITest::PipeStatsWindow::LibraryLogPath());
             }
 
             // How many bytes the library log already holds. Everything this fixture asserts on
             // is searched from here forward, because the file is APPENDED to by every process
             // in the lane and a line left behind by an earlier one would otherwise satisfy the
             // assertion without this process having done anything at all.
-            static std::uintmax_t LibraryLogSize() {
-                std::error_code ec;
-                const std::filesystem::path path = LibraryLogPath();
-                if (path.empty()) return 0;
-                const std::uintmax_t size = std::filesystem::file_size(path, ec);
-                return ec ? 0 : size;
+            // ONE MARK PER ROLE. The library writes a log per role, so "how long is the log
+            // right now" is two numbers; a single scalar applied to the concatenation would slide
+            // by whatever the other role wrote in between and start the read mid-line.
+            static MGITest::PipeStatsWindow::LogMark LibraryLogMark() {
+                return MGITest::PipeStatsWindow::MarkLaneLog();
             }
 
-            static std::string LibraryLogSince(std::uintmax_t offset) {
-                const std::filesystem::path path = LibraryLogPath();
-                if (path.empty()) return {};
-                std::ifstream file(path, std::ios::binary);
-                if (!file.good()) return {};
-                file.seekg(static_cast<std::streamoff>(offset));
-                return std::string((std::istreambuf_iterator<char>(file)),
-                                   std::istreambuf_iterator<char>());
+            // BOTH ROLES. The arming diagnostics this case looks for are emitted by the
+            // BACKEND, and under inproc the backend runs on the apply thread - the server role -
+            // so the line lands in the server's log. Reading only the client's found nothing and
+            // reported the emulation unarmed, which accused the product of a defect the reader
+            // had invented.
+            static std::string LibraryLogSince(const MGITest::PipeStatsWindow::LogMark& mark) {
+                return MGITest::PipeStatsWindow::ReadLaneLogSince(mark);
             }
 
             static GLenum FirstGLError() {
@@ -499,7 +498,7 @@ void main()
             // Taken BEFORE the program is built, so the line this looks for can only be one
             // this process wrote. The latch means it is emitted at the FIRST stage of the
             // FIRST affected program, which is inside the build below.
-            const std::uintmax_t before = LibraryLogSize();
+            const MGITest::PipeStatsWindow::LogMark before = LibraryLogMark();
 
             const GLuint program = BuildPipeline(kDistinctTessEvalSource, kDistinctGeometrySource);
             if (program == 0) {

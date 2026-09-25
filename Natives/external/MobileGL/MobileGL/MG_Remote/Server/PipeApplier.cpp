@@ -9,8 +9,11 @@
 // P5 package v1: the applier bridge, and the consumer for contract 7's five class-B verbs.
 
 #include "PipeApplier.h"
+#include <MG_Remote/FatalFunnel.h>
 
+#include "ServerSession.h"
 #include "../Transport/ReplySlot.h"
+#include "StagedTextureStore.h"
 
 #include <Config.h>
 #include <MG_Backend/MGPipe/PipeInputs.h>
@@ -18,6 +21,8 @@
 // §5.2). The same dependency ServerLoop.cpp already takes for CreateBackend; a server built
 // on Magma simply holds no twins in these tables and every release resolves to nothing.
 #include <MG_Backend/DirectGLES/Managers.h>
+#include <MG_Backend/DirectGLES/DirectGLES.h>
+#include <MG_Backend/DirectVulkan/DirectVulkan.h>
 #include <MG_Remote/Client/ClientSession.h>
 #include <MG_Pipe/PipeApply.h>
 #include <MG_Util/Converters/GLToMG/TextureEnumConverter.h>
@@ -26,8 +31,25 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 namespace MobileGL::MG_Remote::Server {
+
+    // P5e (ra, CONTRACT-P5E §1 / §6): DOES THIS SERVER PUBLISH kCapRunAheadApply? The
+    // question is asked of the server's OWN CallMask and not of a build constant, because
+    // "the client may run ahead" is exactly what that bit says and Magma never sets it.
+    // A session with no CallMask yet (the bring-up window, a fixture that never called
+    // SetCapabilityBits) answers false: no client can have latched run-ahead against a
+    // snapshot that was never published.
+    //
+    // P5e (gl, ID-111): PROMOTED OUT OF THE ANONYMOUS NAMESPACE, unchanged in body. It is now
+    // the second conjunct of the barriered stamp as well as Present's frame-serial gate, and
+    // the red-once has to be able to assert what it answers for the session it built.
+    Bool MGPipeServerPublishesRunAhead() {
+        const ServerSession* session = ServerSession::Active();
+        if (session == nullptr || !session->CallMaskIsSet()) return false;
+        return (session->CallMask() & static_cast<Uint64>(MG_Pipe::kCapRunAheadApply)) != 0;
+    }
 
     ReplyPool::ReplyPool(void* base, Uint64 sizeBytes, Uint32 slotCount, Uint32 slotBytes)
         : m_base(static_cast<Uint8*>(base)), m_size(sizeBytes), m_slots(slotCount), m_slotBytes(slotBytes) {}
@@ -42,6 +64,12 @@ namespace MobileGL::MG_Remote::Server {
     // The view is rebuilt per call rather than stored, so that this body does not change
     // ReplyPool's four members and therefore does not touch v1's header at all.
     void ReplyPool::PostReply(Uint64 seq, Int32 status, const void* bytes, Uint64 size) {
+        if (m_link) {
+            const auto result = m_link->PostReply(seq, status, bytes, size);
+            if (result == MOBILEGL_ERR_BUFFER_TOO_SMALL)
+                SessionFail(MGFatalFamily::ReplyTooLarge, "MGPipe: Fatal{ReplyTooLarge, stream reply}");
+            return;
+        }
         Transport::ReplySlotPool pool(m_base, m_size, m_slots);
         // Fatal inside Post when the answer does not fit a slot: P5 does not chunk replies,
         // and the client knows an answer's size before it emits the record.
@@ -55,8 +83,17 @@ namespace MobileGL::MG_Remote::Server {
     // -----------------------------------------------------------------------------------
 
     void ServerVerbSink::SetBackend(MG_Backend::BackendObject* backend) {
-        if (m_backend != backend) ReleaseFences();
+        if (m_backend != backend) {
+            ReleaseQueries();
+            ReleaseFences();
+        }
         m_backend = backend;
+        if (backend != nullptr) {
+            const auto& limits = backend->GetDynamicParameters();
+            ServerStagedTexture().SetDeviceLimits(
+                limits.MaxTextureSize, limits.Max3DTextureSize, limits.MaxCubeMapTextureSize,
+                limits.MaxArrayTextureLayers, limits.MaxTextureBufferSize);
+        }
     }
 
     const MG_Backend::GlobalBackendFunctionsTable* ServerVerbSink::Table(const char* verb) const {
@@ -165,20 +202,27 @@ namespace MobileGL::MG_Remote::Server {
         m_fences.clear();
     }
 
+#include "QueryServer.inc"
+
     Bool ServerVerbSink::OnClear(const MG_Pipe::MGPClear& clear) {
         const MG_Backend::GlobalBackendFunctionsTable* table = Table("clear");
         if (table == nullptr) return false;
         const MG_Backend::GLFunctionsTable& gl = table->GL;
 
-        // Named records precede the verb; bound-form backends re-sync the live draw binding.
-        if (!MG_Pipe::MGPipeHandleIsNull(clear.Fbo) &&
-            clear.Fbo != MG_Pipe::MGPipeApplier().BoundFramebuffer[0]) {
-            const char* slot = clear.Kind == kMGPClearKindDepthStencil ? "ClearNamedFramebufferfi+UNBOUND" :
-                clear.ValueClass == kMGPClearValueClassInt ? "ClearNamedFramebufferiv+UNBOUND" :
-                clear.ValueClass == kMGPClearValueClassUint ? "ClearNamedFramebufferuiv+UNBOUND" :
-                "ClearNamedFramebufferfv+UNBOUND";
-            MGLOG_F("MGPipe: Fatal{UnmigratedVerb, \"%s\"}", slot);
-            std::abort();
+        // The named framebuffer record already crossed before this verb. Scope
+        // only the server's resolved draw target; the next verb still observes
+        // the application's unchanged binding. Both backends sync from this
+        // handle and never need the frontend FramebufferObject.
+        auto& applier = MG_Pipe::MGPipeApplier();
+        struct ScopedClearTarget {
+            MG_Pipe::MGPipeApplierState& State;
+            MG_Pipe::MGPipeHandle Saved;
+            ~ScopedClearTarget() { State.BoundFramebuffer[0] = Saved; }
+        } clearTarget{applier, applier.BoundFramebuffer[0]};
+        if (!MG_Pipe::MGPipeHandleIsNull(clear.Fbo)) {
+            if (!applier.FramebufferRecordFor(clear.Fbo))
+                Wire::WireProtocolFatal("Clear.Fbo", "missing named framebuffer record");
+            applier.BoundFramebuffer[0] = clear.Fbo;
         }
         switch (clear.Kind) {
         case kMGPClearKindWhole:
@@ -288,7 +332,66 @@ namespace MobileGL::MG_Remote::Server {
         ++m_presents;
         // FrameSerial 0 means "the server stamps its own" (c1-v1 8.3): P5 has no client-side
         // present credit, so the client sends 0 and the frame count on this side IS the serial.
+        //
+        // P5e (ra, CONTRACT-P5E §1, §2.4): IT IS THE CLIENT'S NOW, 1-BASED AND MINTED BY THE
+        // PAYER. A credit can only be paced in an id space the waiter advances, and the waiter
+        // is the client (`WaitForPresentAck(m_presentsSent + 1 - credit)`), so a server-stamped
+        // serial would be the server acknowledging its own count. The 0 arm survives for a
+        // peer that has not been re-built - and on a server that PUBLISHES the run-ahead cap it
+        // is a protocol fault, because such a client is pacing on this answer and a 0 would
+        // acknowledge a frame nobody asked about.
+        if (present.FrameSerial == 0 && MGPipeServerPublishesRunAhead()) {
+            // PH-1 (3): latches in an armed session child - no credit is returned for it, the
+            // session closes and the peer's credit wait ends on the hang-up.
+            return SessionLatch(MGFatalFamily::ProtocolCorruption, "MGPipe: Fatal{ProtocolCorruption, \"Present.FrameSerial\"} - a run-ahead "
+                    "server was handed present serial 0. The client mints this 1-based and "
+                    "waits on it for its credit (CONTRACT-P5E §2.4); returning a credit for "
+                    "serial 0 would release a wait that is asking about frame N");
+        }
         m_lastPresentSerial = present.FrameSerial != 0 ? present.FrameSerial : m_presents;
+        // §2.4's other half, and the reason ServerSession::ReturnPresentCredit has had no
+        // production caller since v1 wrote it: ONE CREDIT PER SWAP, returned after Present()
+        // has returned rather than before it, because what the client is waiting for is the
+        // swap and not the record's apply. It advances presentAckSerial AND rings the client's
+        // bell - a client parked in WaitForPresentAck(kWaitForever) needs the pair.
+        if (ServerSession* session = ServerSession::Active()) {
+            session->ReturnPresentCredit(m_lastPresentSerial);
+        }
+        return true;
+    }
+
+    Bool ServerVerbSink::OnGetTextureImage(const MG_Pipe::MGPReadbackInfo& info, Uint64 seq,
+                                           Wire::ReplySink* replies) {
+        if (!replies) Wire::WireProtocolFatal("GetTextureImage.reply", "missing reply sink");
+        const SizeT bpp = MG_Util::GetInputBytesPerPixel(
+            MG_Util::ConvertGLEnumToTextureInputFormat(info.Format),
+            MG_Util::ConvertGLEnumToTexturePixelDataType(info.Type));
+        if (!bpp || !info.Box.W || !info.Box.H || !info.Box.D || info.Box.X || info.Box.Y || info.Box.Z) {
+            Wire::WireProtocolFatal("GetTextureImage.extent", "invalid tight image extent");
+        }
+        const Uint64 tight = static_cast<Uint64>(info.Box.W) * info.Box.H * info.Box.D * bpp;
+        if (tight / bpp / info.Box.W / info.Box.H != info.Box.D ||
+            info.DstOffset > tight || !info.DstSize || info.DstSize > tight - info.DstOffset)
+            Wire::WireProtocolFatal("GetTextureImage.range", "invalid reply window");
+        auto image = info;
+        image.DstOffset = 0;
+        image.DstSize = tight;
+        Vector<Uint8> bytes;
+        Bool ok = false;
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (m_backend && m_backend->GetBackendType() == BackendType::DirectGLES)
+            ok = MG_Backend::DirectGLES::ReadTextureImageWire(image, bytes);
+        else if (m_backend && m_backend->GetBackendType() == BackendType::DirectVulkan &&
+                 MG_Backend::DirectVulkan::pVulkanRenderer)
+            ok = MG_Backend::DirectVulkan::pVulkanRenderer->ReadTextureImageWire(image, bytes);
+#endif
+        if (!ok || bytes.size() != tight) {
+            replies->PostReply(seq, Wire::ReplySink::kStatusError, nullptr, 0);
+            return false;
+        }
+        replies->PostReply(seq, Wire::ReplySink::kStatusOk, bytes.data() + info.DstOffset, info.DstSize);
+        m_readbackBytes += info.DstSize;
+        ++m_readbacks;
         return true;
     }
 
@@ -298,56 +401,65 @@ namespace MobileGL::MG_Remote::Server {
             // The decoder always passes its ReplySink; a null one means the applier was built
             // without a reply pool, and answering nothing would leave the client's barrier
             // waiting for a slot that never gets stamped - a hang, not a wrong picture.
-            MGLOG_F("MGPipe: Fatal{ProtocolCorruption, \"read_pixels without a reply sink\"} - "
+            SessionFail(MGFatalFamily::ProtocolCorruption, "MGPipe: Fatal{ProtocolCorruption, \"read_pixels without a reply sink\"} - "
                     "the pixels' only destination in P5 is SEG_REPLY (contract table 1 row 23) "
                     "and a client blocked on seq %llu would never be answered",
                     static_cast<unsigned long long>(seq));
-            std::abort();
         }
-        const MG_Backend::GlobalBackendFunctionsTable* table = Table("read_pixels");
-        if (table == nullptr || table->GL.ReadPixels == nullptr) {
-            // DECLINED IS A REAL ANSWER (table 0's slot-header row) and it is the RIGHT one
-            // here: the client is parked on this seq inside the verb barrier, so returning
-            // false without posting would convert "not implemented" into "never returns".
-            replies->PostReply(seq, Wire::ReplySink::kStatusDeclined, nullptr, 0);
-            return false;
-        }
-        if (info.DstSize == 0) {
-            replies->PostReply(seq, Wire::ReplySink::kStatusError, nullptr, 0);
-            return false;
-        }
-        // ID-49: THE REPLY CROSSES TIGHT AND PACK STATE NEVER CROSSES FOR A READ. The server reads
-        // with NEUTRAL pack state - ROW_LENGTH 0, SKIP_ROWS/PIXELS/IMAGES 0, ALIGNMENT 1 - into a
-        // w*h*bytesPerPixel extent that IS the reply payload, and restores the pack state
-        // afterwards; the CLIENT scatters those tight rows into the application's pointer per its
-        // own GL_PACK_* state (c1's half). Reading with the client's pack state HERE was the
-        // codex-1 blocker: the backend's ReadPixels honours ROW_LENGTH/SKIP_* and writes PAST a
-        // DstSize the client sized without the initial skip (a 4x3 RGBA8 read with ROW_LENGTH=8,
-        // SKIP_ROWS=1, SKIP_PIXELS=2 allocates 80 and lands its last write at 120), which is the
-        // two DepthReadbackHonoursThePackPixelStoreParameters SEGFAULTs the census omitted. THE
-        // DstSize FORMULA BOTH SIDES AGREE ON: w * h * bytesPerPixel. A non-default server-visible
-        // pack state can no longer change either the reply's size or its bytes.
         const SizeT bytesPerPixel = MG_Util::GetInputBytesPerPixel(
             MG_Util::ConvertGLEnumToTextureInputFormat(static_cast<GLenum>(info.Format)),
             MG_Util::ConvertGLEnumToTexturePixelDataType(static_cast<GLenum>(info.Type)));
-        // Tight size = w*h*bpp, the whole of ID-49's formula. If this build cannot size the
-        // (format, type) pair (bpp == 0) it trusts the client's DstSize - a neutral read still
-        // cannot overflow it via row length or skips, and an unsizeable pair is c1's
-        // Fatal{UnsizedReadback} at emission, not this side's.
-        const Uint64 tight = bytesPerPixel != 0
-                                 ? static_cast<Uint64>(info.Box.W) * static_cast<Uint64>(info.Box.H) *
-                                       static_cast<Uint64>(bytesPerPixel)
-                                 : info.DstSize;
-        if (bytesPerPixel != 0 && tight != info.DstSize) {
-            // Both halves compute w*h*bpp under ID-49, so a disagreement is the two sides
-            // disagreeing about the frame. Read (and post) the tight extent this side owns rather
-            // than the client's number, so a wrong DstSize can never make this a short read into
-            // uninitialised scratch.
+        // The server's LinkTerms.maxReplyBytes is copied from its attached ILink capabilities.
+        // Reject malformed shapes and oversized replies before growing m_readbackScratch. The
+        // client-side guard is not a trust boundary: a peer can write this record directly.
+        const auto rejectReadback = [&] {
+            replies->PostReply(seq, Wire::ReplySink::kStatusError, nullptr, 0);
+            return false;
+        };
+        if (bytesPerPixel == 0 || info.Box.W == 0 || info.Box.H == 0 ||
+            info.Box.W > static_cast<Uint32>(std::numeric_limits<GLsizei>::max()) ||
+            info.Box.H > static_cast<Uint32>(std::numeric_limits<GLsizei>::max()) ||
+            info.DstSize == 0 || m_maxReplyBytes == 0) {
+            return rejectReadback();
+        }
+
+        const Uint64 width = info.Box.W;
+        const Uint64 height = info.Box.H;
+        const Uint64 bpp = static_cast<Uint64>(bytesPerPixel);
+        constexpr Uint64 kUint64Max = std::numeric_limits<Uint64>::max();
+        if (width > kUint64Max / height) return rejectReadback();
+        const Uint64 pixels = width * height;
+        if (pixels > kUint64Max / bpp) return rejectReadback();
+        const Uint64 tight = pixels * bpp;
+        // PH-3's bound is the SERVER's answer size: w*h*bpp against its own maxReplyBytes,
+        // checked before the scratch grows. It is not a rule about DstSize.
+        if (tight > m_maxReplyBytes ||
+            tight > static_cast<Uint64>(std::numeric_limits<SizeT>::max())) {
+            return rejectReadback();
+        }
+        // ID-49: THE REPLY CROSSES TIGHT, WHATEVER DstSize THE CLIENT SENT. The server reads with
+        // neutral pack state into a w*h*bpp extent that IS the reply payload and the client
+        // scatters it per its own GL_PACK_* state, so a DstSize that disagrees with the tight
+        // extent (a client that sized its destination with pack padding) is logged and the tight
+        // extent this side owns is read and posted - never the client's number, so a wrong
+        // DstSize cannot make this a short read into uninitialised scratch. F2's first PH-3 draft
+        // refused the mismatch instead, which broke the ID-49 control
+        // (ServerLoopEglTest.AReadPixelsReplyIsTheTightExtentWhateverDstSizeTheClientSent); the
+        // bound above is what PH-3 needs and it does not depend on DstSize.
+        if (tight != info.DstSize) {
             MGLOG_E_ONCE("MG_Remote server: read_pixels DstSize %llu != tight w*h*bpp %llu "
-                         "(%ux%u, bpp %zu); reading the tight extent (ID-49)",
+                         "(%ux%u, bpp %llu); reading the tight extent (ID-49)",
                          static_cast<unsigned long long>(info.DstSize),
                          static_cast<unsigned long long>(tight), info.Box.W, info.Box.H,
-                         bytesPerPixel);
+                         static_cast<unsigned long long>(bpp));
+        }
+
+        const MG_Backend::GlobalBackendFunctionsTable* table = Table("read_pixels");
+        if (table == nullptr || table->GL.ReadPixels == nullptr) {
+            // A well-formed call can still be unsupported by this server; return the
+            // established decline status after the peer-controlled size has been checked.
+            replies->PostReply(seq, Wire::ReplySink::kStatusDeclined, nullptr, 0);
+            return false;
         }
         if (tight > m_readbackScratch.size()) {
             m_readbackScratch.resize(static_cast<SizeT>(tight));
@@ -360,12 +472,10 @@ namespace MobileGL::MG_Remote::Server {
         // in which the pack state is neutral does not outlive the call.
         const MG_Pipe::PixelStoreParameters savedPack =
             MG_Pipe::gPipeInputs.GetPixelStoreParameters(/*isUnpack=*/false);
-        MG_Pipe::MGPPixelPackState neutralPack{};
-        neutralPack.Pack.RowLength = 0;
-        neutralPack.Pack.SkipRows = 0;
-        neutralPack.Pack.SkipPixels = 0;
-        neutralPack.Pack.SkipImages = 0;
-        neutralPack.Pack.Alignment = 1;
+        // MG_Pipe owns the constant (MGPipeTypes.h): in a verify build the compare-at-read hook's
+        // oracle for the pack half inside this window is the same value, and a second hand-typed
+        // copy would drift without a build break.
+        const MG_Pipe::MGPPixelPackState neutralPack = MG_Pipe::MGPipeNeutralReadPixelsPack();
         MG_Pipe::MGPipeApplySetPixelPackState(neutralPack);
 
         table->GL.ReadPixels(info.Box.X, info.Box.Y, static_cast<GLsizei>(info.Box.W),
@@ -394,11 +504,13 @@ namespace MobileGL::MG_Remote::Server {
     // slot flipped on the client ahead of its server half aborts BY NAME on the apply thread
     // rather than rendering nothing. Named "(server sink)" in the message so a log reader can
     // tell which half is missing.
-    [[noreturn]] static void ServerUnmigratedVerbFatal(const char* slot) {
-        MGLOG_F("MGPipe: Fatal{UnmigratedVerb, \"%s\"} (server sink: the record crossed and "
+    //
+    // PH-1 (3): the shape is the PEER's (a multi-draw record it chose to send), so in an armed
+    // session child the refusal latches and the verb returns false; unarmed it still dies.
+    static Bool ServerUnmigratedVerbLatch(const char* slot) {
+        return SessionLatch(MGFatalFamily::UnmigratedVerb, "MGPipe: Fatal{UnmigratedVerb, \"%s\"} (server sink: the record crossed and "
                 "ServerVerbSink has no body for it yet - CONTRACT-P5B.md names the package)",
                 slot);
-        std::abort();
     }
 
     // P5b d1 (MG_Remote/CONTRACT-P5B.md §2 d1): draw_vbo's whole cross product. The record
@@ -427,12 +539,74 @@ namespace MobileGL::MG_Remote::Server {
     // with a span (the client refuses "MultiDrawElements+CLIENT_INDICES" first; P8's
     // HostResolve.cpp flattens it) and a multi-draw that claims instancing (no GL entry point
     // produces one; the client never sends it).
+#if MOBILEGL_BUILD_DISAGGREGATED
+    namespace {
+        // P5e (tx2), CONTRACT-P5E §5.3 / ruling 19 (ID-95, A8 closed). THE TWO UNIT WINDOWS MUST
+        // COVER [0, MaxTouchedTextureUnit], AND THIS IS WHERE THAT PROMISE IS CHECKED.
+        //
+        // Everything the texture and sampler families do per draw now reads
+        // [SamplerViewStart, +SamplerViewCount) and [SamplerStateStart, +SamplerStateCount).
+        // Under run-ahead a window NARROWER than the frontend's high-water mark silently drops a
+        // sync of a texture the draw is about to sample, or leaves an earlier draw's sampler
+        // object on a unit - and a decline is exactly what run-ahead cannot take, because the
+        // client has already moved on and there is no wait in which to notice.
+        //
+        // A SERVER-SIDE RE-DERIVATION IS REFUSED, and that is the ruling's point: the client owns
+        // the high-water mark (it is the `count` argument SamplerEmit.h passes, Start=0 /
+        // Count=maxTouched+1) and the server's job is to check the promise, not to invent a
+        // second authority for it. So this is a CHECK and its failure is corruption.
+        //
+        // WHERE THE MARK COMES FROM: MGPContextValues::MaxTouchedTextureUnit, applied by
+        // set_context_values, which precedes the verb on the ring - the same ordering §2.1's
+        // XFB clause leans on. It is RECORD_SUPPLIED, so reading it is reading what a record
+        // put there and not client memory (rule F).
+        //
+        // WIDER IS FINE. A window larger than the mark costs a walk over provably-empty units;
+        // only SMALLER is unrepresentable. An empty window on a draw that touches no unit at all
+        // (mark 0 with nothing ever touched) is the correct and only possible emission, so a
+        // count of 0 is admitted exactly while the applied counters say no unit was touched.
+        //
+        // THE ONE ADMITTED SILENCE, and it is the A/B rather than a hole: a client whose sampler
+        // subsystem bit is CLEAR emits neither record, the backend then runs its pre-handle
+        // frontend walk, and there is no window to check because there is no window. That is
+        // "both counts are still 0", and it is distinguishable from the narrowing this refuses
+        // (a narrowed window carries a non-zero count that is merely too small). The moment
+        // either set has been received, the rule binds.
+        //
+        // PH-1 (3): both windows are the PEER's records, so the refusals latch in an armed
+        // session child (false = latched, the verb declines); unarmed they still die.
+        Bool CheckUnitWindows(const MG_Pipe::MGPipeApplierState& st, const char* verb) {
+            if (st.SamplerViewCount == 0 && st.SamplerStateCount == 0) return true;
+            const Int maxTouched = MG_Pipe::gPipeInputs.GetMaxTouchedTextureUnit();
+            if (maxTouched < 0) return true;
+            const Uint32 required = static_cast<Uint32>(maxTouched) + 1u;
+            if (st.SamplerViewStart != 0 || st.SamplerViewCount < required) {
+                return SessionLatch(MGFatalFamily::ProtocolCorruption, "MGPipe: Fatal{ProtocolCorruption, \"SetSamplerViews.Count\"} - %s applies with "
+                        "units 0..%d touched, so set_sampler_views must carry Start=0 and Count >= %u "
+                        "(CONTRACT-P5E.md §5.3); the applied window is Start=%u Count=%u, which drops "
+                        "the sync of at least one texture this draw samples",
+                        verb, static_cast<int>(maxTouched), required, st.SamplerViewStart,
+                        st.SamplerViewCount);
+            }
+            if (st.SamplerStateStart != 0 || st.SamplerStateCount < required) {
+                return SessionLatch(MGFatalFamily::ProtocolCorruption, "MGPipe: Fatal{ProtocolCorruption, \"BindSamplerStates.Count\"} - %s applies with "
+                        "units 0..%d touched, so bind_sampler_states must carry Start=0 and Count >= %u "
+                        "(CONTRACT-P5E.md §5.3); the applied window is Start=%u Count=%u, which leaves "
+                        "an earlier draw's sampler object on at least one unit",
+                        verb, static_cast<int>(maxTouched), required, st.SamplerStateStart,
+                        st.SamplerStateCount);
+            }
+            return true;
+        }
+    } // namespace
+#endif
+
     Bool ServerVerbSink::OnDrawVbo(const MG_Pipe::MGPDrawInfo& info,
                                    const MG_Pipe::MGPDrawRange* ranges,
                                    const MG_Pipe::MGHostSpan* userIndices,
                                    const MG_Pipe::MGPDrawIndirect* indirect) {
-        if (userIndices != nullptr) {
-            Wire::CheckDrawUserIndices(info, ranges, *userIndices);
+        if (userIndices != nullptr && !Wire::CheckDrawUserIndices(info, ranges, *userIndices)) {
+            return false; // PH-1 (3): latched (armed session child); unarmed it died inside
         }
         // The witness first, before the backend is consulted, so a unit process with no
         // backend object still sees the wire's fields (PipeApplier.h LastDraw).
@@ -449,6 +623,11 @@ namespace MobileGL::MG_Remote::Server {
         }
         ++m_drawRecords;
 
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // Ruling 19 / ID-95: the window promise, checked at every draw, before the backend is
+        // asked to resolve anything out of the windows.
+        if (!CheckUnitWindows(MG_Pipe::MGPipeApplier(), "draw_vbo")) return false;
+#endif
         const MG_Backend::GlobalBackendFunctionsTable* table = Table("draw_vbo");
         if (table == nullptr) return false;
         const MG_Backend::GLFunctionsTable& gl = table->GL;
@@ -524,12 +703,12 @@ namespace MobileGL::MG_Remote::Server {
         // ---- the multi-draws: the two arrays rebuilt from the ranges (rule C) --------------
         if (info.NumDraws != 1) {
             if (userIndices != nullptr) {
-                ServerUnmigratedVerbFatal(info.IndexSize == 0 ? "MultiDrawArrays+CLIENT_INDICES"
-                                                              : "MultiDrawElements+CLIENT_INDICES");
+                return ServerUnmigratedVerbLatch(info.IndexSize == 0 ? "MultiDrawArrays+CLIENT_INDICES"
+                                                                     : "MultiDrawElements+CLIENT_INDICES");
             }
             if (instanced) {
-                ServerUnmigratedVerbFatal(info.IndexSize == 0 ? "MultiDrawArrays+INSTANCED"
-                                                              : "MultiDrawElements+INSTANCED");
+                return ServerUnmigratedVerbLatch(info.IndexSize == 0 ? "MultiDrawArrays+INSTANCED"
+                                                                     : "MultiDrawElements+INSTANCED");
             }
             const auto n = static_cast<SizeT>(info.NumDraws);
             m_multiCounts.resize(n);
@@ -668,15 +847,26 @@ namespace MobileGL::MG_Remote::Server {
     // identical - and it is also the honest statement of the debt, which `rsp` counts.
 
     Bool ServerVerbSink::OnLaunchGrid(const MG_Pipe::MGPGridInfo& grid) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+        // Ruling 19 / ID-95: a dispatch samples through the same unit windows a draw does.
+        if (!CheckUnitWindows(MG_Pipe::MGPipeApplier(), "launch_grid")) return false;
+#endif
         const MG_Backend::GlobalBackendFunctionsTable* table = Table("launch_grid");
         if (table == nullptr) return false;
         const MG_Backend::GLFunctionsTable& gl = table->GL;
-        // The compute program is NOT named by this record and must not be: it is
-        // GetProgramForDispatch, GetProgramForDraw's twin, which the backend pulls inside its
-        // own PrepareForCompute (DirectGLES.cpp:5779). i1 is what puts compute on the path, so
-        // the field moves FATAL -> BARRIER_PULLED in FieldOwnership.def (contract §6.9, the
-        // one row this package is granted). Block* are 0 on the wire for the same reason: the
-        // local size is a link artifact the backend reads from its own program.
+        // The compute program is NOT named by THIS record and must not be - but it IS named, by
+        // the set_dispatch_program record that preceded it, and the backend's PrepareForCompute
+        // reads MGPipeApplier().DispatchProgram from there.
+        //
+        // P5e (pa): that is what this comment used to get wrong. Until P5e the backend PULLED
+        // GetProgramForDispatch - GetProgramForDraw's twin - inside PrepareForCompute, and the
+        // field's FATAL -> BARRIER_PULLED move in FieldOwnership.def (contract §6.9, i1's one
+        // granted row) is what made the pull legal. pg gave the sync and the link/SPIR-V gate a
+        // handle arm and pa retired the pull itself, so on the handle arm the row is not read at
+        // all; the BARRIER_PULLED class stays because the monolith arm still reads it (ID-81).
+        // Block* are 0 on the wire for the unchanged reason: the local size is a link artifact
+        // the backend reads from the program it resolved, which on that arm is the record's
+        // archive.
         if (grid.IsIndirect != 0) {
             if (gl.DispatchComputeIndirect == nullptr) return false;
             // IndirectBuffer travels for P7's sake; the BINDING is server state, put there by
@@ -725,23 +915,14 @@ namespace MobileGL::MG_Remote::Server {
         if (table == nullptr) return false;
         if (table->GL.CopyImageSubData == nullptr) return false;
 
-        // REFUSED BY NAME ON BOTH SIDES OF ONE WIRE. The client refuses a renderbuffer endpoint
-        // before it emits (ID-57's shape, EmitTables.cpp), and this is the same refusal for a
-        // record that reached here anyway: no sticky forward hands out a RenderbufferObject, so
-        // there is no honest way to build the endpoint, and guessing an empty one would copy
-        // nothing and say it copied.
-        if (copy.SrcTarget == GL_RENDERBUFFER || copy.DstTarget == GL_RENDERBUFFER) {
-            ServerUnmigratedVerbFatal("CopyImageSubData+RENDERBUFFER");
-        }
-
-        // THE TWO ENDPOINTS ARE REBUILT FROM THE GL NAMES, through the BARRIER-PULLED sticky
-        // forward GetTextureObject(name) - `rsp` counts every one of these and P7 is what
-        // retires them by making the backend take the handles that travel beside the names.
+        // Typed handles resolve both texture and renderbuffer storage on the server.
         MG_Backend::CopyImageEndpoint src{};
         MG_Backend::CopyImageEndpoint dst{};
-        src.Texture = MG_Pipe::gPipeInputs.GetTextureObject(static_cast<Uint>(copy.SrcGlName));
-        dst.Texture = MG_Pipe::gPipeInputs.GetTextureObject(static_cast<Uint>(copy.DstGlName));
-        if (!src.Exists() || !dst.Exists()) {
+        if (copy.SrcTarget == GL_RENDERBUFFER) src.RenderbufferHandle = copy.Src;
+        else src.TextureHandle = copy.Src;
+        if (copy.DstTarget == GL_RENDERBUFFER) dst.RenderbufferHandle = copy.Dst;
+        else dst.TextureHandle = copy.Dst;
+        if (MG_Pipe::MGPipeHandleIsNull(copy.Src) || MG_Pipe::MGPipeHandleIsNull(copy.Dst)) {
             // The monolith's own answer to this, in its own words (DirectGLES.cpp:9067
             // "source or destination image failed to sync; declining the copy"): the frontend
             // validator is what keeps it unreachable and what reports the INVALID_VALUE the
@@ -802,9 +983,10 @@ namespace MobileGL::MG_Remote::Server {
         // application's block INDEX. `name` points into the decoder's bounded local and is
         // valid for this call only (rule C); the backend slot copies what it needs.
         //
-        // Both backends resolve the PROGRAM through the barrier-pulled GetProgramObject(GlName)
-        // / TryGetDirectVulkanProgram - `rsp` again, retired by P9. ShaderCso travels beside the
-        // name for the phase that dispatches on it.
+        // P5f fe: publish the record's program handle for the backend consumer. Espryt
+        // resolves its server twin directly; Magma's consumer is the fm package's seam.
+        MG_Pipe::MGPipeApplier().ClearVerbHandles();
+        MG_Pipe::MGPipeApplier().VerbStorageBlockProgram = binding.ShaderCso;
         table->GL.ShaderStorageBlockBinding(static_cast<GLuint>(binding.GlName), name,
                                             static_cast<GLuint>(binding.Binding));
         ++m_storageBlockBindings;
@@ -828,6 +1010,9 @@ namespace MobileGL::MG_Remote::Server {
     // crash or as a silent success. Contract §2 t2 says so for PatchParameteri by name.
 
     Bool ServerVerbSink::OnBeginStreamOutput(const MG_Pipe::MGPStreamOutputBegin& begin) {
+        auto& state = MG_Pipe::MGPipeApplier();
+        state.BoundStreamOutputLifetimeId = begin.LifetimeId;
+        state.StreamOutputSpans[begin.LifetimeId] = begin;
         const MG_Backend::GlobalBackendFunctionsTable* table = Table("begin_stream_output");
         if (table == nullptr) return false;
         if (table->GL.BeginTransformFeedback == nullptr) return false;
@@ -845,7 +1030,11 @@ namespace MobileGL::MG_Remote::Server {
     Bool ServerVerbSink::OnEndStreamOutput(const MG_Pipe::MGPXfbAccounting& accounting) {
         const MG_Backend::GlobalBackendFunctionsTable* table = Table("end_stream_output");
         if (table == nullptr) return false;
-        if (table->GL.EndTransformFeedback == nullptr) return false;
+        if (table->GL.EndTransformFeedback == nullptr) {
+            auto& state = MG_Pipe::MGPipeApplier();
+            state.StreamOutputSpans.erase(state.BoundStreamOutputLifetimeId);
+            return false;
+        }
         // THE THREE ACCOUNTING FIELDS ARE NOT READ, AND THAT IS THE RULING RATHER THAN AN
         // OMISSION. glEndTransformFeedback takes no arguments; the numbers are the CLIENT's own
         // per-span accounting (contract §2 t2's companions row) and the client is where they are
@@ -856,6 +1045,8 @@ namespace MobileGL::MG_Remote::Server {
         // server-side scatter is what will need them.
         (void)accounting;
         table->GL.EndTransformFeedback();
+        auto& state = MG_Pipe::MGPipeApplier();
+        state.StreamOutputSpans.erase(state.BoundStreamOutputLifetimeId);
         ++m_streamOutputSpans;
         return true;
     }
@@ -883,17 +1074,31 @@ namespace MobileGL::MG_Remote::Server {
     Bool ServerVerbSink::OnBindStreamOutput(const MG_Pipe::MGPStreamOutputBind& bind) {
         const MG_Backend::GlobalBackendFunctionsTable* table = Table("bind_stream_output");
         if (table == nullptr) return false;
-        if (table->GL.BindTransformFeedback == nullptr) return false;
         // THE GL NAME IS THE ARGUMENT, NOT THE LifetimeId BESIDE IT. Espryt keys its driver
         // objects by the GL name (XfbImpl::g_xfbObjects[name], DirectGLES.cpp:1401) and creates
         // the ES object on first bind; passing the lifetime id would index a map that has never
         // heard of it and silently create a second driver object per bind. The lifetime id
-        // travels as the identity P7/P9 will dispatch on once the XFB namespace has a wire
-        // lifetime of its own - it has no reader on this side today, and pretending otherwise
-        // by folding it into the key is exactly the "a GL name is never an identity" confusion
-        // the contract's GlName row is written against.
-        table->GL.BindTransformFeedback(static_cast<GLuint>(bind.GlName));
+        // identifies the P5f capture snapshot on this side. Keeping it separate preserves
+        // the backend GL-name argument while Begin/End find the right server-owned span.
+        MG_Pipe::MGPipeApplier().BoundStreamOutputLifetimeId = bind.LifetimeId;
+        if (table->GL.BindTransformFeedback) table->GL.BindTransformFeedback(static_cast<GLuint>(bind.GlName));
         ++m_streamOutputBinds;
+        return true;
+    }
+
+    Bool ServerVerbSink::OnDeleteStreamOutput(const MG_Pipe::MGPStreamOutputBind& object) {
+        const auto* table = Table("DeleteTransformFeedback");
+        if (!table) return false;
+        if (!object.GlName || object.Pad0)
+            Wire::WireProtocolFatal("DeleteStreamOutput.name", "default object or reserved field");
+        auto& state = MG_Pipe::MGPipeApplier();
+        if (object.LifetimeId) {
+            state.StreamOutputSpans.erase(object.LifetimeId);
+            if (state.BoundStreamOutputLifetimeId == object.LifetimeId) state.BoundStreamOutputLifetimeId = 0;
+        }
+        state.VerbDeleteStreamOutputLifetimeId = object.LifetimeId;
+        if (table->GL.DeleteTransformFeedback) table->GL.DeleteTransformFeedback(object.GlName);
+        state.VerbDeleteStreamOutputLifetimeId = 0;
         return true;
     }
 
@@ -923,6 +1128,8 @@ namespace MobileGL::MG_Remote::Server {
         auto& applierState = MG_Pipe::MGPipeApplier();
         applierState.ClearVerbHandles();
         applierState.VerbMipRes = plan.Res;
+        applierState.VerbMipBaseLevel = plan.BaseLevel;
+        applierState.VerbMipLevelCount = plan.LevelCount;
 #endif
         table->GL.GenerateMipmap(plan.Target);
         return true;
@@ -966,14 +1173,14 @@ namespace MobileGL::MG_Remote::Server {
         // session, so the only legal sequence is 0, 1, 2, ... and the session's own count of
         // accepted resets IS the expected value; anything else means the two ends disagree
         // about how many make-current edges have crossed, which no backend answer can fix.
+        // PH-1 (3): latches in an armed session child (the peer wrote the serial); dies unarmed.
         if (reset.ContextSerial != m_applierResetSerial) {
-            MGLOG_F("MGPipe: Fatal{ProtocolCorruption, \"ApplierReset.ContextSerial\"} - the "
+            return SessionLatch(MGFatalFamily::ProtocolCorruption, "MGPipe: Fatal{ProtocolCorruption, \"ApplierReset.ContextSerial\"} - the "
                     "record carries %llu and this session has accepted %llu reset(s); the "
                     "serial is asserted against the session's own count, not dispatched on "
                     "(one context per session in P5c)",
                     static_cast<unsigned long long>(reset.ContextSerial),
                     static_cast<unsigned long long>(m_applierResetSerial));
-            std::abort();
         }
         ++m_applierResetSerial;
         // THE WHOLE POINT OF THE RECORD: the reset runs HERE, on the apply thread, against
@@ -989,17 +1196,16 @@ namespace MobileGL::MG_Remote::Server {
         // §1's zero ruling: a null handle means "the object never crossed", and the client
         // emits NOTHING in that case (§5.2) - so a null handle arriving here is corruption,
         // not a no-op.
+        // PH-1 (3): both refusals latch in an armed session child; unarmed they die as before.
         if (MG_Pipe::MGPipeHandleIsNull(death.Handle)) {
-            MGLOG_F("MGPipe: Fatal{ProtocolCorruption, \"ObjectDeath.Handle\"} - a null "
+            return SessionLatch(MGFatalFamily::ProtocolCorruption, "MGPipe: Fatal{ProtocolCorruption, \"ObjectDeath.Handle\"} - a null "
                     "handle never crosses: the client emits nothing for an object its own "
                     "allocator cannot resolve (CONTRACT-P5C.md §5.2)");
-            std::abort();
         }
         if (death.Kind >= static_cast<Uint32>(MG_Pipe::MGPipeKind::KindCount)) {
-            MGLOG_F("MGPipe: Fatal{ProtocolCorruption, \"ObjectDeath.Kind\"} - %u is not an "
+            return SessionLatch(MGFatalFamily::ProtocolCorruption, "MGPipe: Fatal{ProtocolCorruption, \"ObjectDeath.Kind\"} - %u is not an "
                     "MGPipeKind",
                     static_cast<unsigned>(death.Kind));
-            std::abort();
         }
         // The per-kind release, keyed by the handle the record carried. A false answer is
         // NOT a decline: the kind's own delete opcode may already have released the twin
@@ -1019,16 +1225,31 @@ namespace MobileGL::MG_Remote::Server {
     PipeApplier::PipeApplier(Wire::SegmentTable* segments, ReplyPool* replies)
         : m_segments(segments), m_replies(replies) {}
 
+    void PipeApplier::Attach(Transport::ILink* link, MG_Backend::BackendObject* backend) {
+        if (!link || !link->Attached() || !m_segments)
+            SessionFail(MGFatalFamily::ProtocolCorruption, "MGPipe: Fatal{ProtocolCorruption, PipeApplier::Attach missing link}");
+        m_verbs.SetBackend(backend);
+        m_verbs.SetMaxReplyBytes(link->Capabilities().MaxReplyBytes);
+        m_decoder = Wire::PipeWireDecoder(link, m_segments, m_replies);
+        m_decoder.SetVerbSink(&m_verbs);
+        MG_Pipe::MGPipeServerBlockNoteIdentity(); m_attached = true;
+    }
+
     void PipeApplier::Attach(Transport::RingControl* control, MG_Backend::BackendObject* backend) {
         if (control == nullptr || m_segments == nullptr) {
-            MGLOG_F("MGPipe: Fatal{ProtocolCorruption, \"PipeApplier::Attach\"} - no control "
+            SessionFail(MGFatalFamily::ProtocolCorruption, "MGPipe: Fatal{ProtocolCorruption, \"PipeApplier::Attach\"} - no control "
                     "page or no segment table; ServerSession::Accept builds both before the "
                     "apply thread starts");
-            std::abort();
         }
         m_verbs.SetBackend(backend);
         m_decoder = Wire::PipeWireDecoder(control, m_segments, m_replies);
         m_decoder.SetVerbSink(&m_verbs);
+        // P5f (f1), CONTRACT-P5E §3.2: the server block's identity, once per session (the
+        // per-verb stamp refreshes it against the served-context serial). A no-op unless the
+        // dual-block rehearsal is armed; without it the server block's ContextIdentity() stays
+        // nullptr and the backend's identity-keyed memo caches read that as a HIT on their
+        // zero-initialised slot - an unnamed null dereference instead of a named marker.
+        MG_Pipe::MGPipeServerBlockNoteIdentity();
         m_attached = true;
     }
 
@@ -1042,10 +1263,9 @@ namespace MobileGL::MG_Remote::Server {
 
     Bool PipeApplier::ApplyOne(const Transport::RingRecordView& record) {
         if (!m_attached) {
-            MGLOG_F("MGPipe: Fatal{ProtocolCorruption, \"PipeApplier::ApplyOne before Attach\"} "
+            SessionFail(MGFatalFamily::ProtocolCorruption, "MGPipe: Fatal{ProtocolCorruption, \"PipeApplier::ApplyOne before Attach\"} "
                     "- a record reached the applier with no decoder; the apply thread calls "
                     "Attach once before its first pop");
-            std::abort();
         }
         // R-1's INVARIANT, THE SERVER'S HALF (table 3's gPipeInputs row, c1-v1 8.1). The flag
         // is raised for the WHOLE of this function and not only around DecodeAndApply: the
@@ -1069,10 +1289,47 @@ namespace MobileGL::MG_Remote::Server {
         // §4.4 exemptions from a probe the client's own wait still makes safe - a refusal with
         // no defect behind it. The predicate is computed on every record all the same, so it is
         // exercised for the whole phase rather than first run on the day it starts deciding.
+        //
+        // AND THE SERVER'S OWN CAPABILITY IS THE SECOND CONJUNCT (P5e gl, ID-111). The constant
+        // above says what the CLIENT will do once ra's wait rule is live; it says nothing about
+        // which server this is. kCapRunAheadApply is never published on DirectVulkan (ID-90,
+        // MGPipeRunAheadCapBitsFor), yet draw_vbo / blit / clear / launch_grid are all
+        // kWaitNone - so a stamp that read the build constant alone would, on the day it flips,
+        // have a MAGMA server mark every draw record UNBARRIERED while its client is still
+        // lockstep. CountBarrierPull (PipeInputs.cpp) is an unconditional Fatal on an
+        // unbarriered pull, no knob involved, and Magma's residual fill is its ONLY source for
+        // the seven pointer-backed fields: Magma would die on its first draw and take
+        // MagmaP7AllocatorDebtScope's exemption with it.
+        //
+        // BOTH PREDICATES ARE COMPUTED UNCONDITIONALLY, as arguments rather than as the arms of
+        // a short-circuit, which is ID-103's reason extended to the capability probe: they are
+        // exercised on every record for the whole phase rather than first running on the day
+        // they start deciding.
+        //
+        // PH-1 (3): BUT NOT BEFORE THE RECORD HAS BEEN ADMITTED. MGPipeBarriered reads payload
+        // fields (a DrawVbo's MGPDrawInfo::Flags) and the stamps index per-opcode tables, so a
+        // record whose ring header is shorter than its own type - or names no opcode - would be
+        // read past its end here, before DecodeAndApply's pre-gate could refuse it. In an armed
+        // session child the pre-gate therefore runs FIRST: a refused record latches by name and
+        // is declined with nothing stamped (ServerLoopTest's short-record case reads the stamp).
+        // Unarmed it admits everything and the generated gate keeps its death, as before.
+        if (!m_decoder.AdmitOrDecline(record)) return false;
         const Bool wireSaysBarriered = MG_Pipe::MGPipeBarriered(
             static_cast<MG_Pipe::MGPWireOp>(record.kind), record.payload, MG_Pipe::MGPipeApplier());
         MG_Pipe::MGPipeApplierSetCurrentRecordBarriered(
-            MG_Pipe::kMGPipeP5eClientWaitRuleLanded ? wireSaysBarriered : true);
+            MGPipeApplierStampsBarriered(MG_Pipe::kMGPipeP5eClientWaitRuleLanded,
+                                         MGPipeServerPublishesRunAhead(), wireSaysBarriered));
+        // P5e (gl), ID-128: AND WHETHER IT WAS BARRIERED BY ESCALATION RATHER THAN BY ITS CLASS.
+        // The predicate above is the static wait class plus two payload-derived escalations
+        // (ID-83: an open transform-feedback span, a draw carrying client vertex arrays), so the
+        // difference between it and the table IS the escalation - both halves are already
+        // computed here, and the second flag costs one compare. The strict knob is the only
+        // reader: a pull on an escalated record is a debt the phase that owns XFB (§5.7) or
+        // client arrays (ID-82) owes, neither of which is this one.
+        MG_Pipe::MGPipeApplierSetCurrentRecordBarrieredByEscalation(
+            wireSaysBarriered &&
+            MG_Pipe::MGPipeWaitClassFor(static_cast<MG_Pipe::MGPWireOp>(record.kind)) ==
+                MG_Pipe::kWaitNone);
         // ORDER IS THE CONTRACT'S: stamp, then apply. The stamp is what makes any server-side
         // read of gPipeInputs legal at all (PipeApplier.h's block 1), so a record applied
         // before it aborts on the FIRST field inside SyncRenderState.

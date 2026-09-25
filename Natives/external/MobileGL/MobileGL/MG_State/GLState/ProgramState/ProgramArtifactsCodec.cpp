@@ -13,6 +13,7 @@
 #include <bit>
 #include <cstring>
 #include <set>
+#include <limits>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -70,6 +71,88 @@ namespace MobileGL::MG_State::GLState {
         template <class T>
         concept ArchiveUniformInitializer = std::same_as<T, UniformInitializer>;
 
+        // glslang supplies no VisitFields table for this aggregate. Keep its one explicit
+        // table shared by the payload writer, reader and wire-schema walk.
+        template <class Self, class Visitor>
+        void VisitUniformInitializer(Self& value, Visitor&& visit) {
+            visit("name", value.name);
+            visit("basicType", value.basicType);
+            visit("vectorSize", value.vectorSize);
+            visit("matrixCols", value.matrixCols);
+            visit("matrixRows", value.matrixRows);
+            visit("arraySize", value.arraySize);
+            visit("intValues", value.intValues);
+            visit("floatValues", value.floatValues);
+        }
+
+#if MOBILEGL_BUILD_DISAGGREGATED
+        void SchemaWord(Uint64& hash, Uint64 word) {
+            for (unsigned i = 0; i < 8; ++i) {
+                hash ^= (word >> (i * 8)) & 255u;
+                hash *= 1099511628211ull;
+            }
+        }
+        void SchemaName(Uint64& hash, const char* text) {
+            do {
+                hash ^= static_cast<unsigned char>(*text);
+                hash *= 1099511628211ull;
+            } while (*text++ != '\0');
+        }
+        template <class Value>
+        void DescribeWireType(Uint64& hash) {
+            using T = std::remove_cv_t<Value>;
+            if constexpr (ArchiveScalar<T>) {
+                // These are the bytes PutRaw/TakeRaw actually carry, not the surrounding
+                // C++ object's layout. Equal-width signed/unsigned or float/int differ.
+                if constexpr (std::is_enum_v<T>) {
+                    SchemaName(hash, "enum");
+                    DescribeWireType<std::underlying_type_t<T>>(hash);
+                } else {
+                    SchemaName(hash, std::is_same_v<T, bool> ? "bool" :
+                                     std::is_floating_point_v<T> ? "ieee-float" :
+                                     std::is_signed_v<T> ? "signed" : "unsigned");
+                    SchemaWord(hash, sizeof(T));
+                    if constexpr (std::is_floating_point_v<T>) {
+                        static_assert(std::numeric_limits<T>::is_iec559);
+                        SchemaWord(hash, std::numeric_limits<T>::digits);
+                        SchemaWord(hash, std::numeric_limits<T>::max_exponent);
+                    }
+                }
+            } else if constexpr (ArchiveString<T>) {
+                SchemaName(hash, "string-u64-count-byte-content");
+            } else if constexpr (ArchiveMap<T>) {
+                SchemaName(hash, "map-u64-count");
+                DescribeWireType<typename T::key_type>(hash);
+                DescribeWireType<typename T::mapped_type>(hash);
+            } else if constexpr (ArchiveSet<T>) {
+                SchemaName(hash, "set-u64-count");
+                DescribeWireType<typename T::value_type>(hash);
+            } else if constexpr (ArchiveFixedArray<T>) {
+                SchemaName(hash, "fixed-array");
+                SchemaWord(hash, std::tuple_size<T>::value);
+                DescribeWireType<typename T::value_type>(hash);
+            } else if constexpr (ArchiveVector<T>) {
+                SchemaName(hash, "vector-u64-count");
+                DescribeWireType<typename T::value_type>(hash);
+            } else {
+                SchemaName(hash, ArchiveUniformInitializer<T> ? "uniform-initializer" : "record");
+                // Visit only types/names from default records. Container contents are never
+                // traversed, and no sizeof(string/vector/map), offset or allocator enters it.
+                T value{};
+                Uint64 fields = 0;
+                const auto field = [&](const char* name, const auto& member) {
+                    ++fields;
+                    SchemaName(hash, name);
+                    DescribeWireType<std::remove_cvref_t<decltype(member)>>(hash);
+                };
+                if constexpr (ArchiveUniformInitializer<T>) VisitUniformInitializer(value, field);
+                else VisitFields(value, field);
+                SchemaWord(hash, fields);
+                SchemaName(hash, "end-record");
+            }
+        }
+#endif
+
         // ---- the writer ----
 
         template <class T>
@@ -117,6 +200,11 @@ namespace MobileGL::MG_State::GLState {
             } else if constexpr (ArchiveVector<T>) {
                 WriteSequence(out, value);
             } else if constexpr (ArchiveUniformInitializer<T>) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+                VisitUniformInitializer(value, [&out](const char*, const auto& member) {
+                    WriteValue(out, member);
+                });
+#else
                 WriteValue(out, value.name);
                 WriteValue(out, value.basicType);
                 WriteValue(out, value.vectorSize);
@@ -125,6 +213,7 @@ namespace MobileGL::MG_State::GLState {
                 WriteValue(out, value.arraySize);
                 WriteValue(out, value.intValues);
                 WriteValue(out, value.floatValues);
+#endif
             } else {
                 // The archive's own structs: TypeFacts, ResourceReflection, XfbVarying. ONE
                 // table serves both directions, so a member added to any of them is carried by
@@ -158,15 +247,68 @@ namespace MobileGL::MG_State::GLState {
             return true;
         }
 
-        // A COUNT IS CHECKED AGAINST THE BYTES THAT REMAIN BEFORE ANYTHING IS ALLOCATED. Every
-        // element this codec writes costs at least one byte, so a count larger than the
-        // remaining bytes cannot describe this stream - and refusing it here is what stops a
-        // corrupt or truncated archive from turning into a multi-gigabyte resize before the
-        // element loop notices it has run out.
-        Bool TakeCount(ReadCursor& in, SizeT& count) {
+        // ---- the fewest bytes the writer can emit for one value of a type ----
+        //
+        // What PH-5's vector bound charges per element (TakeCount below). It is the WRITER'S
+        // floor, derived arm for arm from WriteValue above: a scalar is its own width, a string
+        // or a container is its u64 count and nothing else when empty, a fixed array is its
+        // width times its element's floor, and a record - VisitFields, or the hand-written
+        // TUniformInitializer table - is the sum of its fields' floors. It depends on the TYPE
+        // only; the default-constructed instance is there because VisitFields needs something to
+        // walk, and no member value is read.
+        template <class Value>
+        SizeT MinEncodedBytesOf() {
+            using T = std::remove_cv_t<Value>;
+            if constexpr (ArchiveScalar<T>) {
+                return sizeof(T);
+            } else if constexpr (ArchiveString<T> || ArchiveMap<T> || ArchiveSet<T> || ArchiveVector<T>) {
+                return sizeof(Uint64);
+            } else if constexpr (ArchiveFixedArray<T>) {
+                return std::tuple_size<T>::value * MinEncodedBytesOf<typename T::value_type>();
+            } else {
+                T value{};
+                SizeT bytes = 0;
+                const auto field = [&bytes](const char*, const auto& member) {
+                    bytes += MinEncodedBytesOf<std::remove_cvref_t<decltype(member)>>();
+                };
+                if constexpr (ArchiveUniformInitializer<T>) VisitUniformInitializer(value, field);
+                else VisitFields(value, field);
+                return bytes;
+            }
+        }
+
+        // At least one byte, so a count is always bounded by the bytes that remain (a type whose
+        // floor were zero - an empty record, a zero-width array - would otherwise admit any count).
+        template <class Value>
+        SizeT MinEncodedBytes() {
+            static const SizeT bytes = [] {
+                const SizeT least = MinEncodedBytesOf<Value>();
+                return least == 0 ? SizeT{1} : least;
+            }();
+            return bytes;
+        }
+
+        // A COUNT IS CHECKED AGAINST THE BYTES THAT REMAIN BEFORE ANYTHING IS ALLOCATED: every
+        // one of `count` elements still has to be read out of Remaining(), so a count larger than
+        // Remaining() / (the element's smallest encoding) is one no stream this writer produced
+        // can back, and it is refused before the resize.
+        //
+        // PH-5 (codex closeout finding 3): the charge per element is the MINIMUM ENCODED size,
+        // NOT sizeof(value_type). The first PH-5 charged sizeof, and that refused archives this
+        // very encoder writes: a Vector<String> element is eight bytes of count plus its
+        // characters on the wire but a 32-byte object in memory, so ten one-character
+        // xfbInterfaceNames with empty vectors behind them decoded to false
+        // (ProgramArtifactsCodecTest's ACompactArchiveOf* round trips). The allocation stays
+        // bounded all the same - resize(count) costs at most
+        // (Remaining() / MinEncodedBytes<T>()) * sizeof(T), a
+        // constant factor of the archive fixed per type (on libstdc++: 4 for a String, 3 for a
+        // nested vector, ~1.3 for a ResourceReflection), never the peer's count. The division
+        // form avoids multiplying attacker input and is safe on both 32-bit and 64-bit SizeT.
+        Bool TakeCount(ReadCursor& in, SizeT& count, SizeT minEncodedBytesPerElement = 1) {
             Uint64 raw = 0;
             if (!TakeRaw(in, raw)) return false;
-            if (raw > static_cast<Uint64>(in.Remaining())) {
+            if (minEncodedBytesPerElement == 0 ||
+                raw > static_cast<Uint64>(in.Remaining() / minEncodedBytesPerElement)) {
                 in.Ok = false;
                 return false;
             }
@@ -215,7 +357,8 @@ namespace MobileGL::MG_State::GLState {
                 }
             } else if constexpr (ArchiveVector<T>) {
                 SizeT count = 0;
-                if (!TakeCount(in, count)) return;
+                using Element = typename T::value_type;
+                if (!TakeCount(in, count, MinEncodedBytes<Element>())) return;
                 value.clear();
                 value.resize(count);
                 for (auto& element : value) {
@@ -223,6 +366,11 @@ namespace MobileGL::MG_State::GLState {
                     if (!in.Ok) return;
                 }
             } else if constexpr (ArchiveUniformInitializer<T>) {
+#if MOBILEGL_BUILD_DISAGGREGATED
+                VisitUniformInitializer(value, [&in](const char*, auto& member) {
+                    if (in.Ok) ReadValue(in, member);
+                });
+#else
                 ReadValue(in, value.name);
                 ReadValue(in, value.basicType);
                 ReadValue(in, value.vectorSize);
@@ -231,6 +379,7 @@ namespace MobileGL::MG_State::GLState {
                 ReadValue(in, value.arraySize);
                 ReadValue(in, value.intValues);
                 ReadValue(in, value.floatValues);
+#endif
             } else {
                 VisitFields(value, [&in](const char*, auto& field) {
                     if (in.Ok) ReadValue(in, field);
@@ -238,21 +387,41 @@ namespace MobileGL::MG_State::GLState {
             }
         }
 
-        // The struct-size echo. Under a toolchain whose sizes are not pinned yet
-        // (ProgramArtifacts.h's libc++ branch until the integrator fills it in) this is 0,
-        // which still round-trips within one build - the echo compares what THIS build wrote
-        // against what THIS build expects - and stops mattering the moment the pin lands.
+        // v1 is retained for local monolith verification. Its native size echo is not a
+        // wire compatibility fact: libstdc++ writes 1056 while unpinned libc++ writes zero.
+#if !MOBILEGL_BUILD_DISAGGREGATED
 #ifdef MGL_LINKARTIFACTS_SIZE
         inline constexpr Uint64 kLinkArtifactsSizeEcho = MGL_LINKARTIFACTS_SIZE;
 #else
         inline constexpr Uint64 kLinkArtifactsSizeEcho = 0;
 #endif
+#endif
     } // namespace
+
+#if MOBILEGL_BUILD_DISAGGREGATED
+    Uint64 ProgramArtifactsSchemaFingerprint() {
+        static const Uint64 fingerprint = [] {
+            Uint64 hash = 1469598103934665603ull;
+            SchemaName(hash, "MobileGL.ProgramArchive.v2.little-endian");
+            // The outer stage framing is part of the same wire contract.
+            SchemaName(hash, "stage-list-u32-count-u32-elements");
+            SchemaWord(hash, kProgramArchiveMaxStages);
+            DescribeWireType<LinkArtifacts>(hash);
+            DescribeWireType<SpirvArtifacts>(hash);
+            return hash == 0 ? Uint64{1} : hash;
+        }();
+        return fingerprint;
+    }
+#endif
 
     void EncodeProgramArtifacts(const LinkArtifacts& link, const SpirvArtifacts& spirv,
                                 Vector<Uint8>& out) {
         PutRaw(out, kProgramArtifactsCodecVersion);
+#if MOBILEGL_BUILD_DISAGGREGATED
+        PutRaw(out, ProgramArtifactsSchemaFingerprint());
+#else
         PutRaw(out, kLinkArtifactsSizeEcho);
+#endif
         // `link` is walked through its own VisitFields table, which omits the live
         // SharedPtr<glslang::TProgram>: 57 of the 58 members. There is no arm here for it and
         // there must not be one - it points into a glslang arena that no archived instance
@@ -272,14 +441,16 @@ namespace MobileGL::MG_State::GLState {
 
         ReadCursor in{bytes, size, 0, true};
         Uint32 version = 0;
-        Uint64 sizeEcho = 0;
-        if (!TakeRaw(in, version) || !TakeRaw(in, sizeEcho)) return false;
-        // REFUSED, NOT GUESSED. A different version word or a struct that changed width means
-        // the bytes describe a layout this build does not have; deserialising them anyway
-        // writes garbage into the tail of a reflection table, which is exactly the failure the
-        // two words exist to turn into a clean false.
+        Uint64 schema = 0;
+        if (!TakeRaw(in, version) || !TakeRaw(in, schema)) return false;
+        // Refuse the declared wire shape before reading any field. In v2 the second word
+        // follows serialization types/order; C++ container object sizes are irrelevant.
         if (version != kProgramArtifactsCodecVersion) return false;
-        if (sizeEcho != kLinkArtifactsSizeEcho) return false;
+#if MOBILEGL_BUILD_DISAGGREGATED
+        if (schema != ProgramArtifactsSchemaFingerprint()) return false;
+#else
+        if (schema != kLinkArtifactsSizeEcho) return false;
+#endif
 
         ReadValue(in, link);
         ReadValue(in, spirv);
@@ -298,6 +469,57 @@ namespace MobileGL::MG_State::GLState {
         }
         // Never written, never read, and stated here so it cannot be added by reflex.
         link.program = nullptr;
+        return true;
+    }
+
+    // ---- P5e (pg): the frame -------------------------------------------------------------
+    //
+    // ONE MORE LENGTH-PREFIXED RUN IN FRONT, and deliberately in front rather than behind:
+    // DecodeProgramArtifacts refuses trailing bytes ("the format accounts for every byte it
+    // writes"), which is a rule worth keeping, so the stage list is consumed BEFORE the
+    // codec's own stream is handed the exact remainder. The version word inside that stream
+    // still governs the archive proper; the frame has no version of its own because it is one
+    // count and one run of Uint32 and there is nothing about it a future reader could
+    // misinterpret without the count already disagreeing.
+    void EncodeProgramArchive(const LinkArtifacts& link, const SpirvArtifacts& spirv,
+                              const Vector<Uint32>& linkedStages, Vector<Uint8>& out) {
+        PutRaw(out, static_cast<Uint32>(linkedStages.size()));
+        for (const Uint32 stage : linkedStages) PutRaw(out, stage);
+        EncodeProgramArtifacts(link, spirv, out);
+    }
+
+    Bool DecodeProgramArchive(const Uint8* bytes, SizeT size, ProgramArchive& out) {
+        out = ProgramArchive{};
+        if (bytes == nullptr) return false;
+        if (size < sizeof(Uint32)) return false;
+
+        Uint32 stageCount = 0;
+        std::memcpy(&stageCount, bytes, sizeof(stageCount));
+        // BOUNDED BEFORE IT IS MULTIPLIED, the same rule the codec's own TakeCount keeps: a
+        // corrupt count must not become a four-billion-element resize, and a count past the
+        // declared maximum is a program this frame cannot describe rather than one to truncate.
+        if (static_cast<SizeT>(stageCount) > kProgramArchiveMaxStages) return false;
+        const SizeT framed = sizeof(Uint32) + static_cast<SizeT>(stageCount) * sizeof(Uint32);
+        if (size < framed) return false;
+
+        out.LinkedStages.resize(stageCount);
+        for (Uint32 i = 0; i < stageCount; ++i) {
+            std::memcpy(&out.LinkedStages[i], bytes + sizeof(Uint32) + i * sizeof(Uint32),
+                        sizeof(Uint32));
+        }
+        if (!DecodeProgramArtifacts(bytes + framed, size - framed, out.Link, out.Spirv)) {
+            out = ProgramArchive{};
+            return false;
+        }
+        // THE TWO HALVES MUST AGREE, and this is the only place that can say so: the backend
+        // pairs linkedStages[i] with generatedSpirv[i] and indexes both by one running index,
+        // so a frame whose count disagrees with the decoded module count would read off the
+        // end of one of them. The frontend builds both from one snapshot loop, so a mismatch
+        // here is a wire fault and not a program shape.
+        if (out.LinkedStages.size() != out.Spirv.generatedSpirv.size()) {
+            out = ProgramArchive{};
+            return false;
+        }
         return true;
     }
 } // namespace MobileGL::MG_State::GLState
