@@ -1605,6 +1605,7 @@ void* hooked_dlsym(void* handle, const char* name) {
             if (g_real_spvc_compiler_compile == NULL) return NULL;
             return (void *)amethyst_spvc_compiler_compile;
         }
+    }
 
     if (name != NULL && g_zinkStrideFixActive) {
         if (strcmp(name, "vkGetInstanceProcAddr") == 0) {
