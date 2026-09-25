@@ -38,8 +38,15 @@ extern void *amethyst_sdl3_hook_resolve(void *handle, const char *name);
 //
 // 26.3 的 `#include <minecraft:...>` 由 libshaderc.dylib 的 shim 层在编译入口
 // 做文本级展开（Natives/shaderc_shim.c Task 47 + Natives/shaderc_include.c），
-// 与参考仓库一致。此处不再于 dlsym 层接管 shaderc 编译入口：重复的接管会
-// 额外持有一把跨库编译锁，导致 MobileGlues 侧拿不到 master compile lock 而卡住。
+// 与参考仓库一致。
+//
+// 另：shaderc_compile_into_* 三个【编译入口】由本文件 hooked_dlsym 接管并 hop 到
+// 32MB 栈线程，与参考仓库一致（下方 MARK）。此前本仓库只接管了 spvc 两个入口，
+// 依据参考仓库真机记录（hs_err_pid27946 等）：MC 26.3 正式版走 RenderPearl 的
+// shaderc 编译路径，glslang 深递归在 JVM 1MB 栈上 SIGSEGV；而 snapshot-10 不走
+// 该路径（"dlsym 拦截日志只证明符号被解析，不代表函数被调用"），故此前未暴露。
+// 编译入口的 32MB hop 不持任何跨库锁（生命周期入口的串行化仍由
+// shaderc_shim.c / spvc_shim.c 负责），不会重现 master compile lock 死锁。
 
 static bool (*g_real_SDL_SetWindowRelativeMouseMode)(void *window, bool enabled) = NULL;
 
@@ -1211,25 +1218,95 @@ void rebindZinkStrideFixForNewImage(void) {
 /// 其他函数正常返回 orig_dlsym 的结果，避免日志爆炸。
 
 // ============================================================================
-// spvc（SPIR-V -> 桌面 GLSL）32MB 栈线程重定向（对齐 Air）
+// MARK: - shaderc 编译重定向到 32MB 栈线程（MC 26.3 RenderPearl）
 //
-// RenderPearl 的跨后端管线：游戏 GLSL 经 shaderc 编为 SPIR-V 作为核心 IR；
-// GLES 无 GL_ARB_gl_spirv，GL 后端必须用 spvc 把 IR 重新发射成桌面 GLSL
-// （MG 日志里收到的 "#version 330" 即此产物），再由 MobileGlues 转成 ESSL。
-// spvc_context_parse_spirv / spvc_compiler_compile 与 shaderc 同族
-// （glslang / spirv-cross 深递归），在 JVM 1MB 栈上同样会 SIGSEGV，
-// 因此一并与 shaderc 编译入口同样 hop 到 32MB 栈线程。
-// ============================================================================
+// MC 26.3 起 RenderPearl 用 LWJGL 的 shaderc 绑定在游戏线程上直接编译 GLSL
+// （shaderc_compile_into_spv / _spv_assembly / _preprocessed_text 三个入口，
+// dlsym 解析自 libshaderc.dylib，内含 glslang）。glslang 的解析与 AST 遍历是
+// 深递归、帧大、深度不可控，实测在 JVM 1MB 线程栈上 SIGSEGV —— 崩溃点
+// glslang::TParseContext::lValueErrorCheck+0x204（设备日志，构建 662d6e2，
+// JVM Flags 含 iOS OpenJDK 运行时注入的 -Xss1M）。
+//
+// 26.3-pre-1 真机第二击（hs_err_pid27118）：重定向生效后，glslang 首次读源码
+// 就 SEGV_ACCERR @ 0x143ed900 —— sources[0] 指针与长度 0x278 均自洽，但该页
+// 已无读权限。反汇编 stub 字节码证实：MC 把 GLSL 源文本经 MemoryStack.nUTF8
+// 编码进 LWJGL MemoryStack 的 direct ByteBuffer（HotSpot native 内存），指针
+// 由 getPointerAddress() 计算后传给我们。该缓冲页的生命周期归 JVM/Cleaner
+// 管：我们把编译 hop 到 32MB 栈线程后原线程阻塞等待，等待窗口内 JVM 侧的
+// GC（实测 3.3s 内 24 次 young GC）/Cleaner/运行时可能回收或去提交该页，
+// job 线程随后读取 → SEGV_ACCERR。
+//
+// 修复：在调用方线程上（此刻源码页刚被 nUTF8 写入、必然可读）先把 source /
+// input_file / entry_point 快照进 malloc 副本，job 线程全程只触碰副本；spvc
+// 两个入口同理 —— 输出槽（parsed_ir / glsl 输出指针位）原本也指向 JVM 侧
+// 内存，改用本地槽承载 job 线程写入，join 后由调用方线程回写。
+//
+// MobileGlues 自己的转换管线早已为同一批着色器配备了专用 32MB 栈线程（设备
+// 日志原文 "dedicated 32MB-stack thread"），证明该库家族需要这一栈预算。
+// shaderc 的编译入口是线程安全 API，参数与返回值均为裸指针/标量，跨线程
+// 传递无副作用；GLSL emission 与结果访问器均作用在堆对象上，线程亲和性无关。
+//
+// 26.3-pre-1 真机第三击（hs_err_pid27240，快照修复 3d0b882a 之后）：首个编译
+// 任务日志 "source=0x278 size=0" —— 暴露快照读到了错位槽。旧 typedef 把 kind
+// 写在 source 之前（与 shaderc.h ABI 的 source_text/source_size/shader_kind
+// 顺序不符）：474b71d3 时代无快照、纯按位置转发，错位在机器层自相抵消
+// （pid27118 的源指针 <4GB，流经 int kind 槽截断后侥幸自洽，遂未察觉）；
+// 3d0b882a 的快照按"形参名"取值后，两个恶果同时显形：
+//   1) source 槽实际装的是 source_size(0x278)、source_size 槽装的是
+//      shader_kind(0=vertex) → 快照 memcpy(0x278, 0 字节) = 空转；
+//   2) 真实 64 位 source 指针流经 int kind 槽被截断成 32 位
+//      （0x14007c000 → 0x4007c000，恰落入 JVM 保留未提交区），job 线程
+//      首次读源码即 SEGV_ACCERR。
+// 修复：typedef 改为与 shaderc.h 公开 ABI 严格一致
+//   (compiler, source_text, source_size, shader_kind, input_file_name,
+//    entry_point_name, additional_options)
+// 类型与位置双重对齐后，快照取的是真源码、64 位指针不再流经 32 位槽。
+// 此前 snapshot-10 未触发是因为该版本不走 RenderPearl 的 shaderc 编译路径
+// —— dlsym 拦截日志只证明符号被解析，不代表函数被调用。
+//
+// 26.3-pre-1 真机第五击（hs_err_pid27946，构建 744642f2，Task 30 判读）：
+// shaderc 首批 8 次编译 + MG 转换全部成功、首帧已渲染；第 9 次编译（LWJGL
+// Java 直调路径，经本 wrapper → shaderc-shim → impl）在
+// glslang::TParseContext::lValueErrorCheck+0x204 崩。反汇编（impl dylib 本地
+// 复核）：EOpVectorSwizzle 分支的 swizzle 重复分量检查循环里
+// `(*p)->getAsTyped()->getAsConstantUnion()->getConstArray()[0]` 链条，
+// TIntermConstantUnion 对象偏移 +0xd8 的 constArray 指针字段装着 8 字节 ASCII
+// （si_addr=0x66617263656e6900 ≈ "\0inceraf"）——池内存被释放后又被字符串
+// 分配复用的特征，非栈溢出（32MB 栈 free=32705k）。
+// 修复职责分层：本文件维持快照 + 32MB hop + 逐编译取证日志；
+// shaderc/spvc **生命周期入口**（compiler/options 的 initialize/release/
+// clone/add_macro_definition、spvc context destroy 族）由 shaderc_shim.c /
+// spvc_shim.c 纳入编译同一把锁——release-vs-compile 竞态（MC 资源重载 = 旧
+// RenderPearl 管线释放 + 新管线并发编译）是当前主嫌疑，MobileGlues 侧另加
+// 转换进程级互斥（见 MobileGlues-cpp/gl/glsl/glsl_for_es.cpp）。
+// options 结构体为 impl 私有不透明类型无法深拷贝；其内嵌宏名/宏值在
+// add_macro_definition 时已由 impl 拷贝为自有内存，危险面是 options 结构
+// 本体被并发 release——已由 shim 锁关闭。
+//
+// 对 26.3 之前版本无影响：只有真正 dlsym 请求这些符号的代码（LWJGL 的
+// shaderc / spvc 绑定）才会被包装。与 JavaLauncher.m 的 -Xss32M 形成双保险
+// —— 即便运行时注入的 -Xss1M 覆盖了我们的参数，本重定向仍按构造生效。
+
+typedef void *(*ame_shaderc_compile_fn)(void *compiler, const char *source,
+                                        size_t source_size, int kind,
+                                        const char *input_file,
+                                        const char *entry_point, void *options);
+
 typedef int (*ame_spvc_parse_fn)(void *context, const unsigned *spirv, size_t word_count,
                                  void **parsed_ir);
 typedef int (*ame_spvc_compile_fn)(void *compiler, const char **source);
 
-static ame_spvc_parse_fn   g_real_spvc_parse_spirv = NULL;
-static ame_spvc_compile_fn g_real_spvc_compiler_compile = NULL;
+static ame_shaderc_compile_fn g_real_shaderc_into_spv = NULL;
+static ame_shaderc_compile_fn g_real_shaderc_into_spv_assembly = NULL;
+static ame_shaderc_compile_fn g_real_shaderc_into_preprocessed_text = NULL;
+static ame_spvc_parse_fn     g_real_spvc_parse_spirv = NULL;
+static ame_spvc_compile_fn   g_real_spvc_compiler_compile = NULL;
 
+// 通用"在 32MB 栈线程上执行 job->main_fn 并 join"的底座。
+// 返回 false = pthread_create 失败（调用方退回原线程直跑）。
 static bool ame_run_on_32mb_stack(void *(*main_fn)(void *), void *job) {
     pthread_attr_t attr;
-    if (pthread_attr_init(&attr) != 0) return false;
+    pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 32ull * 1024ull * 1024ull);
     pthread_t tid;
     int rc = pthread_create(&tid, &attr, main_fn, job);
@@ -1239,13 +1316,144 @@ static bool ame_run_on_32mb_stack(void *(*main_fn)(void *), void *job) {
     return true;
 }
 
+static void ame_log_redirect_once(const char *tag) {
+    static bool sLogged[2] = {false, false};
+    bool *logged = (strcmp(tag, "shaderc") == 0) ? &sLogged[0] : &sLogged[1];
+    if (!*logged) {
+        *logged = true;
+        NSLog(@"[%s] redirecting compiles to a 32MB-stack thread "
+              @"(glslang/spirv-cross deep recursion overflows the JVM 1MB stack)", tag);
+    }
+}
+
+// ---- shaderc（GLSL → SPIR-V）----
+
+typedef struct {
+    ame_shaderc_compile_fn fn;
+    void      *compiler;
+    const char *source;
+    size_t     source_size;
+    int        kind;
+    const char *input_file;
+    const char *entry_point;
+    void       *options;
+    void       *result;
+} ame_shaderc_job;
+
+static void *ame_shaderc_job_main(void *arg) {
+    ame_shaderc_job *job = (ame_shaderc_job *)arg;
+    job->result = job->fn(job->compiler, job->source, job->source_size, job->kind,
+                          job->input_file, job->entry_point, job->options);
+    return NULL;
+}
+
+// 调用方线程上的参数快照工具：job 线程绝不直接触碰 JVM 侧内存。
+static char *ame_copy_bytes(const void *src, size_t n) {
+    char *copy = (char *)malloc(n != 0 ? n : 1);
+    if (copy == NULL) return NULL;
+    if (n != 0) memcpy(copy, src, n);
+    return copy;
+}
+
+// C 字符串副本（strnlen 限界，防失控扫描；含 NUL 结尾）。
+static char *ame_copy_cstr(const char *src, size_t limit) {
+    if (src == NULL) return NULL;
+    return ame_copy_bytes(src, strnlen(src, limit) + 1);
+}
+
+static void *ame_shaderc_run_on_big_stack(ame_shaderc_compile_fn real, void *compiler,
+                                          const char *source, size_t source_size, int kind,
+                                          const char *input_file, const char *entry_point,
+                                          void *options) {
+    ame_log_redirect_once("shaderc");
+    // Task 30 取证日志（hs_err_pid27946）：逐编译打印全参数（长度/文件名/入口名/
+    // options 指针 + source 头 16 字节安全转写）。下轮崩溃日志可据此直接指认：
+    // 崩溃的是第几次编译、参数是否来自已释放内存（对照 [shaderc-shim] 的
+    // options_release / compiler_release 行与 BLOCKED 行）。
+    static int sCompileSeq = 0;
+    int seq = __sync_fetch_and_add(&sCompileSeq, 1);
+    char head[17];
+    head[0] = '\0';
+    if (source != NULL && source_size > 0) {
+        size_t n = (source_size < 16) ? source_size : 16;
+        for (size_t i = 0; i < n; ++i) {
+            unsigned char c = (unsigned char)source[i];
+            head[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+        }
+        head[n] = '\0';
+    }
+    // 截断 C 字符串副本（防止超长文件名刷爆 latestlog 管道窗口）。
+    char inBuf[49], epBuf[33];
+    snprintf(inBuf, sizeof(inBuf), "%s", input_file ? input_file : "(null)");
+    snprintf(epBuf, sizeof(epBuf), "%s", entry_point ? entry_point : "(null)");
+    NSLog(@"[shaderc] compile#%d snapshot: len=%zu kind=%d in='%s' entry='%s' opt=%p "
+          @"head16='%s' (source snapshot + 32MB-stack hop)",
+          seq, source_size, kind, inBuf, epBuf, options, head);
+
+    // 1) 调用方线程上快照输入：此刻源码页刚被 nUTF8 写入，必然可读。
+    char *source_copy = (source != NULL) ? ame_copy_bytes(source, source_size) : NULL;
+    char *input_file_copy = ame_copy_cstr(input_file, 8192);
+    char *entry_point_copy = ame_copy_cstr(entry_point, 256);
+
+    // malloc 失败时回退用原指针（OOM 极端场景，行为同旧版）。
+    ame_shaderc_job job = {
+        real, compiler,
+        (source_copy != NULL) ? source_copy : source, source_size, kind,
+        (input_file_copy != NULL) ? input_file_copy : input_file,
+        (entry_point_copy != NULL) ? entry_point_copy : entry_point,
+        options, NULL};
+
+    bool ok = ame_run_on_32mb_stack(ame_shaderc_job_main, &job);
+
+    // 2) job 已 join，副本生命周期结束。
+    free(source_copy);
+    free(input_file_copy);
+    free(entry_point_copy);
+
+    if (ok) return job.result;
+    NSLog(@"[shaderc] pthread_create failed, falling back to caller thread");
+    return real(compiler, source, source_size, kind, input_file, entry_point, options);
+}
+
+static void *amethyst_shaderc_into_spv(void *compiler, const char *source,
+                                       size_t source_size, int kind,
+                                       const char *input_file,
+                                       const char *entry_point, void *options) {
+    return ame_shaderc_run_on_big_stack(g_real_shaderc_into_spv, compiler, source,
+                                        source_size, kind, input_file, entry_point, options);
+}
+
+static void *amethyst_shaderc_into_spv_assembly(void *compiler, const char *source,
+                                                size_t source_size, int kind,
+                                                const char *input_file,
+                                                const char *entry_point, void *options) {
+    return ame_shaderc_run_on_big_stack(g_real_shaderc_into_spv_assembly, compiler, source,
+                                        source_size, kind, input_file, entry_point, options);
+}
+
+static void *amethyst_shaderc_into_preprocessed_text(void *compiler, const char *source,
+                                                     size_t source_size, int kind,
+                                                     const char *input_file,
+                                                     const char *entry_point, void *options) {
+    return ame_shaderc_run_on_big_stack(g_real_shaderc_into_preprocessed_text, compiler, source,
+                                        source_size, kind, input_file, entry_point, options);
+}
+
+// ---- spvc（SPIR-V → 桌面 GLSL）----
+//
+// RenderPearl 的跨后端管线：游戏 GLSL 经 shaderc 编为 SPIR-V 作为核心 IR；
+// GLES 无 GL_ARB_gl_spirv，GL 后端必须用 spvc 把 IR 重新发射成桌面 GLSL
+// （MG 日志里收到的 "#version 330" 即此产物），再由 MobileGlues 转成 ESSL。
+// spvc_context_parse_spirv / spvc_compiler_compile 与 shaderc 同族（glslang /
+// spirv-cross 深递归），一并重定向。
+
 typedef struct {
     ame_spvc_parse_fn fn;
-    void           *context;
+    void       *context;
     const unsigned *spirv;
-    size_t          word_count;
-    void          **parsed_ir;
-    int             rc;
+    size_t      word_count;
+    void      **parsed_ir;
+    int         rc;
 } ame_spvc_parse_job;
 
 static void *ame_spvc_parse_job_main(void *arg) {
@@ -1256,9 +1464,9 @@ static void *ame_spvc_parse_job_main(void *arg) {
 
 typedef struct {
     ame_spvc_compile_fn fn;
-    void          *compiler;
-    const char   **source;
-    int            rc;
+    void       *compiler;
+    const char **source;
+    int         rc;
 } ame_spvc_compile_job;
 
 static void *ame_spvc_compile_job_main(void *arg) {
@@ -1267,17 +1475,15 @@ static void *ame_spvc_compile_job_main(void *arg) {
     return NULL;
 }
 
-// 输入 SPIR-V 与输出槽（parsed_ir 指向的指针位）都可能位于 JVM 侧可回收内存，
-// 故 job 线程全程用副本/本地槽，join 后在调用方线程回写。
 static int amethyst_spvc_parse_spirv(void *context, const unsigned *spirv, size_t word_count,
                                      void **parsed_ir) {
-    unsigned *spirv_copy = NULL;
-    if (spirv != NULL && word_count != 0) {
-        size_t n = word_count * sizeof(unsigned);
-        spirv_copy = (unsigned *)malloc(n);
-        if (spirv_copy != NULL) memcpy(spirv_copy, spirv, n);
-    }
+    ame_log_redirect_once("spvc");
+    // 同 shaderc：输入 SPIR-V 可能也在 JVM 侧可回收内存里；输出槽（parsed_ir
+    // 指向的指针位）同样如此。job 线程全程用副本/本地槽，join 后在调用方线程回写。
+    unsigned *spirv_copy = (spirv != NULL && word_count != 0)
+        ? (unsigned *)ame_copy_bytes(spirv, word_count * sizeof(unsigned)) : NULL;
     void *ir_slot = NULL;
+
     ame_spvc_parse_job job = {g_real_spvc_parse_spirv, context,
                               (spirv_copy != NULL) ? spirv_copy : spirv, word_count,
                               &ir_slot, 0};
@@ -1292,15 +1498,17 @@ static int amethyst_spvc_parse_spirv(void *context, const unsigned *spirv, size_
 }
 
 static int amethyst_spvc_compiler_compile(void *compiler, const char **source) {
+    ame_log_redirect_once("spvc");
+    // 同上：spvc 把发射的 GLSL 指针写进 *source（JVM 侧内存），改用本地槽承载
+    // job 线程写入，join 后回写。
     const char *out = NULL;
     ame_spvc_compile_job job = {g_real_spvc_compiler_compile, compiler, &out, 0};
-    bool ok = ame_run_on_32mb_stack(ame_spvc_compile_job_main, &job);
-    if (!ok) {
-        NSLog(@"[spvc] pthread_create failed, falling back to caller thread");
-        return g_real_spvc_compiler_compile(compiler, source);
+    if (ame_run_on_32mb_stack(ame_spvc_compile_job_main, &job)) {
+        if (source != NULL) *source = out;
+        return job.rc;
     }
-    if (source != NULL) *source = out;
-    return job.rc;
+    NSLog(@"[spvc] pthread_create failed, falling back to caller thread");
+    return g_real_spvc_compiler_compile(compiler, source);
 }
 
 void* hooked_dlsym(void* handle, const char* name) {
@@ -1356,10 +1564,31 @@ void* hooked_dlsym(void* handle, const char* name) {
         NSLog(@"[SDLGL] dlsym query: %s", name);
     }
 
-    // spvc 编译入口 -> 32MB 栈线程重定向（见上方说明）。
-    // 注：shaderc_compile_into_* 三个入口由 libshaderc.dylib 的 shim 层接管
-    // （Natives/shaderc_shim.c 已含 include 展开与串行化），此处只补 LWJGL 直调的
-    // spvc 两个重活。
+    // shaderc / spvc 编译入口 → 32MB 栈线程重定向（见上方 MARK 注释）。
+    // LWJGL 3.4.1 绑定恰好只 dlsym 这五个入口（三个 shaderc 编译 + 两个 spvc 重活）。
+    if (name != NULL && strncmp(name, "shaderc_compile_into_", 21) == 0) {
+        ame_shaderc_compile_fn *slot = NULL;
+        void *wrapper = NULL;
+        if (strcmp(name, "shaderc_compile_into_spv") == 0) {
+            slot = &g_real_shaderc_into_spv;
+            wrapper = (void *)amethyst_shaderc_into_spv;
+        } else if (strcmp(name, "shaderc_compile_into_spv_assembly") == 0) {
+            slot = &g_real_shaderc_into_spv_assembly;
+            wrapper = (void *)amethyst_shaderc_into_spv_assembly;
+        } else if (strcmp(name, "shaderc_compile_into_preprocessed_text") == 0) {
+            slot = &g_real_shaderc_into_preprocessed_text;
+            wrapper = (void *)amethyst_shaderc_into_preprocessed_text;
+        }
+        if (slot != NULL) {
+            if (*slot == NULL) {
+                *slot = (ame_shaderc_compile_fn)orig_dlsym(handle, name);
+            }
+            if (*slot == NULL) return NULL;  // 真实符号缺失：保持原有失败语义
+            NSLog(@"[shaderc] dlsym intercepted: %s -> 32MB-stack wrapper (real=%p)",
+                  name, (void *)*slot);
+            return wrapper;
+        }
+    }
     if (name != NULL && (strcmp(name, "spvc_context_parse_spirv") == 0 ||
                          strcmp(name, "spvc_compiler_compile") == 0)) {
         NSLog(@"[spvc] dlsym intercepted: %s -> 32MB-stack wrapper", name);
@@ -1376,7 +1605,6 @@ void* hooked_dlsym(void* handle, const char* name) {
             if (g_real_spvc_compiler_compile == NULL) return NULL;
             return (void *)amethyst_spvc_compiler_compile;
         }
-    }
 
     if (name != NULL && g_zinkStrideFixActive) {
         if (strcmp(name, "vkGetInstanceProcAddr") == 0) {
