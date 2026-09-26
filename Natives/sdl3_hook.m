@@ -2372,6 +2372,24 @@ static bool ame_glBridgeEnabled(void) {
     // 原生 Vulkan 自身走 Vulkan 路径，不需要 GL bridge
     if (strstr(renderer, "libMoltenVK") != NULL) return false;
 
+    // Task 171：ANGLE（libtinygl4angle.dylib）加入接管列表。
+    // 病历（对标本仓 issue：26.3 选 ANGLE 渲染器时 GL 后端被拒）：
+    //   [SDLGL] SDL_GL_LoadLibrary(.../libtinygl4angle.dylib) -> failed:
+    //           OpenGL library already loaded（真实 SDL 拒载，本 bridge 未接管）
+    //   [Render thread/ERROR]: Failed to create backend OpenGL
+    //           BackendCreationException: glGetError mismatch
+    //   → renderpearl 回落 MC 原生 Vulkan 后端（MoltenVK）→ GL 上下文从未
+    //     建立，Iris 一类模组在 RenderSystem.initRenderer 阶段拿到空的
+    //     GL.getCapabilities() → ExceptionInInitializerError 崩溃。
+    // tinygl4angle 此前从未进过本列表（Task 79 只收编了 zink 系）——它与
+    // opengles/gl4es 同为 raw ANGLE 家族，bridge 接管后
+    // SDL_GL_LoadLibrary/GetProcAddress 走镜像链（同一 NOLOAD 句柄 + 同一
+    // GPA/dlsym 链），指针一致性按构造成立 → GL backend 被接受 → 不再回落
+    // Vulkan。逃生阀与 zink 同款：AMETHYST_ANGLE_GL_BRIDGE=0 一行回退旧行为。
+    if (strstr(renderer, "libtinygl4angle") != NULL) {
+        return ame_envFlagOn("AMETHYST_ANGLE_GL_BRIDGE", true);
+    }
+
     // 需要 EGL bridge 的转译型渲染器：它们提供 EGL + GL 符号，SDL 的 EAGL
     // 后端无法对接，必须由 bridge 建上下文并供给 GL 函数指针。
     if (strstr(renderer, "libMobileGL") != NULL) return true;    // MobileGL 双后端
@@ -2836,20 +2854,33 @@ static void *ame_SDL_GL_GetProcAddress(const char *proc) {
         // 链 —— 对 MG 这种「自己实现 eglGetProcAddress 分发」的渲染器，
         // 两条链会给出不同地址，于是 mismatch。
         //
-        // 修法：按构造对齐 —— 先走 eglGetProcAddress / OSMesaGetProcAddress，
-        // 再回落到 dlsym(lib, name)。两条腿由此执行同一条链、调用同一个函数
-        // 对象，指针一致性按构造成立，不依赖 dyld 的 caller-image 语义
-        // （启动器的全局 dlsym 重绑定会让 RTLD_SELF/RTLD_NEXT 判定失准，
-        // 任何依赖镜像顺序的方案都不可靠）。
+        // Task 172 修正镜像本身：对 lwjgl-opengl.jar 里 GL$1.class 的 CFR
+        // 反编译实证，macOS 平台分支的构造链是 ——
+        //   switch (Platform.get()) { case LINUX: glXGetProcAddress / ARB;
+        //                              case WINDOWS: wglGetProcAddress; }  // 无 macOS case
+        //   if (GetProcAddress == 0) GetProcAddress = OSMesaGetProcAddress;
+        //   查询：GetProcAddress(name) 非空则取其结果，否则 dlsym(lib, name)。
+        // 即 GL$1 在 macOS 上【从不查询 eglGetProcAddress】。旧镜像的
+        // “eglGetProcAddress 优先”是错误的反推：对 MG/zink 恰好两条链殊途
+        // 同归（要么都不导出 eglGetProcAddress，要么 GPA 与 dlsym 同址），
+        // 装机验证通过纯属侥幸；对 libtinygl4angle（ANGLE 家族，依赖链的
+        // libEGL 导出 eglGetProcAddress，而 glGetError 是依赖链 libGLESv2
+        // 的直接导出）则两条链拿到不同地址 —— 实锤：bridge 已接管
+        //（"hooked SDL_GL_LoadLibrary -> EGL bridge"）但 GlBackend.loadLibrary
+        // 仍报 "glGetError mismatch" → 回落 Vulkan → Iris No GLCapabilities。
+        // 修法 = 镜像链逐字对齐 GL$1 的 macOS 分支（只查 OSMesaGetProcAddress），
+        // 指针一致性对所有渲染器按构造成立。
         static void *g_mirrorGPA = NULL;
         static bool  g_mirrorGPATried = false;
         if (!g_mirrorGPATried) {
             g_mirrorGPATried = true;
-            g_mirrorGPA = dlsym(h, "eglGetProcAddress");
-            if (g_mirrorGPA == NULL) g_mirrorGPA = dlsym(h, "OSMesaGetProcAddress");
+            // 镜像 GL$1 的 FunctionProvider 解析（macOS 平台分支：仅
+            // OSMesaGetProcAddress —— eglGetProcAddress 从不参与，见上方注释）
+            g_mirrorGPA = dlsym(h, "OSMesaGetProcAddress");
             // 诊断（release 可见）：provider 取不到 = GL$1 镜像链失效 =
             // mismatch 会复发（MC 拒绝 GL 后端回退 MoltenVK）。正常应非 NULL。
-            NSLog(@"[SDLHook][diag] GL$1 mirror provider = %p (eglGetProcAddress/OSMesaGetProcAddress from %s)",
+            NSLog(@"[SDLHook][diag] GL$1 mirror provider = %p (OSMesaGetProcAddress only; "
+                  @"eglGetProcAddress deliberately NOT consulted per decompiled GL$1 macOS branch, from %s)",
                   g_mirrorGPA, getenv("AMETHYST_RENDERER") ?: "<unset>");
         }
         if (g_mirrorGPA != NULL) {
