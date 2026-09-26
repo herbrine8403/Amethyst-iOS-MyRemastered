@@ -1497,10 +1497,22 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
     gl_render_window_t* bundle = calloc(1, sizeof(gl_render_window_t));
 
     NSString *renderer = NSProcessInfo.processInfo.environment[@"AMETHYST_RENDERER"];
+    // SFPEW 叠加模式下 AMETHYST_RENDERER 已被换成 libSimpleFPEWrapper.dylib，但
+    // 「导出的是 desktop OpenGL 还是 OpenGL ES」取决于真后端，与 dlsym_EGL() 里
+    // EGL 来源的判定必须一致（真后端名在 AMETHYST_SFPEW_BACKEND）。
+    // 若按 SFPEW 判定，MobileGL-gles（desktop GL）会被当成 ES 后端：
+    // eglChooseConfig 请求 EGL_OPENGL_ES3_BIT、eglBindAPI(EGL_OPENGL_ES_API)，
+    // 而 MobileGL 导出的是 desktop OpenGL → 上下文类型不匹配 →
+    // glCheckFramebufferStatus 返回垃圾值（如 0x582B0D8）崩溃。
+    const char *apiRenderer = renderer.UTF8String;
+    if (isSFPEWRenderer(apiRenderer)) {
+        const char *sfpewBackend = getenv("AMETHYST_SFPEW_BACKEND");
+        if (sfpewBackend != NULL && sfpewBackend[0] != '\0') apiRenderer = sfpewBackend;
+    }
     // ANGLE / Mithril / MobileGL 导出的都是 desktop OpenGL，走 EGL_OPENGL_BIT +
     // eglBindAPI(EGL_OPENGL_API)；其余（gl4es / MobileGlues / LTW）是 OpenGL ES。
-    BOOL desktopGL = isDesktopGLRenderer(renderer.UTF8String);
-    BOOL mobileGL = isMobileGLRenderer(renderer.UTF8String);
+    BOOL desktopGL = isDesktopGLRenderer(apiRenderer);
+    BOOL mobileGL = isMobileGLRenderer(apiRenderer);
 
     const EGLint attribs[] = {
         EGL_RED_SIZE, 8,
