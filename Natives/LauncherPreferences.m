@@ -258,7 +258,15 @@ static NSArray<NSDictionary *> *rendererCandidates(void) {
           @"file": @ RENDERER_NAME_MOBILEGL},
         @{@"key": @ RENDERER_NAME_MOBILEGL_GLES,
           @"name": localize(@"preference.title.renderer.debug.mobilegl_gles", nil),
-          @"file": @ RENDERER_NAME_MOBILEGL_GLES}
+          @"file": @ RENDERER_NAME_MOBILEGL_GLES},
+        // SimpleFPEWrapper（独立选项）：固定管线 (GL 1.x) 仿真层，仅供 <= 1.16.x。
+        // 与上面的叠加开关（video.sfpew_overlay）的区别：叠加是"选中某个 GLES 后端
+        // 再被 SFPEW 顶替"，这里是直接把 SFPEW 选为渲染器，后端由
+        // AMETHYST_SFPEW_BACKEND 指定（缺省 libmobileglues.dylib）。
+        // 两者最终的环境变量形态一致，只是入口不同。
+        @{@"key": @ RENDERER_NAME_SFPEW,
+          @"name": localize(@"preference.title.renderer.debug.sfpew", nil),
+          @"file": @ RENDERER_NAME_SFPEW}
     ];
 }
 
