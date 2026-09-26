@@ -1552,9 +1552,18 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
             if (forceGlobal == NULL) forceGlobal = getenv("AMETHYST_MOBILEGL_RTLD_GLOBAL");
             // 与 egl_bridge.m 同一套排除规则：需要向其他镜像暴露符号的渲染器
             // 保持 RTLD_GLOBAL（ANGLE 是共享 EGL host；Mesa/gallium 内部互解析）。
+            // SFPEW 必须 RTLD_GLOBAL：它是 opengl.libname（LWJGL 的 GL 提供者），
+            // 而 LWJGL 在 iOS 上用 dlsym(RTLD_DEFAULT, "gl*") 解析 GL 入口。
+            // 若这里以 RTLD_LOCAL 预载，SFPEW 的 gl* 进不了 flat namespace，
+            // LWJGL 会命中 RTLD_GLOBAL 的 ANGLE 副本 —— 而当前上下文是 SFPEW
+            // 后端（MobileGL/MobileGlues）建的，ANGLE 侧无上下文，
+            // glCheckFramebufferStatus 等返回垃圾值（实测 93651672）。
+            // 这与 egl_bridge.m「preloading ... with RTLD_GLOBAL」的意图一致；
+            // 隔离只服务于 26.3/SDL3，SFPEW 面向 ≤1.16.5，无从冲突。
             const BOOL needsGlobalSymbols =
                 strcmp(preloadName, RENDERER_NAME_MTL_ANGLE) == 0 ||
-                strncmp(preloadName, "libOSMesa", 9) == 0;
+                strncmp(preloadName, "libOSMesa", 9) == 0 ||
+                strcmp(preloadName, RENDERER_NAME_SFPEW) == 0;
             const BOOL forceGlobalSymbols = (forceGlobal != NULL && forceGlobal[0] == '1');
             if (preloadIsolateDisabled) {
                 NSLog(@"[JavaLauncher] renderer preload skipped: AMETHYST_PRELOAD_ISOLATE=0 (%s)",

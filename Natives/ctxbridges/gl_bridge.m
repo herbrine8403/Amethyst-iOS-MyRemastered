@@ -1258,8 +1258,13 @@ static bool dlsym_EGL() {
 
     // Task 36：MobileGlues 前端 EGL 准备（不改变任何行为，仅记录句柄/符号，
     // 真正的指针切换发生在 ame_mgBootstrap 成功之后）。
-    if (renderer && strcmp(renderer, RENDERER_NAME_MOBILEGLUES) == 0 &&
-        !isSelfEglRenderer(renderer)) {
+    // SFPEW 叠加时 AMETHYST_RENDERER 已是 libSimpleFPEWrapper.dylib，这里必须按
+    // 真后端（eglRenderer）判定，否则前端镜像不加载 → ame_mg_handle 为 NULL →
+    // bootstrap 跳过 → MobileGlues 的 LOAD_EGL 静态指针在后端句柄 `egl` 仍为 NULL
+    // 时被永久初始化成 NULL（static 局部变量只初始化一次，事后 mg_init_gles 也
+    // 救不回来）→ eglCreateContext/eglMakeCurrent 全部失败 → 无当前上下文。
+    if (eglRenderer && strcmp(eglRenderer, RENDERER_NAME_MOBILEGLUES) == 0 &&
+        !isSelfEglRenderer(eglRenderer)) {
         ame_mg_angle_handle = dl_handle;
         void *mg = dlopen("@rpath/" RENDERER_NAME_MOBILEGLUES, RTLD_NOW | RTLD_LOCAL);
         if (!mg) {
@@ -1439,6 +1444,17 @@ static BOOL ame_mgBootstrap(EGLDisplay dpy, EGLConfig config) {
     // 4) 把生命周期 EGL 切换到 MobileGlues 前端（此后 eglCreateContext 会建立
     //    MGContext 记录、eglMakeCurrent 会绑定 g_current_ctx 与每上下文子系统，
     //    eglSwapBuffers 走 presentSurface）。任一符号缺失则单独回退 raw。
+    // SFPEW 叠加时生命周期指针必须留在 SFPEW 上：SFPEW 的 wrapper 会转发给
+    // MobileGlues 前端（它 dlopen 的后端就是 libmobileglues.dylib），直接换成
+    // 前端会把 SFPEW 整层绕开，固定管线仿真根本不安装。此时 bootstrap 的价值
+    // 是「mg_init_gles 已跑、MG 后端句柄已绑定」，而非切换函数指针。
+    if (isSFPEWRenderer(getenv("AMETHYST_RENDERER"))) {
+        NSLog(@"[MG-Bridge] bootstrap: mg_init_gles done under SFPEW overlay -- "
+              @"lifecycle EGL stays on SFPEW (it forwards to the MobileGlues frontend)");
+        ame_mgFrontendActive = YES;
+        return YES;
+    }
+
     void *fn = NULL;
     #define AME_MG_SWAP(field, name)                                                  \
         do {                                                                          \
