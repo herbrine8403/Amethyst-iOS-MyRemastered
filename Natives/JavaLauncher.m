@@ -200,7 +200,31 @@ void init_loadMobileGluesConfig() {
     // customGLVersion 约束（settings.cpp 第 71-79 行）：>46 截断为 46，<32 且非 0 截断为 32，
     // 33-39 截断为 33，0 使用默认值 40。
     // 因此必须写入十进制数（40, 41, 42, ..., 46），不能写入十六进制 0x040000。
-    config[@"enableExtDirectStateAccess"] = @1;
+    // Task 166（对齐 Air）：DSA 默认改为【关】。
+    // Air 三会话 A/B 实锤（同机同模组包同 MobileGlues 2.0.17）：
+    //   enable_ext_direct_state_access=0 → "DSA support not detected" → 全程可玩 + FSR 生效
+    //   =1 → "ARB_direct_state_access detected, enabling DSA" → 黑屏
+    //        （swap 100% 健康 + render-texture 探针全零 + 首秒固定 10 次一次性
+    //         "No context is current"）
+    // 机理：MobileGlues 2.0.17 的 DSA 是 DSAWrapper 模拟层（temporarilyBindFramebuffer
+    // 的状态往返在 FSR1 fb0 重定向下自洽性未经上游验证），MC 26.x 的 DSA 路径一旦
+    // 激活即不再走经典路径。这正是「26.2 可玩、26.3 闪退」的成因。
+    //
+    // 此前本仓库默认为 @1（开启）—— 与 Air 相反，且我曾据此错误地判定
+    // 「Task166 反向迁移对本仓库不适用」。实为 26.3 + MobileGlues 崩溃的直接原因。
+    //
+    // Task 167：存量设备迁移。若偏好里已存 1（旧默认或用户手动开过），
+    // 仅改默认值无效（下方覆盖链会读回 1），故在此显式迁回 0。
+    // 用户日后仍可在设置里手动开回。
+    {
+        id dsaPref = getPrefObject(@"mobileglues.enable_ext_direct_state_access");
+        if (dsaPref && [dsaPref respondsToSelector:@selector(boolValue)] && [dsaPref boolValue]) {
+            setPrefObject(@"mobileglues.enable_ext_direct_state_access", @NO);
+            NSLog(@"[JavaLauncher] Task167: migrated legacy mobileglues.enable_ext_direct_state_access 1 -> 0 "
+                  @"(Air Task166/167: DSA on breaks MC 26.x under MobileGlues)");
+        }
+    }
+    config[@"enableExtDirectStateAccess"] = @0;
     config[@"maxGlslCacheSize"] = @128;
     config[@"customGLVersion"] = @40;  // 十进制 40 = GL 4.0
 
