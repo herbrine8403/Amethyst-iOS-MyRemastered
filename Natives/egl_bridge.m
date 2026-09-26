@@ -259,6 +259,24 @@ static int pojavInitOpenGLInternal(BOOL setLwjglProperty) {
         NSLog(@"[egl_bridge] LTW renderer: preloading ANGLE as host EGL before LTW init");
         dlopen("@rpath/" RENDERER_NAME_MTL_ANGLE, RTLD_GLOBAL);
         set_gl_bridge_tbl();
+    } else if ([renderer isEqualToString:@ RENDERER_NAME_SFPEW]) {
+        // SimpleFPEWrapper（MobileGL-Dev，LGPL-3.0）—— GL 1.x 固定管线仿真层。
+        // 与 LTW 完全同构：SFPEW 只导出 eglGetProcAddress / eglCreateContext /
+        // eglDestroyContext / eglMakeCurrent / eglSwapBuffers(WithDamage)，
+        // eglGetDisplay / eglInitialize / eglChooseConfig / eglCreateWindowSurface
+        // 等基础设施一概不导出，必须由 host EGL 提供。
+        //
+        // 所以它不能进 isSelfEglRenderer()：那条路会让 gl_bridge.m 的
+        // dlsym_EGL() 直接去 SFPEW 里 dlsym eglGetDisplay，取不到就返回 false，
+        // 初始化失败。EGL 基础设施仍走 ANGLE，仅生命周期三个 wrapper +
+        // eglSwapBuffers 改从 libSimpleFPEWrapper.dylib 解析（见 gl_bridge.m）。
+        //
+        // set_gl_bridge_tbl() 是必需的：bridge_tbl.h 里 br_init 等函数指针没有
+        // 初始值（C 全局零初始化 = NULL），缺这一步 pojavInitOpenGL 末尾的
+        // !br_init() 就是空指针调用。
+        NSLog(@"[egl_bridge] SFPEW renderer: FPE shim over host EGL, SFPEW_EGL=%s",
+              getenv("SFPEW_EGL") ?: "<unset>");
+        set_gl_bridge_tbl();
     } else if ([renderer isEqualToString:@ RENDERER_NAME_MITHRIL]) {
         // Mithril 渲染器：EGL 1.5 + GL 3.3 Core 全部由 libmithril.dylib 提供
         // （Vulkan backend，经 MoltenVK 到 Metal）。

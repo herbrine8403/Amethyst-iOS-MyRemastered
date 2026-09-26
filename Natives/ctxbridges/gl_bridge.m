@@ -1314,6 +1314,22 @@ static bool dlsym_EGL() {
         NSLog(@"EGLBridge: LTW mode active, eglCreateContext/Destroy/MakeCurrent resolved from libltw.dylib");
     }
 
+    // SFPEW：与 LTW 同构的部分拦截层。基础设施（display / config / surface）
+    // 仍从 ANGLE 解析，生命周期 wrapper 从 libSimpleFPEWrapper.dylib 取，
+    // 否则固定管线仿真根本不会被安装（SFPEW 静默降级为透传）。
+    BOOL useSFPEW = renderer && isSFPEWRenderer(renderer);
+    void *sfpew_handle = NULL;
+    if (useSFPEW) {
+        sfpew_handle = dlopen("@rpath/" RENDERER_NAME_SFPEW, RTLD_NOW | RTLD_LOCAL);
+        if (!sfpew_handle) {
+            NSLog(@"EGLBridge: SFPEW renderer selected but failed to load %s: %s",
+                  RENDERER_NAME_SFPEW, dlerror() ?: "unknown dlopen error");
+            return false;
+        }
+        NSLog(@"EGLBridge: SFPEW mode active, lifecycle EGL resolved from %s",
+              RENDERER_NAME_SFPEW);
+    }
+
     memset(&handle, 0, sizeof(handle));
     handle.eglBindAPI = load_egl_symbol(dl_handle, "eglBindAPI");
     handle.eglChooseConfig = load_egl_symbol(dl_handle, "eglChooseConfig");
@@ -1322,6 +1338,12 @@ static bool dlsym_EGL() {
         handle.eglCreateContext = load_egl_symbol(ltw_handle, "eglCreateContext");
         handle.eglDestroyContext = load_egl_symbol(ltw_handle, "eglDestroyContext");
         handle.eglMakeCurrent = load_egl_symbol(ltw_handle, "eglMakeCurrent");
+    } else if (useSFPEW && sfpew_handle) {
+        // 从 SFPEW 解析三个 wrapper（关键：FPE 的 GL 入口转译表在
+        // eglCreateContext / eglMakeCurrent 里安装，直接调 ANGLE 的会绕过它）
+        handle.eglCreateContext = load_egl_symbol(sfpew_handle, "eglCreateContext");
+        handle.eglDestroyContext = load_egl_symbol(sfpew_handle, "eglDestroyContext");
+        handle.eglMakeCurrent = load_egl_symbol(sfpew_handle, "eglMakeCurrent");
     } else {
         handle.eglCreateContext = load_egl_symbol(dl_handle, "eglCreateContext");
         handle.eglDestroyContext = load_egl_symbol(dl_handle, "eglDestroyContext");
@@ -1336,6 +1358,12 @@ static bool dlsym_EGL() {
     handle.eglGetPlatformDisplay = load_egl_symbol(dl_handle, "eglGetPlatformDisplay");
     handle.eglInitialize = load_egl_symbol(dl_handle, "eglInitialize");
     handle.eglSwapBuffers = load_egl_symbol(dl_handle, "eglSwapBuffers");
+    if (useSFPEW && sfpew_handle) {
+        // SFPEW 的 swap 先 flush 再交给后端，绕过它会导致 FPE 的立即模式
+        // 绘制与后端的提交顺序错乱。
+        void *sfpewSwap = load_egl_symbol(sfpew_handle, "eglSwapBuffers");
+        if (sfpewSwap) handle.eglSwapBuffers = sfpewSwap;
+    }
     handle.eglReleaseThread = load_egl_symbol(dl_handle, "eglReleaseThread");
     handle.eglSwapInterval = load_egl_symbol(dl_handle, "eglSwapInterval");
     handle.eglTerminate = load_egl_symbol(dl_handle, "eglTerminate");
