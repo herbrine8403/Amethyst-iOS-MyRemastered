@@ -1329,21 +1329,27 @@ static bool dlsym_EGL() {
         NSLog(@"EGLBridge: LTW mode active, eglCreateContext/Destroy/MakeCurrent resolved from libltw.dylib");
     }
 
-    // SFPEW：与 LTW 同构的部分拦截层。基础设施（display / config / surface）
-    // 仍从 ANGLE 解析，生命周期 wrapper 从 libSimpleFPEWrapper.dylib 取，
-    // 否则固定管线仿真根本不会被安装（SFPEW 静默降级为透传）。
-    BOOL useSFPEW = renderer && isSFPEWRenderer(renderer);
-    void *sfpew_handle = NULL;
-    if (useSFPEW) {
-        sfpew_handle = dlopen("@rpath/" RENDERER_NAME_SFPEW, RTLD_NOW | RTLD_LOCAL);
-        if (!sfpew_handle) {
-            NSLog(@"EGLBridge: SFPEW renderer selected but failed to load %s: %s",
-                  RENDERER_NAME_SFPEW, dlerror() ?: "unknown dlopen error");
-            return false;
-        }
-        NSLog(@"EGLBridge: SFPEW mode active, lifecycle EGL resolved from %s",
-              RENDERER_NAME_SFPEW);
-    }
+    // SFPEW（SimpleFPEWrapper）—— 对齐安卓 Amethyst-Android v3_openjdk 的接入模型。
+    //
+    // 安卓 JREUtils.java：POJAVEXEC_EGL 始终指向真后端（libmobileglues.so /
+    // libEGL_angle.so / libEGL_mesa.so / libltw.so），启用 SFPEW 时只做两件事：
+    //   SFPEW_EGL = POJAVEXEC_EGL（真后端）；renderLibrary = libSimpleFPEWrapper.so。
+    // 然后 egl_loader.c 的 dlsym_EGL() 用 loader_dlopen(getenv("POJAVEXEC_EGL"))
+    // 取 eglGetProcAddress，再逐个拿 eglGetDisplay / eglInitialize /
+    // eglChooseConfig / eglCreateContext / eglMakeCurrent / eglSwapBuffers ...
+    // 即：安卓上 SFPEW 的 EGL 导出一次都不会被调用，它只承担 GL。
+    // （JREUtils.java:349 还把 SDL_EGL_LIBRARY 也指向 POJAVEXEC_EGL，同理。）
+    //
+    // SFPEW 上游本来就允许 EGL 被绕过：fpe.cpp 里 sfpewNoteCurrentContext 的注释
+    // 写的是 "Set by the wrapper's own eglMakeCurrent **when the app routes EGL
+    // through us**"，并且 sfpewReconcileContext() 每 ~256 次 resolve 就用后端的
+    // eglGetCurrentContext 重新校准（还有 SFPEW_RELAXED_CONTEXT 开关）。
+    //
+    // 所以这里 EGL 生命周期必须留在真后端 dl_handle（= eglRenderer，见上方
+    // AMETHYST_SFPEW_BACKEND 判定）上。此前把 CreateContext/DestroyContext/
+    // MakeCurrent/SwapBuffers 从 SFPEW 取，会把 EGL 劈成两半 —— infra 来自真后端、
+    // lifecycle 先进 SFPEW 再转发后端 —— 与安卓模型不符，是 iOS 上
+    // SFPEW + MobileGlues / SFPEW + MobileGL-GLES 双双崩溃的成因。
 
     memset(&handle, 0, sizeof(handle));
     handle.eglBindAPI = load_egl_symbol(dl_handle, "eglBindAPI");
@@ -1353,12 +1359,6 @@ static bool dlsym_EGL() {
         handle.eglCreateContext = load_egl_symbol(ltw_handle, "eglCreateContext");
         handle.eglDestroyContext = load_egl_symbol(ltw_handle, "eglDestroyContext");
         handle.eglMakeCurrent = load_egl_symbol(ltw_handle, "eglMakeCurrent");
-    } else if (useSFPEW && sfpew_handle) {
-        // 从 SFPEW 解析三个 wrapper（关键：FPE 的 GL 入口转译表在
-        // eglCreateContext / eglMakeCurrent 里安装，直接调 ANGLE 的会绕过它）
-        handle.eglCreateContext = load_egl_symbol(sfpew_handle, "eglCreateContext");
-        handle.eglDestroyContext = load_egl_symbol(sfpew_handle, "eglDestroyContext");
-        handle.eglMakeCurrent = load_egl_symbol(sfpew_handle, "eglMakeCurrent");
     } else {
         handle.eglCreateContext = load_egl_symbol(dl_handle, "eglCreateContext");
         handle.eglDestroyContext = load_egl_symbol(dl_handle, "eglDestroyContext");
@@ -1373,12 +1373,6 @@ static bool dlsym_EGL() {
     handle.eglGetPlatformDisplay = load_egl_symbol(dl_handle, "eglGetPlatformDisplay");
     handle.eglInitialize = load_egl_symbol(dl_handle, "eglInitialize");
     handle.eglSwapBuffers = load_egl_symbol(dl_handle, "eglSwapBuffers");
-    if (useSFPEW && sfpew_handle) {
-        // SFPEW 的 swap 先 flush 再交给后端，绕过它会导致 FPE 的立即模式
-        // 绘制与后端的提交顺序错乱。
-        void *sfpewSwap = load_egl_symbol(sfpew_handle, "eglSwapBuffers");
-        if (sfpewSwap) handle.eglSwapBuffers = sfpewSwap;
-    }
     handle.eglReleaseThread = load_egl_symbol(dl_handle, "eglReleaseThread");
     handle.eglSwapInterval = load_egl_symbol(dl_handle, "eglSwapInterval");
     handle.eglTerminate = load_egl_symbol(dl_handle, "eglTerminate");
