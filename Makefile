@@ -473,13 +473,11 @@ dep_mg:
 #                              pool-zero/size-guard 补丁的 glslang 静态库上。
 # SHADERC_IMPL_FROM_SOURCE=0 : 垫片引入时的原始行为（3bed818be0）—— 直接用
 #                              Natives/resources/Frameworks/ 下预提交二进制。
-#                              默认 0：MG + 26.3 在 from-source 路径下依旧静默
-#                              闪退，预编译 impl 是该路径引入之前的状态，先回到
-#                              它取一帧真机证据；两条路只靠本变量即可整包 A/B。
-#                              注意：Air Task 45 的注释结论与本默认值相反 ——
-#                              它认定预编译 impl 是 26.3 崩溃家族的成因。本开关
-#                              存在的意义正是用真机把这条结论在我们这里复验一次。
-SHADERC_IMPL_FROM_SOURCE ?= 0
+#                              默认 1：两份 hs_err（pid11633 / pid23353）证明两条
+#                              路都崩，且是同一个病 —— 见下方符号围栏注释。围栏
+#                              只能作用于我们自己链接的 impl，预编译二进制改不动，
+#                              故默认走 from-source。变量仍可置 0 做整包 A/B。
+SHADERC_IMPL_FROM_SOURCE ?= 1
 
 ifeq ($(SHADERC_IMPL_FROM_SOURCE),1)
 dep_shaderc_impl: dep_mg
@@ -507,8 +505,10 @@ dep_shaderc_impl: dep_mg
 		fi; \
 	done; \
 	echo "[shaderc-impl] linking from-source impl (spirv=$$mg_spirv_a glslang=$$mg_glslang_a rl=$$mg_rl_a extra libs:$$extra_glslang_libs)"; \
+	printf '_shaderc_*\n' > $(WORKINGDIR)/shaderc_impl.exports; \
 	xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
 		-install_name @rpath/libshaderc_impl.dylib \
+		$(FENCE_IMPL) \
 		-I$(SOURCEDIR)/Natives/external/MobileGlues/MobileGlues-cpp/3rdparty/glslang \
 		-o $(WORKINGDIR)/libshaderc_impl.dylib \
 		$(SOURCEDIR)/Natives/shaderc_impl_glue.c \
@@ -530,6 +530,33 @@ dep_shaderc_impl:
 	echo '[shaderc-impl] mode=prebuilt - end'
 endif
 
+# --- 导出符号围栏（26.3 + MobileGL/MobileGlues SIGSEGV 根因）----------------
+# 两份真机 hs_err 的崩溃栈都跨了两个镜像：
+#   pid11633  C [libshaderc.dylib+0x3adafc]      spvtools::opt::Module::ForEachInst
+#             C [libMobileGL-gles.dylib+0xfd3014] spvtools::Optimizer::Run
+#   pid23353  C [libMobileGL-gles.dylib+0xaaff64] TGlslangToSpvTraverser::visitAggregate
+#             C [libshaderc_impl.dylib+0x75230]   glslang::TIntermAggregate::traverse
+# 渲染器镜像内嵌一份 glslang / SPIRV-Tools，shaderc 垫片内嵌另一份。两者都是
+# C++ 头文件内联产生的 weak 符号，在 flat namespace 下被 dyld 合并成同一份：
+# MobileGL 用自己那套 AST 建的节点，却跳进 shaderc 镜像里的 traverse/ForEachInst
+# 去遍历 —— 布局与虚表不匹配，随即 SIGSEGV。
+# 这与 impl 是预编译还是 from-source 无关（两份报告各占一条路），只取决于
+# 这些符号有没有被导出进全局空间。
+# shaderc_impl_glue.c 的公开面只有 shaderc_*（其余全 static），spvc_shim.c 只有
+# spvc_*；glslang / spvtools / spirv-cross 的符号纯粹是静态库顺带泄漏出来的。
+# 因此用 -exported_symbols_list 做白名单即可彻底切断串台，不影响垫片功能。
+SHADER_SHIM_SYMBOL_FENCE ?= 1
+
+ifeq ($(SHADER_SHIM_SYMBOL_FENCE),1)
+FENCE_IMPL    := -Wl,-exported_symbols_list,$(WORKINGDIR)/shaderc_impl.exports
+FENCE_SHADERC := -Wl,-exported_symbols_list,$(WORKINGDIR)/shaderc.exports
+FENCE_SPVC    := -Wl,-exported_symbols_list,$(WORKINGDIR)/spvc.exports
+else
+FENCE_IMPL    :=
+FENCE_SHADERC :=
+FENCE_SPVC    :=
+endif
+
 # --- 垫片总开关 -------------------------------------------------------------
 # SHADER_SHIMS=0 : dep_shader_shims 整体停用，Frameworks 下直接随包携带
 #                  Natives/resources/Frameworks/ 里的原始预提交二进制 —— 即
@@ -543,15 +570,19 @@ dep_shader_shims: dep_shaderc_impl dep_mg
 	echo '[Amethyst v$(VERSION)] dep_shader_shims - start'
 	cp $(SOURCEDIR)/Natives/resources/Frameworks/libspirv-cross-c-shared.0.dylib $(WORKINGDIR)/libspirv-cross-c-shared.0.impl.dylib || exit 1
 	install_name_tool -id @rpath/libspirv-cross-c-shared.0.impl.dylib $(WORKINGDIR)/libspirv-cross-c-shared.0.impl.dylib || exit 1
+	printf '_shaderc_*\n_ame_*\n' > $(WORKINGDIR)/shaderc.exports; \
 	xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
 		-install_name @rpath/libshaderc.dylib \
+		$(FENCE_SHADERC) \
 		-Wl,-reexport_library,$(WORKINGDIR)/libshaderc_impl.dylib \
 		-o $(WORKINGDIR)/libshaderc.dylib \
 		$(SOURCEDIR)/Natives/shaderc_shim.c \
 		$(SOURCEDIR)/Natives/shaderc_include.c \
 		$(SOURCEDIR)/Natives/shaderc_sandbox.m || exit 1
+	printf '_spvc_*\n_ame_*\n' > $(WORKINGDIR)/spvc.exports; \
 	xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
 		-install_name @rpath/libspirv-cross-c-shared.0.dylib \
+		$(FENCE_SPVC) \
 		-Wl,-reexport_library,$(WORKINGDIR)/libspirv-cross-c-shared.0.impl.dylib \
 		-o $(WORKINGDIR)/libspirv-cross-c-shared.0.dylib \
 		$(SOURCEDIR)/Natives/spvc_shim.c || exit 1
