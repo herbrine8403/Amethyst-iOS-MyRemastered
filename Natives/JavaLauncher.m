@@ -1529,6 +1529,16 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         // Required by Cosmetica to inject DNS
         PUSH_MARGV_LITERAL("--add-opens=java.base/java.net=ALL-UNNAMED");
 
+        // ★ [FIX262] java.base/java.lang 必须对未命名模块 open：
+        //   metallum agent 用 defineClass 把 metallum 类集直接定义进 MC 的类加载器，
+        //   走的是 ClassLoader#defineClass 反射 + setAccessible(true)。未命名模块下
+        //   setAccessible 需要显式 opens，否则抛 InaccessibleObjectException:
+        //     module java.base does not "opens java.lang" to unnamed module
+        //   ⇒ defineMetallumClasses 整段失败，metallum 一个类都定义不上 ⇒ 26.2 起不来。
+        //   （Forge 下 agent 是命名模块，另由 agent 侧 Instrumentation.redefineModule
+        //     打开；这一条对两条路径都安全、无副作用。）
+        PUSH_MARGV_LITERAL("--add-opens=java.base/java.lang=ALL-UNNAMED");
+
         // Setup Caciocavallo
         PUSH_MARGV_LITERAL("-Dawt.toolkit=com.github.caciocavallosilano.cacio.ctc.CTCToolkit");
         PUSH_MARGV_LITERAL("-Djava.awt.graphicsenv=com.github.caciocavallosilano.cacio.ctc.CTCGraphicsEnvironment");
