@@ -923,10 +923,6 @@ static void ame99_installAppKitMenuStubs(void) {
 int launchJVM(NSString *accountId, id launchTarget, int width, int height, int minVersion) {
     NSLog(@"[JavaLauncher] Beginning JVM launch");
 
-    // 尽早武装崩溃捕获：游戏闪退时 latestlog.txt 会随进程一起消失，
-    // 只有这里写的 native-crash.log 能留下崩溃栈。
-    ameInstallCrashCapture();
-
     // 防御检查：headless JVM（Forge/NeoForge 直装 processors 阶段）已在当前进程
     // 创建过 JVM。进程内 JVM 只能创建一次，再次 JLI_Launch 必然崩溃。
     // 提示用户重启 app 后再启动游戏。
@@ -940,6 +936,12 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
 
     init_loadDefaultEnv();
     init_loadCustomEnv();
+
+    // 武装崩溃捕获：游戏闪退时 latestlog.txt 会随进程一起消失，只有这里写的
+    // native-crash.log 能留下崩溃栈。
+    // 必须放在 init_loadCustomEnv() 之后 —— 否则读不到用户在设置里填的
+    // AMETHYST_CRASH_CAPTURE=0。仍在 JLI_Launch 之前，启动期崩溃一样能抓到。
+    ameInstallCrashCapture();
 
     // 同步自 catsruledogs：刷新 JIT flags，决定是否需要 Debug JIT Mapping
     // 使用 DeviceNeedsDebugJITMapping() 基于 JIT_FLAG_IS_IOS_26 | JIT_FLAG_FORCE_MIRRORED
@@ -1977,9 +1979,6 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
 int launchHeadlessJVM(NSString *mainClass, NSArray<NSString *> *args, int minJavaVersion) {
     NSLog(@"[JavaLauncher] Beginning headless JVM launch: %@ (minJava=%d)", mainClass, minJavaVersion);
 
-    // 安装器阶段同样可能崩（Forge/NeoForge processors），一并捕获。
-    ameInstallCrashCapture();
-
     if (!mainClass.length) {
         NSLog(@"[JavaLauncher] launchHeadlessJVM: mainClass is empty");
         return -6;
@@ -2003,6 +2002,10 @@ int launchHeadlessJVM(NSString *mainClass, NSArray<NSString *> *args, int minJav
 
     init_loadDefaultEnv();
     init_loadCustomEnv();
+
+    // 安装器阶段同样可能崩（Forge/NeoForge processors），一并捕获。
+    // 位置同 launchJVM：必须在 init_loadCustomEnv() 之后才能读到开关。
+    ameInstallCrashCapture();
 
     // 与 launchJVM 相同的 JIT26 处理（iOS 26+ 无 TXM 设备需要 Debug JIT Mapping）
     DeviceGetJITFlags(YES);
