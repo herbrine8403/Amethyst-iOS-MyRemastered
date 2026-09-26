@@ -335,7 +335,13 @@ static int pojavInitOpenGLInternal(BOOL setLwjglProperty) {
         // 跳过下方的统一 JNI_LWJGL_changeRenderer 和 dlopen（已处理）
         return pojavFinishOpenGLInit(!br_init());
     }
-    if (!isMobileGLRenderer(renderer.UTF8String)) {
+    // SFPEW 叠加在 MobileGL(-gles) 上时 AMETHYST_RENDERER 是 SFPEW，但真后端仍是
+    // MobileGL —— MOBILEGL_BACKEND_TYPE 必须保留，否则后端选成默认的 DirectVulkan。
+    const char *sfpewBackend = getenv("AMETHYST_SFPEW_BACKEND");
+    BOOL mobileGLActive = isMobileGLRenderer(renderer.UTF8String) ||
+        (isSFPEWRenderer(renderer.UTF8String) && sfpewBackend != NULL &&
+         isMobileGLRenderer(sfpewBackend));
+    if (!mobileGLActive) {
         // 切换渲染器后清掉 MobileGL 专用环境变量，避免残留影响下一次启动
         unsetenv("MOBILEGL_BACKEND_TYPE");
         unsetenv("MOBILEGL_LOG_FILE_PATH");

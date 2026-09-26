@@ -845,14 +845,31 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         // 后端 EGL 路径写进 SFPEW_EGL —— SFPEW 的 init 会 dlopen 它并通过
         // eglGetProcAddress 取回全部 GL 入口点。
         // 后端可用 AMETHYST_SFPEW_BACKEND 覆盖，缺省 libmobileglues.dylib。
-        if ([renderer isEqualToString:@ RENDERER_NAME_SFPEW]) {
-            const char *backend = getenv("AMETHYST_SFPEW_BACKEND");
-            if (backend == NULL || backend[0] == '\0') backend = RENDERER_NAME_MOBILEGLUES;
+        // 叠加模型（对齐安卓 Tools.useSFPEW）：默认开启，作用于 GLES 后端渲染器。
+        // 安卓是"保留 POJAVEXEC_EGL 指向真后端 + 把 renderLibrary 换成
+        // libSimpleFPEWrapper.so"；iOS 侧 AMETHYST_RENDERER 同时决定 LWJGL 加载的
+        // GL 库和 EGL 路由，所以这里把它换成 SFPEW，并把真后端写进 SFPEW_EGL /
+        // AMETHYST_SFPEW_BACKEND，由 SFPEW 内部 dlopen 后端并转发。
+        id sfpewPref = getPrefObject(@"video.sfpew_overlay");
+        BOOL sfpewEnabled = YES;
+        if (sfpewPref != nil && [sfpewPref respondsToSelector:@selector(boolValue)]) {
+            sfpewEnabled = [sfpewPref boolValue];
+        } else if (sfpewPref == nil) {
+            // 首次运行落默认（安卓 Tools.useSFPEW 默认 true），保证设置页开关与实际一致
+            setPrefObject(@"video.sfpew_overlay", @YES);
+        }
+        if (sfpewEnabled && isSFPEWOverlayEligibleRenderer(renderer.UTF8String)) {
+            const char *backend = renderer.UTF8String;
+            setenv("AMETHYST_SFPEW_BACKEND", backend, 1);
             NSString *bPath = [NSString stringWithFormat:@"@rpath/%s", backend];
             setenv("SFPEW_EGL", bPath.UTF8String, 1);
-            NSLog(@"[JavaLauncher] SimpleFPEWrapper active: backend EGL=%s (%@)", backend, bPath);
+            renderer = @ RENDERER_NAME_SFPEW;
+            setenv("AMETHYST_RENDERER", renderer.UTF8String, 1);
+            NSLog(@"[JavaLauncher] SFPEW overlay active: backend=%s -> AMETHYST_RENDERER=%@, SFPEW_EGL=%@",
+                  backend, renderer, bPath);
         } else {
             // 切换渲染器后清掉，避免残留影响后续启动
+            unsetenv("AMETHYST_SFPEW_BACKEND");
             unsetenv("SFPEW_EGL");
         }
 

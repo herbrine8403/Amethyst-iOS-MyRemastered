@@ -715,6 +715,14 @@
               @"pickKeys": self.rendererKeys,
               @"pickList": self.rendererList
             },
+            // SimpleFPEWrapper 固定管线 (GL 1.x) 仿真层，仅叠加在 GLES 后端之上
+            // （MobileGlues / MobileGL-gles）；gl4es、zink、Vulkan 等不适用。
+            @{@"key": @"sfpew_overlay",
+              @"hasDetail": @YES,
+              @"icon": @"square.stack.3d.down.right",
+              @"type": self.typeSwitch,
+              @"enableCondition": whenNotInGame
+            },
             @{@"key": @"resolution",
               @"hasDetail": @YES,
               @"icon": @"viewfinder",

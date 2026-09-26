@@ -1237,7 +1237,17 @@ static bool dlsym_EGL() {
     //     mg_init_gles 引导完成前避免触发前端内部的 LOAD_EGL 一次性初始化）。
     //   - 其余渲染器（gl4es / ANGLE / LTW）：全部从 ANGLE 解析。
     const char *renderer = getenv("AMETHYST_RENDERER");
-    const char *eglLibrary = isSelfEglRenderer(renderer) ? renderer : RENDERER_NAME_MTL_ANGLE;
+    // SFPEW 叠加模式下 AMETHYST_RENDERER 已换成 libSimpleFPEWrapper.dylib，但 EGL
+    // 基础设施必须由真后端提供（对齐安卓：POJAVEXEC_EGL 不变，只换 renderLibrary）。
+    // 真后端名在 AMETHYST_SFPEW_BACKEND（JavaLauncher.m 设置）：
+    //   - MobileGlues：与单独使用时一致，EGL 走 ANGLE
+    //   - MobileGL(-gles)：自带 EGL，从 libMobileGL.dylib 解析
+    const char *eglRenderer = renderer;
+    if (isSFPEWRenderer(renderer)) {
+        const char *sfpewBackend = getenv("AMETHYST_SFPEW_BACKEND");
+        if (sfpewBackend != NULL && sfpewBackend[0] != '\0') eglRenderer = sfpewBackend;
+    }
+    const char *eglLibrary = isSelfEglRenderer(eglRenderer) ? eglRenderer : RENDERER_NAME_MTL_ANGLE;
     NSString *eglPath = [NSString stringWithFormat:@"@rpath/%s", eglLibrary ?: ""];
     void* dl_handle = dlopen(eglPath.UTF8String, RTLD_NOW | RTLD_GLOBAL);
     if (!dl_handle) {

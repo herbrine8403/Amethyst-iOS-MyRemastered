@@ -79,6 +79,15 @@ static inline bool isSFPEWRenderer(const char *renderer) {
     return renderer && !strcmp(renderer, RENDERER_NAME_SFPEW);
 }
 
+// SFPEW 只能叠加在「OpenGL ES 后端」之上（对齐安卓 JREUtils：gl4es / system-gles /
+// zink 一律 Tools.useSFPEW=false，只有 MobileGlues 这类 GLES 后端才叠加）。
+// 桌面 GL→GLES 的 MobileGL-gles 同样属于 GLES 后端，故一并允许。
+static inline bool isSFPEWOverlayEligibleRenderer(const char *renderer) {
+    if (!renderer) return false;
+    return !strcmp(renderer, RENDERER_NAME_MOBILEGLUES) ||
+           !strcmp(renderer, RENDERER_NAME_MOBILEGL_GLES);
+}
+
 static inline bool isMobileGLRenderer(const char *renderer) {
     return renderer && (!strcmp(renderer, RENDERER_NAME_MOBILEGL) ||
                         !strcmp(renderer, RENDERER_NAME_MOBILEGL_GLES));
