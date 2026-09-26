@@ -173,6 +173,22 @@ void init_loadMobileGluesConfig() {
         [renderer isEqualToString:@"auto"] ||
         [renderer isEqualToString:@ RENDERER_NAME_VULKAN];
 
+    // SFPEW 独立选中（渲染器列表里的 SFPEW 项）时，真后端由 AMETHYST_SFPEW_BACKEND
+    // 决定，缺省 libmobileglues.dylib。此时 MobileGlues 依然会被加载 —— 只是改由
+    // SFPEW 内部 dlopen 成为它的后端 —— 所以 config.json 必须照常写入。
+    //
+    // 漏掉这一步的后果（1.7.10 + SFPEW standalone 真机日志实测）：
+    //     MG_DIR_PATH = /sdcard/MG          ← Android 默认路径，iOS 上不存在
+    //     config.json not loaded, using defaults
+    // 于是 enableExtDirectStateAccess 落回默认 true、maxGlslCacheSize 落回 30、
+    // customGLVersion 变成 (default)，本仓库写入的 MG 偏好在 SFPEW 路径下全部失效，
+    // Task166 的 DSA 默认改关等修复也就完全够不到这一条路径。
+    if (!usesMobileGlues && isSFPEWRenderer(renderer.UTF8String)) {
+        const char *backend = getenv("AMETHYST_SFPEW_BACKEND");
+        if (backend == NULL || backend[0] == '\0') backend = RENDERER_NAME_MOBILEGLUES;
+        usesMobileGlues = (strcmp(backend, RENDERER_NAME_MOBILEGLUES) == 0);
+    }
+
     if (!usesMobileGlues) {
         NSLog(@"[JavaLauncher] MobileGlues config not written (renderer is not mobileglues/auto/vulkan)");
         return;
