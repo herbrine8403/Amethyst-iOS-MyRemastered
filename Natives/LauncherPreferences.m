@@ -333,7 +333,15 @@ static NSArray<NSDictionary *> *rendererCandidates(void) {
         // 两者最终的环境变量形态一致，只是入口不同。
         @{@"key": @ RENDERER_NAME_SFPEW,
           @"name": localize(@"preference.title.renderer.debug.sfpew", nil),
-          @"file": @ RENDERER_NAME_SFPEW}
+          @"file": @ RENDERER_NAME_SFPEW},
+        // Metal（metallum / MetalUniversal）：原生 Metal 后端，对应 dylib 为
+        // libmetallum.dylib（由 metallum agent jar 在运行期解出到 App.app/Frameworks，
+        // 见 utils.h RENDERER_NAME_METAL 与 JavaLauncher.m 置 AMETHYST_METAL=1 的分支）。
+        // 刻意追加在表末：已有 profile / 全局偏好里存的 renderer 值（libxxx.dylib）
+        // 在 pick 控件里按下标配对，插到中间会让这些已存值显示错位。
+        @{@"key": @ RENDERER_NAME_METAL,
+          @"name": localize(@"preference.title.renderer.debug.metal", nil),
+          @"file": @ RENDERER_NAME_METAL}
     ];
 }
 

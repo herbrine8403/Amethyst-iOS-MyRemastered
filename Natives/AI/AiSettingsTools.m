@@ -81,6 +81,8 @@
     if ([lower containsString:@"zink"] || [lower containsString:@"mesa"] || [lower containsString:@"osmesa"]) return @(RENDERER_NAME_VK_ZINK);
     if ([lower containsString:@"mobileglues"] || [lower isEqualToString:@"mg"]) return @(RENDERER_NAME_MOBILEGLUES);
     if ([lower containsString:@"angle"] || [lower containsString:@"tinygl4"]) return @(RENDERER_NAME_MTL_ANGLE);
+    // 必须排在 angle 之后："MetalANGLE" 同样含 "metal" 子串
+    if ([lower containsString:@"metallum"] || [lower containsString:@"metal"]) return @(RENDERER_NAME_METAL);
     if ([lower containsString:@"gl4es"]) return @(RENDERER_NAME_GL4ES);
     if ([lower containsString:@"ltw"]) return @(RENDERER_NAME_LTW);
     return nil;
@@ -94,6 +96,7 @@
     if ([storageKey isEqualToString:@(RENDERER_NAME_MOBILEGLUES)]) return @"MobileGlues (libmobileglues.dylib)";
     if ([storageKey isEqualToString:@(RENDERER_NAME_MTL_ANGLE)]) return @"ANGLE/MetalANGLE (libtinygl4angle.dylib)";
     if ([storageKey isEqualToString:@(RENDERER_NAME_GL4ES)]) return @"GL4ES (libgl4es_114.dylib)";
+    if ([storageKey isEqualToString:@(RENDERER_NAME_METAL)]) return @"Metal (libmetallum.dylib)";
     if ([storageKey isEqualToString:@(RENDERER_NAME_LTW)]) return @"LTW (libltw.dylib)";
     return storageKey;
 }
