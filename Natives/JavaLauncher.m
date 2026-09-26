@@ -223,18 +223,32 @@ void init_loadMobileGluesConfig() {
     // 不读该键，写了也是无效键；而且它与 GL 3.2 档自相
     // 矛盾（宣称 GL 4.3 能力）。Air 从不写这个键。
     //
-    // 开关语义：用户开启 mobileglues.enable_angle 即选 GLES 档（GL 3.2），
-    // 关闭即选 OpenGL 4.0 档（GL 4.0）——与 Air 的两档一一对应，
-    // 可直接切换回退。
+    // Task158 对齐 Air 的语义修正（Air latestlog 26.3-rc-2 + libmobileglues.dylib 实证）：
+    //   Air 的两档由 *渲染器档位*（ame158_mg_mobileglues_mode）决定，而不是由
+    //   mobileglues.enable_angle 这个开关决定：
+    //     mode 1（mg GLES 后端）  → enableANGLE=3 + customGLVersion=32
+    //     mode 2（mg OpenGL 4.0） → enableANGLE=0 + customGLVersion=40
+    //     mode 0（独立 MobileGlues 直选）→ 不强制，保持默认 customGLVersion=40
+    //   Air 那份 26.3-rc-2 全程可玩日志（swapOK=3402 无崩溃）正是 mode 0：
+    //     mobileglues.enable_angle = 0 -> enableANGLE = 0
+    //     mobileglues.custom_gl_version = 0 (raw) -> customGLVersion = 40
+    //     [Render thread] Using graphics backend OpenGL, using drivers: 4.0.0 MobileGlues 2.0.17
+    //
+    // 本函数只在 renderer 为 libmobileglues / auto / vulkan 时执行，即 Air 的 mode 0
+    // 场景，因此必须保持默认 40（GL 4.0）。
+    //
+    // 此前把 enable_angle 开关直接绑成 GLES 档（angleOn → 32）是错误的映射：
+    // 存量设备上 enable_angle=YES 会把 26.3 的驱动版本压到 GL 3.2，
+    // 而 26.3 在 GL 4.0 下才走通（26.2 不受影响，故表现为"26.2 可玩、26.3 闪退"）。
+    // 现在 enable_angle 只写 enableANGLE 键（iOS 上 MG 不读该键，仅作记录），
+    // 不再降级 customGLVersion。需要 GL 3.2 的用户请在设置里显式选择
+    // mobileglues.custom_gl_version = 3.2（下方透传逻辑照常生效，与 Air 一致）。
     id enableAngle = getPrefObject(@"mobileglues.enable_angle");
     BOOL angleOn = [enableAngle respondsToSelector:@selector(boolValue)] && [enableAngle boolValue];
     config[@"enableANGLE"] = angleOn ? @3 : @0;
-    if (angleOn) {
-        config[@"customGLVersion"] = @32;
-    }
-    NSLog(@"[JavaLauncher] Task158: mg backend -> MobileGlues (enableANGLE=%@, customGLVersion=%@; "
-          @"ANGLE is inert on iOS -- MG settings.cpp Apple branch hardcodes Disabled and never reads the key; "
-          @"customGLVersion is the only live knob)",
+    NSLog(@"[JavaLauncher] Task158: mg backend -> MobileGlues mode 0 (直选) -- enableANGLE=%@, "
+          @"customGLVersion=%@ (Air 对齐：mode 0 不强制，保持 GL 4.0 默认；"
+          @"enableANGLE 在 iOS 上被 MG settings.cpp Apple 分支硬编码忽略)",
           config[@"enableANGLE"], config[@"customGLVersion"]);
 
     id enableNoError = getPrefObject(@"mobileglues.enable_no_error");
