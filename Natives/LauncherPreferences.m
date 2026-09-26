@@ -27,6 +27,36 @@ void toggleIsolatedPref(BOOL forceEnable) {
     [pref toggleIsolationForced:forceEnable];
 }
 
+#pragma mark - Task141 launch memory
+
+int ame141_currentLaunchAllocMem(void) {
+    int deviceMB = (int)(NSProcessInfo.processInfo.physicalMemory >> 20);
+    int allocmem;
+    if (getPrefBool(@"java.auto_ram")) {
+        CGFloat autoRatio = getEntitlementValue(@"com.apple.private.memorystatus") ? 0.4 : 0.25;
+        allocmem = (int)roundf(deviceMB * autoRatio);
+    } else {
+        allocmem = (int)getPrefInt(@"java.allocated_memory");
+    }
+    if (allocmem < 256) allocmem = 256;
+
+    // Jetsam 上限 = allocmem + 1024（1024 MB 留给 JVM native 堆 + UIKit/Metal/EGL）。
+    // 若该上限逼近设备物理内存总量，进程一旦接近上限就会被系统 SIGKILL，
+    // 而 SIGKILL 不可捕获 —— 表现为"日志突然中断、没有任何崩溃栈"。
+    // 因此把上限收敛到设备物理内存的 70%，给系统与其它进程留出余量。
+    const char *noClamp = getenv("AMETHYST_MEM_NO_CLAMP");
+    if (!(noClamp && noClamp[0] == '1') && deviceMB > 0) {
+        int safeLimit = (int)(deviceMB * 0.70);
+        if (allocmem + 1024 > safeLimit) {
+            int clamped = safeLimit - 1024;
+            if (clamped < 512) clamped = 512;
+            NSLog(@"[Task141] launch memory clamped %d MB -> %d MB (device %d MB, jetsam limit %d MB)", allocmem, clamped, deviceMB, clamped + 1024);
+            allocmem = clamped;
+        }
+    }
+    return allocmem;
+}
+
 #pragma mark Download source migration
 
 /// 一次性迁移：旧键 general.download_source → 新版 4 个分类镜像策略键

@@ -33,6 +33,14 @@ UIColor *accentColor(void);
 
 BOOL getEntitlementValue(NSString *key);
 
+/// Task141：启动内存（JVM Xmx）的单一事实源。
+/// JavaLauncher 的 launchJVM 与 SurfaceViewController 的 updateJetsamControl
+/// 必须读同一个值 —— 两处错位会让 Jetsam 上限低于"Xmx + native 开销"，
+/// 系统在 JVM 启动阶段直接 SIGKILL（不可捕获，日志表现为进程凭空消失、无崩溃栈）。
+/// 本函数同时按设备物理内存收敛上限，保证 jetsam 上限（allocmem + 1024）
+/// 给系统与其它进程留出余量。设 AMETHYST_MEM_NO_CLAMP=1 可关闭收敛。
+int ame141_currentLaunchAllocMem(void);
+
 UIEdgeInsets getDefaultSafeArea();
 CGRect getSafeArea(CGRect screenBounds);
 void setSafeArea(CGSize screenSize, CGRect safeArea);

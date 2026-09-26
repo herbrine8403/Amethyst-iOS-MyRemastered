@@ -1317,13 +1317,8 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
     setenv("JAVA_HOME", javaHome.UTF8String, 1);
     NSLog(@"[JavaLauncher] JAVA_HOME has been set to %@", javaHome);
 
-    int allocmem;
-    if (getPrefBool(@"java.auto_ram")) {
-        CGFloat autoRatio = getEntitlementValue(@"com.apple.private.memorystatus") ? 0.4 : 0.25;
-        allocmem = roundf((NSProcessInfo.processInfo.physicalMemory >> 20) * autoRatio);
-    } else {
-        allocmem = getPrefInt(@"java.allocated_memory");
-    }
+    // Task141：启动内存单一事实源（见 ame141_currentLaunchAllocMem）。
+    int allocmem = ame141_currentLaunchAllocMem();
     NSLog(@"[JavaLauncher] Max RAM allocation is set to %d MB", allocmem);
     if (!validateVirtualMemorySpace(allocmem)) {
         UIKit_returnToSplitView();
