@@ -934,7 +934,23 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
             NSLog(@"[JavaLauncher] SFPEW overlay skipped: MC %@ needs no fixed-function emulation (SFPEW serves <= 1.16.x only)",
                   sfpewVersionId);
         }
-        if (sfpewEnabled && sfpewVersionOK && isSFPEWOverlayEligibleRenderer(renderer.UTF8String)) {
+        // 独立选中 SFPEW（渲染器列表里的 SFPEW 项，而非叠加）：
+        // AMETHYST_RENDERER 已经是 SFPEW 本身，只需把真后端写进 SFPEW_EGL。
+        // 后端由 AMETHYST_SFPEW_BACKEND 指定，缺省 libmobileglues.dylib。
+        // 与叠加分支最终的环境变量形态完全一致，只是入口不同。
+        if (isSFPEWRenderer(renderer.UTF8String)) {
+            const char *backend = getenv("AMETHYST_SFPEW_BACKEND");
+            if (backend == NULL || backend[0] == '\0') backend = RENDERER_NAME_MOBILEGLUES;
+            setenv("AMETHYST_SFPEW_BACKEND", backend, 1);
+            NSString *bPathS = [NSString stringWithFormat:@"@rpath/%s", backend];
+            setenv("SFPEW_EGL", bPathS.UTF8String, 1);
+            if (!sfpewVersionOK) {
+                NSLog(@"[JavaLauncher] SFPEW standalone: MC %@ is outside the fixed-function era -- "
+                      @"expect no benefit (SFPEW serves <= 1.16.x only)", sfpewVersionId);
+            }
+            NSLog(@"[JavaLauncher] SFPEW standalone: backend=%s -> AMETHYST_RENDERER=%@, SFPEW_EGL=%@",
+                  backend, renderer, bPathS);
+        } else if (sfpewEnabled && sfpewVersionOK && isSFPEWOverlayEligibleRenderer(renderer.UTF8String)) {
             const char *backend = renderer.UTF8String;
             setenv("AMETHYST_SFPEW_BACKEND", backend, 1);
             NSString *bPath = [NSString stringWithFormat:@"@rpath/%s", backend];
