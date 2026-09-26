@@ -9,6 +9,15 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <mach/mach.h>
+// 独立 native 崩溃捕获（见 ameInstallCrashCapture 处注释）
+#include <execinfo.h>
+#include <fcntl.h>
+#include <mach-o/dyld.h>
+#include <pthread.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/ucontext.h>
+#include <time.h>
 // Task 99：MC 26.3 的 Window.<init> 经 jna-objc 找 NSApplication（AppKit 菜单集成）
 // iOS 无 AppKit，需要在 JLI_Launch 前用 ObjC 运行时注册最小桩类。
 #include <objc/runtime.h>
@@ -38,6 +47,173 @@ BOOL validateVirtualMemorySpace(size_t size) {
     if(map == MAP_FAILED || munmap(map, size) != 0)
         return NO;
     return YES;
+}
+
+#pragma mark - 独立 native 崩溃捕获
+
+// 为什么需要它：游戏闪退时，写 latestlog.txt 的线程随进程一起消失，日志必然
+// 截断在最后一行，永远拿不到崩溃点。此前十几轮排查全是静态对照，正是因为
+// 缺一份真正的 native 栈。这里在进程内直接用 sigaltstack + sigaction 抓栈，
+// 写到 <POJAV_HOME>/native-crash.log（独立于游戏日志，进程被杀也不丢）。
+//
+// 安全约束：signal handler 内只允许 async-signal-safe 操作 —— write、预先
+// 打开的 fd、栈上缓冲。禁止 NSLog / malloc / ObjC / 锁 / 路径拼接。地址到
+// 十六进制的转换自己写（ameCrashU64），不依赖 snprintf。
+//
+// 崩溃后不 _exit，而是依靠 SA_RESETHAND 让 handler 自动恢复为 SIG_DFL：
+// handler 返回后出错指令重新执行并再次触发，此时交给系统默认处理，iOS
+// 「设置 → 隐私与安全性 → 分析数据」里也能同时留下一份标准报告。
+
+#define AME_CRASH_MAX_FRAMES 64
+
+static int gAmeCrashFd = -1;
+static void *gAmeCrashAltStack = NULL;
+static size_t gAmeCrashAltStackSize = 0;
+static volatile sig_atomic_t gAmeCrashInHandler = 0;
+
+// 把 v 格式化成 16 位定长十六进制（含前导零），写入 out[17]。
+static void ameCrashU64(char *out, uint64_t v) {
+    static const char digits[] = "0123456789abcdef";
+    for (int i = 15; i >= 0; i--) { out[i] = digits[v & 0xfu]; v >>= 4; }
+    out[16] = '\0';
+}
+
+static void ameCrashWrite(const char *s) {
+    if (gAmeCrashFd >= 0 && s != NULL) write(gAmeCrashFd, s, strlen(s));
+}
+
+// 手写拼接 "label=0xXXXXXXXXXXXXXXXX\n"，全程只用栈上缓冲 + write。
+static void ameCrashLine(const char *label, uint64_t v) {
+    if (gAmeCrashFd < 0) return;
+    char hex[17];
+    char buf[128];
+    size_t n = 0;
+    ameCrashU64(hex, v);
+    for (const char *p = label; *p != '\0' && n < sizeof(buf) - 20; p++) buf[n++] = *p;
+    buf[n++] = '='; buf[n++] = '0'; buf[n++] = 'x';
+    for (int i = 0; i < 16; i++) buf[n++] = hex[i];
+    buf[n++] = '\n';
+    write(gAmeCrashFd, buf, n);
+}
+
+static void ameCrashHandler(int sig, siginfo_t *si, void *ucRaw) {
+    // 递归保护：handler 自身再出错时直接退出，避免无限循环。
+    if (gAmeCrashInHandler) _exit(128 + sig);
+    gAmeCrashInHandler = 1;
+
+    uint64_t pc = 0, sp = 0, fp = 0, lr = 0;
+    ucontext_t *uc = (ucontext_t *)ucRaw;
+#if defined(__arm64__) || defined(__aarch64__)
+    if (uc != NULL && uc->uc_mcontext != NULL) {
+        pc = (uint64_t)uc->uc_mcontext->__ss.__pc;
+        sp = (uint64_t)uc->uc_mcontext->__ss.__sp;
+        fp = (uint64_t)uc->uc_mcontext->__ss.__fp;
+        lr = (uint64_t)uc->uc_mcontext->__ss.__lr;
+    }
+#endif
+
+    ameCrashWrite("\n=== NATIVE CRASH ===\n");
+    ameCrashLine("signal", (uint64_t)(int64_t)sig);
+    ameCrashLine("si_addr", (uint64_t)(uintptr_t)(si != NULL ? si->si_addr : NULL));
+    ameCrashLine("si_code", (uint64_t)(int64_t)(si != NULL ? si->si_code : 0));
+    ameCrashLine("thread", (uint64_t)pthread_mach_thread_np(pthread_self()));
+    ameCrashLine("pc", pc);
+    ameCrashLine("sp", sp);
+    ameCrashLine("fp", fp);
+    ameCrashLine("lr", lr);
+
+    // backtrace 在 arm64 上依赖 frame pointer，可能不完整；原始地址始终写出，
+    // 之后用 dSYM + atos，或按下方 image slide 手工定位。
+    void *frames[AME_CRASH_MAX_FRAMES];
+    int nf = backtrace(frames, AME_CRASH_MAX_FRAMES);
+    ameCrashLine("frames", (uint64_t)(int64_t)nf);
+    for (int i = 0; i < nf && i < AME_CRASH_MAX_FRAMES; i++) {
+        ameCrashLine("  frame", (uint64_t)(uintptr_t)frames[i]);
+    }
+    // best-effort 符号化：非 async-signal-safe，放最后，即使它出问题，前面的
+    // 原始地址也已经落盘。
+    if (gAmeCrashFd >= 0 && nf > 0) backtrace_symbols_fd(frames, nf, gAmeCrashFd);
+    ameCrashWrite("=== END CRASH ===\n");
+}
+
+// 启动时记录已加载镜像清单 + slide：崩溃日志里只有原始地址，没有 slide 就
+// 无法判断 PC 落在哪个 dylib、偏移多少。
+static void ameCrashDumpImages(void) {
+    if (gAmeCrashFd < 0) return;
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        dprintf(gAmeCrashFd, "image[%u] slide=0x%016llx %s\n",
+                i, (uint64_t)slide, name != NULL ? name : "(null)");
+    }
+}
+
+static void ameCrashDumpEnv(const char *key) {
+    if (gAmeCrashFd < 0) return;
+    const char *v = getenv(key);
+    dprintf(gAmeCrashFd, "env %s=%s\n", key, v != NULL ? v : "(unset)");
+}
+
+// 在 JLI_Launch 之前调用；幂等，重复调用无副作用。
+static void ameInstallCrashCapture(void) {
+    static BOOL installed = NO;
+    if (installed) return;
+    installed = YES;
+
+    const char *off = getenv("AMETHYST_CRASH_CAPTURE");
+    if (off != NULL && off[0] == '0') {
+        NSLog(@"[JavaLauncher] native crash capture disabled (AMETHYST_CRASH_CAPTURE=0)");
+        return;
+    }
+
+    const char *home = getenv("POJAV_HOME");
+    if (home == NULL || home[0] == '\0') home = "/tmp";
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/native-crash.log", home);
+    gAmeCrashFd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (gAmeCrashFd < 0) {
+        NSLog(@"[JavaLauncher] native crash capture unavailable (cannot open %s)", path);
+        return;
+    }
+
+    dprintf(gAmeCrashFd, "\n\n======== LAUNCH %lld ========\n", (long long)time(NULL));
+    ameCrashDumpEnv("AMETHYST_RENDERER");
+    ameCrashDumpEnv("AMETHYST_RENDERER_RTLD_GLOBAL");
+    ameCrashDumpEnv("AMETHYST_PRELOAD_ISOLATE");
+    ameCrashDumpEnv("AMETHYST_SFPEW_BACKEND");
+    ameCrashDumpEnv("SFPEW_EGL");
+    ameCrashDumpEnv("MG_DIR_PATH");
+    ameCrashDumpEnv("POJAV_GAME_DIR");
+    ameCrashDumpImages();
+
+    // 备用信号栈：栈溢出类崩溃时原栈已不可用，handler 必须跑在独立栈上。
+    gAmeCrashAltStackSize = 128 * 1024;
+    gAmeCrashAltStack = mmap(NULL, gAmeCrashAltStackSize, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (gAmeCrashAltStack != MAP_FAILED) {
+        stack_t ss;
+        ss.ss_sp = gAmeCrashAltStack;
+        ss.ss_size = gAmeCrashAltStackSize;
+        ss.ss_flags = 0;
+        sigaltstack(&ss, NULL);
+    } else {
+        gAmeCrashAltStack = NULL;
+    }
+
+    const int sigs[] = { SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGFPE };
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = ameCrashHandler;
+    // SA_RESETHAND：进入 handler 即自动恢复 SIG_DFL，handler 返回后再次触发时
+    // 由系统默认处理，既有我们的日志也有标准 crash report。
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
+    sigemptyset(&sa.sa_mask);
+    for (size_t i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
+        sigaction(sigs[i], &sa, NULL);
+    }
+
+    NSLog(@"[JavaLauncher] native crash capture armed -> %s", path);
 }
 
 void init_loadDefaultEnv() {
@@ -746,6 +922,10 @@ static void ame99_installAppKitMenuStubs(void) {
 
 int launchJVM(NSString *accountId, id launchTarget, int width, int height, int minVersion) {
     NSLog(@"[JavaLauncher] Beginning JVM launch");
+
+    // 尽早武装崩溃捕获：游戏闪退时 latestlog.txt 会随进程一起消失，
+    // 只有这里写的 native-crash.log 能留下崩溃栈。
+    ameInstallCrashCapture();
 
     // 防御检查：headless JVM（Forge/NeoForge 直装 processors 阶段）已在当前进程
     // 创建过 JVM。进程内 JVM 只能创建一次，再次 JLI_Launch 必然崩溃。
@@ -1796,6 +1976,9 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
 // 注意：调用后进程内 JVM 已创建，游戏启动必须重启 app（见 gJvmUsedInProcess）。
 int launchHeadlessJVM(NSString *mainClass, NSArray<NSString *> *args, int minJavaVersion) {
     NSLog(@"[JavaLauncher] Beginning headless JVM launch: %@ (minJava=%d)", mainClass, minJavaVersion);
+
+    // 安装器阶段同样可能崩（Forge/NeoForge processors），一并捕获。
+    ameInstallCrashCapture();
 
     if (!mainClass.length) {
         NSLog(@"[JavaLauncher] launchHeadlessJVM: mainClass is empty");
