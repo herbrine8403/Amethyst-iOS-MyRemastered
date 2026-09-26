@@ -82,26 +82,10 @@ static inline bool isSFPEWRenderer(const char *renderer) {
 // SFPEW 只能叠加在「OpenGL ES 后端」之上（对齐安卓 JREUtils：gl4es / system-gles /
 // zink 一律 Tools.useSFPEW=false，只有 MobileGlues 这类 GLES 后端才叠加）。
 // 桌面 GL→GLES 的 MobileGL-gles 同样属于 GLES 后端，故一并允许。
-// SFPEW 叠加在 iOS 上暂不可用，两个候选后端均实测 SIGSEGV，故白名单暂时清空。
-//
-// 证据（53e0f31，iPhone X iOS 16.7.15，1.7.10，SFPEW 叠加 mobileglues）：
-//   [MG] SYMBOL THEFT: flat namespace resolves glTexImage2D to 0x2240a5d48,
-//        this layer's export is 0x137813464 -- the application is calling someone else
-//   SIGSEGV at pc=0x1378135dc
-//   C  [libmobileglues.dylib+0x275dc]  glTexImage2D+0x178
-// 0x137813464 + 0x178 == pc，崩溃点精确落在 MG 自己的 glTexImage2D 内部。
-//
-// 机制：SFPEW 要被 LWJGL 的 dlsym(RTLD_DEFAULT) 看见，必须以 RTLD_GLOBAL 预载；
-// 而这会让 SFPEW 导出的 gl* 进入 flat namespace，与后端 MG 的 gl* 同名冲突
-// （0x2240a5d48 即 SFPEW 的副本）。SFPEW 转发后崩在 MG 内部。
-// 这是符号模型冲突，不是配置问题，启动器侧无解 —— 安卓可行是因为其 SFPEW
-// 只拦截固定管线入口、不整表导出同名 gl*。
-//
-// MobileGL-gles 叠加同样崩溃（glCheckFramebufferStatus 返回垃圾值）。
-// 恢复条件：拿到 SFPEW 侧的真机栈，或上游改为不导出与后端同名的 gl*。
 static inline bool isSFPEWOverlayEligibleRenderer(const char *renderer) {
-    (void)renderer;
-    return false;
+    if (!renderer) return false;
+    return !strcmp(renderer, RENDERER_NAME_MOBILEGLUES) ||
+           !strcmp(renderer, RENDERER_NAME_MOBILEGL_GLES);
 }
 
 static inline bool isMobileGLRenderer(const char *renderer) {
