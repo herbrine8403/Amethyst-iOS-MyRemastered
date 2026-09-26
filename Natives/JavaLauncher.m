@@ -488,6 +488,28 @@ NSInteger ame98_mcMajorFromVersionId(NSString *versionId) {
     return 0;
 }
 
+// SFPEW（固定管线仿真层）适用的 MC 版本判定：仅 GL 1.x 固定管线时代，即 <= 1.16.x。
+// MC 1.17 起渲染切到 GL 3.2 core + shader/VAO，不再有 immediate mode（glBegin/glEnd、
+// 光照、texenv、矩阵栈等），SFPEW 的 fpe_shadergen 无对象可仿真，叠加只带来
+// 多一层转发开销与崩溃风险（26.3 会话实测因此崩于 glCheckFramebufferStatus 垃圾值）。
+// 年份制版本（21wxx 起，含 26.x）一律属于 1.17+，返回 NO。
+static BOOL ameSFPEWSupportsVersionId(NSString *versionId) {
+    if (![versionId isKindOfClass:[NSString class]] || versionId.length == 0) {
+        return NO;
+    }
+    NSRegularExpression *legacyRegex = [NSRegularExpression
+        regularExpressionWithPattern:@"(?:^|[-_])1\\.(\\d+)" options:0 error:nil];
+    NSTextCheckingResult *match = [legacyRegex firstMatchInString:versionId
+                                                          options:0
+                                                            range:NSMakeRange(0, versionId.length)];
+    if (match && match.numberOfRanges >= 2) {
+        NSInteger minor = [[versionId substringWithRange:[match rangeAtIndex:1]] integerValue];
+        return minor <= 16;
+    }
+    // 年份制（26.3 / 25w45a 等）或非 1.x 版本号
+    return NO;
+}
+
 // 解析 profile 的 lwjglVersion 设置为具体的 LWJGL 版本：
 //   "333" / "341" -> 原样使用
 //   "auto"        -> MC 26.x 及以上用 3.4.1，其余用 3.3.3
@@ -865,14 +887,30 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         // GL 库和 EGL 路由，所以这里把它换成 SFPEW，并把真后端写进 SFPEW_EGL /
         // AMETHYST_SFPEW_BACKEND，由 SFPEW 内部 dlopen 后端并转发。
         id sfpewPref = getPrefObject(@"video.sfpew_overlay");
-        BOOL sfpewEnabled = YES;
+        BOOL sfpewEnabled = NO;
         if (sfpewPref != nil && [sfpewPref respondsToSelector:@selector(boolValue)]) {
             sfpewEnabled = [sfpewPref boolValue];
         } else if (sfpewPref == nil) {
-            // 首次运行落默认（安卓 Tools.useSFPEW 默认 true），保证设置页开关与实际一致
-            setPrefObject(@"video.sfpew_overlay", @YES);
+            // 首次运行落默认（默认关闭），保证设置页开关与实际一致
+            setPrefObject(@"video.sfpew_overlay", @NO);
         }
-        if (sfpewEnabled && isSFPEWOverlayEligibleRenderer(renderer.UTF8String)) {
+        // 版本门控：SFPEW 只服务 GL 1.x 固定管线，仅对 <= 1.16.x 生效。
+        // 26.x / 25wxx 等年份制版本一律跳过，避免无意义叠加导致崩溃。
+        NSString *sfpewVersionId = nil;
+        if ([launchTarget isKindOfClass:NSDictionary.class]) {
+            sfpewVersionId = [launchTarget[@"id"] description];
+        } else if ([launchTarget isKindOfClass:NSString.class]) {
+            sfpewVersionId = (NSString *)launchTarget;
+        }
+        if (sfpewVersionId.length == 0) {
+            sfpewVersionId = [PLProfiles.current.selectedProfile[@"lastVersionId"] description];
+        }
+        BOOL sfpewVersionOK = ameSFPEWSupportsVersionId(sfpewVersionId);
+        if (sfpewEnabled && !sfpewVersionOK) {
+            NSLog(@"[JavaLauncher] SFPEW overlay skipped: MC %@ needs no fixed-function emulation (SFPEW serves <= 1.16.x only)",
+                  sfpewVersionId);
+        }
+        if (sfpewEnabled && sfpewVersionOK && isSFPEWOverlayEligibleRenderer(renderer.UTF8String)) {
             const char *backend = renderer.UTF8String;
             setenv("AMETHYST_SFPEW_BACKEND", backend, 1);
             NSString *bPath = [NSString stringWithFormat:@"@rpath/%s", backend];
