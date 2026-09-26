@@ -88,10 +88,13 @@ $(OUTPUTDIR)/lwjgl-%.jar: $(CLASSES) check_empty_classes
 	@cd $(OUTPUTDIR)/lwjgl_lib_$* && find org/lwjgl/openal -maxdepth 1 -name 'SOFTSystemEvent*.class' -delete 2>/dev/null || true
 	@cd $(OUTPUTDIR)/lwjgl_lib_$* && find ../../libs/lwjgl-$* -name 'lwjgl*.jar' -exec $(BOOTJDK)/jar -xf {} \; && rm -rf META-INF
 	@cp -R $(OUTPUTDIR)/lwjgl/* $(OUTPUTDIR)/lwjgl_lib_$*/
-	@mkdir -p $(OUTPUTDIR)/lwjgl_lib_$*/com/apple/ios/audio
-	@cp -R $(OUTPUTDIR)/launcher/com/apple/ios/audio/*.class $(OUTPUTDIR)/lwjgl_lib_$*/com/apple/ios/audio/
-	@mkdir -p $(OUTPUTDIR)/lwjgl_lib_$*/META-INF/services
-	@cp $(SOURCEDIR)/launcher/META-INF/services/javax.sound.sampled.spi.MixerProvider $(OUTPUTDIR)/lwjgl_lib_$*/META-INF/services/
+	@# Forge / NeoForge 的 bootstraplauncher 把整条 classpath 交给 JPMS 解析，classpath 上每个 jar
+	@# 各自成为一个自动模块；任何同时存在于 launcher.jar 与 lwjgl-<ver>.jar 的包都会导致 split
+	@# package 解析失败（ResolutionException: Modules launcher and lwjgl export package …）。
+	@# launcher.jar 已自带这些类与 SPI，故此处直接剔除 lwjgl jar 中的重复包（不生成中间清单文件）。
+	@rm -rf $(OUTPUTDIR)/lwjgl_lib_$*/com/apple/ios/audio
+	@rm -rf $(OUTPUTDIR)/lwjgl_lib_$*/com/mojang
+	@rm -f  $(OUTPUTDIR)/lwjgl_lib_$*/META-INF/services/javax.sound.sampled.spi.MixerProvider
 	@$(BOOTJDK)/jar -cf $@ -C $(OUTPUTDIR)/lwjgl_lib_$* .
 
 # lwjgl.jar 仅作占位：all 目标因 src/lwjgl 是源码目录而列出它，但运行时使用

@@ -562,6 +562,22 @@ static glue_result_t *ame_glue_compile(glue_compiler_t *compiler,
         goto done;
     }
 
+    /*
+     * IO 映射（对齐上游 shaderc）
+     *
+     * 上游 shaderc 在 program->link() 成功之后、生成 SPIR-V 之前会执行一次
+     * IO 映射（glslang::TProgram::mapIO()），由它解析 uniform / attribute /
+     * SSBO 的 binding 与 location 并写入 intermediate。本自研 impl（Air Task 45）
+     * 之前直接从 link() 走到 SPIRV_generate_with_options()，漏掉了这一步 ——
+     * 与上游行为不一致，未映射的 IO 只能拿到默认（0）的 binding / location。
+     * 这里补上，非致命失败只记日志，保持既有的错误处理路径不变。
+     */
+    if (!glslang_program_map_io(program)) {
+        const char *maplog = glslang_program_get_info_log(program);
+        fprintf(stderr, "[amethyst-glue] program map_io failed: %s\n",
+                (maplog != NULL && *maplog != '\0') ? maplog : "(no log)");
+    }
+
     {
         glslang_spv_options_t spv_opts;
         memset(&spv_opts, 0, sizeof spv_opts);
