@@ -77,7 +77,14 @@ NSString *const PREF_MOD_MIRROR = @"general.mod_mirror";
             @"fix_simple_voice_chat_mod": @NO,
             @"allow_microphone": @NO,
             // MC 26.2+ 游戏内 OpenGL/Vulkan 切换，空串=默认（由 JavaLauncher 处理）
-            @"graphics_api": @""
+            @"graphics_api": @"",
+            // SimpleFPEWrapper（GL 1.x 固定管线仿真层）叠加开关。
+            // 默认关闭：iOS 侧叠加后 mobileglues / MobileGL-gles 两条路径在 1.7.10 上
+            // 均会崩溃，故改为显式开启（opt-in）。
+            // 键必须在此注册：否则 PLPreferences 的 getter/setter 因键不存在而静默
+            // 失败（日志刷 "could not find preference video.sfpew_overlay"），
+            // 设置页开关既读不出也存不下。
+            @"sfpew_overlay": @NO
         }.mutableCopy,
         @"control": @{
             @"default_ctrl": @"default.json",
