@@ -855,6 +855,17 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
 
         // Setup AMETHYST_RENDERER
         NSString *renderer = [PLProfiles resolveKeyForCurrentProfile:@"renderer"];
+        // Metal 渲染器（libmetallum.dylib）：图形后端由 metallum agent 走原生 Metal
+        // （直接 MTLDevice），不经过 EGL 渲染器。渲染器回落 auto（→ANGLE）仅为
+        // Surface 提供 GL 上下文，与 metallum 官方集成一致（渲染器只管 GL/Vulkan
+        // 回退）。★ 必须置 AMETHYST_METAL=1：agent 只认这个开关来打开渲染 patch
+        // （MetallumAgent.IS_METAL_RENDERER），否则整段渲染 patch 关闭 ——
+        // 日志 "non-Metal renderer: ... render patches disabled"，26.2 起不来。
+        if ([renderer isEqualToString:@ RENDERER_NAME_METAL]) {
+            setenv("AMETHYST_METAL", "1", 1);
+            NSLog(@"[JavaLauncher] Metal renderer selected: AMETHYST_METAL=1 (EGL renderer falls back to auto for surface)");
+            renderer = @"auto";
+        }
         NSLog(@"[JavaLauncher] RENDERER is set to %@\n", renderer);
         setenv("AMETHYST_RENDERER", renderer.UTF8String, 1);
 

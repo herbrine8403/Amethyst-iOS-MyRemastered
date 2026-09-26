@@ -49,6 +49,14 @@
 //   - Fragment shader 编译失败时忽略错误，让 BSL/Mellow 等光影包能运行
 #define RENDERER_NAME_LTW "libltw.dylib"
 
+// Metal 渲染器（metallum / MetalUniversal）：图形后端由 metallum agent 走原生 Metal
+// （直接 MTLDevice），不经过 EGL 渲染器 —— 选中它时 JavaLauncher 只置
+// AMETHYST_METAL=1（agent 据此打开渲染 patch），并把 AMETHYST_RENDERER 回落
+// auto（Surface 的 GL 上下文仍由 ANGLE 提供），与 metallum 官方集成一致
+// （渲染器只管 GL / Vulkan 回退）。
+// 渲染器 dylib 由 agent jar 自带（natives/ios/libmetallum.dylib，运行期解出）。
+#define RENDERER_NAME_METAL "libmetallum.dylib"
+
 // Mithril 渲染器 - OpenGL 3.3 Core → Vulkan/Metal 转译层（libmithril.dylib）。
 // 自带完整的 EGL 1.5 + GL 实现（Vulkan backend，经 MoltenVK 到 Metal），
 // 必须从自身 dylib 解析 EGL 符号：若复用 ANGLE 的 EGL，会创建 ANGLE 的 Metal
