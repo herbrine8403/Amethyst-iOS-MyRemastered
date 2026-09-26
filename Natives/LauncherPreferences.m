@@ -4,6 +4,7 @@
 #import "PLPreferences.h"
 #import "UIKit+hook.h"
 #import <CoreFoundation/CoreFoundation.h>
+#import <os/proc.h>
 
 static PLPreferences* pref;
 
@@ -24,37 +25,73 @@ void toggleIsolatedPref(BOOL forceEnable) {
     // 导致切换目录后仍读取旧实例的 launcher_preferences.plist，
     // 用户必须重启启动器才能让 instancePath 重新计算。这里改为每次都刷新。
     pref.instancePath = [NSString stringWithFormat:@"%s/launcher_preferences.plist", getenv("POJAV_GAME_DIR")];
-    [pref toggleIsolationForced:forceEnable];
-}
+    [pref toggleIsolationForc#pragma mark - Task141 launch memory
 
-#pragma mark - Task141 launch memory
+/// Task173（对齐参考仓库 Air）：设备安全堆顶。
+/// os_proc_available_memory() 返回当前进程可安全申请的内存（iOS 13+），
+/// 减去 1200 MB 原生预留（JVM 非堆 + 渲染面 + 系统开销）即为可安全承诺的 -Xmx。
+/// 返回 0 表示不支持（老系统/模拟器），退回物理内存 × 0.6。
+/// 下限 1024 MB：Air 从不以低于 1024 MB 的 -Xmx 跑 26.x —— iPhone X 上
+/// auto 比例算出的 706 MB 会让 MC 26.3 陷入 GC 抖动，最终无栈 SIGKILL
+/// （jetsam / 看门狗都发不可捕获的 SIGKILL，日志表现为进程凭空消失）。
+static int ame173_safeHeapCeilingMB(void) {
+    static int cachedCeilingMB = -1;
+    if (cachedCeilingMB > 0) return cachedCeilingMB;
+    int ceilingMB = 0;
+    uint64_t avail = os_proc_available_memory();
+    if (avail > 0) {
+        int availMB = (int)(avail >> 20);
+        ceilingMB = availMB - 1200;
+        NSLog(@"[Task173] safe heap ceiling: os_proc_available_memory=%dMB -> Xmx ceiling %dMB (native reserve 1200MB)", availMB, ceilingMB);
+    }
+    if (ceilingMB <= 0) {
+        int physMB = (int)(NSProcessInfo.processInfo.physicalMemory >> 20);
+        ceilingMB = (int)(physMB * 0.6);
+        NSLog(@"[Task173] safe heap ceiling: fallback 60%% of physical = %dMB (phys=%dMB)", ceilingMB, physMB);
+    }
+    if (ceilingMB < 1024) ceilingMB = 1024;
+    cachedCeilingMB = ceilingMB;
+    return ceilingMB;
+}
 
 int ame141_currentLaunchAllocMem(void) {
     int deviceMB = (int)(NSProcessInfo.processInfo.physicalMemory >> 20);
     int allocmem;
     if (getPrefBool(@"java.auto_ram")) {
-        CGFloat autoRatio = getEntitlementValue(@"com.apple.private.memorystatus") ? 0.4 : 0.25;
+        CGFloat autoRatio = getEntitlementValue(@"com.apple.private.memorystatus") ? 0.5 : 0.25;
         allocmem = (int)roundf(deviceMB * autoRatio);
+        NSLog(@"[Task141] launch memory from auto ratio %.2f x %dMB = %d MB", autoRatio, deviceMB, allocmem);
     } else {
         allocmem = (int)getPrefInt(@"java.allocated_memory");
+        NSLog(@"[Task141] launch memory from preference java.allocated_memory = %d MB", allocmem);
+    }
+    // 调试/A-B 覆盖：AMETHYST_MEM_MB=<n> 直接指定 -Xmx，无需改设置页。
+    const char *forcedMB = getenv("AMETHYST_MEM_MB");
+    if (forcedMB && forcedMB[0]) {
+        int forced = atoi(forcedMB);
+        if (forced > 0) {
+            NSLog(@"[Task141] launch memory overridden by AMETHYST_MEM_MB: %d MB -> %d MB", allocmem, forced);
+            allocmem = forced;
+        }
     }
     if (allocmem < 256) allocmem = 256;
 
-    // Jetsam 上限 = allocmem + 1024（1024 MB 留给 JVM native 堆 + UIKit/Metal/EGL）。
-    // 若该上限逼近设备物理内存总量，进程一旦接近上限就会被系统 SIGKILL，
-    // 而 SIGKILL 不可捕获 —— 表现为"日志突然中断、没有任何崩溃栈"。
-    // 因此把上限收敛到设备物理内存的 70%，给系统与其它进程留出余量。
+    // 只在超过设备安全堆顶时向下钳制（Air Task173）。
+    // 绝不能把健康值压小：上一版 "物理内存 × 0.70 − 1024" 会把 iPhone X 上
+    // 任何 > 953 MB 的设置硬压到 953 MB，反而制造内存不足。
     const char *noClamp = getenv("AMETHYST_MEM_NO_CLAMP");
-    if (!(noClamp && noClamp[0] == '1') && deviceMB > 0) {
-        int safeLimit = (int)(deviceMB * 0.70);
-        if (allocmem + 1024 > safeLimit) {
-            int clamped = safeLimit - 1024;
-            if (clamped < 512) clamped = 512;
-            NSLog(@"[Task141] launch memory clamped %d MB -> %d MB (device %d MB, jetsam limit %d MB)", allocmem, clamped, deviceMB, clamped + 1024);
-            allocmem = clamped;
+    if (!(noClamp && noClamp[0] == '1')) {
+        int ceiling = ame173_safeHeapCeilingMB();
+        if (allocmem > ceiling) {
+            NSLog(@"[Task173] launch memory %dMB exceeds safe ceiling %dMB -- clamping (preference on disk preserved)", allocmem, ceiling);
+            allocmem = ceiling;
         }
     }
+    NSLog(@"[Task141] final launch memory = %d MB (device %d MB, jetsam limit %d MB)", allocmem, deviceMB, allocmem + 1024);
     return allocmem;
+}
+
+return allocmem;
 }
 
 #pragma mark Download source migration
