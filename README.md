@@ -17,6 +17,10 @@
   <a href="./README.md">English</a> | <a href="./README_CN.md">Chinese</a>
 </p>
 
+> [!IMPORTANT]
+> **This is the one and only official Air repository:** [herbrine8403/Amethyst-iOS-MyRemastered](https://github.com/herbrine8403/Amethyst-iOS-MyRemastered).
+> Beware of unofficial forks or mirror repositories using the "Air" name — always verify that the repository owner is [@herbrine8403](https://github.com/herbrine8403) and that the URL matches the link above.
+
 ---
 
 A premium Minecraft: Java Edition launcher for iOS and iPadOS, rebuilt from the ground up on the official Amethyst project. It delivers a refined mobile experience with comprehensive mod management, intelligent renderer selection, and deep platform integration.
