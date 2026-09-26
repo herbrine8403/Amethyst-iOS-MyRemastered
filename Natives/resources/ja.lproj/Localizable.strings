@@ -246,6 +246,7 @@
 "preference.title.renderer.debug.mobilegl" = "MobileGL Vulkan（1.17+）- OpenGL 3.3 核心，实验性";
 "preference.title.renderer.debug.mobilegl_gles" = "MobileGL GLES（1.17+）- OpenGL 3.3 核心，经 OpenGL ES，实验性";
 "preference.title.renderer.debug.sfpew" = "SFPEW（≤1.16.x）- 固定管线仿真层，后端默认 MobileGlues，实验性";
+"preference.title.renderer.debug.metal" = "Metal (metallum)";
 
 "preference.detail.renderer" = "Change the OpenGL render engine to use. Zink is temporarily disabled on iOS 16 and later to diagnose issues.";
 
