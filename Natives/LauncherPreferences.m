@@ -25,7 +25,10 @@ void toggleIsolatedPref(BOOL forceEnable) {
     // 导致切换目录后仍读取旧实例的 launcher_preferences.plist，
     // 用户必须重启启动器才能让 instancePath 重新计算。这里改为每次都刷新。
     pref.instancePath = [NSString stringWithFormat:@"%s/launcher_preferences.plist", getenv("POJAV_GAME_DIR")];
-    [pref toggleIsolationForc#pragma mark - Task141 launch memory
+    [pref toggleIsolationForced:forceEnable];
+}
+
+#pragma mark - Task141 launch memory
 
 /// Task173（对齐参考仓库 Air）：设备安全堆顶。
 /// os_proc_available_memory() 返回当前进程可安全申请的内存（iOS 13+），
@@ -89,9 +92,6 @@ int ame141_currentLaunchAllocMem(void) {
     }
     NSLog(@"[Task141] final launch memory = %d MB (device %d MB, jetsam limit %d MB)", allocmem, deviceMB, allocmem + 1024);
     return allocmem;
-}
-
-return allocmem;
 }
 
 #pragma mark Download source migration
