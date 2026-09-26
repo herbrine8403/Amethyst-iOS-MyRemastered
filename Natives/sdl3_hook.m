@@ -2014,9 +2014,20 @@ static void ame_maybeWrapGl(const char *name, void **out) {
     // glScissor 与 glViewport 是彼此独立的 GL 状态，必须一并修正，否则绘制
     // 会被残留的 scissor box 裁掉（详见 ame_glScissor 处注释）。
     if (strcmp(name, "glScissor") == 0) {
-        if (ame_real_glScissor == NULL && ame_glSymbolTrusted(*out))
+        // [fix/mg-recursion] 与下方 3059 处同理:句柄自解析 / 已是我们的钩子时必须放行。
+        // 少了这道判定, MobileGlues 在 constructor 里 dlsym(gles_handle, "glScissor")
+        // 会被接管并把 ame_real_glScissor 写成 ame_glScissor 自己, 于是钩子每次调用
+        // 都回环到自身 -> 5642 层无限递归 -> 击穿栈保护区 ->
+        // EXC_BAD_ACCESS(KERN_PROTECTION_FAILURE, SIGILL/SIGBUS) 崩溃。
+        if (*out == (void *)ame_glScissor) return;
+        if (ame_real_glScissor == NULL) {
+            if (!ame_glSymbolTrusted(*out)) return;   // 不可信 -> 不缓存也不包装
             ame_real_glScissor = (ame_fn_glScissor)*out;
-        if (ame_real_glScissor != NULL) *out = (void *)ame_glScissor;
+        }
+        // 兜底: 万一还是解析成自己, 绝不能再包装一次
+        if (ame_real_glScissor != NULL && ame_real_glScissor != ame_glScissor
+            && *out != (void *)ame_glScissor)
+            *out = (void *)ame_glScissor;
         return;
     }
     if (strcmp(name, "glViewport") != 0) return;
