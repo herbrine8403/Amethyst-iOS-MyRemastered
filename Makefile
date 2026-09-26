@@ -467,8 +467,23 @@ dep_mg:
 # 复制出 impl 名字并改写 LC_ID（reexport 记录的是 impl 的 install name，
 # 否则会把构建期绝对路径烧进产物）。
 # ---------------------------------------------------------------------------
-dep_shader_shims: dep_mg
-	echo '[Amethyst v$(VERSION)] dep_shader_shims - start'
+# --- libshaderc_impl.dylib 的来源开关（A/B 用）-------------------------------
+# SHADERC_IMPL_FROM_SOURCE=1 : Air Task 45 路径 —— Natives/shaderc_impl_glue.c
+#                              覆在 dep_mg 刚编出的、已打 nullguard +
+#                              pool-zero/size-guard 补丁的 glslang 静态库上。
+# SHADERC_IMPL_FROM_SOURCE=0 : 垫片引入时的原始行为（3bed818be0）—— 直接用
+#                              Natives/resources/Frameworks/ 下预提交二进制。
+#                              默认 0：MG + 26.3 在 from-source 路径下依旧静默
+#                              闪退，预编译 impl 是该路径引入之前的状态，先回到
+#                              它取一帧真机证据；两条路只靠本变量即可整包 A/B。
+#                              注意：Air Task 45 的注释结论与本默认值相反 ——
+#                              它认定预编译 impl 是 26.3 崩溃家族的成因。本开关
+#                              存在的意义正是用真机把这条结论在我们这里复验一次。
+SHADERC_IMPL_FROM_SOURCE ?= 0
+
+ifeq ($(SHADERC_IMPL_FROM_SOURCE),1)
+dep_shaderc_impl: dep_mg
+	echo '[shaderc-impl] mode=from-source (Air Task 45) - start'
 	# libshaderc_impl.dylib 从源码构建：Natives/shaderc_impl_glue.c 直接覆在
 	# glslang C 接口上，链接 dep_mg 刚构建的（已打 nullguard + pool-zero/size-guard
 	# 补丁的）静态库。预编译的 libshaderc.dylib 内含未打补丁的 glslang，其
@@ -503,6 +518,29 @@ dep_shader_shims: dep_mg
 		$$extra_glslang_libs \
 		-lc++ || exit 1
 	install_name_tool -id @rpath/libshaderc_impl.dylib $(WORKINGDIR)/libshaderc_impl.dylib || exit 1
+	echo '[shaderc-impl] mode=from-source - end'
+else
+dep_shaderc_impl:
+	echo '[shaderc-impl] mode=prebuilt (Natives/resources/Frameworks/libshaderc.dylib) - start'
+	# $(WORKINGDIR) 由 dep_mg 内的 cmake 步骤创建；本分支不再依赖 dep_mg，
+	# 故显式建目录（dep_openal_shim 同款处理），无副作用。
+	mkdir -p $(WORKINGDIR)
+	cp $(SOURCEDIR)/Natives/resources/Frameworks/libshaderc.dylib $(WORKINGDIR)/libshaderc_impl.dylib || exit 1
+	install_name_tool -id @rpath/libshaderc_impl.dylib $(WORKINGDIR)/libshaderc_impl.dylib || exit 1
+	echo '[shaderc-impl] mode=prebuilt - end'
+endif
+
+# --- 垫片总开关 -------------------------------------------------------------
+# SHADER_SHIMS=0 : dep_shader_shims 整体停用，Frameworks 下直接随包携带
+#                  Natives/resources/Frameworks/ 里的原始预提交二进制 —— 即
+#                  3bed818be0 引入垫片之前的状态（26.3 + MG 黑屏但不闪退）。
+#                  payload 的 "cp -R Natives/resources/*" 负责把它们放进 app，
+#                  本目标不产出任何同名 dylib，故不会发生覆盖。
+SHADER_SHIMS ?= 1
+
+ifeq ($(SHADER_SHIMS),1)
+dep_shader_shims: dep_shaderc_impl dep_mg
+	echo '[Amethyst v$(VERSION)] dep_shader_shims - start'
 	cp $(SOURCEDIR)/Natives/resources/Frameworks/libspirv-cross-c-shared.0.dylib $(WORKINGDIR)/libspirv-cross-c-shared.0.impl.dylib || exit 1
 	install_name_tool -id @rpath/libspirv-cross-c-shared.0.impl.dylib $(WORKINGDIR)/libspirv-cross-c-shared.0.impl.dylib || exit 1
 	xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
@@ -558,6 +596,11 @@ dep_shader_shims: dep_mg
 		echo "[dep_shader_shims] MG spvc decoupled: $$mg_dep -> @rpath/libspirv-cross-mg.dylib"; \
 	done
 	echo '[Amethyst v$(VERSION)] dep_shader_shims - end'
+else
+dep_shader_shims:
+	echo '[Amethyst v$(VERSION)] dep_shader_shims - DISABLED (SHADER_SHIMS=0): shipping prebuilt libshaderc.dylib + libspirv-cross-c-shared.0.dylib verbatim (pre-3bed818be0 state)'
+endif
+
 
 
 dep_openal_shim:
