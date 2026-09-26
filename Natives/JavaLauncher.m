@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <mach/mach.h>
+#include <mach/task_info.h>
 // 独立 native 崩溃捕获（见 ameInstallCrashCapture 处注释）
 #include <execinfo.h>
 #include <fcntl.h>
@@ -65,6 +66,10 @@ BOOL validateVirtualMemorySpace(size_t size) {
 // 「设置 → 隐私与安全性 → 分析数据」里也能同时留下一份标准报告。
 
 #define AME_CRASH_MAX_FRAMES 64
+
+// 前向声明：handler 需要在定义之前引用内存采样与镜像 dump。
+static void ameCrashSampleMemLocked(const char *tag);
+static void ameCrashDumpImagesFrom(uint32_t start);
 
 static int gAmeCrashFd = -1;
 static void *gAmeCrashAltStack = NULL;
@@ -133,20 +138,80 @@ static void ameCrashHandler(int sig, siginfo_t *si, void *ucRaw) {
     // best-effort 符号化：非 async-signal-safe，放最后，即使它出问题，前面的
     // 原始地址也已经落盘。
     if (gAmeCrashFd >= 0 && nf > 0) backtrace_symbols_fd(frames, nf, gAmeCrashFd);
+    // 崩溃时刻补记内存水位 + 上次采样之后新加载的镜像。两者都不是
+    // async-signal-safe，所以放在最后：即使它们出问题，前面的原始地址已落盘。
+    ameCrashSampleMemLocked("crash");
+    ameCrashDumpImagesFrom(gAmeCrashImageCount);
     ameCrashWrite("=== END CRASH ===\n");
 }
 
-// 启动时记录已加载镜像清单 + slide：崩溃日志里只有原始地址，没有 slide 就
+// 记录已加载镜像清单 + slide：崩溃日志里只有原始地址，没有 slide 就
 // 无法判断 PC 落在哪个 dylib、偏移多少。
-static void ameCrashDumpImages(void) {
+//
+// 2026-09-26 修正：原先只在「装配时」dump 一次，那是 JVM 启动之前，
+// libmobileglues / libshaderc_impl 等全部还没 dlopen，清单里根本没有它们，
+// PC 拿到也无法定位。改为：后台采样线程持续增量追加新镜像，崩溃时再补一次。
+static uint32_t gAmeCrashImageCount = 0;
+
+static void ameCrashDumpImagesFrom(uint32_t start) {
     if (gAmeCrashFd < 0) return;
     uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
+    for (uint32_t i = start; i < count; i++) {
         const char *name = _dyld_get_image_name(i);
         intptr_t slide = _dyld_get_image_vmaddr_slide(i);
         dprintf(gAmeCrashFd, "image[%u] slide=0x%016llx %s\n",
                 i, (uint64_t)slide, name != NULL ? name : "(null)");
     }
+    gAmeCrashImageCount = count;
+}
+
+static void ameCrashDumpImages(void) { ameCrashDumpImagesFrom(0); }
+
+// 写一行内存水位。phys_footprint 是 jetsam 实际据以 kill 的指标，比 RSS 更准。
+// 只在普通线程里调用（dprintf 非 async-signal-safe）。
+static void ameCrashSampleMemLocked(const char *tag) {
+    if (gAmeCrashFd < 0) return;
+    uint64_t footprint = 0, resident = 0;
+#if defined(TASK_VM_INFO)
+    task_vm_info_data_t vminfo;
+    mach_msg_type_number_t vmcnt = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vminfo, &vmcnt) == KERN_SUCCESS) {
+        footprint = vminfo.phys_footprint;
+    }
+#endif
+    mach_task_basic_info_data_t basic;
+    mach_msg_type_number_t bcnt = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&basic, &bcnt) == KERN_SUCCESS) {
+        resident = basic.resident_size;
+    }
+    dprintf(gAmeCrashFd, "mem %s t=%lld footprint=%llu MB resident=%llu MB\n",
+            tag, (long long)time(NULL),
+            (unsigned long long)(footprint / (1024 * 1024)),
+            (unsigned long long)(resident / (1024 * 1024)));
+}
+
+// 后台采样线程：每 2 秒把内存水位和「新增的镜像」直接写盘。
+//
+// 为什么必须持续写而不是等崩溃时再写：如果进程是被 jetsam 用 SIGKILL 杀掉的
+// （内存超限），signal handler 根本不会执行 —— SIGKILL 不可捕获、不可忽略。
+// 那份 26.3 日志就是这种情况：日志装配成功却没有任何崩溃记录。只有把内存
+// 曲线持续落盘，被 SIGKILL 之后才留下最后一段水位可供判断。
+static void *ameCrashSamplerMain(void *arg) {
+    (void)arg;
+    unsigned interval = 2;
+    const char *iv = getenv("AMETHYST_CRASH_SAMPLE_INTERVAL");
+    if (iv != NULL && iv[0] != '\0') {
+        int parsed = atoi(iv);
+        if (parsed >= 1 && parsed <= 60) interval = (unsigned)parsed;
+    }
+    for (;;) {
+        if (gAmeCrashFd >= 0) {
+            ameCrashSampleMemLocked("sample");
+            ameCrashDumpImagesFrom(gAmeCrashImageCount);
+        }
+        sleep(interval);
+    }
+    return NULL;
 }
 
 static void ameCrashDumpEnv(const char *key) {
@@ -211,6 +276,13 @@ static void ameInstallCrashCapture(void) {
     sigemptyset(&sa.sa_mask);
     for (size_t i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
         sigaction(sigs[i], &sa, NULL);
+    }
+
+    // 启动后台采样线程：持续把内存水位与新加载镜像写盘。SIGKILL（jetsam 内存
+    // 超限）不可捕获，只有持续落盘才能在那种死法下留下证据。
+    pthread_t sampler;
+    if (pthread_create(&sampler, NULL, ameCrashSamplerMain, NULL) == 0) {
+        pthread_detach(sampler);
     }
 
     NSLog(@"[JavaLauncher] native crash capture armed -> %s", path);
