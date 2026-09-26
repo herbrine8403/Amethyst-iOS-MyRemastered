@@ -72,6 +72,10 @@ static void ameCrashSampleMemLocked(const char *tag);
 static void ameCrashDumpImagesFrom(uint32_t start);
 
 static int gAmeCrashFd = -1;
+// 已 dump 过的镜像数量（后台采样线程增量追加用）。必须定义在 handler 之前：
+// handler 内会引用它，而 C 不允许引用后面才声明的变量 —— 这正是上一笔
+// CI 编译失败的原因（use of undeclared identifier）。
+static uint32_t gAmeCrashImageCount = 0;
 static void *gAmeCrashAltStack = NULL;
 static size_t gAmeCrashAltStackSize = 0;
 static volatile sig_atomic_t gAmeCrashInHandler = 0;
@@ -151,8 +155,6 @@ static void ameCrashHandler(int sig, siginfo_t *si, void *ucRaw) {
 // 2026-09-26 修正：原先只在「装配时」dump 一次，那是 JVM 启动之前，
 // libmobileglues / libshaderc_impl 等全部还没 dlopen，清单里根本没有它们，
 // PC 拿到也无法定位。改为：后台采样线程持续增量追加新镜像，崩溃时再补一次。
-static uint32_t gAmeCrashImageCount = 0;
-
 static void ameCrashDumpImagesFrom(uint32_t start) {
     if (gAmeCrashFd < 0) return;
     uint32_t count = _dyld_image_count();
