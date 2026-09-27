@@ -2592,9 +2592,8 @@ static void ame_logGLStateOnce(const char *tag) {
     if (ame_glStateLogBudget <= 0) return;
     void *rh = ame_rendererHandle();
     if (rh == NULL) return;
-    void *p = dlsym(rh, "glGetIntegerv");
-    if (p == NULL || !ame_glSymbolTrusted((const void *)p)) return;
-    ame_fn_glGetIntegerv giv = (ame_fn_glGetIntegerv)p;
+    ame_fn_glGetIntegerv giv = ame_resolve_glGetIntegerv();   // [fix/mg-recursion-3] 缓存解析
+    if (giv == NULL) return;
     int32_t vp[4] = {0, 0, 0, 0};
     int32_t sc[4] = {0, 0, 0, 0};
     int32_t st = 0, fb = 0;
@@ -2605,6 +2604,33 @@ static void ame_logGLStateOnce(const char *tag) {
     ame_glStateLogBudget--;
     NSDebugLog(@"[SDLHook][glstate] %s viewport=%dx%d scissor=%dx%d scissorTest=%d fb=%d",
                tag, vp[2], vp[3], sc[2], sc[3], st, fb);
+}
+
+// [fix/mg-recursion-3] glGetIntegerv 的统一解析器: 取一次 -> 可信校验 -> 缓存。
+// 之前多处(glstate 记录 / ame_fixStaleScissor / ame_currentFramebufferBinding)都在热路径
+// 里每次 dlsym("glGetIntegerv") 并直接调用;若那次 dlsym 命中我们自己的 glGetIntegerv 钩子,
+// 调用会绕回 glScissor 钩子 -> 与 ame_currentFramebufferBinding 形成
+//   ame_glScissor <-> ame_currentFramebufferBinding
+// 的无限递归(崩溃报告 recursionInfoArray: depth 5643 -> 栈保护击穿 -> EXC_BAD_ACCESS/SIGILL)。
+// 统一走本函数即可: 只解析一次, 且解析期间置深度以防重入。
+static ame_fn_glGetIntegerv ame_cached_glGetIntegerv = NULL;
+static int ame_giv_resolve_depth = 0;
+
+static ame_fn_glGetIntegerv ame_resolve_glGetIntegerv(void) {
+    if (ame_cached_glGetIntegerv != NULL &&
+        ame_glSymbolTrusted((const void *)ame_cached_glGetIntegerv)) {
+        return ame_cached_glGetIntegerv;
+    }
+    ame_cached_glGetIntegerv = NULL;
+    if (ame_giv_resolve_depth > 0) return NULL;   // 重入: 不解析, 让调用方保守放行
+    void *rh = ame_rendererHandle();
+    if (rh == NULL) return NULL;
+    ame_giv_resolve_depth++;
+    void *p = dlsym(rh, "glGetIntegerv");
+    ame_giv_resolve_depth--;
+    if (p == NULL || !ame_glSymbolTrusted((const void *)p)) return NULL;
+    ame_cached_glGetIntegerv = (ame_fn_glGetIntegerv)p;
+    return ame_cached_glGetIntegerv;
 }
 
 static ame_fn_glScissor ame_resolve_glScissor(void) {
@@ -2647,16 +2673,11 @@ static int ame_cfb_depth = 0;
 
 static int32_t ame_currentFramebufferBinding(void) {
     if (ame_cfb_depth > 0) return -1;              // 重入: 保守放行, 绝不再绕一圈
-    if (ame_cfb_glGetIntegerv == NULL) {
-        void *rh = ame_rendererHandle();
-        if (rh == NULL) return -1;
-        void *p = dlsym(rh, "glGetIntegerv");
-        if (p == NULL || !ame_glSymbolTrusted((const void *)p)) return -1;
-        ame_cfb_glGetIntegerv = (ame_fn_glGetIntegerv)p;
-    }
+    ame_fn_glGetIntegerv giv = ame_resolve_glGetIntegerv();   // [fix/mg-recursion-3] 统一解析器
+    if (giv == NULL) return -1;
     int32_t fb = -1;
     ame_cfb_depth++;
-    ame_cfb_glGetIntegerv(0x8CA6 /* GL_FRAMEBUFFER_BINDING */, &fb);
+    giv(0x8CA6 /* GL_FRAMEBUFFER_BINDING */, &fb);
     ame_cfb_depth--;
     return fb;
 }
@@ -2681,9 +2702,8 @@ static void ame_fixStaleScissor(int eglW, int eglH) {
     if (ame_real_glScissor == NULL) return;
     void *rh = ame_rendererHandle();
     if (rh == NULL) return;
-    void *p = dlsym(rh, "glGetIntegerv");
-    if (p == NULL || !ame_glSymbolTrusted((const void *)p)) return;
-    ame_fn_glGetIntegerv giv = (ame_fn_glGetIntegerv)p;
+    ame_fn_glGetIntegerv giv = ame_resolve_glGetIntegerv();   // [fix/mg-recursion-3] 缓存解析
+    if (giv == NULL) return;
     int32_t sc[4] = {0, 0, 0, 0};
     giv(0x0C10, sc);  // GL_SCISSOR_BOX
     const char *why = NULL;
