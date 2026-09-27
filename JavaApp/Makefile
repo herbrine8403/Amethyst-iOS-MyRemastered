@@ -69,7 +69,14 @@ $(OUTPUTDIR)/launcher.jar: $(CLASSES) check_empty_classes
 	@# MC-BOOTSTRAP 层), 所以这里从 launcher.jar 中剔除该包, 让它只有唯一提供者。
 	@# 注意: 只删【打好的 jar 内条目】, 不动 $(basename $@) 的 class 目录 ——
 	@# mojang-stubs.jar 依赖该目录取类, 不受影响。
-	@$(BOOTJDK)/jar -d -f $@ com/mojang/text2speech >/dev/null 2>&1 || true
+	@# 用"解包 -> 删 -> 重打"而不是 `jar -d`(部分 JDK 的 jar 不支持 -d, 会被 || true 静默吞掉,
+	@# 于是 CI 包里 launcher.jar 仍带着该包 -> Forge 继续 module ResolutionException)。
+	@rm -rf $(OUTPUTDIR)/launcher_strip && mkdir -p $(OUTPUTDIR)/launcher_strip
+	@(cd $(OUTPUTDIR)/launcher_strip && $(BOOTJDK)/jar -xf $(abspath $@))
+	@rm -rf $(OUTPUTDIR)/launcher_strip/com/mojang/text2speech
+	@cd $(OUTPUTDIR)/launcher_strip && $(BOOTJDK)/jar -cf $(abspath $@) .
+	@rm -rf $(OUTPUTDIR)/launcher_strip
+	@$(BOOTJDK)/jar -tf $@ | grep -q '^com/mojang/text2speech' && { echo "ERROR: text2speech still present in $@ (Forge split-package guard failed)"; exit 1; } || true
 
 # 按 LWJGL 版本分别产出一个合并 jar（3.3.3 与 3.4.1）。
 #
