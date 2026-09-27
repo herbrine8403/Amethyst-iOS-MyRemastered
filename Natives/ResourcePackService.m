@@ -139,7 +139,7 @@
         NSDictionary *profiles = PLProfiles.current.profiles;
         NSDictionary *prof = profiles[profile];
         if ([prof isKindOfClass:[NSDictionary class]]) {
-            NSString *gameDir = prof[@"gameDir"];
+            NSString *gameDir = [PLProfiles effectiveGameDirForProfile:prof];
             if ([gameDir isKindOfClass:[NSString class]] && gameDir.length > 0) {
                 NSString *resourcePacksPath = [gameDir stringByAppendingPathComponent:@"resourcepacks"];
                 BOOL isDir = NO;
@@ -173,7 +173,7 @@
         NSDictionary *profiles = PLProfiles.current.profiles;
         NSDictionary *prof = profiles[profile];
         if ([prof isKindOfClass:[NSDictionary class]]) {
-            NSString *gameDir = prof[@"gameDir"];
+            NSString *gameDir = [PLProfiles effectiveGameDirForProfile:prof];
             if ([gameDir isKindOfClass:[NSString class]] && gameDir.length > 0) {
                 resourcePacksPath = [gameDir stringByAppendingPathComponent:@"resourcepacks"];
             }
@@ -332,7 +332,7 @@
             NSDictionary *profiles = PLProfiles.current.profiles;
             NSDictionary *prof = profiles[profile];
             if ([prof isKindOfClass:[NSDictionary class]]) {
-                gameDir = prof[@"gameDir"];
+                gameDir = [PLProfiles absoluteGameDirForProfile:prof];
             }
         } @catch (NSException *ex) { }
 

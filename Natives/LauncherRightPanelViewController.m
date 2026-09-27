@@ -777,9 +777,8 @@ static void *ProgressObserverContext = &ProgressObserverContext;
     for (NSString *profileName in sortedNames) {
         NSDictionary *profile = profiles[profileName];
         NSString *versionId = profile[@"lastVersionId"] ?: @"";
-        // 检测是否启用版本隔离（gameDir != "."）
-        NSString *gameDir = profile[@"gameDir"] ?: @".";
-        BOOL isolated = ![gameDir isEqualToString:@"."];
+        // 检测是否启用版本隔离（full / mod 均视为已隔离）
+        BOOL isolated = ![[PLProfiles isolationModeForProfile:profile] isEqualToString:PLIsolationNone];
         NSMutableString *title = [NSMutableString string];
         if ([profileName isEqualToString:currentSelected]) {
             [title appendString:@"✓ "];
@@ -1431,9 +1430,8 @@ static void *ProgressObserverContext = &ProgressObserverContext;
         NSDictionary *profile = PLProfiles.current.profiles[selectedProfile];
         if (profile) {
             NSString *versionId = profile[@"lastVersionId"] ?: @"unknown";
-            // 显示版本隔离状态：gameDir != "." 表示已隔离
-            NSString *gameDir = profile[@"gameDir"] ?: @".";
-            BOOL isolated = ![gameDir isEqualToString:@"."];
+            // 显示版本隔离状态：full / mod 均视为已隔离
+            BOOL isolated = ![[PLProfiles isolationModeForProfile:profile] isEqualToString:PLIsolationNone];
             if (isolated) {
                 self.versionLabel.text = [NSString stringWithFormat:localize(@"i18n_str_440", nil), versionId];
             } else {

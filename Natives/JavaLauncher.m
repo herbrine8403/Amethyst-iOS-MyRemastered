@@ -1287,11 +1287,16 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         setenv("AMETHYST_GRAPHICS_API", graphicsApi.UTF8String, 1);
         NSLog(@"[JavaLauncher] GRAPHICS_API is set to %@\n", graphicsApi);
 
-        // Setup gameDir
+        // Setup gameDir：版本隔离由 profile 的 isolation 决定
+        // none/mod → 实例主目录；full → versions/<版本>（或用户自定义隔离目录）
+        NSDictionary *isolationProfile = PLProfiles.current.selectedProfile ?: @{};
         gameDir = [NSString stringWithFormat:@"%s/instances/%@/%@",
             getenv("POJAV_HOME"), getPrefObject(@"general.game_directory"),
-            [PLProfiles resolveKeyForCurrentProfile:@"gameDir"]]
+            [PLProfiles effectiveGameDirForProfile:isolationProfile]]
             .stringByStandardizingPath;
+        // 按 PCL2 目录结构就绪隔离目录，并对齐"仅 Mod 隔离"的共享 mods 符号链接
+        [PLProfiles ensureIsolationDirectoriesForProfile:isolationProfile];
+        [PLProfiles alignSharedModsDirectoryForProfile:isolationProfile];
     } else {
         defaultJRETag = @"execute_jar";
         gameDir = @(getenv("POJAV_GAME_DIR"));

@@ -209,22 +209,11 @@
         NSDictionary *profiles = PLProfiles.current.profiles;
         NSDictionary *prof = profiles[profile];
         if (![prof isKindOfClass:[NSDictionary class]]) return nil;
-        NSString *gameDir = prof[@"gameDir"];
-        if (![gameDir isKindOfClass:[NSString class]] || gameDir.length == 0) return nil;
-        if ([gameDir isEqualToString:@"."]) {
-            // "." 表示主目录
-            const char *env = getenv("POJAV_GAME_DIR");
-            return env ? [NSString stringWithUTF8String:env] : NSHomeDirectory();
-        }
-        if ([gameDir isAbsolutePath]) {
-            return gameDir;
-        }
-        // 相对路径，相对于 POJAV_GAME_DIR 解析
-        const char *env = getenv("POJAV_GAME_DIR");
-        NSString *baseDir = env ? [NSString stringWithUTF8String:env] : NSHomeDirectory();
-        // 去掉 "./" 前缀（如果有），stringByAppendingPathComponent 能正确处理
-        NSString *cleanGameDir = [gameDir hasPrefix:@"./"] ? [gameDir substringFromIndex:2] : gameDir;
-        return [baseDir stringByAppendingPathComponent:cleanGameDir];
+        // 版本隔离：ModService 只关心"哪个目录下的 mods"，故取有效 mods 目录的父目录。
+        // 仅 Mod 隔离 → versions/<版本>；完全隔离 → 版本目录或用户自定义目录；不隔离 → 实例主目录。
+        NSString *modsDir = [PLProfiles absoluteModsDirForProfile:prof];
+        if (modsDir.length == 0) return nil;
+        return [modsDir stringByDeletingLastPathComponent];
     } @catch (NSException *ex) {
         return nil;
     }

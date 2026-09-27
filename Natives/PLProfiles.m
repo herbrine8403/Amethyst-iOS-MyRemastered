@@ -12,6 +12,8 @@
 static PLProfiles* current;
 
 @interface PLProfiles()
+// 相对路径 → 绝对路径（"." 与空串返回 POJAV_GAME_DIR 本体）
++ (NSString *)absolutePathInGameHome:(NSString *)relativePath;
 @end
 
 @implementation PLProfiles
@@ -160,8 +162,204 @@ static PLProfiles* current;
     if (!self.profileDict[@"profiles"]) {
         self.profileDict[@"profiles"] = [NSMutableDictionary dictionary];
     }
+    // 新建版本默认完全隔离（对齐 PCL2）。放在这里可统一覆盖下载安装、加载器安装、导入等全部创建路径。
+    if (!self.profiles[name]) {
+        [PLProfiles applyDefaultIsolationForNewProfile:(NSMutableDictionary *)profile];
+    }
     self.profileDict[@"profiles"][name] = profile;
     [self save];
+}
+
+#pragma mark - 版本隔离
+
+NSString * const PLIsolationNone = @"none";
+NSString * const PLIsolationMod  = @"mod";
+NSString * const PLIsolationFull = @"full";
+
+/// 完全隔离时在版本目录内建的标准结构（对齐 PCL2 / HMCL）
+static NSArray<NSString *> *PLIsolationStandardSubdirectories(void) {
+    static NSArray<NSString *> *dirs;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        dirs = @[@"mods", @"saves", @"config", @"resourcepacks", @"shaderpacks",
+                 @"logs", @"crash-reports", @"datapacks", @"screenshots"];
+    });
+    return dirs;
+}
+
+/// profile 里的自定义 gameDir；空串与 "." 均视为"未自定义"
+static NSString *PLCustomGameDir(NSDictionary *profile) {
+    id raw = profile[@"gameDir"];
+    if (![raw isKindOfClass:[NSString class]]) return nil;
+    NSString *value = [(NSString *)raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (value.length == 0 || [value isEqualToString:@"."]) return nil;
+    return value;
+}
+
+static NSString *PLIsolationVersionId(NSDictionary *profile) {
+    id raw = profile[@"lastVersionId"];
+    return ([raw isKindOfClass:[NSString class]] && [(NSString *)raw length] > 0) ? raw : nil;
+}
+
++ (NSString *)isolationModeForProfile:(NSDictionary *)profile {
+    if (![profile isKindOfClass:[NSDictionary class]]) return PLIsolationNone;
+    id raw = profile[@"isolation"];
+    if ([raw isKindOfClass:[NSString class]] &&
+        ([raw isEqualToString:PLIsolationNone] || [raw isEqualToString:PLIsolationMod] || [raw isEqualToString:PLIsolationFull])) {
+        return raw;
+    }
+    // 旧数据兼容：手填过自定义游戏目录的版本继续按完全隔离处理，行为不变
+    return PLCustomGameDir(profile) ? PLIsolationFull : PLIsolationNone;
+}
+
++ (NSString *)effectiveGameDirForProfile:(NSDictionary *)profile {
+    if (![[self isolationModeForProfile:profile] isEqualToString:PLIsolationFull]) {
+        // none / mod：游戏数据仍在实例主目录，mod 模式只把 mods 移出去
+        return @".";
+    }
+    NSString *custom = PLCustomGameDir(profile);
+    if (custom) return custom;
+    NSString *versionId = PLIsolationVersionId(profile);
+    return versionId ? [@"versions" stringByAppendingPathComponent:versionId] : @".";
+}
+
++ (NSString *)effectiveModsDirForProfile:(NSDictionary *)profile {
+    if ([[self isolationModeForProfile:profile] isEqualToString:PLIsolationMod]) {
+        NSString *versionId = PLIsolationVersionId(profile);
+        if (versionId) {
+            return [[@"versions" stringByAppendingPathComponent:versionId] stringByAppendingPathComponent:@"mods"];
+        }
+    }
+    return [[self effectiveGameDirForProfile:profile] stringByAppendingPathComponent:@"mods"];
+}
+
++ (NSString *)absolutePathInGameHome:(NSString *)relativePath {
+    const char *env = getenv("POJAV_GAME_DIR");
+    NSString *base = env ? @(env) : NSHomeDirectory();
+    if (relativePath.length == 0 || [relativePath isEqualToString:@"."]) return base;
+    if ([relativePath hasPrefix:@"/"]) return relativePath;
+    NSString *clean = [relativePath hasPrefix:@"./"] ? [relativePath substringFromIndex:2] : relativePath;
+    return [base stringByAppendingPathComponent:clean];
+}
+
++ (NSString *)absoluteGameDirForProfile:(NSDictionary *)profile {
+    return [self absolutePathInGameHome:[self effectiveGameDirForProfile:profile]];
+}
+
++ (NSString *)absoluteModsDirForProfile:(NSDictionary *)profile {
+    return [self absolutePathInGameHome:[self effectiveModsDirForProfile:profile]];
+}
+
++ (void)ensureIsolationDirectoriesForProfile:(NSDictionary *)profile {
+    NSString *mode = [self isolationModeForProfile:profile];
+    if ([mode isEqualToString:PLIsolationNone]) return;
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([mode isEqualToString:PLIsolationMod]) {
+        // 仅 Mod 隔离：只需版本自己的 mods 目录
+        [fm createDirectoryAtPath:[self absoluteModsDirForProfile:profile]
+      withIntermediateDirectories:YES attributes:nil error:nil];
+        return;
+    }
+
+    NSString *root = [self absoluteGameDirForProfile:profile];
+    [fm createDirectoryAtPath:root withIntermediateDirectories:YES attributes:nil error:nil];
+    for (NSString *sub in PLIsolationStandardSubdirectories()) {
+        [fm createDirectoryAtPath:[root stringByAppendingPathComponent:sub]
+      withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+}
+
++ (void)alignSharedModsDirectoryForProfile:(NSDictionary *)profile {
+    const char *env = getenv("POJAV_GAME_DIR");
+    if (!env) return;
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *sharedMods = [@(env) stringByAppendingPathComponent:@"mods"];
+    NSString *mode = [self isolationModeForProfile:profile];
+
+    // 非"仅 Mod 隔离"时，共享 mods 必须是真实目录（此前可能被 mod 隔离换成了符号链接）
+    if (![mode isEqualToString:PLIsolationMod]) {
+        NSDictionary *attrs = [fm attributesOfItemAtPath:sharedMods error:nil];
+        if ([attrs[NSFileType] isEqualToString:NSFileTypeSymbolicLink]) {
+            [fm removeItemAtPath:sharedMods error:nil];
+            [fm createDirectoryAtPath:sharedMods withIntermediateDirectories:YES attributes:nil error:nil];
+            NSLog(@"[PLProfiles] 版本隔离：已把共享 mods 恢复为真实目录 (%@)", sharedMods);
+        }
+        return;
+    }
+
+    NSString *isolatedMods = [self absoluteModsDirForProfile:profile];
+    if (isolatedMods.length == 0) return;
+    [fm createDirectoryAtPath:isolatedMods withIntermediateDirectories:YES attributes:nil error:nil];
+
+    NSDictionary *attrs = [fm attributesOfItemAtPath:sharedMods error:nil];
+    if (attrs) {
+        if ([attrs[NSFileType] isEqualToString:NSFileTypeSymbolicLink]) {
+            NSString *dest = [fm destinationOfSymbolicLinkAtPath:sharedMods error:nil];
+            if ([dest isEqualToString:isolatedMods]) return; // 已指向本版本
+            [fm removeItemAtPath:sharedMods error:nil];
+        } else {
+            // 真实目录：把已有 mod 迁移进版本目录，避免"开启 Mod 隔离后 mod 消失"
+            NSError *err = nil;
+            NSArray<NSString *> *items = [fm contentsOfDirectoryAtPath:sharedMods error:&err];
+            if (err) {
+                NSLog(@"[PLProfiles] 版本隔离：读取共享 mods 失败，保持原状：%@", err.localizedDescription);
+                return;
+            }
+            for (NSString *item in items) {
+                NSString *from = [sharedMods stringByAppendingPathComponent:item];
+                NSString *to = [isolatedMods stringByAppendingPathComponent:item];
+                if ([fm fileExistsAtPath:to]) continue; // 版本目录已有同名文件，保留版本目录的
+                if (![fm moveItemAtPath:from toPath:to error:&err]) {
+                    NSLog(@"[PLProfiles] 版本隔离：迁移 %@ 失败，取消符号链接以免丢文件：%@", item, err.localizedDescription);
+                    return;
+                }
+            }
+            if ([fm contentsOfDirectoryAtPath:sharedMods error:nil].count > 0) {
+                NSLog(@"[PLProfiles] 版本隔离：共享 mods 未清空，取消符号链接以免丢文件");
+                return;
+            }
+            [fm removeItemAtPath:sharedMods error:nil];
+        }
+    }
+
+    NSError *linkErr = nil;
+    if ([fm createSymbolicLinkAtPath:sharedMods withDestinationPath:isolatedMods error:&linkErr]) {
+        NSLog(@"[PLProfiles] 版本隔离(仅Mod)：%@ → %@", sharedMods, isolatedMods);
+    } else {
+        NSLog(@"[PLProfiles] 版本隔离：创建 mods 符号链接失败：%@", linkErr.localizedDescription);
+    }
+}
+
++ (void)setIsolationMode:(NSString *)mode customGameDir:(NSString *)customGameDir forProfileName:(NSString *)name {
+    if (name.length == 0) return;
+    if (![mode isEqualToString:PLIsolationNone] && ![mode isEqualToString:PLIsolationMod] && ![mode isEqualToString:PLIsolationFull]) {
+        mode = PLIsolationNone;
+    }
+
+    NSMutableDictionary *profiles = [PLProfiles current].profiles;
+    NSMutableDictionary *profile = [profiles[name] mutableCopy] ?: [NSMutableDictionary dictionary];
+    profile[@"isolation"] = mode;
+    if ([mode isEqualToString:PLIsolationFull] && customGameDir.length > 0) {
+        profile[@"gameDir"] = customGameDir;
+    } else {
+        // 自动完全隔离 / 仅Mod隔离 / 不隔离：清掉自定义目录，让 gameDir 回落到主目录
+        profile[@"gameDir"] = @".";
+    }
+    profiles[name] = profile;
+    [[PLProfiles current] save];
+
+    NSLog(@"[PLProfiles] 版本隔离：profile '%@' → %@%@", name, mode,
+          ([mode isEqualToString:PLIsolationFull] && customGameDir.length > 0) ? [NSString stringWithFormat:@" (%@)", customGameDir] : @"");
+    [self ensureIsolationDirectoriesForProfile:[profile copy]];
+}
+
++ (void)applyDefaultIsolationForNewProfile:(NSMutableDictionary *)profile {
+    if (![profile isKindOfClass:[NSMutableDictionary class]]) return;
+    if (profile[@"isolation"]) return;          // 调用方已显式指定
+    if (PLCustomGameDir(profile)) return;       // 整合包等自带自定义目录，保持原样
+    profile[@"isolation"] = PLIsolationFull;    // 新建版本默认完全隔离（对齐 PCL2）
 }
 
 #pragma mark - 服务器地址（FCL 风格：启动后自动加入服务器）

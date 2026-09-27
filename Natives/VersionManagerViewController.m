@@ -1333,8 +1333,8 @@ static NSInteger const kSectionVersions    = 1;
         NSDictionary *profile = PLProfiles.current.profiles[profileName];
         NSString *versionId = profile[@"lastVersionId"] ?: localize(@"i18n_str_1052", nil);
         BOOL isSelected = [profileName isEqualToString:self.selectedProfile];
-        NSString *gameDir = profile[@"gameDir"] ?: @".";
-        BOOL isolated = ![gameDir isEqualToString:@"."];
+        // 版本隔离：任一隔离模式（full / mod）都算已隔离
+        BOOL isolated = ![[PLProfiles isolationModeForProfile:profile] isEqualToString:PLIsolationNone];
         NSString *lastPlayed = [self formatLastPlayed:profile[@"lastPlayed"]];
 
         [cell configureWithName:profileName version:versionId isSelected:isSelected isolated:isolated lastPlayed:lastPlayed];

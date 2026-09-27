@@ -179,6 +179,13 @@
 "preference.title.confirm" = "よろしいですか？";
 
 "preference.title.game_directory" = "ゲームのディレクトリ";
+
+"preference.isolation.title" = "バージョン分離";
+"preference.isolation.message" = "PCL2 と同様にバージョンごとにゲームデータを分離します。完全分離では mods・セーブ・config などが versions/<バージョン> に入ります。";
+"preference.isolation.none" = "分離しない";
+"preference.isolation.mod" = "Mod のみ分離";
+"preference.isolation.full" = "完全分離";
+"preference.isolation.custom" = "カスタムディレクトリ…";
 "preference.title.confirm.delete_game_directory" = "インスタンス %@ は永久に削除されるため、復元できません。";
 "preference.multidir.add_directory" = "ゲームディレクトリの追加";
 
