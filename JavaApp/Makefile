@@ -61,6 +61,15 @@ $(OUTPUTDIR)/launcher.jar: $(CLASSES) check_empty_classes
 	@echo "Creating $@"
 	@cp -r $(SOURCEDIR)/launcher/META-INF $(basename $@)/ 2>/dev/null || true
 	@$(BOOTJDK)/jar -cf $@ -C $(basename $@) .
+	@# Forge/BootstrapLauncher 的模块解析【只看包名由谁 export】: launcher.jar 与
+	@# mojang-stubs.jar 都带 com/mojang/text2speech 时, 会以
+	@#   java.lang.module.ResolutionException:
+	@#     Modules launcher and mojang.stubs export package com.mojang.text2speech to module logging
+	@# 直接杀掉进程。Task158 已该桩【必须】由 mojang-stubs.jar 提供(它才会被模块化并落在
+	@# MC-BOOTSTRAP 层), 所以这里从 launcher.jar 中剔除该包, 让它只有唯一提供者。
+	@# 注意: 只删【打好的 jar 内条目】, 不动 $(basename $@) 的 class 目录 ——
+	@# mojang-stubs.jar 依赖该目录取类, 不受影响。
+	@$(BOOTJDK)/jar -d -f $@ com/mojang/text2speech >/dev/null 2>&1 || true
 
 # 按 LWJGL 版本分别产出一个合并 jar（3.3.3 与 3.4.1）。
 #
