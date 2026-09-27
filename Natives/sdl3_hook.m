@@ -1912,7 +1912,6 @@ static ame_fn_glScissor ame_real_glScissor = NULL;
 // [fix/mg-recursion-3] 前置声明: 定义在使用点之后, C 需要先见到原型, 否则隐式声明报错。
 static ame_fn_glGetIntegerv ame_resolve_glGetIntegerv(void);
 static int ame_glScissorLogBudget = 8;
-static int ame_glScissor_depth = 0;   // [fix/mg-recursion-4] 重入深度保险
 static void ame_glScissor(int32_t x, int32_t y, int32_t width, int32_t height);
 
 // 判断某个 viewport 是否为「已知的错误候选」。只做精确匹配，不做比例推断，
@@ -2732,8 +2731,8 @@ static void ame_glScissor(int32_t x, int32_t y, int32_t width, int32_t height) {
     // [fix/mg-recursion-4] 最后一道保险: 若"真实实现"竟是我们自己, 直接返回(空操作),
     // 绝不回调自身 —— 任何路径把 ame_real_glScissor 写成钩子时都不会再递归。
     if (ame_real_glScissor == ame_glScissor) return;
-    if (ame_glScissor_depth > 0) return;
-    ame_glScissor_depth++;
+    // 注: 这里曾经加过"深度保险", 但它在本函数里没有配对的递减点(函数体内多处 return),
+    // 会让 glScissor 永久短路、修正失效。上面的"自指判定"已经足够挡住递归, 故移除。
     // 绑定 FBO 时不介入：离屏渲染里的 scissor 尺寸由渲染目标自身决定，与 EGL
     // surface 无关，不适用「应等于 surface」这一前提（见
     // ame_currentFramebufferBinding 处注释）。
