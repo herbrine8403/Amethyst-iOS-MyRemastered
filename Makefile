@@ -918,8 +918,12 @@ payload: native dep_mg dep_shader_shims dep_openal_shim dep_angle_freeze dep_sdl
 	$(call METHOD_DIRCHECK,$(WORKINGDIR)/AngelAuraAmethyst.app/libs_caciocavallo)
 	$(call METHOD_DIRCHECK,$(WORKINGDIR)/AngelAuraAmethyst.app/libs_caciocavallo17)
 	cp -R $(SOURCEDIR)/Natives/resources/en.lproj/LaunchScreen.storyboardc $(WORKINGDIR)/AngelAuraAmethyst.app/Base.lproj/ || exit 1
-	cp -R $(SOURCEDIR)/Natives/resources/* $(WORKINGDIR)/AngelAuraAmethyst.app/ || exit 1
 	cp $(WORKINGDIR)/*.dylib $(WORKINGDIR)/AngelAuraAmethyst.app/Frameworks/ || exit 1
+	# [fix/shim-overwrite] 断言: 共享库目录里这三份必须是"真库", 不能被同名 shim 覆盖掉。
+	# 历史问题: Frameworks 组装时先拷真库、后拷 WORKINGDIR 的 shim, 同名文件被 shim 覆盖,
+	# 导致 SPIRV-Cross 拒绝 MSL 后端 (create_compiler backend=3 -> rc=-4, "Invalid backend")。
+	@for f in libshaderc.dylib libspirv-cross-c-shared.0.dylib libspirv-cross.dylib; do 		sz=$$(stat -f%z "$(WORKINGDIR)/AngelAuraAmethyst.app/Frameworks/$$f" 2>/dev/null || echo 0); 		if [ "$$sz" -lt 1048576 ]; then echo "ERROR: $$f is only $$sz bytes (shim overwrote the real library)"; exit 1; fi; 	done
+	cp -R $(SOURCEDIR)/Natives/resources/* $(WORKINGDIR)/AngelAuraAmethyst.app/ || exit 1
 	# spirv-cross 软链接（防御性兜底）：若 MobileGlues 构建产出 libspirv-cross-c-shared.0.dylib，
 	# 创建 libspirv-cross.dylib 软链接，兼容按 macOS 默认名加载的 native 代码。
 	if [ -f "$(WORKINGDIR)/AngelAuraAmethyst.app/Frameworks/libspirv-cross-c-shared.0.dylib" ] && [ ! -f "$(WORKINGDIR)/AngelAuraAmethyst.app/Frameworks/libspirv-cross.dylib" ]; then \
