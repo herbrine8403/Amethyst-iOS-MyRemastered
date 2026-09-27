@@ -1912,7 +1912,8 @@ static ame_fn_glScissor ame_real_glScissor = NULL;
 // [fix/mg-recursion-3] 前置声明: 定义在使用点之后, C 需要先见到原型, 否则隐式声明报错。
 static ame_fn_glGetIntegerv ame_resolve_glGetIntegerv(void);
 static int ame_glScissorLogBudget = 8;
-static void ame_glScissor(int32_t x, int32_t y, int32_t width, int32_t height);
+static void ame_glScissor(int32_t x, int32_t y, int32_t width, int32_t height);      // 外层(重入保护)
+static void ame_glScissor_impl(int32_t x, int32_t y, int32_t width, int32_t height); // 真正实现
 
 // 判断某个 viewport 是否为「已知的错误候选」。只做精确匹配，不做比例推断，
 // 以免误伤渲染到 FBO 时的合法小 viewport（阴影贴图、GUI 元素、缩略图等）。
@@ -2723,7 +2724,21 @@ static void ame_fixStaleScissor(int eglW, int eglH) {
     }
 }
 
+// [fix/mg-recursion-5] 重入保护(根治版): 崩溃报告的 recursionInfoArray 显示
+// ame_glScissor 深度 5707、keyFrame 就是它自己, 说明钩子被【任何内部路径】绕回自身。
+// 之前那版把深度计数塞进原函数体, 但函数里有多处提前 return, 计数不配平 -> 会永久短路,
+// 所以撤掉了。这里改成【包一层】: 原实现改名 *_impl, 外层只负责"进/出各一次", 无论
+// 内部怎么 return, 计数都配平; 重入时直接空操作返回, 绝不回环。
+static __thread int ame_glScissor_depth = 0;
+
 static void ame_glScissor(int32_t x, int32_t y, int32_t width, int32_t height) {
+    if (ame_glScissor_depth > 0) return;            // 重入: 空操作, 绝不回环
+    ame_glScissor_depth++;
+    ame_glScissor_impl(x, y, width, height);
+    ame_glScissor_depth--;
+}
+
+static void ame_glScissor_impl(int32_t x, int32_t y, int32_t width, int32_t height) {
     if (ame_real_glScissor == NULL) {
         (void)ame_resolve_glScissor();
         if (ame_real_glScissor == NULL) return;  // 拿不到可信实现则原样放行
