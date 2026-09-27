@@ -1909,6 +1909,8 @@ typedef void (*ame_fn_glScissor)(int32_t x, int32_t y,
                                  int32_t width, int32_t height);
 
 static ame_fn_glScissor ame_real_glScissor = NULL;
+// [fix/mg-recursion-3] 前置声明: 定义在使用点之后, C 需要先见到原型, 否则隐式声明报错。
+static ame_fn_glGetIntegerv ame_resolve_glGetIntegerv(void);
 static int ame_glScissorLogBudget = 8;
 static void ame_glScissor(int32_t x, int32_t y, int32_t width, int32_t height);
 
