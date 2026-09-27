@@ -74,9 +74,13 @@ $(OUTPUTDIR)/launcher.jar: $(CLASSES) check_empty_classes
 	@rm -rf $(OUTPUTDIR)/launcher_strip && mkdir -p $(OUTPUTDIR)/launcher_strip
 	@(cd $(OUTPUTDIR)/launcher_strip && $(BOOTJDK)/jar -xf $(abspath $@))
 	@rm -rf $(OUTPUTDIR)/launcher_strip/com/mojang/text2speech
+	@# [fix/forge-split] MC 自己提供 com/mojang/blaze3d/**; launcher.jar 再带一份会让 Forge 报
+	@#   ResolutionException: Module minecraft contains package com.mojang.blaze3d.platform,
+	@#     module launcher exports package com.mojang.blaze3d.platform to minecraft
+	@rm -rf $(OUTPUTDIR)/launcher_strip/com/mojang/blaze3d
 	@cd $(OUTPUTDIR)/launcher_strip && $(BOOTJDK)/jar -cf $(abspath $@) .
 	@rm -rf $(OUTPUTDIR)/launcher_strip
-	@$(BOOTJDK)/jar -tf $@ | grep -q '^com/mojang/text2speech' && { echo "ERROR: text2speech still present in $@ (Forge split-package guard failed)"; exit 1; } || true
+	@$(BOOTJDK)/jar -tf $@ | grep -qE '^com/mojang/(text2speech|blaze3d)' && { echo "ERROR: text2speech still present in $@ (Forge split-package guard failed)"; exit 1; } || true
 
 # 按 LWJGL 版本分别产出一个合并 jar（3.3.3 与 3.4.1）。
 #
