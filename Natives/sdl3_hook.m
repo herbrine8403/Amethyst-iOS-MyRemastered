@@ -1981,8 +1981,19 @@ static bool ame_glSymbolTrusted(const void *sym) {
     Dl_info info;
     if (dladdr(sym, &info) == 0 || info.dli_fname == NULL) return false;
     const char *img = info.dli_fname;
-    return (strstr(img, "OpenGLES.framework") == NULL &&
-            strstr(img, "OpenGL.framework") == NULL);
+    if (strstr(img, "OpenGLES.framework") != NULL) return false;
+    if (strstr(img, "OpenGL.framework") != NULL) return false;
+    // [fix/mg-recursion-6] 关键: 我们自己镜像里的"GL 入口点"其实就是我们的钩子。
+    // 之前这里只拒系统框架, 于是每条解析路径(dlsym / 包装 / 句柄表 / 状态自查)都可能
+    // 把 ame_glScissor 之类当成"可信的真实实现"缓存下来, 钩子随即调用自己 ->
+    // 无限递归(崩溃报告 recursionInfoArray: depth 5707, keyFrame symbol ame_glScissor)
+    // -> 栈保护击穿 -> EXC_BAD_ACCESS / SIGILL。逐个堵回路治不完, 把信任判定收紧到
+    // "不接受自家镜像 / 不接受已知钩子符号"才是根治。
+    if (strstr(img, "AngelAuraAmethyst") != NULL) return false;      // 主二进制(我们的钩子都在这里)
+    if (strstr(img, "/App.app/") != NULL) return false;
+    if (sym == (const void *)ame_glScissor) return false;
+    if (sym == (const void *)ame_glViewport) return false;
+    return true;
 }
 
 static ame_fn_glViewport ame_resolve_glViewport(void) {
