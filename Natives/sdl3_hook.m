@@ -2636,13 +2636,28 @@ static ame_fn_glScissor ame_resolve_glScissor(void) {
 //
 // 返回 -1 表示无法判定（拿不到可信的 glGetIntegerv），此时调用方应保守放行
 // 原始值 —— 宁可漏修，不可误伤。
+// [fix/mg-recursion-2] 只解析一次并缓存: 之前每次调用都 dlsym("glGetIntegerv"),
+// 若那次 dlsym 命中【我们自己的 glGetIntegerv 钩子】(崩溃报告的 recursionInfoArray
+// 里正是 ame_glScissor -> (hooked_dlsym) -> ame_currentFramebufferBinding -> ame_glScissor
+// 5643 层 -> 栈保护击穿 -> EXC_BAD_ACCESS/KERN_PROTECTION_FAILURE), 就会回环到
+// ame_glScissor 自身。这里与 sdl3_hook 内既有范式(见 ame_nudge_glGetIntegerv)统一:
+// 取一次 -> 可信校验 -> 缓存; 再加一层重入深度保险。
+static ame_fn_glGetIntegerv ame_cfb_glGetIntegerv = NULL;
+static int ame_cfb_depth = 0;
+
 static int32_t ame_currentFramebufferBinding(void) {
-    void *rh = ame_rendererHandle();
-    if (rh == NULL) return -1;
-    void *p = dlsym(rh, "glGetIntegerv");
-    if (p == NULL || !ame_glSymbolTrusted((const void *)p)) return -1;
+    if (ame_cfb_depth > 0) return -1;              // 重入: 保守放行, 绝不再绕一圈
+    if (ame_cfb_glGetIntegerv == NULL) {
+        void *rh = ame_rendererHandle();
+        if (rh == NULL) return -1;
+        void *p = dlsym(rh, "glGetIntegerv");
+        if (p == NULL || !ame_glSymbolTrusted((const void *)p)) return -1;
+        ame_cfb_glGetIntegerv = (ame_fn_glGetIntegerv)p;
+    }
     int32_t fb = -1;
-    ((ame_fn_glGetIntegerv)p)(0x8CA6 /* GL_FRAMEBUFFER_BINDING */, &fb);
+    ame_cfb_depth++;
+    ame_cfb_glGetIntegerv(0x8CA6 /* GL_FRAMEBUFFER_BINDING */, &fb);
+    ame_cfb_depth--;
     return fb;
 }
 
