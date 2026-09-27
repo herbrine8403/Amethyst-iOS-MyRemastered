@@ -930,7 +930,11 @@ payload: native dep_mg dep_shader_shims dep_openal_shim dep_angle_freeze dep_sdl
 	# 原因: WORKINGDIR/*.dylib 里有同名 shim(libshaderc.dylib 111KB / libspirv-cross-c-shared.0.dylib 52KB),
 	# 会覆盖先拷进去的真库, 导致 SPIRV-Cross 拒绝 MSL 后端("Invalid backend", create_compiler backend=3 rc=-4)。
 	# 同时断言: 若覆盖后这三份仍 < 1MB, 直接失败(避免再次静默出货)。
-	for f in libshaderc.dylib libspirv-cross-c-shared.0.dylib libspirv-cross.dylib; do 		if [ -f "$(SOURCEDIR)/Natives/resources/Frameworks/$$f" ]; then 			cp -f "$(SOURCEDIR)/Natives/resources/Frameworks/$$f" "$(WORKINGDIR)/AngelAuraAmethyst.app/Frameworks/$$f" || exit 1; 		fi; 		sz=$$(stat -f%z "$(WORKINGDIR)/AngelAuraAmethyst.app/Frameworks/$$f" 2>/dev/null || echo 0); 		if [ "$$sz" -lt 1048576 ]; then echo "ERROR: $$f is only $$sz bytes after restore (shim overwrote real library)"; exit 1; fi; 	done
+	# 注意: 只覆盖 spirv-cross 两份。libshaderc.dylib 必须保持 WORKINGDIR 产出的"垫片"版本——
+	# 它导出 ame_master_compile_lock, spvc_shim/shaderc_shim 靠 dlopen+dlsym 拿这个符号做跨库编译总锁;
+	# 换成真库会拿不到锁 -> MG/shaderc 并发进 glslang -> SIGSEGV(glslang::TParseContext::lValueErrorCheck)。
+	# 真实现放在 libshaderc_impl.dylib(垫片按 @loader_path 解析), 不受影响。
+	for f in libspirv-cross-c-shared.0.dylib libspirv-cross.dylib; do 		if [ -f "$(SOURCEDIR)/Natives/resources/Frameworks/$$f" ]; then 			cp -f "$(SOURCEDIR)/Natives/resources/Frameworks/$$f" "$(WORKINGDIR)/AngelAuraAmethyst.app/Frameworks/$$f" || exit 1; 		fi; 		sz=$$(stat -f%z "$(WORKINGDIR)/AngelAuraAmethyst.app/Frameworks/$$f" 2>/dev/null || echo 0); 		if [ "$$sz" -lt 1048576 ]; then echo "ERROR: $$f is only $$sz bytes after restore"; exit 1; fi; 	done
 		cp -R $(SOURCEDIR)/JavaApp/libs/others/* $(WORKINGDIR)/AngelAuraAmethyst.app/libs/ || exit 1
 	cp $(SOURCEDIR)/JavaApp/build/launcher.jar $(SOURCEDIR)/JavaApp/build/patchjna_agent.jar $(SOURCEDIR)/JavaApp/build/patchsvc.jar $(SOURCEDIR)/JavaApp/build/mojang-stubs.jar $(WORKINGDIR)/AngelAuraAmethyst.app/libs/ || exit 1
 	# LWJGL 以双版本 jar 发布，由启动器按 MC 版本在运行时选择其一。
