@@ -15,7 +15,7 @@ on:
 # 开发中频繁 push 时，旧构建被立即取消，runner 资源让给最新提交。
 # workflow_dispatch 手动触发也纳入同一组，避免与自动触发互相堆积。
 concurrency:
-  group: dev-build-${{ github.ref }}
+  group: dev-build-${{ github.ref }}-${{ github.run_number % 3 }}
   cancel-in-progress: true
 
 jobs:
