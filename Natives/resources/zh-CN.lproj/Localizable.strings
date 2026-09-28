@@ -1938,3 +1938,7 @@
 
 "preference.auto" = "Auto";
 "preference.auto_select" = "Auto";
+
+"i18n_str_jit26_pending" = "JIT：已启用（启动时自动附加）";
+"jit.timeout_retry_msg" = "等待 JIT 超时（120 秒），JIT 工具可能未响应。点重试可再试一次，也可手动附加调试器后重试。";
+"jit.retry" = "重试";
