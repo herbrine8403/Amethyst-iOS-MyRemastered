@@ -1942,3 +1942,37 @@
 "i18n_str_jit26_pending" = "JIT：已启用（启动时自动附加）";
 "jit.timeout_retry_msg" = "等待 JIT 超时（120 秒），JIT 工具可能未响应。点重试可再试一次，也可手动附加调试器后重试。";
 "jit.retry" = "重试";
+
+// Task 134: JIT 开启工具选择（参照 Air 移植）
+"preference.debug.jit_enabler.auto" = "自动（推荐）";
+"preference.debug.jit_enabler.stikjit" = "StikDebug / StikJIT";
+"preference.debug.jit_enabler.sidestore" = "SideStore";
+"preference.debug.jit_enabler.stosdebug" = "StosDebug";
+"preference.debug.jit_enabler.jitstreamer" = "JitStreamer-EB";
+"preference.debug.jit_enabler.trollstore" = "TrollStore";
+"preference.debug.jit_enabler.manual" = "手动（自行附加调试器）";
+"preference.title.jit_enabler" = "JIT 开启工具";
+"preference.detail.jit_enabler" = "选择用于开启 JIT 的工具。没有安装 StikDebug 的用户请改选 SideStore、StosDebug、JitStreamer-EB 或 TrollStore，否则点击启动可能没有任何反应。默认自动：按设备状态依次尝试 TrollStore、StikDebug、SideStore。";
+"preference.title.jit26_script_disable" = "禁用 iOS 26 JS 脚本 JIT";
+"preference.detail.jit26_script_disable" = "启动游戏时不再向 JIT 工具发送 UniversalJIT26.js 脚本（纯调试器附加式 JIT）。仅当你的工具不支持脚本、或脚本导致异常时才需要开启；依赖系统级内存映射的设备（TXM）开启后可能无法启动游戏。";
+"i18n_str_jit26_not_ready" = "JIT26 调试器未就绪：JIT 断点无人应答。请确认已在 StikDebug 中指定 Universal JIT 脚本并重新开启 JIT，然后再点击启动。";
+
+"custom_controls.control_menu.save.error.default" = "控件名称不能是“default”，因为它是不可更改的。";
+"launcher.menu.install_jar" = "安装 .jar";
+"preference.title.jitstreamer_server" = "JitStreamer的服务器地址";
+"preference.detail.jitstreamer_server" = "该选项将自定义获取 JIT 权限地址的 JitStreamer 服务器。能用就别动！";
+"preference.title.enable_altkit" = "使用 AltKit 启用 JIT";
+"preference.detail.enable_altkit" = "启用时，Amethyst 将尝试连接到本地 AltServers 以启用 JIT。";
+"preference.title.debug_show_layout_bounds" = "显示边界布局";
+"preference.detail.debug_show_layout_bounds" = "显示剪辑边界、边距";
+"preference.title.debug_show_layout_overlap" = "布局重叠显示";
+"preference.detail.debug_show_layout_overlap" = "用浅黄色覆盖每个视图，颜色越深则重叠越多";
+"preference.title.mod_touch_enable" = "启用 TouchController 支持";
+"preference.detail.mod_touch_enable" = "启用 TouchController 模组支持。注意：开启此项将禁用“可滑动快捷栏”。";
+"preference.title.custom_controls" = "键位调整";
+"preference.detail.custom_controls" = "自定义游戏控制布局，拖拽按钮位置和大小";
+"preference.popup.touch_info.title" = "TouchController 适配说明";
+"preference.popup.touch_info.message" = "本功能是为 TouchController 模组制作的非官方 iOS 兼容方案。\n\nMod项目地址：https://github.com/TouchController/TouchController\n\n技术说明：\n由于模组不支持 iOS，本功能通过本地 UDP 协议 (Localhost) 在启动器与游戏进程间建立通信桥接。此连接仅用于设备内部传输触控数据，绝不会连接互联网，请放心使用。\n此功能由WeiErLiTeo制作。";
+"preference.title.two_finger_keyboard" = "双指呼出键盘";
+"preference.detail.two_finger_keyboard" = "在游戏中双指长按屏幕呼出键盘。";
+"spdt" = "我是个飞机!!!!!!";
