@@ -1422,7 +1422,13 @@ static bool dlsym_EGL() {
     //
     // 其余 EGL 函数（eglChooseConfig / eglCreateWindowSurface / eglSwapBuffers 等）
     // LTW 不做 wrapper，直接从 ANGLE 解析。
-    BOOL useLTW = renderer && strcmp(renderer, RENDERER_NAME_LTW) == 0;
+    //
+    // [fix/sfpew-ltw-backend] 判定必须用 eglRenderer（真后端名），不能用 renderer：
+    // SFPEW 叠加模式下 AMETHYST_RENDERER 已被换成 libSimpleFPEWrapper.dylib，
+    // 用它比较 RENDERER_NAME_LTW 恒为 false —— LTW 的 wrapper 一次都不会被解析，
+    // 转译层形同未接入，画面必黑。eglRenderer 在上方已按 AMETHYST_SFPEW_BACKEND
+    // 还原成真后端名（dlsym_EGL() 开头那段），用它才判得出「后端是 LTW」。
+    BOOL useLTW = eglRenderer && strcmp(eglRenderer, RENDERER_NAME_LTW) == 0;
     void *ltw_handle = NULL;
     if (useLTW) {
         ltw_handle = dlopen("@rpath/" RENDERER_NAME_LTW, RTLD_NOW | RTLD_LOCAL);
@@ -1462,16 +1468,19 @@ static bool dlsym_EGL() {
     // [sfpew-egl-route] A/B：AMETHYST_SFPEW_EGL_ROUTE=1 时改走 (c) —— EGL 全部经
     // SFPEW 的 eglGetProcAddress 解析（安卓/FCL 实测模型）。失败则回落到下方
     // 真后端 dlsym 路径，不改变默认行为。
-    // Task 178：LTW 下不得走这条早退路径。
+    // Task 181：LTW 后端同样要走这条路由 —— Task 178 的 `!useLTW` 排除是反的。
     //
-    // LTW 的 eglCreateContext / eglDestroyContext / eglMakeCurrent 是它注入
-    // GL Core 3.3 -> ES 3 转译逻辑的 wrapper（见上方 1392-1407 的注释：建 ES3
-    // 上下文 + 安装 GL 函数指针转译表 + 伪装 ARB 扩展），而这些解析发生在本
-    // 函数下方的 useLTW 分支里。此处一旦 return true，函数立即返回，LTW 的
-    // wrapper 永远不会被解析 —— SFPEW 的转发链把 LTW 整个架空，转译层形同
-    // 未接入，画面必黑。因此 LTW 模式一律走下方正常路径（lifecycle 从
-    // ltw_handle 取，SFPEW 只承担 GL）。
-    if (isSFPEWRenderer(renderer) && ameSFPEWEglRouteWanted() && !useLTW) {
+    // 关键事实：路由并不是「绕过后端」，而是「经 SFPEW 转发到后端」。SFPEW 的
+    // eglGetProcAddress 对 create/destroy/makeCurrent 返回它自己的 wrapper，而
+    // wrapper 内部调用的是 SFPEW_EGL 指向的后端 EGL —— 也就是 libltw.dylib 的
+    // eglCreateContext。LTW 注入的 wrapper（建 ES3 上下文 + 装 GL Core 3.3 -> ES 3
+    // 函数指针转译表 + 伪装 ARB 扩展）照样会被执行，一次都不会被架空。
+    //
+    // 反而是排除它会致命：eglSwapBuffers 落回后端直调，SFPEW 的 pending batch
+    // 就永远没有 drain 的机会（lookup.cpp:75-79 的注释），每帧几何被推到下一帧
+    // 再被 clear —— 这正是 LTW/ANGLE + SFPEW 全黑的成因，与 MobileGL-gles 白屏
+    // 同源。故此处不再按后端类型排除。
+    if (isSFPEWRenderer(renderer) && ameSFPEWEglRouteWanted()) {
         if (ameSFPEWResolveEGL()) {
             ame_sfpew_egl_route_active = YES;
             NSLog(@"[SFPEW-EGL] route ACTIVE -- lifecycle+infra both resolved through SFPEW "

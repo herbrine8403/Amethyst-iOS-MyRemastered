@@ -380,6 +380,51 @@ def patch_backend_es_detect(root: Path) -> None:
     )
 
 
+def patch_capabilities_es_detect(root: Path) -> None:
+    """让 sfpewBackendIsES() 与 sfpewDesktopGLVersion() 用同一判据。
+
+    patch_backend_es_detect() 只覆盖了 translator.cpp 的 detect_backend_target()，
+    漏了 backend/capabilities.cpp 的 sfpewBackendIsES()——它仍用不带尾随空格的
+    "OpenGL ES"，于是 MobileGL-gles 的 "Direct (OpenGL ES) Backend" 在这一个
+    函数里被判成 ES，而 sfpewDesktopGLVersion()（带空格）判成非 ES：同一个后端
+    在 SFPEW 内部结论相反，能力面自相矛盾。
+
+    sfpewBackendIsES() 决定两件事：
+      * texture_image.cpp 的 glGetTexImage / glGetCompressedTexImage /
+        glGetTexLevelParameteriv —— desktop-only 查询，判成 ES 就不会去查；
+      * sfpewTextureBorderClampSupported() —— 判成 ES 就改查后端扩展串，
+        判成桌面则直接声明 GL_ARB_texture_border_clamp。
+
+    注意：同文件里的 sfpewBackendTakesBgra()（capabilities.cpp:192）用不带空格
+    的 "OpenGL ES" 是**故意**的，不要动——它的判据是「后端是否原生接受 BGRA」，
+    MobileGlues 报桌面版本串但实际不重排 BGRA 字节，必须靠无空格匹配才能把它
+    和真 ES 一起识别出来（源码里那段注释就是这个意思）。
+
+    逃逸阀 AMETHYST_SFPEW_BACKEND_ES=0/1 与 translator.cpp 那份共用，一处设置
+    两个函数同时生效。
+    """
+    caps = root / "SimpleFPEWrapper" / "backend" / "capabilities.cpp"
+    if not caps.is_file():
+        fail(f"missing {caps}")
+    t = caps.read_text(encoding="utf-8")
+    if "sfpewIosBackendReportsES" in t:
+        print("patch_sfpew_ios: capabilities ES detect: already patched -- skip")
+        return
+
+    replace_once(
+        caps,
+        "bool sfpewBackendIsES() {",
+        ES_DETECT_HELPER + "\nbool sfpewBackendIsES() {",
+        "capabilities ES detect (helper insertion)",
+    )
+    replace_once(
+        caps,
+        '        cached = std::strstr((const char*)raw, "OpenGL ES") != nullptr ? 1 : 0;',
+        "        cached = sfpewIosBackendReportsES((const char*)raw);",
+        "capabilities ES detect (call site)",
+    )
+
+
 def main() -> None:
     if len(sys.argv) != 2:
         fail(f"usage: {sys.argv[0]} <SimpleFPEWrapper source dir>")
@@ -391,6 +436,7 @@ def main() -> None:
     patch_float_call_site(root)
     patch_format_to_compat(root)
     patch_backend_es_detect(root)
+    patch_capabilities_es_detect(root)
 
 
 if __name__ == "__main__":
