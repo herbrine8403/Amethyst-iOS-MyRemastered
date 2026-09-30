@@ -1976,3 +1976,13 @@
 "preference.title.two_finger_keyboard" = "双指呼出键盘";
 "preference.detail.two_finger_keyboard" = "在游戏中双指长按屏幕呼出键盘。";
 "spdt" = "我是个飞机!!!!!!";
+
+// 启动器检查更新（ZL2 风格弹窗 + 启动自动检查）
+"update_dialog.title" = "发现新版本";
+"update_dialog.version_from" = "%@（当前：%@）";
+"update_dialog.published_at" = "发布于 %@";
+"update_dialog.ignore" = "忽略此版本";
+"update_dialog.later" = "稍后";
+"update_dialog.update" = "更新";
+"preference.title.auto_check_update" = "启动时检查更新";
+"preference.detail.auto_check_update" = "启动启动器时自动检查 GitHub Releases。每小时最多检查一次，被你选择忽略的版本不会再提示。";
