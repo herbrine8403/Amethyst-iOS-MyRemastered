@@ -332,6 +332,61 @@ static NSString *PLIsolationVersionId(NSDictionary *profile) {
     }
 }
 
++ (void)migrateLegacyDataForProfile:(NSDictionary *)profile {
+    if (![[self isolationModeForProfile:profile] isEqualToString:PLIsolationFull]) return;
+
+    const char *env = getenv("POJAV_GAME_DIR");
+    if (!env) return;
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    // POJAV_GAME_DIR 指向 Library/Application Support/minecraft，而它是指向 instances/<目录> 的符号链接；
+    // 需解析符号链接后才能与版本目录做前缀比较，否则迁移永远不会触发。
+    NSString *sourceRoot = [[@(env) stringByStandardizingPath] stringByResolvingSymlinksInPath];
+    NSString *destRoot = [[[self absoluteGameDirForProfile:profile] stringByStandardizingPath] stringByResolvingSymlinksInPath];
+    if (sourceRoot.length == 0 || destRoot.length == 0) return;
+
+    // 只处理"版本目录位于实例主目录之内"的标准完全隔离；指向别处的自定义隔离目录不自动搬迁，避免误移动
+    if ([destRoot isEqualToString:sourceRoot] ||
+        ![destRoot hasPrefix:[sourceRoot stringByAppendingString:@"/"]]) {
+        return;
+    }
+
+    NSUInteger moved = 0;
+    for (NSString *sub in PLIsolationStandardSubdirectories()) {
+        NSString *srcSub = [sourceRoot stringByAppendingPathComponent:sub];
+        NSString *dstSub = [destRoot stringByAppendingPathComponent:sub];
+
+        NSDictionary *attrs = [fm attributesOfItemAtPath:srcSub error:nil];
+        if (!attrs) continue;
+        // 符号链接（如"仅Mod隔离"留下的共享 mods 链接）交由 alignSharedModsDirectoryForProfile 处理
+        if (![attrs[NSFileType] isEqualToString:NSFileTypeDirectory]) continue;
+
+        NSArray<NSString *> *items = [fm contentsOfDirectoryAtPath:srcSub error:nil] ?: @[];
+        if (items.count == 0) continue;
+
+        [fm createDirectoryAtPath:dstSub withIntermediateDirectories:YES attributes:nil error:nil];
+        for (NSString *item in items) {
+            NSString *from = [srcSub stringByAppendingPathComponent:item];
+            NSString *to = [dstSub stringByAppendingPathComponent:item];
+            if ([fm fileExistsAtPath:to]) continue; // 版本目录已有同名项，保留版本目录的
+            NSError *err = nil;
+            if ([fm moveItemAtPath:from toPath:to error:&err]) {
+                moved++;
+            } else {
+                NSLog(@"[PLProfiles] 版本隔离：迁移 %@/%@ 失败，已跳过：%@", sub, item, err.localizedDescription);
+            }
+        }
+        // 源子目录已搬空才删除，确保失败项不会被误删
+        if (([fm contentsOfDirectoryAtPath:srcSub error:nil] ?: @[]).count == 0) {
+            [fm removeItemAtPath:srcSub error:nil];
+        }
+    }
+
+    if (moved > 0) {
+        NSLog(@"[PLProfiles] 版本隔离：已自动迁移 %lu 项老数据 → %@", (unsigned long)moved, destRoot);
+    }
+}
+
 + (void)setIsolationMode:(NSString *)mode customGameDir:(NSString *)customGameDir forProfileName:(NSString *)name {
     if (name.length == 0) return;
     if (![mode isEqualToString:PLIsolationNone] && ![mode isEqualToString:PLIsolationMod] && ![mode isEqualToString:PLIsolationFull]) {
@@ -352,6 +407,8 @@ static NSString *PLIsolationVersionId(NSDictionary *profile) {
 
     NSLog(@"[PLProfiles] 版本隔离：profile '%@' → %@%@", name, mode,
           ([mode isEqualToString:PLIsolationFull] && customGameDir.length > 0) ? [NSString stringWithFormat:@" (%@)", customGameDir] : @"");
+    // 先搬迁老数据再补建目录，保证已有存档 / Mod 跟随进版本目录
+    [self migrateLegacyDataForProfile:[profile copy]];
     [self ensureIsolationDirectoriesForProfile:[profile copy]];
 }
 

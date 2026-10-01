@@ -54,6 +54,11 @@ extern NSString * const PLIsolationFull;
 /// 启动前对齐共享 mods 目录：mod 隔离时把 <游戏主目录>/mods 指向版本 mods，其余模式恢复为真实目录。
 + (void)alignSharedModsDirectoryForProfile:(NSDictionary *)profile;
 
+/// 老数据自动迁移：完全隔离时把共享主目录里已存在的标准子目录内容搬进版本目录，
+/// 避免"开启完全隔离后存档 / Mod 消失"。不覆盖目标同名项、不搬迁 versions / libraries / assets
+/// 等启动器资源，源子目录搬空才删除；幂等，可安全重复调用。
++ (void)migrateLegacyDataForProfile:(NSDictionary *)profile;
+
 /// 新建 profile 的默认隔离：无显式 isolation 且无自定义 gameDir 时设为完全隔离。
 + (void)applyDefaultIsolationForNewProfile:(NSMutableDictionary *)profile;
 
