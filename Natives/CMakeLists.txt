@@ -284,7 +284,14 @@ add_executable(AngelAuraAmethyst
   JavaLauncher.m
   external/fishhook/fishhook.c
   UIKit+hook.m
-  ScreenUtils.m
+  ScreenUtils.m
+  # ---- Amethyst 新 UI 设计系统（ui-redesign P0，参考 ZalithLauncher2）----
+  # AMTheme 由 docs/gen_amtheme.py 从 ZL2 Color.kt 自动生成（35 角色 × 7 色板 × 明暗）；
+  # AMAnimation 移植 ZL2 utils/animation 的果冻回弹/弹跳 easing 与速度/幅度换算；
+  # AMDesignTokens 是形状/间距/字体档位。均为纯新增类，不与现有 VC 交互。
+  AMTheme.m
+  AMAnimation.m
+  AMDesignTokens.m
 
   authenticator/BaseAuthenticator.m
   authenticator/LocalAuthenticator.m
