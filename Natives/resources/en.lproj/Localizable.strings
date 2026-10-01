@@ -253,6 +253,10 @@
 "preference.title.resolution" = "Resolution (%)";
 "preference.detail.resolution" = "Allows you to decrease the game resolution.";
 
+"preference.title.fsr1" = "FSR1 Upscaling";
+"preference.detail.fsr1" = "When Resolution is below 100%, replaces the default bilinear stretch with AMD FSR1 (edge-adaptive upscaling + sharpening): the game renders at the lower resolution and FSR1 restores detail on the way to the screen. Runs above EGL and outside the renderer, so it works with every backend. No effect while Resolution is 100%.";
+
+
 "preference.title.disable_game_vsync" = "Unlock framerate (disable VSync)";
 "preference.detail.disable_game_vsync" = "Minecraft enables VSync by default, which caps FPS at the screen refresh rate (60 or 120). When enabled, the launcher forces VSync off so the game can exceed the refresh rate. Turn off if you prefer VSync or want to reduce heat/battery drain.";
 
