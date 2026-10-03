@@ -1,3 +1,4 @@
+#import "utils.h"   // ★ [MODPACK-FIX] missingAPIKeyError 面向用户文案改用 localize()（与 ModrinthAPI.m 同约定：utils.h 置首）
 #import "CurseForgeAPI.h"
 #import "AFNetworking.h"
 #import "PLPreferences.h"
@@ -69,7 +70,16 @@ static NSString *CFAMirrorResolvedURL(NSString *urlString) {
 /// 重写 baseURL getter，根据 PLMirrorCenter 的资源搜索（AssetSearch）策略
 /// 动态返回官方或 MCIM 镜像 URL，这样所有使用 self.baseURL 的请求都会自动走镜像
 - (NSString *)baseURL {
-    return [PLMirrorCenter curseForgeAPIBaseURL];
+    NSString *resolved = [PLMirrorCenter curseForgeAPIBaseURL];
+    // ★ [MODPACK-FIX] 未配置 API key 时强制回落 MCIM 镜像（免 key，实测 200）。
+    //   官方 api.curseforge.com 对无 x-api-key 的请求恒 403；而默认策略
+    //   （official_first / auto）会让无 key 设备首选官方 → 「进入 CurseForge 源即报错」。
+    //   有 key 的设备保持原镜像策略语义不变。
+    if ([self apiKey].length == 0 && [resolved containsString:@"api.curseforge.com"]) {
+        NSLog(@"[CurseForgeAPI] MODPACK-FIX: no API key -- baseURL forced to MCIM mirror (keyless, field-tested 200)");
+        return [PLMirrorCenter mcimCurseForgeAPIBaseURL];
+    }
+    return resolved;
 }
 
 + (instancetype)sharedInstance {
@@ -123,7 +133,19 @@ static NSString *CFAMirrorResolvedURL(NSString *urlString) {
 - (NSDictionary *)headers {
     NSString *key = [self apiKey];
     if (key.length == 0) {
-        return nil;
+        // ★ [MODPACK-FIX] keyless 不再返回 nil。旧实现把 headers == nil 当作
+        //   「API key 缺失」的致命门（getEndpoint / postEndpoint / searchModWithFilters
+        //   三处直接 missingAPIKeyError，请求根本不发出）——而 baseURL 在无 key 时
+        //   已强制回落 MCIM 镜像（镜像无 key 实测 200）。两者语义互相打架 ⇒
+        //   无 key 构建（所有 CI/sideload 构建）在 CurseForge 源上一律报
+        //   "CurseForge API key is missing..." 死路。新语义：keyless = 照常发请求
+        //   但不带 x-api-key（走镜像），有 key 照旧。
+        static BOOL s_modpackFixKeylessLogged = NO;
+        if (!s_modpackFixKeylessLogged) {
+            s_modpackFixKeylessLogged = YES;
+            NSLog(@"[CurseForgeAPI] MODPACK-FIX: no API key configured -- requests go keyless to the MCIM mirror");
+        }
+        return @{ @"Accept" : @"application/json" };
     }
     return @{
         @"Accept": @"application/json",
@@ -148,10 +170,21 @@ static NSString *CFAMirrorResolvedURL(NSString *urlString) {
     return NO;
 }
 
+// ★ [MODPACK-FIX] CurseForge 源可用性 —— 恒定 YES。
+//   key 仅「官方直连」需要；未配 key 时 baseURL 强制落 MCIM 镜像（免 key，实测 200），
+//   源对所有人可用。凡「切到 CurseForge 源前先查 key」的 UI 门控都必须用本方法，
+//   否则无 key 构建（所有 CI/sideload 构建）会被直接挡在门外并弹报错/被重定向到设置页。
++ (BOOL)isSourceAvailable {
+    return YES;
+}
+
 - (NSError *)missingAPIKeyError {
+    // ★ [MODPACK-FIX] 面向用户的文案改为可执行的引导（复用已有 i18n 键，指向设置页
+    //   CurseForge API Key 入口），不再是英文死路 "Set CURSEFORGE_API_KEY before building"。
+    //   注意：正常情况下无 key 已走镜像免 key 路径，本错误仅在镜像亦不可达时兜底。
     return [NSError errorWithDomain:@"CurseForgeAPI"
                                code:401
-                           userInfo:@{NSLocalizedDescriptionKey: @"CurseForge API key is missing. Set CURSEFORGE_API_KEY before building."}];
+                           userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_172", nil)}];
 }
 
 #pragma mark - 错误诊断辅助
@@ -284,11 +317,9 @@ static NSString *CFAMirrorResolvedURL(NSString *urlString) {
 #pragma mark - 同步网络请求（原有 AFNetworking 实现，保持兼容）
 
 - (id)getEndpoint:(NSString *)endpoint params:(NSDictionary *)params {
+    // ★ [MODPACK-FIX] 不再把 headers==nil 当作致命门：headers 现无 key 也返回
+    //   Accept-only 字典（keyless 请求走 MCIM 镜像，实测 200）。
     NSDictionary *headers = [self headers];
-    if (!headers) {
-        self.lastError = [self missingAPIKeyError];
-        return nil;
-    }
     
     __block id result;
     dispatch_group_t group = dispatch_group_create();
@@ -308,11 +339,8 @@ static NSString *CFAMirrorResolvedURL(NSString *urlString) {
 }
 
 - (id)postEndpoint:(NSString *)endpoint params:(NSDictionary *)params {
+    // ★ [MODPACK-FIX] 同 getEndpoint：headers 恒非 nil，去掉 keyless 致命门。
     NSDictionary *headers = [self headers];
-    if (!headers) {
-        self.lastError = [self missingAPIKeyError];
-        return nil;
-    }
     
     __block id result;
     dispatch_group_t group = dispatch_group_create();
@@ -630,11 +658,9 @@ static NSString *CFAMirrorResolvedURL(NSString *urlString) {
     
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
     NSDictionary *headers = [self headers];
-    if (!headers) {
-        NSLog(@"[CurseForgeAPI] Warning: searchModWithFilters failed: API Key not configured");
-        if (completion) completion(nil, [self missingAPIKeyError]);
-        return;
-    }
+    // ★ [MODPACK-FIX] keyless 不再拦截（旧：headers==nil -> 立即 missingAPIKeyError，
+    //   请求根本不发出，使 Task162 的镜像回退成死代码）。headers 无 key 时也返回
+    //   Accept-only 字典，照常发往 MCIM 镜像。for-in 对 nil 本就安全，此处不加门。
     for (NSString *key in headers) {
         [request setValue:headers[key] forHTTPHeaderField:key];
     }
@@ -734,7 +760,13 @@ static NSString *CFAMirrorResolvedURL(NSString *urlString) {
     if (!url) return nil;
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
     request.HTTPMethod = @"POST";
-    [request setValue:[self apiKey] forHTTPHeaderField:@"x-api-key"];
+    // ★ [MODPACK-FIX] 空 key 不发空 x-api-key 头（空值头会被 MCIM 镜像网关当成坏请求）
+    {
+        NSString *modpackFixKey = [self apiKey];
+        if (modpackFixKey.length > 0) {
+            [request setValue:modpackFixKey forHTTPHeaderField:@"x-api-key"];
+        }
+    }
     [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
     NSDictionary *body = @{@"fingerprints": @[fingerprint]};
     NSError *jsonError = nil;
@@ -777,7 +809,13 @@ static NSString *CFAMirrorResolvedURL(NSString *urlString) {
     if (!url) return @[];
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
     request.HTTPMethod = @"POST";
-    [request setValue:[self apiKey] forHTTPHeaderField:@"x-api-key"];
+    // ★ [MODPACK-FIX] 空 key 不发空 x-api-key 头（空值头会被 MCIM 镜像网关当成坏请求）
+    {
+        NSString *modpackFixKey = [self apiKey];
+        if (modpackFixKey.length > 0) {
+            [request setValue:modpackFixKey forHTTPHeaderField:@"x-api-key"];
+        }
+    }
     [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
     NSDictionary *body = @{@"fingerprints": fingerprints};
     NSError *bodyError = nil;
@@ -832,7 +870,13 @@ static NSString *CFAMirrorResolvedURL(NSString *urlString) {
         return;
     }
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
-    [request setValue:[self apiKey] forHTTPHeaderField:@"x-api-key"];
+    // ★ [MODPACK-FIX] 空 key 不发空 x-api-key 头（空值头会被 MCIM 镜像网关当成坏请求）
+    {
+        NSString *modpackFixKey = [self apiKey];
+        if (modpackFixKey.length > 0) {
+            [request setValue:modpackFixKey forHTTPHeaderField:@"x-api-key"];
+        }
+    }
     [request setValue:@"application/json" forHTTPHeaderField:@"Accept"];
     request.timeoutInterval = 30.0;
     NSLog(@"[CurseForgeAPI] loadDetailsOfMod starting request modID=%@: %@", modID, urlStr);
@@ -929,7 +973,13 @@ static NSString *CFAMirrorResolvedURL(NSString *urlString) {
         return;
     }
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
-    [request setValue:[self apiKey] forHTTPHeaderField:@"x-api-key"];
+    // ★ [MODPACK-FIX] 空 key 不发空 x-api-key 头（空值头会被 MCIM 镜像网关当成坏请求）
+    {
+        NSString *modpackFixKey = [self apiKey];
+        if (modpackFixKey.length > 0) {
+            [request setValue:modpackFixKey forHTTPHeaderField:@"x-api-key"];
+        }
+    }
     [request setValue:@"application/json" forHTTPHeaderField:@"Accept"];
     request.timeoutInterval = 30.0;
     NSLog(@"[CurseForgeAPI] 🔍 getServerPackFilesForModpack: %@", urlStr);

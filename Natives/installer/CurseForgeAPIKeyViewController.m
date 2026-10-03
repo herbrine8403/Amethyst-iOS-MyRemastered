@@ -40,98 +40,58 @@ static NSString *CFKCompiledAPIKey(void) {
 }
 
 /// Material Design 3 主色调（CurseForge 橙色调，与品牌呼应）
-static UIColor *CFKMD3PrimaryColor(void) {
-    return [UIColor colorWithDynamicProvider:^UIColor * _Nonnull(UITraitCollection * _Nonnull traitCollection) {
-        if (traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) {
-            return [UIColor colorWithRed:0.85 green:0.55 blue:0.30 alpha:1.0];
-        }
-        return [UIColor colorWithRed:0.80 green:0.42 blue:0.16 alpha:1.0];
-    }];
+static UIColor *CFKMD3PrimaryColor(void) {// ★ HIG:品牌主色 → 系统橙(CurseForge 品牌色,深浅色自动适配)
+    return [UIColor systemOrangeColor];
 }
 
 /// Material Design 3 主色调上的文字颜色（始终白色）
-static UIColor *CFKMD3OnPrimaryColor(void) {
+static UIColor *CFKMD3OnPrimaryColor(void) {// ★ HIG:主色之上的文字(彩色按钮内允许白字)
     return [UIColor whiteColor];
 }
 
 /// Material Design 3 描边按钮的描边颜色
-static UIColor *CFKMD3OutlineColor(void) {
-    return [UIColor colorWithDynamicProvider:^UIColor * _Nonnull(UITraitCollection * _Nonnull traitCollection) {
-        if (traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) {
-            return [UIColor colorWithWhite:1.0 alpha:0.32];
-        }
-        return [UIColor colorWithWhite:0.0 alpha:0.24];
-    }];
+static UIColor *CFKMD3OutlineColor(void) {// ★ HIG:描边 → 系统分隔色
+    return [UIColor separatorColor];
 }
 
 /// 卡片背景色（适配深浅色）
-static UIColor *CFKCardBackgroundColor(void) {
-    return [UIColor colorWithDynamicProvider:^UIColor * _Nonnull(UITraitCollection * _Nonnull traitCollection) {
-        if (traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) {
-            return [UIColor colorWithWhite:1.0 alpha:0.06];
-        }
-        return [UIColor colorWithWhite:1.0 alpha:0.75];
-    }];
+static UIColor *CFKCardBackgroundColor(void) {// ★ HIG:卡片底 → 系统分组背景(不再自绘 白6%/白75%)
+    return [UIColor secondarySystemGroupedBackgroundColor];
 }
 
 /// 卡片描边色
-static UIColor *CFKCardBorderColor(void) {
-    return [UIColor colorWithDynamicProvider:^UIColor * _Nonnull(UITraitCollection * _Nonnull traitCollection) {
-        if (traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) {
-            return [UIColor colorWithWhite:1.0 alpha:0.10];
-        }
-        return [UIColor colorWithWhite:0.0 alpha:0.08];
-    }];
+static UIColor *CFKCardBorderColor(void) {// ★ HIG:卡片描边 → 系统分隔色
+    return [UIColor separatorColor];
 }
 
 /// 页面背景色
-static UIColor *CFKPageBackgroundColor(void) {
-    return [UIColor colorWithDynamicProvider:^UIColor * _Nonnull(UITraitCollection * _Nonnull traitCollection) {
-        if (traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) {
-            return [UIColor colorWithRed:0.05 green:0.05 blue:0.07 alpha:1.0];
-        }
-        return [UIColor colorWithRed:0.96 green:0.96 blue:0.98 alpha:1.0];
-    }];
+static UIColor *CFKPageBackgroundColor(void) {// ★ HIG:页面底 → 系统分组背景
+    return [UIColor systemGroupedBackgroundColor];
 }
 
 /// 主要文字颜色
-static UIColor *CFKPrimaryTextColor(void) {
-    return [UIColor colorWithDynamicProvider:^UIColor * _Nonnull(UITraitCollection * _Nonnull traitCollection) {
-        if (traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) {
-            return [UIColor whiteColor];
-        }
-        return [UIColor colorWithRed:0.10 green:0.10 blue:0.12 alpha:1.0];
-    }];
+static UIColor *CFKPrimaryTextColor(void) {// ★ HIG:主文字 → labelColor(自动深浅反转,消除"黑字压暗底"类问题)
+    return [UIColor labelColor];
 }
 
 /// 次要文字颜色
-static UIColor *CFKSecondaryTextColor(void) {
-    return [UIColor colorWithDynamicProvider:^UIColor * _Nonnull(UITraitCollection * _Nonnull traitCollection) {
-        if (traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) {
-            return [UIColor colorWithWhite:1.0 alpha:0.60];
-        }
-        return [UIColor colorWithWhite:0.0 alpha:0.55];
-    }];
+static UIColor *CFKSecondaryTextColor(void) {// ★ HIG:次文字 → secondaryLabelColor
+    return [UIColor secondaryLabelColor];
 }
 
 /// 输入框背景色
-static UIColor *CFKFieldBackgroundColor(void) {
-    return [UIColor colorWithDynamicProvider:^UIColor * _Nonnull(UITraitCollection * _Nonnull traitCollection) {
-        if (traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark) {
-            return [UIColor colorWithWhite:1.0 alpha:0.08];
-        }
-        return [UIColor colorWithWhite:0.0 alpha:0.04];
-    }];
+static UIColor *CFKFieldBackgroundColor(void) {// ★ HIG:输入框底 → tertiarySystemFillColor
+    return [UIColor tertiarySystemFillColor];
 }
 
 /// 成功状态颜色
-static UIColor *CFKSuccessColor(void) {
-    return [UIColor colorWithRed:0.18 green:0.69 blue:0.45 alpha:1.0];
+static UIColor *CFKSuccessColor(void) {// ★ HIG:成功 → systemGreen
+    return [UIColor systemGreenColor];
 }
 
 /// 失败状态颜色
-static UIColor *CFKErrorColor(void) {
-    return [UIColor colorWithRed:0.86 green:0.27 blue:0.27 alpha:1.0];
+static UIColor *CFKErrorColor(void) {// ★ HIG:失败 → systemRed
+    return [UIColor systemRedColor];
 }
 
 @interface CurseForgeAPIKeyViewController () <UITextFieldDelegate>

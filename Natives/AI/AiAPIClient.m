@@ -17,15 +17,11 @@ static const NSTimeInterval kChunkThrottleInterval = 0.2;
 
 @property (nonatomic, strong) NSMutableString *streamBuffer;    // 未切分完的流缓冲
 @property (nonatomic, strong) NSMutableData *streamData;        // 原始字节缓冲（保证跨块多字节字符完整性）
-@property (nonatomic, strong) NSMutableString *fullResponseText; // 已接收全文（content 部分，不含 reasoning）
-@property (nonatomic, strong) NSMutableString *fullReasoningText; // 推理模型思考过程（delta.reasoning_content / delta.reasoning 累积）
-@property (nonatomic, copy, nullable) NSString *finishReason; // choice.finish_reason（stop/length/content_filter/tool_calls…）
+@property (nonatomic, strong) NSMutableString *fullResponseText; // 已接收全文
 @property (nonatomic, strong) NSMutableString *pendingDelta;     // 待节流刷新的增量
 @property (nonatomic, assign) NSTimeInterval lastChunkFlushTime;
 @property (nonatomic, assign) BOOL streamDone;
 @property (nonatomic, assign) NSInteger statusCode;
-/// 流中间收到的 error 事件文案（HTTP 200 但 data 行是 {"error":...}，OpenRouter/中转常见）
-@property (nonatomic, copy, nullable) NSString *streamErrorMessage;
 @end
 
 @implementation AiAPIClient
@@ -36,7 +32,6 @@ static const NSTimeInterval kChunkThrottleInterval = 0.2;
         self.streamBuffer = [NSMutableString string];
         self.streamData = [NSMutableData data];
         self.fullResponseText = [NSMutableString string];
-        self.fullReasoningText = [NSMutableString string];
         self.pendingDelta = [NSMutableString string];
     }
     return self;
@@ -67,12 +62,9 @@ static const NSTimeInterval kChunkThrottleInterval = 0.2;
     [self.streamBuffer setString:@""];
     [self.streamData setLength:0];
     [self.fullResponseText setString:@""];
-    [self.fullReasoningText setString:@""];
     [self.pendingDelta setString:@""];
     self.streamDone = NO;
     self.statusCode = 0;
-    self.finishReason = nil;
-    self.streamErrorMessage = nil;
 
     // 构造 URL：baseURL 末尾不是 / 则补 /，再拼 chat/completions
     NSString *base = provider.baseURL;
@@ -264,9 +256,6 @@ static const NSTimeInterval kChunkThrottleInterval = 0.2;
 - (void)processStreamLine:(NSString *)line {
     NSString *trimmed = [line stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (trimmed.length == 0) return;
-    // SSE 注释行（: keep-alive）与事件名行（event: ...）不携带 delta，直接跳过，
-    // 真正的错误正文在随后的 data: 行里（{"error":{...}}），那里再捕获。
-    if ([trimmed hasPrefix:@":"] || [trimmed hasPrefix:@"event:"]) return;
 
     // 前缀兼容三种形态："data: "、"data:"（无空格）、以及整行无前缀（裸行直接把整行作为 payload）
     NSString *payload = nil;
@@ -289,54 +278,19 @@ static const NSTimeInterval kChunkThrottleInterval = 0.2;
     NSDictionary *json = [NSJSONSerialization JSONObjectWithData:jsonData options:0 error:&error];
     if (error || ![json isKindOfClass:[NSDictionary class]]) return;
 
-    // 流中间错误（HTTP 200 但 data 行是 {"error":{"message":...}}）：记下来，
-    // 收尾时按失败回传，避免“说一半停了还没弹窗”的静默早停。
-    id topError = json[@"error"];
-    if ([topError isKindOfClass:[NSDictionary class]]) {
-        id msg = topError[@"message"];
-        if ([msg isKindOfClass:[NSString class]] && [(NSString *)msg length] > 0) {
-            self.streamErrorMessage = msg;
-        } else {
-            self.streamErrorMessage = @"服务返回了流内错误（error 事件），回复可能不完整";
-        }
-        return;
-    }
-
     NSArray *choices = json[@"choices"];
     if (![choices isKindOfClass:[NSArray class]] || choices.count == 0) return;
     NSDictionary *choice = choices[0];
     if (![choice isKindOfClass:[NSDictionary class]]) return;
-    // finish_reason 透传（length/content_filter 表示被截断，交完成回调提示用户）
-    id finishReason = choice[@"finish_reason"];
-    if ([finishReason isKindOfClass:[NSString class]] && [(NSString *)finishReason length] > 0) {
-        self.finishReason = finishReason;
-    }
     NSDictionary *delta = choice[@"delta"];
     if (![delta isKindOfClass:[NSDictionary class]]) return;
 
     id content = delta[@"content"];
-    // 兼容部分模型把正文放在 delta.text（非标准但常见）
-    if (![content isKindOfClass:[NSString class]]) {
-        id altText = delta[@"text"];
-        if ([altText isKindOfClass:[NSString class]]) content = altText;
-    }
     NSString *deltaText = nil;
     if ([content isKindOfClass:[NSString class]] && content != (id)[NSNull null]) {
         deltaText = content;
         [self.fullResponseText appendString:deltaText];
         [self.pendingDelta appendString:deltaText];
-    }
-
-    // 推理增量（DeepSeek R1 / QwQ 等 thinking 模型只在 reasoning_content 里出字）：
-    // 一并累积显示，避免思考阶段气泡一直是空的、像卡住停了。顺序即到达序。
-    id reasoning = delta[@"reasoning_content"];
-    if (![reasoning isKindOfClass:[NSString class]]) {
-        reasoning = delta[@"reasoning"];
-    }
-    if ([reasoning isKindOfClass:[NSString class]] && [(NSString *)reasoning length] > 0) {
-        [self.fullReasoningText appendString:reasoning];
-        [self.fullResponseText appendString:reasoning];
-        [self.pendingDelta appendString:reasoning];
     }
 
     // tool_calls（Phase 3 使用，本期仅透传）
@@ -413,25 +367,6 @@ static const NSTimeInterval kChunkThrottleInterval = 0.2;
 }
 
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
-    // 关键修复（AI 说话说不全/好话说一半 · 尾包丢失）：
-    // processStreamText 遇到 streamDone 会直接 return，所以必须先把
-    // streamData（最后一个 \n 之后的尾字节）与 streamBuffer（无尾换行的残行）
-    // 刷完，再置 streamDone=YES。以往先置位再刷，尾包必被吞掉，
-    // 表现为每次都差最后几个字，且换 provider 更明显。
-    if (self.streamData.length > 0) {
-        NSString *tail = [[NSString alloc] initWithData:self.streamData encoding:NSUTF8StringEncoding];
-        if (tail.length > 0) {
-            [self processStreamText:tail];
-        }
-        [self.streamData setLength:0];
-    }
-    // 兜底：streamBuffer 里若仍有未以 \n 结尾的残行（内容最后一行或 data: [DONE] 无尾换行），
-    // 复制后清空 buffer，作为最后一个完整行解析一次，确保末尾 delta 刷出
-    if (self.streamBuffer.length > 0) {
-        NSString *tailLine = [self.streamBuffer copy];
-        [self.streamBuffer setString:@""];
-        [self processStreamLine:tailLine];
-    }
     self.streamDone = YES;
 
     void (^complete)(NSDictionary *, NSError *) = self.onComplete;
@@ -460,29 +395,25 @@ static const NSTimeInterval kChunkThrottleInterval = 0.2;
         return;
     }
 
-    // 流中间 error 事件（HTTP 200 但某 data 行是 {"error":...}）：按失败回传，
-    // AiAgent 会保留已流出的半句话并弹窗，避免静默早停。
-    if (self.streamErrorMessage.length > 0) {
-        [self flushPendingDelta];
-        NSError *streamError = [NSError errorWithDomain:@"AiAPIClient" code:102
-                                               userInfo:@{NSLocalizedDescriptionKey: self.streamErrorMessage}];
-        if (complete) {
-            dispatch_async(dispatch_get_main_queue(), ^{ complete(nil, streamError); });
+    // 处理末尾没有换行的最后一块字节（避免丢失最后几个字/整块结尾内容）
+    if (self.streamData.length > 0) {
+        NSString *tail = [[NSString alloc] initWithData:self.streamData encoding:NSUTF8StringEncoding];
+        if (tail.length > 0) {
+            [self processStreamText:tail];
         }
-        return;
+        [self.streamData setLength:0];
+    }
+    // 兜底：streamBuffer 里若仍有未以 \n 结尾的残行（内容最后一行或 data: [DONE] 无尾换行），
+    // 复制后清空 buffer，作为最后一个完整行解析一次，确保末尾 delta 刷出
+    if (self.streamBuffer.length > 0) {
+        NSString *tailLine = [self.streamBuffer copy];
+        [self.streamBuffer setString:@""];
+        [self processStreamLine:tailLine];
     }
     [self flushPendingDelta];
-    NSMutableDictionary *fullResponse = [NSMutableDictionary dictionary];
-    fullResponse[@"content"] = [self.fullResponseText copy] ?: @"";
-    if (self.fullReasoningText.length > 0) {
-        fullResponse[@"reasoning"] = [self.fullReasoningText copy];
-    }
-    // finish_reason 透给 AiAgent：length/content_filter 由 UI 追加截断提示
-    if (self.finishReason.length > 0) {
-        fullResponse[@"finish_reason"] = self.finishReason;
-    }
+    NSDictionary *fullResponse = @{@"content": [self.fullResponseText copy] ?: @""};
     if (complete) {
-        dispatch_async(dispatch_get_main_queue(), ^{ complete([fullResponse copy], nil); });
+        dispatch_async(dispatch_get_main_queue(), ^{ complete(fullResponse, nil); });
     }
 }
 

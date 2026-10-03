@@ -199,6 +199,16 @@ static const NSInteger kNewsPageSize = 24;
     self.title = NSLocalizedString(@"mc_news.title", @"Minecraft 新闻");
     self.view.backgroundColor = [UIColor systemBackgroundColor];
 
+    // ★ [LAND-BUG] 本页只由首页(MinecraftNews tile)以 UIModalPresentationPageSheet 整页弹出，
+    //   且原先没有设置任何 navigationItem（无关闭/返回）⇒ iPhone 上 PageSheet 铺满全屏时
+    //   只剩「下滑手势」这一条退出路径，横屏/无明显抓手时用户会认为「退不出去」。
+    //   在此补一个标准「关闭」按钮（与 AnnouncementListViewController 一致）。
+    UIBarButtonItem *landBugCloseItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemClose
+                                                                                      target:self
+                                                                                      action:@selector(landBugCloseTapped)];
+    landBugCloseItem.accessibilityLabel = @"关闭";
+    self.navigationItem.leftBarButtonItem = landBugCloseItem;
+
     // 适配自定义启动器背景
     [[BackgroundManager sharedManager] makeViewControllerTransparent:self];
 
@@ -456,6 +466,17 @@ static const NSInteger kNewsPageSize = 24;
 
 - (void)safariViewControllerDidFinish:(SFSafariViewController *)controller {
     [controller dismissViewControllerAnimated:YES completion:nil];
+}
+
+#pragma mark - ★ [LAND-BUG] 关闭
+
+- (void)landBugCloseTapped {
+    UINavigationController *nav = self.navigationController;
+    if (nav.presentingViewController) {
+        [nav dismissViewControllerAnimated:YES completion:nil];
+    } else {
+        [self dismissViewControllerAnimated:YES completion:nil];
+    }
 }
 
 @end

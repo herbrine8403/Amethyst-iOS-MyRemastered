@@ -9,7 +9,12 @@
 #include <execinfo.h>
 #include <fcntl.h>
 #include <libgen.h>
+// ★ [SHADER-SIGBUS] 崩溃归属取证需要：task_threads/thread_get_state/ARM_THREAD_STATE64
+// （取各线程 PC 做 dladdr 归属）与 uintptr_t/uint64_t。
+#include <mach/mach.h>
+#include <stdint.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +30,99 @@ void (*orig_abort)();
 void (*orig_exit)(int code);
 void* (*orig_dlopen)(const char* path, int mode);
 void* (*orig_dlsym)(void* handle, const char* name);
+
+// ★ [SHADER-SIGBUS] ==========================================================
+// 崩溃归属取证（native 侧）—— 让下一次真机日志直接给出答案，不用再猜。
+//
+// 背景：glslang 那一类崩溃是「dlopen 期静态初始化 SIGBUS → JVM os::abort →
+// 被 hooked_abort 接管」。此时：
+//   · hooked_abort 拿到的回溯是 *abort 自己的* 栈（信号处理上下文的帧指针链
+//     在 sigtramp 处断开，真正的故障帧不在链上）⇒ 回溯里的 dylib 是 libjvm，
+//     不是元凶；
+//   · latestlog 里的 "35s THREAD DUMP" 只有标题、没有线程栈
+//     ⇒「卡在哪个线程 / 归属哪个 dylib / 偏移多少」这份日志答不了。
+// 本块补上三件事（全部只读旁路，不改变任何既有行为）：
+//   ① 记录最后一个 dlopen/System.load 的目标路径
+//      —— dlopen 期崩溃的元凶就是这个镜像（真机上就是被解包到 home 的那份）；
+//   ② 记录 abort 线程的 名字 + 数值 id（与 JVM hs_err 的 tid 对齐）；
+//   ③ 遍历所有线程取 PC/FP，用 dladdr 归属成「dylib + 偏移 + 符号」，并标注
+//      该地址是否落在 JIT26 已 PrepareRegion 的匿名区（区分"JIT 区"与"真镜像"）。
+// 全部 malloc-free（只用 mach 调用 + dladdr + snprintf），与既有的
+// ame_write_fatal_trace 同一套纪律（heap 损坏场景下仍要能落盘）。
+// ============================================================================
+
+#define AME_DLOPEN_PATH_MAX 1024
+// 仅由 hooked_dlopen / hooked_dlopen_26_ppl 在分发前写入（单写多读，长度有限）。
+static char g_ame_lastDlopenPath[AME_DLOPEN_PATH_MAX];
+static volatile sig_atomic_t g_ame_lastDlopenSet = 0;
+
+void ame_record_dlopen_target(const char *path) {
+    if (path == NULL) return;
+    size_t n = strlen(path);
+    if (n >= AME_DLOPEN_PATH_MAX) n = AME_DLOPEN_PATH_MAX - 1;
+    memcpy(g_ame_lastDlopenPath, path, n);
+    g_ame_lastDlopenPath[n] = '\0';
+    g_ame_lastDlopenSet = 1;
+}
+
+static const char *ame_short_image_name(const char *full) {
+    if (full == NULL) return "(?)";
+    const char *s = strrchr(full, '/');
+    return s ? s + 1 : full;
+}
+
+// 所有线程的 PC 快照 → 「归属 dylib + 偏移 + 符号」+ JIT 区标注。
+// 返回写入字节数；任何一步失败都只是少几行，不抛不崩。
+static size_t ame_snapshot_all_threads(char *out, size_t cap) {
+    if (out == NULL || cap < 256) return 0;
+    size_t len = 0;
+#if defined(__arm64__) || defined(__aarch64__)
+    thread_act_array_t threads = NULL;
+    mach_msg_type_number_t count = 0;
+    if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS || threads == NULL) {
+        return (size_t)snprintf(out, cap, "  (task_threads failed -- no thread snapshot)\n");
+    }
+    unsigned shown = 0;
+    for (mach_msg_type_number_t i = 0; i < count; i++) {
+        if (shown >= 48 || len + 256 >= cap) break;
+        arm_thread_state64_t st;
+        mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
+        memset(&st, 0, sizeof(st));
+        if (thread_get_state(threads[i], ARM_THREAD_STATE64,
+                             (thread_state_t)&st, &sc) != KERN_SUCCESS) {
+            continue;
+        }
+        uint64_t pc = (uint64_t)arm_thread_state64_get_pc(st);
+        uint64_t lr = (uint64_t)arm_thread_state64_get_lr(st);
+        uint64_t tid = 0;
+        char tname[64] = {0};
+        pthread_t pt = pthread_from_mach_thread_np(threads[i]);
+        if (pt != NULL) {
+            pthread_threadid_np(pt, &tid);
+            pthread_getname_np(pt, tname, sizeof(tname));
+        }
+        Dl_info info;
+        memset(&info, 0, sizeof(info));
+        int ok = (pc != 0) ? dladdr((void *)(uintptr_t)pc, &info) : 0;
+        unsigned long long off = ok ? (unsigned long long)(pc - (uintptr_t)info.dli_fbase) : 0;
+        len += (size_t)snprintf(out + len, cap - len,
+            "  thread[%02u] id=%-10llu name=%-22s pc=%s+0x%llx sym=%s %s lr=0x%llx\n",
+            shown, (unsigned long long)tid,
+            tname[0] ? tname : "(unnamed)",
+            ok ? ame_short_image_name(info.dli_fname) : "(unknown-image)",
+            off,
+            (ok && info.dli_sname) ? info.dli_sname : "?",
+            JIT26AddressInPreparedRegion((const void *)(uintptr_t)pc) ? "[JIT-REGION]" : "",
+            (unsigned long long)lr);
+        shown++;
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)threads,
+                  (vm_size_t)(count * sizeof(thread_t)));
+#else
+    len += (size_t)snprintf(out, cap, "  (thread PC snapshot unsupported on this arch)\n");
+#endif
+    return len;
+}
 
 // Task 144：headless JVM（Forge/NeoForge 直装的 processors）执行期 exit 抑制。
 // 病历（装机 latestlog 20:42 会话，9aa15c8 构建）：Forge 处理器全部跑完、
@@ -218,7 +316,9 @@ void ame_write_fatal_trace(const char *reason) {
         return;
     }
 
-    static char report[16384];
+    // 16384 → 32768：★ [SHADER-SIGBUS] 追加了各线程 PC 快照（最多 48 行），
+    // 原容量在帧多时会截断归属块；单次 write(fd,…) 的写法不变。
+    static char report[32768];
     size_t len = 0;
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -241,14 +341,45 @@ void ame_write_fatal_trace(const char *reason) {
         Dl_info info;
         memset(&info, 0, sizeof(info));
         if (dladdr(frames[i], &info) && info.dli_fname) {
+            // ★ [SHADER-SIGBUS] 每帧标注归属 dylib + 偏移 + 符号 + 是否在 JIT 区
             len += (size_t)snprintf(report + len, sizeof(report) - len,
-                "  #%02d %p  %s  %s + %llu\n", i, frames[i],
+                "  #%02d %p  %s  %s + %llu %s\n", i, frames[i],
                 info.dli_fname,
                 info.dli_sname ? info.dli_sname : "?",
-                (unsigned long long)((uintptr_t)frames[i] - (uintptr_t)info.dli_fbase));
+                (unsigned long long)((uintptr_t)frames[i] - (uintptr_t)info.dli_fbase),
+                JIT26AddressInPreparedRegion(frames[i]) ? "[JIT-REGION]" : "");
         } else {
             len += (size_t)snprintf(report + len, sizeof(report) - len,
-                "  #%02d %p\n", i, frames[i]);
+                "  #%02d %p  <anonymous/JIT?>\n", i, frames[i]);
+        }
+    }
+
+    // ★ [SHADER-SIGBUS] 崩溃归属块：dlopen 目标 + 线程 id + 各线程 PC 归属。
+    //   为什么必须加：上面这段回溯是 *abort 自己* 的栈（信号处理上下文里帧指针
+    //   链在 sigtramp 处断开，真正的故障帧不在链上）；对 SIGBUS/dlopen 期静态
+    //   初始化这类崩溃，回溯里的 dylib 只会是 libjvm，元凶要靠"最后一个 dlopen
+    //   目标"和"各线程 PC 的 dladdr 归属"来指认。
+    //   exit(0)/exit(n) 的正常退出取证不含本块（避免刷无关线程快照）。
+    if (reason == NULL || strstr(reason, "exit(") == NULL) {
+        if (g_ame_lastDlopenSet) {
+            len += (size_t)snprintf(report + len, sizeof(report) - len,
+                "★ attribution: last dlopen/System.load target = %s\n"
+                "  (dlopen-time crash 的元凶通常就是这个镜像；home/tmp 下的就是"
+                "被解包出来的副本)\n", g_ame_lastDlopenPath);
+        } else {
+            len += (size_t)snprintf(report + len, sizeof(report) - len,
+                "★ attribution: no dlopen recorded before this abort\n");
+        }
+        uint64_t selfTid = 0;
+        pthread_threadid_np(NULL, &selfTid);
+        len += (size_t)snprintf(report + len, sizeof(report) - len,
+            "★ aborting thread: name=%s id=%llu\n",
+            tname[0] ? tname : "(unnamed)", (unsigned long long)selfTid);
+        if (len + 1024 < sizeof(report)) {
+            len += (size_t)snprintf(report + len, sizeof(report) - len,
+                "-- all-thread PC snapshot (pc → image+offset, [JIT-REGION] = "
+                "落在 JIT26 已 PrepareRegion 的匿名区) --\n");
+            len += ame_snapshot_all_threads(report + len, sizeof(report) - len);
         }
     }
 
@@ -401,6 +532,18 @@ void* hooked_dlopen(const char* path, int mode) {
         }
         return NULL;
     }
+    // ★ [SHADER-SIGBUS] 记录本次 dlopen/System.load 目标（崩溃归属用）。
+    //   必须在所有分发分支（含 musttail 尾返回）之前写入 —— 尾返回没有回头路，
+    //   只能在入口记。若随后在该 dlopen 内崩溃，fatal_trace 会直接点名这个镜像。
+    ame_record_dlopen_target(path);
+    if (path != NULL && strstr(path, "glslang") != NULL) {
+        // ★ [SHADER-SIGBUS] 判据行：glslang 到底从哪加载。
+        //   home/tmp 下的 libglslang_metallum.dylib = 从 jar 解包出的【未签名副本】
+        //   （dlopen 期静态初始化 SIGBUS 的温床）；
+        //   <app>/Frameworks/libglslang.dylib = 包里随 app 一起被 ad-hoc 签名的副本。
+        //   修好后这两行只应出现 Frameworks 那条。
+        NSLog(@"[Amethyst][SHADER-SIGBUS] dlopen(glslang) -> %s", path);
+    }
     // 同步自上游：非 TXM 的 iOS 26+ 设备需要硬件断点重定向（hooked_dlopen_26_ppl）
     BOOL shouldUseDyldBypass26PPL = NO;
     if (DeviceHasJITFlags(JIT_FLAG_FORCE_MIRRORED)) {
@@ -504,6 +647,8 @@ void *exception_handler(void *unused) {
 }
 
 void *hooked_dlopen_26_ppl(const char *path, int mode) {
+    // ★ [SHADER-SIGBUS] 同 hooked_dlopen：记录目标（本分支只在非 TXM 的 iOS 26+ 走）。
+    ame_record_dlopen_target(path);
     if (!excPort) {
         mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &excPort);
         mach_port_insert_right(mach_task_self(), excPort, excPort, MACH_MSG_TYPE_MAKE_SEND);

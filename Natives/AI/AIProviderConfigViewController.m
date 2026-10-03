@@ -52,6 +52,28 @@ NS_ASSUME_NONNULL_END
     [super viewWillAppear:animated];
     // 从编辑页返回后刷新（选中态 / 列表）
     [self.tableView reloadData];
+
+    // ★ [LAND-BUG] 本页会被「设置 ▸ AI ▸ 提供商配置」(LauncherPreferencesViewController:1167)
+    //   与 AI 会话页以模态 UINavigationController(root) 弹出；本页原先没有任何 navigationItem，
+    //   全屏模态下没有返回/关闭 ⇒ 退不出去。补一个左上「关闭」（pushed 进栈时不注入）。
+    UINavigationController *landBugNav = self.navigationController;
+    if (landBugNav.presentingViewController != nil && landBugNav.viewControllers.firstObject == self &&
+        self.navigationItem.leftBarButtonItem == nil) {
+        UIBarButtonItem *landBugCloseItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemClose
+                                                                                          target:self
+                                                                                          action:@selector(landBugCloseTapped)];
+        landBugCloseItem.accessibilityLabel = @"关闭";
+        self.navigationItem.leftBarButtonItem = landBugCloseItem;
+    }
+}
+
+- (void)landBugCloseTapped {
+    UINavigationController *nav = self.navigationController;
+    if (nav.presentingViewController) {
+        [nav dismissViewControllerAnimated:YES completion:nil];
+    } else {
+        [self dismissViewControllerAnimated:YES completion:nil];
+    }
 }
 
 - (void)setupTable {

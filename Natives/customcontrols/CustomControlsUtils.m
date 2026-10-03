@@ -135,10 +135,7 @@ void convertV1Layout(NSMutableDictionary* dict) {
         [btnDict removeObjectForKey:@"isRound"];
 
         // keycode -> keycodes[0]
-        // Task193/198：下载来的 v1 布局可能缺 keycode 字段，
-        // addObject:nil 会直接抛异常（加载仓库控件即崩）。
-        // integerValue 对 nil 返回 0，等价于"未绑定按键"，安全。
-        [keycodes addObject:@([btnDict[@"keycode"] integerValue])];
+        [keycodes addObject:btnDict[@"keycode"]];
         [btnDict removeObjectForKey:@"keycode"];
 
         // alt -> keycodes[i++]
@@ -171,36 +168,8 @@ void convertV1Layout(NSMutableDictionary* dict) {
     convertV2Layout(dict);
 }
 
-/// Task198：识别"v7 内容被误标为 version 1"。
-/// 病历：仓库里的控件种子布局其实是 v7 格式（keycodes 数组 + dynamicX/Y
-/// 表达式），却被标成 "version":"1.0"。照 V1 链转换的后果三重：
-///   - keycode 标量不存在 → 转出的 keycodes 全是 [0]（按键全失效）；
-///   - width/height 再被 scaledAt 除一次（v7 已是 dp）；
-///   - V2 阶段又把 dynamicX 覆盖成 "0.000000 * ${screen_width}"
-///     → 所有控件挤到左上角。
-/// 判据取强特征：v1 布局绝不会有 keycodes 数组（v1 只有标量 keycode），
-/// 因此命中即判 v7，不做任何转换。
-static BOOL ame198_isV7Mislabeled(NSMutableDictionary *dict) {
-    id list = dict[@"mControlDataList"];
-    if (![list isKindOfClass:NSArray.class]) return NO;
-    for (id obj in (NSArray *)list) {
-        if (![obj isKindOfClass:NSDictionary.class]) continue;
-        NSDictionary *b = (NSDictionary *)obj;
-        if ([b[@"keycodes"] isKindOfClass:NSArray.class]) return YES;
-    }
-    return NO;
-}
-
 BOOL convertLayoutIfNecessary(NSMutableDictionary* dict) {
     int version = [dict[@"version"] intValue];
-    // Task198：v7 误标救援（见 ame198_isV7Mislabeled 病历）。
-    if (version <= 1 && ame198_isV7Mislabeled(dict)) {
-        NSLog(@"[CustomControls] Task198: layout declared v%d but carries v7 "
-              @"keycodes arrays -- treating as v7 (V1 conversion skipped; "
-              @"buttons would otherwise all collapse to the top-left corner)",
-              version);
-        version = 7;
-    }
     switch (version) {
         case 0:
         case 1:

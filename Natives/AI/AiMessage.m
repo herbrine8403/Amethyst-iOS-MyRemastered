@@ -46,10 +46,6 @@
         _isToolCall = NO;
         _isToolResult = NO;
         _toolSucceeded = YES;
-        _toolRunning = NO;
-        _reasoning = nil;
-        _reasoningExpanded = NO;
-        _incomplete = NO;
     }
     return self;
 }
@@ -66,9 +62,6 @@
     if ([dict[@"isToolCall"] isKindOfClass:[NSNumber class]]) _isToolCall = [dict[@"isToolCall"] boolValue];
     if ([dict[@"isToolResult"] isKindOfClass:[NSNumber class]]) _isToolResult = [dict[@"isToolResult"] boolValue];
     if ([dict[@"toolSucceeded"] isKindOfClass:[NSNumber class]]) _toolSucceeded = [dict[@"toolSucceeded"] boolValue];
-    if ([dict[@"reasoning"] isKindOfClass:[NSString class]]) _reasoning = dict[@"reasoning"];
-    if ([dict[@"incomplete"] isKindOfClass:[NSNumber class]]) _incomplete = [dict[@"incomplete"] boolValue];
-    // toolRunning / reasoningExpanded / streaming 均为运行时标记，不恢复
     // 时间戳（可选）
     NSNumber *ts = dict[@"createdAt"];
     if ([ts isKindOfClass:[NSNumber class]]) {
@@ -90,8 +83,6 @@
     if (self.isToolResult) dict[@"isToolResult"] = @YES;
     // 仅写出失败态，成功（默认值）不写，兼容旧版
     if (!self.toolSucceeded) dict[@"toolSucceeded"] = @NO;
-    if (self.reasoning.length > 0) dict[@"reasoning"] = self.reasoning;
-    if (self.incomplete) dict[@"incomplete"] = @YES;
     return [dict copy];
 }
 

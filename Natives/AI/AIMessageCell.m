@@ -29,13 +29,6 @@ static const CGFloat kMsgCornerRadius = 12.0;
 @property (nonatomic, strong) UITextView *contentTextView;
 @property (nonatomic, strong) UIView *toolCardView;
 @property (nonatomic, strong) UILabel *toolCardLabel;
-/// 思考过程折叠标签（助手消息有 reasoning 时显示在气泡顶部，点击展开/收起）
-@property (nonatomic, strong) UILabel *reasoningLabel;
-/// 正文顶部约束（无思考块时贴气泡顶 / 有思考块时接思考标签底部，二选一激活）
-@property (nonatomic, strong) NSLayoutConstraint *contentTopPlain;
-@property (nonatomic, strong) NSLayoutConstraint *contentTopWithReasoning;
-/// 当前渲染的消息（供思考块点击回调）
-@property (nonatomic, strong, nullable) AiMessage *currentMessage;
 @end
 
 @implementation AIMessageCell
@@ -64,31 +57,9 @@ static const CGFloat kMsgCornerRadius = 12.0;
         self.contentTextView.textContainer.lineFragmentPadding = 0;
         [self.bubbleView addSubview:self.contentTextView];
 
-        // 思考过程折叠标签：默认隐藏，有 reasoning 的助手消息才显示
-        self.reasoningLabel = [[UILabel alloc] init];
-        self.reasoningLabel.translatesAutoresizingMaskIntoConstraints = NO;
-        self.reasoningLabel.font = [UIFont systemFontOfSize:12.0];
-        self.reasoningLabel.textColor = [UIColor secondaryLabelColor];
-        self.reasoningLabel.numberOfLines = 1;
-        self.reasoningLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-        self.reasoningLabel.hidden = YES;
-        self.reasoningLabel.userInteractionEnabled = YES;
-        [self.bubbleView addSubview:self.reasoningLabel];
-        [NSLayoutConstraint activateConstraints:@[
-            [self.reasoningLabel.topAnchor constraintEqualToAnchor:self.bubbleView.topAnchor constant:kMsgBubblePadding - 2],
-            [self.reasoningLabel.leadingAnchor constraintEqualToAnchor:self.bubbleView.leadingAnchor constant:kMsgBubblePadding],
-            [self.reasoningLabel.trailingAnchor constraintEqualToAnchor:self.bubbleView.trailingAnchor constant:-kMsgBubblePadding],
-        ]];
-        UITapGestureRecognizer *reasonTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(reasoningTapped)];
-        [self.reasoningLabel addGestureRecognizer:reasonTap];
-
         // 约束：文本顶/左/右贴气泡内边距，从内容尺寸撑起气泡高度（不主动撑起）
-        // 有思考块时正文改接思考标签底部（contentTopWithReasoning），二选一激活
-        self.contentTopPlain = [self.contentTextView.topAnchor constraintEqualToAnchor:self.bubbleView.topAnchor constant:kMsgBubblePadding];
-        self.contentTopWithReasoning = [self.contentTextView.topAnchor constraintEqualToAnchor:self.reasoningLabel.bottomAnchor constant:6.0];
-        self.contentTopWithReasoning.active = NO;
         [NSLayoutConstraint activateConstraints:@[
-            self.contentTopPlain,
+            [self.contentTextView.topAnchor constraintEqualToAnchor:self.bubbleView.topAnchor constant:kMsgBubblePadding],
             [self.contentTextView.leadingAnchor constraintEqualToAnchor:self.bubbleView.leadingAnchor constant:kMsgBubblePadding],
             [self.contentTextView.trailingAnchor constraintEqualToAnchor:self.bubbleView.trailingAnchor constant:-kMsgBubblePadding],
             [self.contentTextView.bottomAnchor constraintEqualToAnchor:self.bubbleView.bottomAnchor constant:-kMsgBubblePadding],
@@ -152,25 +123,6 @@ static const CGFloat kMsgCornerRadius = 12.0;
     self.toolCardView.hidden = YES;
     self.bubbleView.hidden = NO;
     BOOL isUser = [message.role isEqualToString:@"user"];
-    self.currentMessage = message;
-    // 思考过程折叠块：仅助手消息且有 reasoning 时显示（工具结果卡片已提前返回，不影响）
-    BOOL showReasoning = !isUser && message.reasoning.length > 0;
-    if (showReasoning) {
-        self.reasoningLabel.hidden = NO;
-        self.reasoningLabel.numberOfLines = message.reasoningExpanded ? 0 : 1;
-        if (message.reasoningExpanded) {
-            self.reasoningLabel.text = message.reasoning;
-        } else {
-            self.reasoningLabel.text = [NSString stringWithFormat:@"💭 思考过程（%lu字）· 点击展开",
-                                        (unsigned long)message.reasoning.length];
-        }
-        self.contentTopPlain.active = NO;
-        self.contentTopWithReasoning.active = YES;
-    } else {
-        self.reasoningLabel.hidden = YES;
-        self.contentTopWithReasoning.active = NO;
-        self.contentTopPlain.active = YES;
-    }
     // 工具调用消息与 AI 的话共存：气泡显示 AI 文本并附加工具调用提示
     NSString *content = message.isToolCall ? [[self class] displayContentForMessage:message] : (message.content ?: @"");
     UIColor *contentColor = [UIColor labelColor];
@@ -232,48 +184,16 @@ static const CGFloat kMsgCornerRadius = 12.0;
     }
 }
 
-/// 思考块点击：交由 VC 翻转展开态并刷新该行
-- (void)reasoningTapped {
-    if (self.onReasoningToggle && self.currentMessage) {
-        self.onReasoningToggle(self.currentMessage);
-    }
-}
-
-- (void)prepareForReuse {
-    [super prepareForReuse];
-    self.currentMessage = nil;
-    self.onReasoningToggle = nil;
-    self.reasoningLabel.hidden = YES;
-    self.contentTopWithReasoning.active = NO;
-    self.contentTopPlain.active = YES;
-}
-
 #pragma mark - 工具卡片文本
 
-/// 工具调用消息用于气泡显示的内容：AI 的话 + 工具调用状态行（共存）
+/// 工具调用消息用于气泡显示的内容：AI 的话 + 工具调用提示（共存）
 + (NSString *)displayContentForMessage:(AiMessage *)message {
     if (message.isToolCall) {
-        NSString *base = message.content ?: @"";
+        NSString *base = message.content.length > 0 ? message.content : @"（正在调用工具…）";
         // 关键修复（工具名显示 call_00_...）：toolName 缺失时显示通用"工具"，
         // 绝不用 toolCallID（形如 call_xxx 的一串 id）顶替真实工具名
         NSString *name = message.toolName.length > 0 ? message.toolName : @"工具";
-        NSString *state = message.toolRunning ? @"正在调用" : @"已调用";
-        NSMutableString *s = [NSMutableString string];
-        if (base.length > 0) {
-            [s appendString:base];
-            [s appendString:@"\n\n"];
-        }
-        [s appendFormat:@"⚙️ %@：%@", state, name];
-        // 参数预览（截断拼单行，避免长 JSON 撑爆气泡）
-        if (message.toolArguments.length > 0) {
-            NSString *args = [[message.toolArguments componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]
-                              componentsJoinedByString:@" "];
-            if (args.length > 80) args = [[args substringToIndex:80] stringByAppendingString:@"…"];
-            [s appendFormat:@"（%@）", args];
-        } else if (base.length == 0) {
-            [s appendString:@"…"];
-        }
-        return [s copy];
+        return [base stringByAppendingFormat:@"\n\n⚙️ 工具：%@", name];
     }
     return message.content ?: @"";
 }
@@ -338,21 +258,6 @@ static const CGFloat kMsgCornerRadius = 12.0;
     CGFloat textHeight = ceil(textSize.height);
     if (textHeight < 20) textHeight = 20;
     CGFloat total = textHeight + 2 * kMsgBubblePadding + 2 * kMsgVerticalPadding;
-    // 思考折叠块高度（与 configure 渲染一致：12pt，收起 1 行 + 6 间距，展开按全文估算）
-    if (!isUser && !message.isToolResult && message.reasoning.length > 0) {
-        CGFloat reasoningHeight;
-        if (message.reasoningExpanded) {
-            UIFont *rFont = [UIFont systemFontOfSize:12.0];
-            CGRect rr = [message.reasoning boundingRectWithSize:CGSizeMake(textWidth, CGFLOAT_MAX)
-                                                       options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingUsesFontLeading
-                                                    attributes:@{NSFontAttributeName: rFont}
-                                                       context:nil];
-            reasoningHeight = ceil(rr.size.height);
-        } else {
-            reasoningHeight = ceil([UIFont systemFontOfSize:12.0].lineHeight);
-        }
-        total += reasoningHeight + 6.0;
-    }
     return MAX(total, 48.0);
 }
 

@@ -16,9 +16,6 @@ NS_ASSUME_NONNULL_BEGIN
 
 + (instancetype)sharedAgent;
 
-/// 当前是否有进行中的请求（供 UI 判断是否可显示"继续生成"等）
-@property (nonatomic, readonly) BOOL running;
-
 /// 发送一条用户消息，驱动流式回复
 /// @param text 用户输入
 /// @param session 目标会话（会就地追加用户消息与助手占位消息）
@@ -35,17 +32,6 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// 取消当前进行的请求（供停止按钮）
 - (void)stopCurrent;
-
-/// 从上一条未完成回复处继续生成（截断续写/中断恢复；不追加用户消息，直接以现有历史开新一轮）
-/// @param session 目标会话（就地追加新的助手占位消息）
-- (void)continueGenerationInSession:(AiSession *)session
-                           provider:(AiProvider *)provider
-                       chunkHandler:(void (^)(NSString *partial))chunkHandler
-                 completionHandler:(void (^)(NSError *error))completionHandler;
-
-/// token 粗估（ASCII≈0.25/字，其余≈1/字，单条+4开销；仅用于配额显示与压缩触发，非精确计费）
-+ (NSUInteger)estimatedTokensForText:(nullable NSString *)text;
-+ (NSUInteger)estimatedTokensForMessages:(NSArray<AiMessage *> *)messages;
 
 @end
 

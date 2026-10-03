@@ -102,7 +102,89 @@ NSError* saveJSONToFile(NSDictionary *dict, NSString *path) {
     return nil;
 }
 
+// ★ [LANG-SWITCH] 启动器界面语言覆盖：持久化键。
+// 刻意与系统的 AppleLanguages 分开——那是全局键，会牵动 App 内所有 bundle 的语言
+// 选择，也不适合作为「跟随系统 / 指定语言」这种应用内偏好的保存位置。
+NSString * const AmeLauncherLanguageDefaultsKey = @"ame_launcher_language";
+
+// ★ [LANG-SWITCH] 读取用户选择；空串与 nil 一律视为「跟随系统」。
+NSString *AmeLauncherPreferredLanguageOverride(void) {
+    NSString *code = [[NSUserDefaults standardUserDefaults] stringForKey:AmeLauncherLanguageDefaultsKey];
+    return (code.length > 0) ? code : nil;
+}
+
+// ★ [LANG-SWITCH] 写入/清除覆盖。code 为 nil 或空串时清除（回到跟随系统）。
+void AmeLauncherSetPreferredLanguageOverride(NSString *code) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    if (code.length > 0) {
+        [defaults setObject:code forKey:AmeLauncherLanguageDefaultsKey];
+    } else {
+        [defaults removeObjectForKey:AmeLauncherLanguageDefaultsKey];
+    }
+    [defaults synchronize];
+}
+
+// ★ [LANG-SWITCH] 语言代码 → 人读显示名，用系统当前语言本地化（NSLocale）：
+// 例如系统为中文时 zh-Hans → 「简体中文」，系统为英文时 → 「Chinese, Simplified」。
+NSString *AmeLauncherDisplayNameForLanguageCode(NSString *code) {
+    if (code.length == 0) return @"";
+    NSLocale *displayLocale = [NSLocale currentLocale];
+    NSString *name = [displayLocale localizedStringForLanguageCode:code];
+    return name.length > 0 ? name : code;
+}
+
+// ★ [LANG-SWITCH] 自动枚举 App 包里实际存在的 .lproj（不手写死清单）：
+// 构建时 `cp -R Natives/resources/*` 会把各 <lang>.lproj 拷进 bundle，
+// 这里以资源目录为准；只保留确实带 Localizable.strings 的语言，避免列出空壳目录。
+NSArray<NSString *> *AmeLauncherAvailableLanguageCodes(void) {
+    NSMutableArray<NSString *> *codes = [NSMutableArray array];
+    NSString *resourcePath = [NSBundle mainBundle].resourcePath;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *entry in [fm contentsOfDirectoryAtPath:resourcePath error:nil]) {
+        if (![entry.pathExtension isEqualToString:@"lproj"]) continue;
+        NSString *code = [entry stringByDeletingPathExtension];
+        if (code.length == 0 || [code isEqualToString:@"Base"]) continue;
+        NSString *stringsPath = [resourcePath stringByAppendingPathComponent:
+                                 [entry stringByAppendingPathComponent:@"Localizable.strings"]];
+        if (![fm fileExistsAtPath:stringsPath]) continue;
+        [codes addObject:code];
+    }
+    // 按系统语言下的显示名排序，列表更符合直觉。
+    [codes sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+        return [AmeLauncherDisplayNameForLanguageCode(a) localizedCaseInsensitiveCompare:
+                AmeLauncherDisplayNameForLanguageCode(b)];
+    }];
+    return codes;
+}
+
+// ★ [LANG-SWITCH] 缓存当前覆盖语言对应的 lproj bundle，避免每次取词都查磁盘。
+// 语言变更时（键值不同）自动重建，所以切换语言无需重启即可生效。
+static NSString *sAmeLocalizedLangCode = nil;
+static NSBundle *sAmeLocalizedLangBundle = nil;
+
 NSString* localize(NSString* key, NSString* comment) {
+    // ★ [LANG-SWITCH] 优先使用用户在「设置 > 语言」里选择的语言包（自定义键持久化）。
+    // 取不到（未设置 / 资源缺失 / 该 key 在目标语言里没定义）再回退下面的原有逻辑。
+    NSString *override = AmeLauncherPreferredLanguageOverride();
+    if (override.length > 0) {
+        if (![override isEqualToString:sAmeLocalizedLangCode]) {
+            NSString *path = [[NSBundle mainBundle] pathForResource:override ofType:@"lproj"];
+            sAmeLocalizedLangCode = override;
+            sAmeLocalizedLangBundle = path ? [NSBundle bundleWithPath:path] : nil;
+        }
+        if (sAmeLocalizedLangBundle) {
+            NSString *overridden = [sAmeLocalizedLangBundle localizedStringForKey:key value:nil table:nil];
+            if (overridden && ![overridden isEqualToString:key]) {
+                return overridden;
+            }
+        }
+    } else {
+        // 跟随系统：清掉覆盖缓存，保证下次选择语言时重新建包。
+        sAmeLocalizedLangCode = nil;
+        sAmeLocalizedLangBundle = nil;
+    }
+
+    // —— 以下为原有回退逻辑（未改动语义）——
     NSString *value = NSLocalizedString(key, nil);
     if (![NSLocale.preferredLanguages[0] isEqualToString:@"en"] && [value isEqualToString:key]) {
         NSString* path = [NSBundle.mainBundle pathForResource:@"en" ofType:@"lproj"];
@@ -185,6 +267,25 @@ void* JIT26CreateRegionLegacy(size_t len) {
     asm("brk #0x69 \n"
         "ret");
 }
+// ★ [POCKETJ-JIT] Universal JIT 协议第 0 号调用:显式请求调试器脱离。
+//   参考:EricoEC/PocketJLauncher · Vendor/StikJIT/Resources/universal.js(commands[0])
+//   与 Vendor/StikJIT/INTEGRATION.md「Implement the universal protocol」给出的签名:
+//     void JIT26Detach(void) { mov x16, #0; brk #0xf00d; ret }
+//   x16=0 ⇒ universal.js 的 JIT26Detach() ⇒ 向 debugserver 发 "D" 并结束脚本循环。
+//   ⚠ 调用时机(INTEGRATION.md 强制):必须先对【所有】初始 RX 区完成
+//     JIT26PrepareRegion、建好可写别名,再调本函数;脚本一旦脱离,后加入的 RX 区
+//     就无法再被服务。本仓库现有启动流程靠 universal.js 的 detachAfterFirstBr
+//     在 dyld 补丁阶段的 JIT26PrepareRegion / JIT26PrepareRegionForPatching 之后
+//     隐式脱离,故这里只补齐协议原语,不在启动路径上另加调用点 —— 擅自提前脱离会让
+//     后续 brk 落在"无人服务"的窗口里,从而整体降级(★ [JIT-NOCRASH] 起,各调用
+//     点已走 Safe 包装,不再硬崩,但 JIT 功能会因此退化)。详见
+//     Natives/pocketj_jit/PORTING_NOTES.md。
+__attribute__((noinline,optnone,naked))
+void JIT26Detach(void) {
+    asm("mov x16, #0 \n"
+        "brk #0xf00d \n"
+        "ret");
+}
 __attribute__((noinline,optnone,naked))
 void* JIT26PrepareRegion(void *addr, size_t len) {
     asm("mov x16, #1 \n"
@@ -214,42 +315,390 @@ void JIT26SendJITScript(NSString* script) {
     BreakSendJITScript((char*)script.UTF8String, script.length);
 }
 
-// brk #0x69 无人应答时的 SIGTRAP 安全网：裸函数会直接致死（议题 #133
-// "开启 JIT 后闪退"），这里在调用窗口内捕获并返回 NULL，把必死崩溃转成
-// 调用方的优雅报错；调试器正常应答时走调试器例外端口/ptrace，本处理器
-// 不会被触发，行为不变。
-static sigjmp_buf g_jit26TrapEnv;
-static volatile sig_atomic_t g_jit26TrapArmed = 0;
+// ★ [JIT-NOCRASH] ============================================================
+// JIT26 brk 协议的统一 SIGTRAP 安全网
+//
+// universal 协议的每一步都靠 `brk` 与调试器握手（legacy 建区为 brk #0x69；其余
+// 全部为 brk #0xf00d）。**调试器未就岗时执行 brk ⇒ SIGTRAP ⇒ 进程直接死**，
+// 连"优雅放弃"的机会都没有（议题 #133「开启 JIT 后闪退」）。这里在调用窗口内
+// 布一层 SIGTRAP handler + sigsetjmp/siglongjmp：无人应答时把"必死崩溃"转成
+// "函数返回失败/降级"，由调用方跳过该步；调试器在岗时 brk 由调试器例外端口/
+// ptrace 现场服务（Mach 例外优先于信号转换），本 handler 根本不会触发，成功
+// 路径与裸调用逐字节一致 —— 安全网只在"无人应答"时兜底，不干扰正常 JIT。
+//
+// 嵌套/可重入（硬约束 5）：裸协议函数全是叶子（naked asm，只 brk+ret，不再调用
+// 别人），单次窗口不会自嵌套；但调用方可能嵌套（外层窗口未退出时又走进另一个
+// [JIT-NOCRASH] 包装）。旧的单缓冲 g_jit26TrapEnv 一旦被内层 sigsetjmp 覆盖，
+// 外层的 siglongjmp 目标即失效 —— 故这里改成【按深度索引的 sigjmp_buf 槽位
+// 栈】：第 0 层复用 g_jit26TrapEnv（保留旧名），更深层用 g_jit26TrapNestEnv[]；
+// handler 永远跳到最内层活动窗口，最内层在跳回后把 depth 回退到自己的槽位，
+// 外层窗口继续存活。g_jit26TrapArmed 保留为"是否有窗口在等 brk 应答"的兼容标志。
+// ============================================================================
+#define JIT26_TRAP_MAX_DEPTH 8
+
+static sigjmp_buf g_jit26TrapEnv;                            // 第 0 层窗口缓冲（复用旧名）
+static sigjmp_buf g_jit26TrapNestEnv[JIT26_TRAP_MAX_DEPTH];  // 更深层窗口槽位
+static volatile sig_atomic_t g_jit26TrapDepth = 0;           // 活动窗口层数（0=未布网）
+static volatile sig_atomic_t g_jit26TrapArmed = 0;           // 兼容标志：>0 即有窗口在等 brk
+
+// 取 depth 对应的窗口缓冲。返回值恒非 NULL（depth 已被 push/pop 约束在 [0,MAX)）。
+static sigjmp_buf *JIT26TrapSlotForDepth(int depth) {
+    if (depth <= 0) return &g_jit26TrapEnv;
+    if (depth < JIT26_TRAP_MAX_DEPTH) return &g_jit26TrapNestEnv[depth];
+    return &g_jit26TrapNestEnv[JIT26_TRAP_MAX_DEPTH - 1];
+}
 
 static void JIT26TrapCatch(int sig) {
-    if (!g_jit26TrapArmed) {
+    if (!g_jit26TrapArmed || g_jit26TrapDepth <= 0) {
         // 不属于本安全网的 SIGTRAP：恢复默认语义原样致死，不吞异常
         signal(sig, SIG_DFL);
         raise(sig);
         return;
     }
-    g_jit26TrapArmed = 0;
-    siglongjmp(g_jit26TrapEnv, 1);
+    // 跳到最内层活动窗口；depth 与 sigaction 由该窗口自己回退。
+    sigjmp_buf *env = JIT26TrapSlotForDepth((int)g_jit26TrapDepth - 1);
+    siglongjmp(*env, 1);
 }
 
-void* JIT26CreateRegionLegacySafe(size_t len) {
-    struct sigaction sa, oldsa;
+// 进入窗口：安装 handler、登记本层槽位。返回本层索引；<0 = 深度超限无法布网，
+// 调用方【必须】据此直接降级，绝不能再调用裸 brk 函数。
+static int JIT26TrapWindowPush(struct sigaction *oldsa, sigjmp_buf **outEnv) {
+    struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = JIT26TrapCatch;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_NODEFER;
-    sigaction(SIGTRAP, &sa, &oldsa);
+    if (oldsa) memset(oldsa, 0, sizeof(*oldsa));   // sigaction 万一失败也不回装垃圾
+    sigaction(SIGTRAP, &sa, oldsa);
 
-    void *result = NULL;
-    if (sigsetjmp(g_jit26TrapEnv, 1) == 0) {
-        g_jit26TrapArmed = 1;
-        result = JIT26CreateRegionLegacy(len);
+    int idx = (int)g_jit26TrapDepth;
+    if (idx < 0 || idx >= JIT26_TRAP_MAX_DEPTH) {
+        sigaction(SIGTRAP, oldsa, NULL);   // 回滚，保持环境原样
+        if (outEnv) *outEnv = NULL;
+        return -1;
+    }
+    if (outEnv) *outEnv = JIT26TrapSlotForDepth(idx);
+    g_jit26TrapDepth = idx + 1;
+    g_jit26TrapArmed = 1;
+    return idx;
+}
+
+// 退出窗口：把 depth 回退到本层（处理"从 handler 跳回时更内层已被解开"的情形），
+// 恢复原 SIGTRAP 处置。idx<0（未曾布网成功）时不动 depth。
+static void JIT26TrapWindowPop(int idx, struct sigaction *oldsa) {
+    if (idx >= 0 && g_jit26TrapDepth > idx) {
+        g_jit26TrapDepth = idx;
+    }
+    if (g_jit26TrapDepth <= 0) {
         g_jit26TrapArmed = 0;
+    }
+    sigaction(SIGTRAP, oldsa, NULL);
+}
+
+// 布网失败（深度超限）时的统一降级日志。
+static void JIT26LogWindowOverflow(const char *op) {
+    NSLog(@"[JIT26] [JIT-NOCRASH] %s: trap-window depth overflow (%d) -- skipping raw brk (degrade)",
+          op, (int)JIT26_TRAP_MAX_DEPTH);
+}
+
+// ★ [SHADER-SIGBUS] ============================================================
+// 已 PrepareRegion 的 JIT 区登记表（纯旁路：只记录，不改变任何行为）。
+//
+// 为什么需要：SIGBUS 那一类崩溃的归属判定卡在"地址落在匿名 JIT 区"还是
+// "落在真实 dylib 镜像"上（上一轮只有 `pc − region_base == dylib 偏移` 这一
+// 条算式，两种解释都成立）。这张表让崩溃取证能直接标注每一帧的类别。
+// 容量 32 已远超实际（启动期 PrepareRegion 调用不超过十余次）；满了就丢弃
+// 最早的记录并计数，绝不分配内存（崩溃路径只读，写入点也在 JIT 握手路径上）。
+// ============================================================================
+#define JIT26_REGION_MAX 32
+static struct { void *addr; size_t len; } g_jit26PreparedRegions[JIT26_REGION_MAX];
+static volatile sig_atomic_t g_jit26PreparedCount = 0;   // 已登记条数（<= MAX）
+static volatile sig_atomic_t g_jit26PreparedDropped = 0; // 溢出丢弃计数
+
+void JIT26RecordPreparedRegion(void *addr, size_t len) {
+    if (addr == NULL || len == 0) return;
+    int n = (int)g_jit26PreparedCount;
+    if (n < 0) n = 0;
+    if (n >= JIT26_REGION_MAX) {
+        g_jit26PreparedDropped = (sig_atomic_t)(g_jit26PreparedDropped + 1);
+        return;
+    }
+    g_jit26PreparedRegions[n].addr = addr;
+    g_jit26PreparedRegions[n].len  = len;
+    g_jit26PreparedCount = (sig_atomic_t)(n + 1);
+}
+
+BOOL JIT26AddressInPreparedRegion(const void *p) {
+    uintptr_t a = (uintptr_t)p;
+    int n = (int)g_jit26PreparedCount;
+    if (n > JIT26_REGION_MAX) n = JIT26_REGION_MAX;
+    for (int i = 0; i < n; i++) {
+        uintptr_t base = (uintptr_t)g_jit26PreparedRegions[i].addr;
+        uintptr_t end  = base + g_jit26PreparedRegions[i].len;
+        if (a >= base && a < end) return YES;
+    }
+    return NO;
+}
+
+// brk #0x69（legacy 建区）安全网：无人应答返回 NULL；调试器在岗返回裸函数值。
+void* JIT26CreateRegionLegacySafe(size_t len) {
+    struct sigaction oldsa;
+    sigjmp_buf *env = NULL;
+    int idx = JIT26TrapWindowPush(&oldsa, &env);
+    if (idx < 0) {
+        JIT26LogWindowOverflow("JIT26CreateRegionLegacySafe");
+        return NULL;
+    }
+    void *result = NULL;
+    if (sigsetjmp(*env, 1) == 0) {
+        result = JIT26CreateRegionLegacy(len);
     } else {
+        NSLog(@"[JIT26] [JIT-NOCRASH] brk #0x69 NOT serviced (no debugger) -- degraded, returning NULL");
         result = NULL;
     }
-    sigaction(SIGTRAP, &oldsa, NULL);
+    JIT26TrapWindowPop(idx, &oldsa);
     return result;
+}
+
+// ★ [POCKETJ-JIT] brk #0xf00d cmd=0（显式请求调试器脱离）安全网：与
+//   JIT26CreateRegionLegacySafe 同款。调试器已脱离时 brk 无人应答，捕获后返回
+//   NO 而不使进程致死；调试器在岗时 brk 由调试器例外端口服务，行为与裸函数一致。
+BOOL JIT26DetachSafe(void) {
+    struct sigaction oldsa;
+    sigjmp_buf *env = NULL;
+    int idx = JIT26TrapWindowPush(&oldsa, &env);
+    if (idx < 0) {
+        JIT26LogWindowOverflow("JIT26DetachSafe");
+        return NO;
+    }
+    BOOL serviced = YES;
+    if (sigsetjmp(*env, 1) == 0) {
+        JIT26Detach();
+    } else {
+        NSLog(@"[JIT26] [JIT-NOCRASH] brk #0xf00d(cmd=0 detach) NOT serviced -- degraded");
+        serviced = NO;
+    }
+    JIT26TrapWindowPop(idx, &oldsa);
+    return serviced;
+}
+
+// ★ [JIT-NOCRASH] brk #0xf00d cmd=1（准备可写别名）安全网。裸函数返回值无调用方
+//   使用，这里只报"是否被调试器服务"；降级返回 NO。
+BOOL JIT26PrepareRegionSafe(void *addr, size_t len) {
+    struct sigaction oldsa;
+    sigjmp_buf *env = NULL;
+    int idx = JIT26TrapWindowPush(&oldsa, &env);
+    if (idx < 0) {
+        JIT26LogWindowOverflow("JIT26PrepareRegionSafe");
+        return NO;
+    }
+    BOOL serviced = YES;
+    if (sigsetjmp(*env, 1) == 0) {
+        (void)JIT26PrepareRegion(addr, len);
+        // ★ [SHADER-SIGBUS] 登记本区（只记录），供崩溃取证区分"匿名 JIT 区"与"真实 dylib"。
+        JIT26RecordPreparedRegion(addr, len);
+        NSDebugLog(@"[JIT26] [JIT-NOCRASH] PrepareRegion serviced (addr=%p len=%lu)", addr, (unsigned long)len);
+    } else {
+        NSLog(@"[JIT26] [JIT-NOCRASH] brk #0xf00d(cmd=1 PrepareRegion) NOT serviced -- degraded");
+        serviced = NO;
+    }
+    JIT26TrapWindowPop(idx, &oldsa);
+    return serviced;
+}
+
+// ★ [JIT-NOCRASH] brk #0xf00d cmd=4（小区域、保留内容）安全网；降级返回 NO。
+BOOL JIT26PrepareRegionForPatchingSafe(void *addr, size_t len) {
+    struct sigaction oldsa;
+    sigjmp_buf *env = NULL;
+    int idx = JIT26TrapWindowPush(&oldsa, &env);
+    if (idx < 0) {
+        JIT26LogWindowOverflow("JIT26PrepareRegionForPatchingSafe");
+        return NO;
+    }
+    BOOL serviced = YES;
+    if (sigsetjmp(*env, 1) == 0) {
+        JIT26PrepareRegionForPatching(addr, len);
+        // ★ [SHADER-SIGBUS] 同 PrepareRegionSafe：登记本区供崩溃取证。
+        JIT26RecordPreparedRegion(addr, len);
+        NSDebugLog(@"[JIT26] [JIT-NOCRASH] PrepareRegionForPatching serviced (addr=%p len=%lu)", addr, (unsigned long)len);
+    } else {
+        NSLog(@"[JIT26] [JIT-NOCRASH] brk #0xf00d(cmd=4 PrepareRegionForPatching) NOT serviced -- degraded");
+        serviced = NO;
+    }
+    JIT26TrapWindowPop(idx, &oldsa);
+    return serviced;
+}
+
+// ★ [JIT-NOCRASH] brk #0xf00d cmd=2（下发 UniversalJIT26 script）安全网；降级返回 NO。
+BOOL JIT26SendJITScriptSafe(NSString *script) {
+    if (script == nil) {
+        NSLog(@"[JIT26] [JIT-NOCRASH] SendJITScript skipped: script is nil");
+        return NO;
+    }
+    struct sigaction oldsa;
+    sigjmp_buf *env = NULL;
+    int idx = JIT26TrapWindowPush(&oldsa, &env);
+    if (idx < 0) {
+        JIT26LogWindowOverflow("JIT26SendJITScriptSafe");
+        return NO;
+    }
+    BOOL serviced = YES;
+    if (sigsetjmp(*env, 1) == 0) {
+        JIT26SendJITScript(script);
+        NSDebugLog(@"[JIT26] [JIT-NOCRASH] SendJITScript serviced");
+    } else {
+        NSLog(@"[JIT26] [JIT-NOCRASH] brk #0xf00d(cmd=2 SendJITScript) NOT serviced -- degraded");
+        serviced = NO;
+    }
+    JIT26TrapWindowPop(idx, &oldsa);
+    return serviced;
+}
+
+// ★ [JIT-NOCRASH] brk #0xf00d cmd=3（首次 brk 后是否自动脱离）安全网；降级返回 NO。
+BOOL JIT26SetDetachAfterFirstBrSafe(BOOL value) {
+    struct sigaction oldsa;
+    sigjmp_buf *env = NULL;
+    int idx = JIT26TrapWindowPush(&oldsa, &env);
+    if (idx < 0) {
+        JIT26LogWindowOverflow("JIT26SetDetachAfterFirstBrSafe");
+        return NO;
+    }
+    BOOL serviced = YES;
+    if (sigsetjmp(*env, 1) == 0) {
+        JIT26SetDetachAfterFirstBr(value);
+        NSDebugLog(@"[JIT26] [JIT-NOCRASH] SetDetachAfterFirstBr(%d) serviced", (int)value);
+    } else {
+        NSLog(@"[JIT26] [JIT-NOCRASH] brk #0xf00d(cmd=3 SetDetachAfterFirstBr) NOT serviced -- degraded");
+        serviced = NO;
+    }
+    JIT26TrapWindowPop(idx, &oldsa);
+    return serviced;
+}
+
+// ============================================================================
+// ★ [POCKETJ-JIT] PocketJ 内置 JIT 前置门禁
+//   (EricoEC/PocketJLauncher · Vendor/StikJIT/INTEGRATION.md
+//    「Built-in StikJIT: Gate every entry point」)
+//
+//   内置 StikJIT 需要同时满足:iOS ≥ 17.4 · 宿主进程 get-task-allow ·
+//   可读配对文件。注意 get-task-allow 属于宿主进程,必须在宿主侧检查。
+//
+//   ⚠ 本仓库暂未接入 Helper 扩展(进程不能自附加调试器 —— 见 PocketJ
+//     Natives/stikdebug/StikDebugEngine.m 顶部同款注释),因此这里【只检测、
+//     只记日志/供 UI 展示】,不做任何 vAttach 动作。等 Helper 扩展落地后,
+//     这三个门禁就是启动 Helper 前的 guard。
+// ============================================================================
+
+BOOL AMEJITDeviceSupportsBuiltInStikJIT(void) {
+    if (@available(iOS 17.4, *)) {
+        return YES;
+    }
+    return NO;
+}
+
+// 宿主进程是否带 get-task-allow。使用 Security 框架 SPI(SecTask*),
+// 原型见本文件顶部的 extern 声明;与 INTEGRATION.md 的 ObjC 示例同构,
+// 但按文档写法释放正确(不复用本文件既有 getEntitlementValue —— 它有一处
+// 释放后使用)。
+BOOL AMEJITHasGetTaskAllow(void) {
+    void *task = SecTaskCreateFromSelf(NULL);
+    if (task == NULL) {
+        return NO;
+    }
+    CFTypeRef value = SecTaskCopyValueForEntitlement(task, @"get-task-allow", NULL);
+    BOOL result = (value == kCFBooleanTrue);
+    if (value != NULL) {
+        CFRelease(value);
+    }
+    CFRelease(task);
+    return result;
+}
+
+// 配对文件推荐位置(INTEGRATION.md「Store and import the pairing file」):
+//   Documents/StikJIT/pairingFile.plist
+// Info.plist 已置 UIFileSharingEnabled=true,用户可经 Finder/AFC 拷入。
+// ★ [JIT-PAIRING] 配对文件在实战里会放在不同位置(用户按不同教程导入的):
+//   以前只认 Documents/StikJIT/pairingFile.plist 一条 ⇒ 明明装了也报 pairing=NO
+//   (用户实测:日志说"没装",但他确实装了)。故改为【多候选】逐个查,并记住命中的那条。
+static NSString *gAmeJITPairingFoundPath = nil;
+
+NSArray<NSString *> *AMEJITPairingFileCandidates(void) {
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
+    NSURL *documents = [NSFileManager.defaultManager
+        URLForDirectory:NSDocumentDirectory inDomain:NSUserDomainMask
+       appropriateForURL:nil create:YES error:nil];
+    NSURL *support = [NSFileManager.defaultManager
+        URLForDirectory:NSApplicationSupportDirectory inDomain:NSUserDomainMask
+       appropriateForURL:nil create:YES error:nil];
+    if (documents) {
+        NSArray<NSString *> *subs = @[@"StikJIT", @"StikDebug", @"pairing", @""];
+        NSArray<NSString *> *names = @[@"pairingFile.plist", @"pairingFile",
+                                       @"mobiledevicepairing.plist", @"pairing_record.plist"];
+        for (NSString *sub in subs) {
+            NSURL *dir = sub.length ? [documents URLByAppendingPathComponent:sub isDirectory:YES] : documents;
+            for (NSString *n in names) {
+                [out addObject:[[dir URLByAppendingPathComponent:n] path]];
+            }
+        }
+    }
+    if (support) {
+        for (NSString *sub in @[@"StikJIT", @"StikDebug", @""]) {
+            NSURL *dir = sub.length ? [support URLByAppendingPathComponent:sub isDirectory:YES] : support;
+            [out addObject:[[dir URLByAppendingPathComponent:@"pairingFile.plist"] path]];
+        }
+    }
+    return out;
+}
+
+/// 返回【实际存在】的配对文件路径;都没有则返回推荐路径(供日志展示“应该放哪”)。
+NSString *AMEJITPairingFilePath(void) {
+    if (gAmeJITPairingFoundPath && [NSFileManager.defaultManager fileExistsAtPath:gAmeJITPairingFoundPath]) {
+        return gAmeJITPairingFoundPath;
+    }
+    for (NSString *p in AMEJITPairingFileCandidates()) {
+        if ([NSFileManager.defaultManager fileExistsAtPath:p]) {
+            gAmeJITPairingFoundPath = p;
+            return p;
+        }
+    }
+    return AMEJITPairingFileCandidates().firstObject;
+}
+
+BOOL AMEJITHasPairingFile(void) {
+    for (NSString *p in AMEJITPairingFileCandidates()) {
+        if ([NSFileManager.defaultManager fileExistsAtPath:p]) {
+            gAmeJITPairingFoundPath = p;
+            return YES;
+        }
+    }
+    return NO;
+}
+
+/// ★ [JIT-PAIRING] 单独探测“使能工具是否已装”——用 URL scheme 探,与配对文件无关。
+///   避免把“没找到配对文件”误读成“工具没装”。
+BOOL AMEJITEnablerAppInstalled(void) {
+    NSArray<NSString *> *schemes = @[@"stikdebug", @"stikjit", @"sidestore", @"stosdebug"];
+    for (NSString *sc in schemes) {
+        NSURL *u = [NSURL URLWithString:[sc stringByAppendingString:@"://"]];
+        if (u && [[UIApplication sharedApplication] canOpenURL:u]) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+// 在一次 JIT 获取动作前把门禁状态打到日志(只读,无副作用)。
+void AMEJITLogPocketJReadiness(NSString *context) {
+    BOOL hasPairing = AMEJITHasPairingFile();
+    NSLog(@"[JIT] [POCKETJ-JIT] readiness(%@): ios17_4=%@ get-task-allow=%@ "
+          @"enabler-app-installed=%@ pairing-file=%@ found=%@ (推荐位置=%@)",
+          context ?: @"?",
+          AMEJITDeviceSupportsBuiltInStikJIT() ? @"YES" : @"NO",
+          AMEJITHasGetTaskAllow() ? @"YES" : @"NO",
+          AMEJITEnablerAppInstalled() ? @"YES" : @"NO",
+          hasPairing ? @"YES" : @"NO",
+          hasPairing ? (AMEJITPairingFilePath() ?: @"(?)") : @"(未找到,已试多路径)",
+          AMEJITPairingFileCandidates().firstObject ?: @"(nil)");
 }
 
 #ifndef P_TRACED

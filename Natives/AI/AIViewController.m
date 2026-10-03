@@ -26,9 +26,6 @@ static const NSTimeInterval kUIThrottleInterval = 0.2;
 @property (nonatomic, assign) NSTimeInterval lastStreamUpdateTime;
 @property (nonatomic, strong) UIActivityIndicatorView *activityIndicator;
 
-// 继续生成按钮（上一条回复未完整时显示在输入栏上方）
-@property (nonatomic, strong) UIButton *continueButton;
-
 // 空态视图
 @property (nonatomic, strong) UIView *emptyStateView;
 @property (nonatomic, strong) UIImageView *emptyIcon;
@@ -71,7 +68,6 @@ static const NSTimeInterval kUIThrottleInterval = 0.2;
     [self setupUI];
     [self setupKeyboardObservers];
     [self updateModelLabel];
-    [self updateContinueButton];
     [self updateEmptyState];
 
     // 监听会话消息变更通知：AiAgent 在 tool_calls / tool 结果消息追加后发出（object=session），
@@ -86,8 +82,6 @@ static const NSTimeInterval kUIThrottleInterval = 0.2;
 - (void)handleSessionMessagesChanged:(NSNotification *)note {
     if (note.object && ![note.object isEqual:self.session]) return;
     [self reloadAndScrollToBottom];
-    [self updateContinueButton];
-    [self updateModelLabel];
 }
 
 - (void)dealloc {
@@ -148,8 +142,6 @@ static const NSTimeInterval kUIThrottleInterval = 0.2;
     self.navigationItem.title = title;
     [self reloadAndScrollToBottom];
     [self updateEmptyState];
-    [self updateContinueButton];
-    [self updateModelLabel];
 }
 
 /// 进入提供商配置页
@@ -222,26 +214,6 @@ static const NSTimeInterval kUIThrottleInterval = 0.2;
     [NSLayoutConstraint activateConstraints:@[
         [self.activityIndicator.centerXAnchor constraintEqualToAnchor:self.tableView.centerXAnchor],
         [self.activityIndicator.centerYAnchor constraintEqualToAnchor:self.tableView.centerYAnchor],
-    ]];
-
-    // 继续生成按钮：上一条回复未完整（截断/中断/杀进程残留）时浮在输入栏上方
-    self.continueButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.continueButton.translatesAutoresizingMaskIntoConstraints = NO;
-    self.continueButton.hidden = YES;
-    self.continueButton.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
-    [self.continueButton setTitle:@"▶ 继续生成" forState:UIControlStateNormal];
-    [self.continueButton addTarget:self action:@selector(continueAction) forControlEvents:UIControlEventTouchUpInside];
-    self.continueButton.backgroundColor = [accentColor() colorWithAlphaComponent:0.15];
-    self.continueButton.layer.cornerRadius = 17;
-    self.continueButton.layer.cornerCurve = kCACornerCurveContinuous;
-    self.continueButton.clipsToBounds = YES;
-    [self.continueButton setTitleColor:accentColor() forState:UIControlStateNormal];
-    [self.view addSubview:self.continueButton];
-    [NSLayoutConstraint activateConstraints:@[
-        [self.continueButton.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
-        [self.continueButton.bottomAnchor constraintEqualToAnchor:self.inputBar.topAnchor constant:-8],
-        [self.continueButton.heightAnchor constraintEqualToConstant:34],
-        [self.continueButton.widthAnchor constraintEqualToConstant:128],
     ]];
 }
 
@@ -370,30 +342,12 @@ static const NSTimeInterval kUIThrottleInterval = 0.2;
     AiProvider *provider = [self currentProvider];
     if (provider && provider.name.length > 0) {
         NSString *model = provider.model.length > 0 ? provider.model : @"默认模型";
-        NSString *base = [NSString stringWithFormat:@"%@ / %@", provider.name, model];
-        // 上下文配额显示（token 粗估 / provider.contextWindow；超 80% 时请求体会自动压缩历史）
-        if (provider.contextWindow > 0 && self.session) {
-            NSUInteger est = [AiAgent estimatedTokensForMessages:self.session.messages];
-            est += [AiAgent estimatedTokensForText:[[AiSettings sharedSettings] systemPrompt]];
-            NSUInteger pct = est * 100 / (NSUInteger)MAX(provider.contextWindow, 1);
-            if (pct > 999) pct = 999;
-            self.inputBar.modelLabel.text = [NSString stringWithFormat:@"%@ · 上下文约%lu%%", base, (unsigned long)pct];
-        } else {
-            self.inputBar.modelLabel.text = base;
-        }
+        self.inputBar.modelLabel.text = [NSString stringWithFormat:@"%@ / %@", provider.name, model];
         self.inputBar.modelLabel.textColor = [UIColor labelColor];
     } else {
         self.inputBar.modelLabel.text = @"未配置 AI 提供商";
         self.inputBar.modelLabel.textColor = [UIColor secondaryLabelColor];
     }
-}
-
-/// 继续生成按钮显隐：空闲且最后一条消息未完整时显示
-- (void)updateContinueButton {
-    if (!self.continueButton) return;
-    BOOL running = [[AiAgent sharedAgent] running];
-    AiMessage *last = self.session.messages.lastObject;
-    self.continueButton.hidden = !(!running && last.incomplete);
 }
 
 - (void)handleModelTap {
@@ -413,40 +367,7 @@ static const NSTimeInterval kUIThrottleInterval = 0.2;
     [self presentProviderConfig];
 }
 
-#pragma mark - 发送 / 停止 / 继续生成
-
-/// 流式增量回调（主线程节流刷新，与 handleSend/continueAction 共用）
-- (void (^)(NSString *))makeStreamChunkHandler {
-    __weak typeof(self) weakSelf = self;
-    return ^(NSString *partial) {
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (!strongSelf) return;
-        (void)partial;
-        [strongSelf updateStreamingCell];
-    };
-}
-
-/// 流式结束回调（主线程 UI 复位 + 刷新继续按钮与上下文用量，与 handleSend/continueAction 共用）
-- (void (^)(NSError *))makeStreamCompletionHandler {
-    __weak typeof(self) weakSelf = self;
-    return ^(NSError *error) {
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (!strongSelf) return;
-        // 关键修复（发送消息崩溃）：completionHandler 同样来自后台队列，UI 更新须回主线程
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [strongSelf.inputBar setIsSending:NO];
-            [strongSelf.activityIndicator stopAnimating];
-            strongSelf.lastStreamUpdateTime = 0;
-            if (error) {
-                [strongSelf showErrorAlert:error];
-            }
-            [strongSelf reloadAndScrollToBottom];
-            [strongSelf updateEmptyState];
-            [strongSelf updateContinueButton];
-            [strongSelf updateModelLabel];
-        });
-    };
-}
+#pragma mark - 发送 / 停止
 
 - (void)handleSend:(NSString *)text {
     NSString *trimmed = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
@@ -460,15 +381,32 @@ static const NSTimeInterval kUIThrottleInterval = 0.2;
 
     [self.inputBar clearText];
     [self.inputBar setIsSending:YES];
-    [self updateContinueButton];
 
     // 发送流程：AiAgent 会追加用户消息 + 助手占位消息并处理持久化
+    __weak typeof(self) weakSelf = self;
     [[AiAgent sharedAgent] sendUserMessage:trimmed
                                    session:self.session
                                   provider:provider
                                   streaming:YES
-                              chunkHandler:[self makeStreamChunkHandler]
-                         completionHandler:[self makeStreamCompletionHandler]];
+                              chunkHandler:^(NSString *partial) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf updateStreamingCell];
+    } completionHandler:^(NSError *error) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        // 关键修复（发送消息崩溃）：completionHandler 同样来自后台队列，UI 更新须回主线程
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [strongSelf.inputBar setIsSending:NO];
+            [strongSelf.activityIndicator stopAnimating];
+            strongSelf.lastStreamUpdateTime = 0;
+            if (error) {
+                [strongSelf showErrorAlert:error];
+            }
+            [strongSelf reloadAndScrollToBottom];
+            [strongSelf updateEmptyState];
+        });
+    }];
 
     // 关键修复（发送后用户消息不立即显示）：sendUserMessage 已同步把用户消息与助手占位
     // 追加进 session.messages，此刻再 reloadData 即可让用户消息立即显示；此前在调用前刷新，
@@ -476,25 +414,6 @@ static const NSTimeInterval kUIThrottleInterval = 0.2;
     [self reloadAndScrollToBottom];
     // 首条消息发送后欢迎语立即消失：用户消息已同步加入 session.messages，立刻刷新空态。
     [self updateEmptyState];
-}
-
-/// 继续生成：上一条回复未完整时，不追加用户消息直接以现有历史开新一轮
-- (void)continueAction {
-    AiProvider *provider = [self currentProvider];
-    if (!provider) {
-        [self showConfigureHint];
-        return;
-    }
-    if ([[AiAgent sharedAgent] running]) return;
-
-    [self.inputBar setIsSending:YES];
-    [self updateContinueButton];
-
-    [[AiAgent sharedAgent] continueGenerationInSession:self.session
-                                             provider:provider
-                                         chunkHandler:[self makeStreamChunkHandler]
-                                    completionHandler:[self makeStreamCompletionHandler]];
-    [self reloadAndScrollToBottom];
 }
 
 /// 节流刷新正在流式生成的最后一条助手消息
@@ -544,7 +463,6 @@ static const NSTimeInterval kUIThrottleInterval = 0.2;
     [self.inputBar setIsSending:NO];
     [self.activityIndicator stopAnimating];
     [self reloadAndScrollToBottom];
-    [self updateContinueButton];
 }
 
 #pragma mark - 表格
@@ -562,18 +480,6 @@ static const NSTimeInterval kUIThrottleInterval = 0.2;
     AiMessage *message = self.session.messages[indexPath.row];
     BOOL md = [[AiSettings sharedSettings] markdownEnabled];
     [cell configureWithMessage:message markdownEnabled:md];
-    // 思考块点击翻转展开态并只刷该行
-    __weak typeof(self) weakSelf = self;
-    cell.onReasoningToggle = ^(AiMessage *msg) {
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (!strongSelf || !msg) return;
-        msg.reasoningExpanded = !msg.reasoningExpanded;
-        NSUInteger idx = [strongSelf.session.messages indexOfObject:msg];
-        if (idx != NSNotFound) {
-            NSIndexPath *ip = [NSIndexPath indexPathForRow:idx inSection:0];
-            [strongSelf.tableView reloadRowsAtIndexPaths:@[ip] withRowAnimation:UITableViewRowAnimationNone];
-        }
-    };
     return cell;
 }
 

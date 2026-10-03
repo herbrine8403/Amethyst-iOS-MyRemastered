@@ -51,6 +51,20 @@ static NSString * const kImportedModpacksKey = @"ImportedModpacks";
 /// Task 5.9：本次导入下载的临时 installer jar 路径（取消时清理）
 @property (nonatomic, copy, nullable) NSString *currentTmpInstallerPath;
 
+/// ★ [MODPACK-LOCAL] 本次解析检测到的 zip「包装根目录」前缀（如 "MyPack/" 或 nil）。
+/// 中国社区整合包常把内容放进单层子目录（MyPack/manifest.json、MyPack/mods/...），
+/// 若按根目录判定会误报「无效的整合包格式」。这里记住前缀，供解析/解压时统一剥离。
+@property (nonatomic, copy, nullable) NSString *ameLocalRootPrefix;
+
+// ★ [MODPACK-LOCAL] 把外部（security-scoped / iCloud / 第三方 File Provider）URL 实体化成本地沙盒副本
+- (nullable NSString *)ameLocal_materializeExternalURL:(NSURL *)fileURL reason:(NSString * _Nullable * _Nullable)reason;
+// ★ [MODPACK-LOCAL] 检测 zip 内单层「包装根目录」前缀（根目录即含结构时返回 nil）
+- (nullable NSString *)ameLocal_detectWrapperRootPrefix:(UZKArchive *)archive;
+// ★ [MODPACK-LOCAL] 带前缀回退的取数据（先试根目录，再试包装前缀）
+- (nullable NSData *)ameLocal_dataFromArchive:(UZKArchive *)archive name:(NSString *)name;
+// ★ [MODPACK-LOCAL] 列 archive 顶层条目（用于「格式错误」时给出具体线索，最多 12 条）
+- (NSString *)ameLocal_topLevelSummaryForArchive:(UZKArchive *)archive;
+
 // 前向声明：将 modpackInfo 中的 iconBase64 解析为可用的文件 URL 字符串
 - (nullable NSString *)resolveIconURLFromModpackInfo:(NSDictionary *)modpackInfo;
 @end
@@ -246,85 +260,287 @@ static NSString * const kImportedModpacksKey = @"ImportedModpacks";
     }
 }
 
+#pragma mark - ★ [MODPACK-LOCAL] 外部文件实体化 / 包装根目录 / 诊断
+
+/// ★ [MODPACK-LOCAL] 把外部（security-scoped / iCloud / 第三方 File Provider）URL 实体化成本地副本。
+///
+/// 根因背景：UIDocumentPicker 给出的 URL 是 security-scoped 资源，且 iCloud/第三方供应商的文件
+/// 往往是「占位文件」（未下载）或需要 NSFileCoordinator 协调访问。直接 `fileExistsAtPath:` /
+/// 直接 open 会失败或读到空 → 被上层归类成「文件不存在」/「格式错误」。
+/// 这里在调用方仍持有 security scope 时把文件拷进 app 沙盒 Caches/modpack_import/<uuid>/，
+/// 之后解析、预览、导入全程只用本地副本，彻底摆脱外部授权生命周期。
+///
+/// 返回本地副本路径；失败返回 nil 并回填 *reason（具体原因，供上层给出可诊断的错误）。
+- (nullable NSString *)ameLocal_materializeExternalURL:(NSURL *)fileURL reason:(NSString * _Nullable * _Nullable)reason {
+    NSString *srcPath = fileURL.path;
+    if (srcPath.length == 0) {
+        if (reason) *reason = @"选择器未返回可用的本地路径";
+        return nil;
+    }
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *inboxRoot = [[NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject
+                            stringByAppendingPathComponent:@"modpack_import"]
+                           stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
+    if (![fm createDirectoryAtPath:inboxRoot withIntermediateDirectories:YES attributes:nil error:NULL]) {
+        if (reason) *reason = @"无法创建沙盒导入目录";
+        return nil;
+    }
+    NSString *name = srcPath.lastPathComponent.length > 0 ? srcPath.lastPathComponent : @"modpack.zip";
+    NSString *destPath = [inboxRoot stringByAppendingPathComponent:name];
+    NSURL *destURL = [NSURL fileURLWithPath:destPath];
+
+    // (1) 首选：NSFileCoordinator 协调读。既是 iCloud/File Provider 的既定要求，
+    //     也会顺带把 iCloud 占位文件实体化（ReadingForUploading 给出的即为可读的本地副本）。
+    __block BOOL copied = NO;
+    NSError *coordinatorError = nil;
+    __block NSString *failureNote = nil;
+    @try {
+        NSFileCoordinator *coordinator = [[NSFileCoordinator alloc] initWithFilePresenter:nil];
+        NSError *err = nil;
+        [coordinator coordinateReadingItemAtURL:fileURL
+                                        options:NSFileCoordinatorReadingForUploading
+                                          error:&err
+                                     byAccessor:^(NSURL *readingURL) {
+            NSError *copyErr = nil;
+            copied = [[NSFileManager defaultManager] copyItemAtURL:readingURL toURL:destURL error:&copyErr];
+            if (!copied) {
+                failureNote = copyErr.localizedDescription ?: @"协调读拷贝失败";
+            }
+        }];
+        if (!copied && err) {
+            coordinatorError = err;
+            failureNote = err.localizedDescription ?: failureNote;
+        }
+    } @catch (NSException *e) {
+        failureNote = e.reason ?: @"协调读抛异常";
+        NSLog(@"[MODPACK-LOCAL] NSFileCoordinator 异常: %@", failureNote);
+    }
+
+    // (2) 回退：直接拷贝（app 沙盒内文件、或协调器不可用时；部分 provider 也允许直读）。
+    if (!copied) {
+        NSError *copyErr = nil;
+        copied = [fm copyItemAtPath:srcPath toPath:destPath error:&copyErr];
+        if (!copied) {
+            NSString *detail = copyErr.localizedDescription ?: failureNote ?: @"未知拷贝错误";
+            if (coordinatorError && copyErr.code == NSFileNoSuchFileError) {
+                detail = @"文件尚未从 iCloud/供应商下载（占位文件不可读）";
+            }
+            NSLog(@"[MODPACK-LOCAL] 外部文件实体化失败: %@ (%@)", srcPath, detail);
+            if (reason) *reason = detail;
+            return nil;
+        }
+    }
+
+    // (3) 校验非空：0 字节副本无法解析，必须当作失败（否则会被下游误判为「格式错误」）。
+    NSDictionary *attrs = [fm attributesOfItemAtPath:destPath error:NULL];
+    unsigned long long size = attrs ? [attrs fileSize] : 0;
+    if (size == 0) {
+        [fm removeItemAtPath:destPath error:NULL];
+        NSLog(@"[MODPACK-LOCAL] 外部文件副本为 0 字节（源文件未下载完成或已损坏）: %@", srcPath);
+        if (reason) *reason = @"文件副本为 0 字节（源文件未下载完成或已损坏）";
+        return nil;
+    }
+    NSLog(@"[MODPACK-LOCAL] 外部文件已实体化: %@ -> %@ (%.2f MB)", srcPath, destPath, (double)size / 1048576.0);
+    return destPath;
+}
+
+/// ★ [MODPACK-LOCAL] 检测 zip 内单层「包装根目录」前缀。
+/// 返回形如 "MyPack/"；当结构就在根目录时返回 nil。
+/// 判定：zip 内所有条目共享同一个顶层路径分量，且该分量是目录（不是单个顶层文件），
+/// 且根目录里找不到任何已知整合包标志 → 视为包装目录。
+- (nullable NSString *)ameLocal_detectWrapperRootPrefix:(UZKArchive *)archive {
+    NSArray<NSString *> *rootMarkers = @[
+        @"modrinth.index.json", @"mmc-pack.json", @"manifest.json", @"mcbbs.packmeta",
+        @"instance.cfg", @"mods/", @"config/", @"versions/", @"overrides/",
+        @"client-overrides/", @".minecraft/", @"saves/", @"resourcepacks/", @"shaderpacks/"
+    ];
+    NSMutableSet<NSString *> *topLevels = [NSMutableSet set];
+    __block BOOL hasTopLevelFile = NO;   // 存在「无斜杠的顶层条目」⇒ 顶层分量不是纯目录
+    __block BOOL rootHasMarker = NO;
+    [archive performOnFilesInArchive:^(UZKFileInfo *fileInfo, BOOL *stop) {
+        NSString *filename = fileInfo.filename;
+        if (filename.length == 0) return;
+        if ([filename hasPrefix:@"__MACOSX/"]) return;
+        if ([filename.lastPathComponent hasPrefix:@"."]) return;
+        NSArray<NSString *> *comps = [filename componentsSeparatedByString:@"/"];
+        if (comps.count >= 1 && [(NSString *)comps[0] length] > 0) {
+            [topLevels addObject:comps[0]];
+        }
+        if (comps.count == 1) {
+            hasTopLevelFile = YES;
+        }
+        for (NSString *marker in rootMarkers) {
+            if ([filename isEqualToString:marker] || [filename hasPrefix:marker]) {
+                rootHasMarker = YES;
+                return;
+            }
+        }
+    } error:nil];
+
+    if (rootHasMarker || hasTopLevelFile || topLevels.count != 1) {
+        return nil;
+    }
+    NSString *only = topLevels.anyObject;
+    if (only.length == 0) return nil;
+    NSString *prefix = [only stringByAppendingString:@"/"];
+    NSLog(@"[MODPACK-LOCAL] 检测到包装根目录前缀: %@（内容位于单层子目录内）", prefix);
+    return prefix;
+}
+
+/// ★ [MODPACK-LOCAL] 带前缀回退的取数据：先按根目录取，再按包装前缀取。
+- (nullable NSData *)ameLocal_dataFromArchive:(UZKArchive *)archive name:(NSString *)name {
+    if (name.length == 0) return nil;
+    NSError *err = nil;
+    NSData *data = [archive extractDataFromFile:name error:&err];
+    if (data.length > 0) return data;
+    NSString *prefix = self.ameLocalRootPrefix;
+    if (prefix.length > 0) {
+        data = [archive extractDataFromFile:[prefix stringByAppendingString:name] error:&err];
+        if (data.length > 0) return data;
+    }
+    return nil;
+}
+
+/// ★ [MODPACK-LOCAL] 汇总 archive 的顶层条目（最多 12 条），用于「格式错误」时给出具体线索。
+- (NSString *)ameLocal_topLevelSummaryForArchive:(UZKArchive *)archive {
+    NSMutableArray<NSString *> *tops = [NSMutableArray array];
+    [archive performOnFilesInArchive:^(UZKFileInfo *fileInfo, BOOL *stop) {
+        NSString *filename = fileInfo.filename;
+        if (filename.length == 0) return;
+        if ([filename hasPrefix:@"__MACOSX/"]) return;
+        NSArray<NSString *> *comps = [filename componentsSeparatedByString:@"/"];
+        NSString *top = comps.firstObject;
+        if (top.length == 0) return;
+        if (comps.count > 1) top = [top stringByAppendingString:@"/"];
+        if (![tops containsObject:top]) {
+            [tops addObject:top];
+            if (tops.count >= 12) *stop = YES;
+        }
+    } error:nil];
+    if (tops.count == 0) return @"(压缩包内没有任何条目)";
+    return [tops componentsJoinedByString:@", "];
+}
+
 #pragma mark - Parse Modpack
 
 - (nullable NSDictionary *)parseModpackAtURL:(NSURL *)fileURL error:(NSError **)error {
-    NSString *filePath = fileURL.path;
+    // ★ [MODPACK-LOCAL] 每次解析重置包装前缀，避免跨次导入残留
+    self.ameLocalRootPrefix = nil;
+
+    NSString *incomingPath = fileURL.path ?: @"";
     NSFileManager *fm = [NSFileManager defaultManager];
-    if (![fm fileExistsAtPath:filePath]) {
-        if (error) {
-            *error = [NSError errorWithDomain:@"ModpackImportError"
-                                         code:1001
-                                     userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_526", nil)}];
+    BOOL isExternal = (incomingPath.length > 0) && ![incomingPath hasPrefix:NSHomeDirectory()];
+    NSLog(@"[MODPACK-LOCAL] parse start: url=%@ external=%d", fileURL.absoluteString ?: @"(nil)", isExternal);
+
+    NSString *filePath = incomingPath;
+
+    // ★ [MODPACK-LOCAL] 根因修复（security-scoped / iCloud / File Provider）：
+    // iOS 文档选择器返回的是 security-scoped URL；iCloud 与第三方供应商的文件还可能是
+    // 「占位文件」（未下载），且必须经 NSFileCoordinator 协调访问。
+    // 旧代码顺序是「先 fileExistsAtPath: 判存在，再拷贝」——对未实体化的外部 URL，
+    // 判存在这一步就会返回 NO ⇒ 直接弹「文件不存在」(i18n_str_526)。
+    // 现在改为「先实体化到 app 沙盒，再判存在」：拷贝在调用方仍持有 security scope 时完成，
+    // 之后解析/预览/导入全程只用本地副本，彻底摆脱外部授权生命周期，顺带消除下游的
+    // 「整合包文件不存在」(i18n_str_534)。沙盒内路径（在线下载的临时 zip 等）不复制。
+    if (isExternal) {
+        NSString *materializeReason = nil;
+        NSString *localCopy = [self ameLocal_materializeExternalURL:fileURL reason:&materializeReason];
+        if (localCopy.length > 0) {
+            filePath = localCopy;
+        } else {
+            NSLog(@"[MODPACK-LOCAL] 外部文件实体化失败（沿用原路径判存在）: %@", materializeReason ?: @"unknown");
         }
-        return nil;
+    } else if (incomingPath.length > 0) {
+        NSLog(@"[MODPACK-LOCAL] 路径已在 app 沙盒内，无需拷贝");
     }
 
-    // 关键修复（参照 ZL2：选中文件先复制到应用私有目录再解析/导入）：
-    // iOS 文档选择器返回的是 security-scoped URL（iCloud Drive、其他 App 容器、外置存储等），
-    // 调用方在解析完成后立即调用 -stopAccessingSecurityScopedResource，
-    // 之后该路径即不可读 —— 导致后续 importModpack: 里的 fileExistsAtPath: 检查失败，
-    // 报出"整合包文件不存在"。这里先把文件复制进沙盒，modpackInfo[@"filePath"] 指向副本，
-    // 后续导入/重新导入/导出都不再依赖外部授权。
-    // 已位于应用沙盒内的路径（如在线下载的临时 zip）不复制，避免无谓的大文件拷贝。
-    if (![filePath hasPrefix:NSHomeDirectory()]) {
-        NSString *inboxDir = [[NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject
-                               stringByAppendingPathComponent:@"modpack_import"]
-                              stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
-        NSString *inboxPath = [inboxDir stringByAppendingPathComponent:(filePath.lastPathComponent.length > 0 ? filePath.lastPathComponent : @"modpack.zip")];
-        NSError *copyError = nil;
-        if ([[NSFileManager defaultManager] createDirectoryAtPath:inboxDir withIntermediateDirectories:YES attributes:nil error:nil] &&
-            [[NSFileManager defaultManager] copyItemAtPath:filePath toPath:inboxPath error:&copyError]) {
-            NSLog(@"[ModpackImport] 外部整合包已复制进沙盒: %@", inboxPath);
-            filePath = inboxPath;
-        } else {
-            NSLog(@"[ModpackImport] 外部整合包复制沙盒失败（沿用原路径）: %@", copyError.localizedDescription);
+    if (filePath.length == 0 || ![fm fileExistsAtPath:filePath]) {
+        if (error) {
+            // ★ [MODPACK-LOCAL] 给出具体原因，而不是笼统的「文件不存在」
+            NSString *detail = @"";
+            if (incomingPath.length == 0) {
+                detail = @"选择器未返回可用路径";
+            } else if (isExternal) {
+                detail = @"外部文件不可读（可能未下载完成、已失去访问授权，或提供方未协调）";
+            } else {
+                detail = @"app 沙盒内文件缺失";
+            }
+            NSString *msg = [NSString stringWithFormat:@"%@（%@）", localize(@"i18n_str_526", nil), detail];
+            *error = [NSError errorWithDomain:@"ModpackImportError"
+                                         code:1001
+                                     userInfo:@{NSLocalizedDescriptionKey: msg}];
         }
+        NSLog(@"[MODPACK-LOCAL] 文件不存在/不可读: filePath=%@ incoming=%@", filePath, incomingPath);
+        return nil;
     }
 
     NSError *archiveError = nil;
     UZKArchive *archive = [[UZKArchive alloc] initWithPath:filePath error:&archiveError];
     if (archiveError || !archive) {
         if (error) {
+            // ★ [MODPACK-LOCAL] 区分「真损坏 / 非 zip」与「格式不符」：这里明确是打不开
+            NSString *detail = archiveError.localizedDescription ?: @"不是有效的 zip 压缩包（文件损坏或未下载完整）";
+            NSString *msg = [NSString stringWithFormat:@"%@（%@）", localize(@"i18n_str_527", nil), detail];
             *error = [NSError errorWithDomain:@"ModpackImportError"
                                          code:1002
-                                     userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_527", nil)}];
+                                     userInfo:@{NSLocalizedDescriptionKey: msg}];
         }
+        NSLog(@"[MODPACK-LOCAL] 压缩包打开失败: %@ (%@)", filePath, archiveError.localizedDescription ?: @"-");
         return nil;
     }
 
-    NSData *indexData = [archive extractDataFromFile:@"modrinth.index.json" error:&archiveError];
+    // ★ [MODPACK-LOCAL] 探测「包装根目录」（内容位于单层子目录，如 MyPack/manifest.json）。
+    // 后续标志文件查找与解压都按剥离前缀后的路径进行。
+    self.ameLocalRootPrefix = [self ameLocal_detectWrapperRootPrefix:archive];
+    NSLog(@"[MODPACK-LOCAL] 包装根目录前缀=%@", self.ameLocalRootPrefix ?: @"(无)");
+
+    // ★ [MODPACK-LOCAL] 空压缩包（0 条目录项）单独判为损坏，避免把「损坏」误报成「格式不符」。
+    NSArray<NSString *> *allNames = [archive listFilenames:nil];
+    if (allNames.count == 0) {
+        if (error) {
+            NSString *msg = [NSString stringWithFormat:@"%@（压缩包内没有任何文件，可能下载不完整或已损坏）", localize(@"i18n_str_527", nil)];
+            *error = [NSError errorWithDomain:@"ModpackImportError"
+                                         code:1002
+                                     userInfo:@{NSLocalizedDescriptionKey: msg}];
+        }
+        NSLog(@"[MODPACK-LOCAL] 空压缩包: %@", filePath);
+        return nil;
+    }
+
+    NSData *indexData = [self ameLocal_dataFromArchive:archive name:@"modrinth.index.json"];
     if (indexData) {
+        NSLog(@"[MODPACK-LOCAL] 探测到格式=modrinth (prefix=%@)", self.ameLocalRootPrefix ?: @"-");
         return [self parseModrinthModpack:archive indexData:indexData filePath:filePath error:error];
     }
 
     // 关键修复（多启动器兼容）：MMC (MultiMC / Prism Launcher) 整合包检测
     // mmc-pack.json 标志文件包含 components 数组，每个 component 有 uid（net.minecraft / net.fabricmc.fabric-loader 等）
     // 必须在 manifest.json (CurseForge) 之前检测，因为某些 MMC 整合包可能也含有 manifest.json
-    NSData *mmcPackData = [archive extractDataFromFile:@"mmc-pack.json" error:&archiveError];
+    NSData *mmcPackData = [self ameLocal_dataFromArchive:archive name:@"mmc-pack.json"];
     if (mmcPackData) {
-        NSLog(@"[ModpackImport] Detected MMC (MultiMC/Prism) modpack");
+        NSLog(@"[MODPACK-LOCAL] 探测到格式=mmc (prefix=%@)", self.ameLocalRootPrefix ?: @"-");
         return [self parseMMCPack:archive mmcPackData:mmcPackData filePath:filePath error:error];
     }
 
     // Task 5.7：MCBBS 格式检测（中国社区标准）——两种标志：
     //   1) mcbbs.packmeta 文件
     //   2) manifest.json 含 addons 数组（区别于 CurseForge 的 minecraft 对象结构）
-    NSData *mcbbsPackmetaData = [archive extractDataFromFile:@"mcbbs.packmeta" error:&archiveError];
+    NSData *mcbbsPackmetaData = [self ameLocal_dataFromArchive:archive name:@"mcbbs.packmeta"];
     if (mcbbsPackmetaData) {
-        NSLog(@"[ModpackImport] Detected MCBBS modpack (mcbbs.packmeta)");
+        NSLog(@"[MODPACK-LOCAL] 探测到格式=mcbbs (mcbbs.packmeta, prefix=%@)", self.ameLocalRootPrefix ?: @"-");
         return [self parseMCBBSPack:archive manifestData:mcbbsPackmetaData filePath:filePath error:error];
     }
 
-    NSData *manifestData = [archive extractDataFromFile:@"manifest.json" error:&archiveError];
+    NSData *manifestData = [self ameLocal_dataFromArchive:archive name:@"manifest.json"];
     if (manifestData) {
         // manifest.json 可能是 CurseForge 或 MCBBS 风格——含 addons 数组即 MCBBS
         NSDictionary *manifestProbe = [NSJSONSerialization JSONObjectWithData:manifestData options:0 error:nil];
         if ([manifestProbe isKindOfClass:[NSDictionary class]] &&
             [manifestProbe[@"addons"] isKindOfClass:[NSArray class]]) {
-            NSLog(@"[ModpackImport] Detected MCBBS modpack (manifest.json with addons)");
+            NSLog(@"[MODPACK-LOCAL] 探测到格式=mcbbs (manifest.json with addons, prefix=%@)", self.ameLocalRootPrefix ?: @"-");
             return [self parseMCBBSPack:archive manifestData:manifestData filePath:filePath error:error];
         }
+        NSLog(@"[MODPACK-LOCAL] 探测到格式=curseforge (manifest.json, prefix=%@)", self.ameLocalRootPrefix ?: @"-");
         return [self parseManifestModpack:archive manifestData:manifestData filePath:filePath error:error];
     }
 
@@ -335,15 +551,20 @@ static NSString * const kImportedModpacksKey = @"ImportedModpacks";
     //   - 也兼容 .minecraft/ 前缀的 zip（HMCL 导出格式之一）
     // 此格式无 mod 下载清单，所有文件直接从 zip 解压，loader 需用户后续手动安装。
     if ([self isPlainZipModpack:archive]) {
-        NSLog(@"[ModpackImport] Detected Plain ZIP modpack (no manifest, direct .minecraft directory structure)");
+        NSLog(@"[MODPACK-LOCAL] 探测到格式=plainzip (prefix=%@)", self.ameLocalRootPrefix ?: @"-");
         return [self parsePlainZipModpack:archive filePath:filePath error:error];
     }
 
     if (error) {
+        // ★ [MODPACK-LOCAL] 「格式错误」必须给出具体线索：列出实际顶层内容，便于一眼判断是
+        // 真损坏 / 真不是整合包，还是某个未被识别的结构（而非笼统一句「格式错误」）。
+        NSString *topLevel = [self ameLocal_topLevelSummaryForArchive:archive];
+        NSString *msg = [NSString stringWithFormat:@"%@（实际顶层内容: %@）", localize(@"i18n_str_528", nil), topLevel];
         *error = [NSError errorWithDomain:@"ModpackImportError"
                                      code:1003
-                                 userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_528", nil)}];
+                                 userInfo:@{NSLocalizedDescriptionKey: msg}];
     }
+    NSLog(@"[MODPACK-LOCAL] 格式未识别: %@ (顶层内容: %@)", filePath, [self ameLocal_topLevelSummaryForArchive:archive]);
     return nil;
 }
 
@@ -545,8 +766,8 @@ static NSString * const kImportedModpacksKey = @"ImportedModpacks";
     NSString *cfgJoinServerEnabled = nil;
     NSInteger cfgMaxMemory = 0;
     NSInteger cfgMinMemory = 0;
-    NSError *cfgError = nil;
-    NSData *cfgData = [archive extractDataFromFile:@"instance.cfg" error:&cfgError];
+    // ★ [MODPACK-LOCAL] 兼容包装根目录（instance.cfg 可能在 MyPack/instance.cfg）
+    NSData *cfgData = [self ameLocal_dataFromArchive:archive name:@"instance.cfg"];
     if (cfgData) {
         NSString *cfgContent = [[NSString alloc] initWithData:cfgData encoding:NSUTF8StringEncoding];
         for (NSString *rawLine in [cfgContent componentsSeparatedByString:@"\n"]) {
@@ -624,6 +845,10 @@ static NSString * const kImportedModpacksKey = @"ImportedModpacks";
     __block BOOL hasMinecraftStructure = NO;
     [archive performOnFilesInArchive:^(UZKFileInfo *fileInfo, BOOL *stop) {
         NSString *filename = fileInfo.filename;
+        // ★ [MODPACK-LOCAL] 剥离包装根目录前缀（如 MyPack/），再按标准结构判定
+        if (self.ameLocalRootPrefix.length > 0 && [filename hasPrefix:self.ameLocalRootPrefix]) {
+            filename = [filename substringFromIndex:self.ameLocalRootPrefix.length];
+        }
         // 兼容 .minecraft/ 前缀（HMCL 导出格式）
         NSString *normalized = filename;
         if ([normalized hasPrefix:@".minecraft/"]) {
@@ -676,6 +901,10 @@ static NSString * const kImportedModpacksKey = @"ImportedModpacks";
     __block NSString *detectedVersion = nil;
     [archive performOnFilesInArchive:^(UZKFileInfo *fileInfo, BOOL *stop) {
         NSString *filename = fileInfo.filename;
+        // ★ [MODPACK-LOCAL] 剥离包装根目录前缀（如 MyPack/）
+        if (self.ameLocalRootPrefix.length > 0 && [filename hasPrefix:self.ameLocalRootPrefix]) {
+            filename = [filename substringFromIndex:self.ameLocalRootPrefix.length];
+        }
         // 兼容 .minecraft/ 前缀
         if ([filename hasPrefix:@".minecraft/"]) {
             filename = [filename substringFromIndex:@".minecraft/".length];
@@ -792,9 +1021,9 @@ static NSString * const kImportedModpacksKey = @"ImportedModpacks";
 - (nullable NSString *)extractIconFromArchive:(UZKArchive *)archive {
     NSArray<NSString *> *iconCandidates = @[@"icon.png", @"modpack.png", @"pack.png"];
     for (NSString *name in iconCandidates) {
-        NSError *err = nil;
-        NSData *data = [archive extractDataFromFile:name error:&err];
-        if (data && !err) {
+        // ★ [MODPACK-LOCAL] 兼容包装根目录（icon 可能在 MyPack/icon.png）
+        NSData *data = [self ameLocal_dataFromArchive:archive name:name];
+        if (data.length > 0) {
             return [NSString stringWithFormat:@"data:image/png;base64,%@",
                     [data base64EncodedStringWithOptions:0]];
         }
@@ -827,10 +1056,22 @@ static NSString * const kImportedModpacksKey = @"ImportedModpacks";
     NSFileManager *fm = [NSFileManager defaultManager];
     if (![fm fileExistsAtPath:filePath]) {
         if (error) {
+            // ★ [MODPACK-LOCAL] 导入期「文件不存在」给出具体原因（旧行为：只报笼统 i18n_str_534，
+            // 用户完全无法判断是授权丢失、副本被清理还是外部文件未实体化）。
+            NSString *detail;
+            if (filePath.length == 0) {
+                detail = @"解析结果未携带文件路径";
+            } else if (![filePath hasPrefix:NSHomeDirectory()]) {
+                detail = @"外部路径已不可访问（security-scoped 授权已失效，且未成功落盘沙盒副本）";
+            } else {
+                detail = @"沙盒内副本缺失（可能被系统清理，请重新选择整合包文件）";
+            }
+            NSString *msg = [NSString stringWithFormat:@"%@（%@）", localize(@"i18n_str_534", nil), detail];
             *error = [NSError errorWithDomain:@"ModpackImportError"
                                          code:2001
-                                     userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_534", nil)}];
+                                     userInfo:@{NSLocalizedDescriptionKey: msg}];
         }
+        NSLog(@"[MODPACK-LOCAL] 导入期文件缺失: %@", filePath);
         return NO;
     }
 
@@ -1193,6 +1434,10 @@ static NSString * const kImportedModpacksKey = @"ImportedModpacks";
             }
 
             NSString *filename = fileInfo.filename;
+            // ★ [MODPACK-LOCAL] 先剥离包装根目录前缀（如 MyPack/），再走标准处理
+            if (self.ameLocalRootPrefix.length > 0 && [filename hasPrefix:self.ameLocalRootPrefix]) {
+                filename = [filename substringFromIndex:self.ameLocalRootPrefix.length];
+            }
             // 兼容 .minecraft/ 前缀（HMCL/MMC 导出格式）
             if ([filename hasPrefix:@".minecraft/"]) {
                 filename = [filename substringFromIndex:@".minecraft/".length];
@@ -1257,13 +1502,18 @@ static NSString * const kImportedModpacksKey = @"ImportedModpacks";
     }
 
     // Modrinth: 解压 overrides 和 client-overrides (后者覆盖前者)
-    [ModpackUtils archive:archive extractDirectory:@"overrides" toPath:destDir error:error];
+    // ★ [MODPACK-LOCAL] 兼容包装根目录：overrides 可能位于 MyPack/overrides
+    NSString *overridesDir = self.ameLocalRootPrefix.length > 0
+        ? [self.ameLocalRootPrefix stringByAppendingString:@"overrides"] : @"overrides";
+    [ModpackUtils archive:archive extractDirectory:overridesDir toPath:destDir error:error];
     if (error && *error) {
         return NO;
     }
 
     if ([format isEqualToString:@"modrinth"]) {
-        [ModpackUtils archive:archive extractDirectory:@"client-overrides" toPath:destDir error:error];
+        NSString *clientOverridesDir = self.ameLocalRootPrefix.length > 0
+            ? [self.ameLocalRootPrefix stringByAppendingString:@"client-overrides"] : @"client-overrides";
+        [ModpackUtils archive:archive extractDirectory:clientOverridesDir toPath:destDir error:error];
         if (error && *error) {
             // client-overrides 不存在不算错误
             NSLog(@"[ModpackImport] client-overrides extract (may not exist): %@", *error);

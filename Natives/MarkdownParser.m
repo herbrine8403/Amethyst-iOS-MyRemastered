@@ -16,18 +16,10 @@
                   linkColor:(UIColor *)linkColor
                  codeBgColor:(UIColor *)codeBgColor;
 + (NSAttributedString *)parseInline:(NSString *)text
-                            baseFont:(UIFont *)baseFont
-                           textColor:(UIColor *)textColor
-                           linkColor:(UIColor *)linkColor
-                          codeBgColor:(UIColor *)codeBgColor;
-/// GFM 表格：按 | 切分单元格（支持首尾管道与 \| 转义）
-+ (NSArray<NSString *> *)tableSplitCells:(NSString *)line;
-/// 判断是否为表格分隔行（每格形如 --- / :--- / ---: / :---:）
-+ (BOOL)tableIsDelimiterRow:(NSArray<NSString *> *)cells;
-/// 显示宽度估算（CJK/全角按 2 宽，用于等宽对齐补空格）
-+ (NSUInteger)tableDisplayWidth:(NSString *)s;
-/// 右侧补空格到指定显示宽度
-+ (NSString *)tablePadCell:(NSString *)cell toWidth:(NSUInteger)width;
+                           baseFont:(UIFont *)baseFont
+                          textColor:(UIColor *)textColor
+                          linkColor:(UIColor *)linkColor
+                         codeBgColor:(UIColor *)codeBgColor;
 @end
 
 @implementation MarkdownParser
@@ -62,97 +54,6 @@
     while (i < lines.count) {
         NSString *line = lines[i];
         NSString *trimmed = [line stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-
-        // GFM 表格：表头行（含 |）且下一行是分隔行时整表消费，
-        // 等宽字体对齐渲染，避免以前直接原样堆出裸 | 乱行。
-        if ([trimmed rangeOfString:@"|"].location != NSNotFound && i + 1 < lines.count) {
-            NSArray<NSString *> *delimCells = [self tableSplitCells:lines[i + 1]];
-            if ([self tableIsDelimiterRow:delimCells]) {
-                NSMutableArray<NSString *> *headerCells = [[self tableSplitCells:line] mutableCopy];
-                NSUInteger colCount = MAX(headerCells.count, delimCells.count);
-                NSMutableArray<NSArray<NSString *> *> *bodyRows = [NSMutableArray array];
-                NSUInteger j = i + 2;
-                while (j < lines.count) {
-                    NSString *rowTrimmed = [lines[j] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-                    if (rowTrimmed.length == 0) break;
-                    if ([rowTrimmed rangeOfString:@"|"].location == NSNotFound) break;
-                    if ([rowTrimmed hasPrefix:@"```"] || [rowTrimmed hasPrefix:@"~~~"]) break;
-                    NSArray<NSString *> *rowCells = [self tableSplitCells:lines[j]];
-                    colCount = MAX(colCount, rowCells.count);
-                    [bodyRows addObject:rowCells];
-                    j++;
-                }
-                // 列数归一（缺格补空）
-                while (headerCells.count < colCount) [headerCells addObject:@""];
-                NSMutableArray<NSArray<NSString *> *> *normBody = [NSMutableArray array];
-                for (NSArray<NSString *> *row in bodyRows) {
-                    NSMutableArray<NSString *> *r = [row mutableCopy];
-                    while (r.count < colCount) [r addObject:@""];
-                    [normBody addObject:[r copy]];
-                }
-                // 每列显示宽度
-                NSMutableArray<NSNumber *> *widths = [NSMutableArray array];
-                for (NSUInteger c = 0; c < colCount; c++) {
-                    NSUInteger w = [self tableDisplayWidth:headerCells[c]];
-                    for (NSArray<NSString *> *row in normBody) {
-                        w = MAX(w, [self tableDisplayWidth:row[c]]);
-                    }
-                    [widths addObject:@(w)];
-                }
-                UIFont *tableFont = [UIFont monospacedSystemFontOfSize:baseFont.pointSize - 1 weight:UIFontWeightRegular];
-                UIFont *tableHeadFont = [UIFont monospacedSystemFontOfSize:baseFont.pointSize - 1 weight:UIFontWeightBold];
-                if (!tableFont) tableFont = baseFont;
-                if (!tableHeadFont) tableHeadFont = tableFont;
-                NSMutableAttributedString *tableBlock = [[NSMutableAttributedString alloc] init];
-                // 表头（粗体）
-                for (NSUInteger c = 0; c < colCount; c++) {
-                    if (c > 0) {
-                        [tableBlock appendAttributedString:[[NSAttributedString alloc] initWithString:@" | "
-                                                                                           attributes:@{NSFontAttributeName: tableHeadFont,
-                                                                                                          NSForegroundColorAttributeName: secondaryColor}]];
-                    }
-                    [tableBlock appendAttributedString:[[NSAttributedString alloc] initWithString:[self tablePadCell:headerCells[c] toWidth:widths[c].unsignedIntegerValue]
-                                                                                       attributes:@{NSFontAttributeName: tableHeadFont,
-                                                                                                      NSForegroundColorAttributeName: textColor}]];
-                }
-                [tableBlock appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n"
-                                                                                  attributes:@{NSFontAttributeName: baseFont}]];
-                // 分隔行
-                for (NSUInteger c = 0; c < colCount; c++) {
-                    if (c > 0) {
-                        [tableBlock appendAttributedString:[[NSAttributedString alloc] initWithString:@"-|-"
-                                                                                           attributes:@{NSFontAttributeName: tableFont,
-                                                                                                          NSForegroundColorAttributeName: secondaryColor}]];
-                    }
-                    NSString *dashes = [@"" stringByPaddingToLength:widths[c].unsignedIntegerValue withString:@"-" startingAtIndex:0];
-                    [tableBlock appendAttributedString:[[NSAttributedString alloc] initWithString:dashes
-                                                                                       attributes:@{NSFontAttributeName: tableFont,
-                                                                                                      NSForegroundColorAttributeName: secondaryColor}]];
-                }
-                [tableBlock appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n"
-                                                                                  attributes:@{NSFontAttributeName: baseFont}]];
-                // 正文行
-                for (NSArray<NSString *> *row in normBody) {
-                    for (NSUInteger c = 0; c < colCount; c++) {
-                        if (c > 0) {
-                            [tableBlock appendAttributedString:[[NSAttributedString alloc] initWithString:@" | "
-                                                                                               attributes:@{NSFontAttributeName: tableFont,
-                                                                                                              NSForegroundColorAttributeName: secondaryColor}]];
-                        }
-                        [tableBlock appendAttributedString:[[NSAttributedString alloc] initWithString:[self tablePadCell:row[c] toWidth:widths[c].unsignedIntegerValue]
-                                                                                           attributes:@{NSFontAttributeName: tableFont,
-                                                                                                          NSForegroundColorAttributeName: textColor}]];
-                    }
-                    [tableBlock appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n"
-                                                                                      attributes:@{NSFontAttributeName: baseFont}]];
-                }
-                [result appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n"
-                                                                             attributes:@{NSFontAttributeName: baseFont}]];
-                [result appendAttributedString:tableBlock];
-                i = j;
-                continue;
-            }
-        }
 
         // 围栏代码块 ``` 或 ~~~
         if ([trimmed hasPrefix:@"```"] || [trimmed hasPrefix:@"~~~"]) {
@@ -413,75 +314,6 @@
     [result appendAttributedString:mutableHeader];
     [result appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n"
                                                                     attributes:@{NSFontAttributeName: baseFont}]];
-}
-
-#pragma mark - GFM 表格
-
-/// 按 | 切分单元格：首尾管道产生的空串剔除，\| 转义还原为字面 |
-+ (NSArray<NSString *> *)tableSplitCells:(NSString *)line {
-    NSString *t = [line stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-    NSString *placeholder = @"\uFFFF";
-    NSString *escaped = [t stringByReplacingOccurrencesOfString:@"\\|" withString:placeholder];
-    NSArray<NSString *> *parts = [escaped componentsSeparatedByString:@"|"];
-    NSMutableArray<NSString *> *cells = [NSMutableArray array];
-    for (NSString *p in parts) {
-        NSString *c = [[p stringByReplacingOccurrencesOfString:placeholder withString:@"|"]
-                        stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-        [cells addObject:c];
-    }
-    if (cells.count > 0 && cells[0].length == 0) [cells removeObjectAtIndex:0];
-    if (cells.count > 0 && cells.lastObject.length == 0) [cells removeLastObject];
-    return [cells copy];
-}
-
-/// 分隔行判定：每格仅含 -/: 且至少一个 -（避免把普通含 | 文本行误判成表）
-+ (BOOL)tableIsDelimiterRow:(NSArray<NSString *> *)cells {
-    if (cells.count == 0) return NO;
-    NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:@"-:"];
-    NSCharacterSet *notAllowed = [allowed invertedSet];
-    for (NSString *c in cells) {
-        NSString *t = [c stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-        if (t.length == 0) return NO;
-        if ([t rangeOfCharacterFromSet:notAllowed].location != NSNotFound) return NO;
-        if ([t rangeOfString:@"-"].location == NSNotFound) return NO;
-    }
-    return YES;
-}
-
-/// 显示宽度：CJK/全角/Emoji 按 2 宽估算，其余 1，保证等宽字体下中文列不断裂错位
-+ (NSUInteger)tableDisplayWidth:(NSString *)s {
-    if (s.length == 0) return 0;
-    NSUInteger w = 0;
-    for (NSUInteger k = 0; k < s.length; k++) {
-        unichar ch = [s characterAtIndex:k];
-        // UTF-16 代理对（Emoji 等）按一个 2 宽字符计，避免拆成两个半宽
-        if (ch >= 0xD800 && ch <= 0xDBFF && k + 1 < s.length) {
-            unichar lo = [s characterAtIndex:k + 1];
-            if (lo >= 0xDC00 && lo <= 0xDFFF) {
-                w += 2;
-                k++;
-                continue;
-            }
-        }
-        if ((ch >= 0x1100 && ch <= 0x115F) ||
-            (ch >= 0x2E80 && ch <= 0x9FFF) ||
-            (ch >= 0xAC00 && ch <= 0xD7AF) ||
-            (ch >= 0xF900 && ch <= 0xFAFF) ||
-            (ch >= 0xFF00 && ch <= 0xFFEF)) {
-            w += 2;
-        } else {
-            w += 1;
-        }
-    }
-    return w;
-}
-
-+ (NSString *)tablePadCell:(NSString *)cell toWidth:(NSUInteger)width {
-    NSUInteger w = [self tableDisplayWidth:cell ?: @""];
-    if (w >= width) return cell ?: @"";
-    return [(cell ?: @"") stringByAppendingString:[@"" stringByPaddingToLength:(width - w)
-                                                                  withString:@" "
-                                                             startingAtIndex:0]];
 }
 
 /// 行内格式解析（递归处理粗体/斜体内部）

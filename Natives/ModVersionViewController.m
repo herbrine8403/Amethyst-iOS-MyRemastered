@@ -498,8 +498,9 @@ static NSArray<NSDictionary *> *SortOptionItems(void) {
     NSInteger newSource = sender.tag;
     if (newSource == self.selectedSource) return; // 未切换则忽略
 
-    // CurseForge 源：检查 API Key 是否已配置
-    if (newSource == kSourceCurseForge && ![CurseForgeAPI isAPIKeyConfigured]) {
+    // ★ [MODPACK-FIX] CurseForge 源：无 key 也可用（无 key 时 baseURL 强制落 MCIM 镜像，
+    // 实测 200），门控改用 isSourceAvailable——key 仅官方直连需要。
+    if (newSource == kSourceCurseForge && ![CurseForgeAPI isSourceAvailable]) {
         [self showSourceAlertWithTitle:localize(@"i18n_str_465", nil)
                                 message:localize(@"i18n_str_466", nil)];
         return;

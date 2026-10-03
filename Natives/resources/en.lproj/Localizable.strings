@@ -250,16 +250,16 @@
 "preference.title.renderer.debug.mobilegl_gles" = "MobileGL GLES (1.17+) - OpenGL 3.3 Core via OpenGL ES, EXPERIMENTAL";
 "preference.title.renderer.debug.sfpew" = "SFPEW (<=1.16.x) - fixed-function emulation, backend defaults to MobileGlues, EXPERIMENTAL";
 "preference.title.renderer.debug.metal" = "Metal (metallum)";
-"preference.title.renderer.debug.nggl4es" = "Krypton Wrapper (≤26.2) - ZalithLauncher 2 gl4es, first choice for legacy versions (formerly NG-GL4ES)";
+/* ★ [RENDERER-GAP] imported from Gsjsjzhznsz/Air-Minecraft-iOS-Launcher */
+"preference.title.renderer.debug.vgpu" = "VGPU (<=1.12) - gl4es fork, enhanced shader syntax, EXPERIMENTAL";
+"preference.title.renderer.debug.virgl" = "VirGL (<=26.2) - Mesa virgl guest + vtest server, EXPERIMENTAL";
+/* ★ [DROP-NGG4ES] 原 "preference.title.renderer.debug.nggl4es" 文案已随该支移除。 */
+"preference.title.renderer.debug.gl4eszl2" = "GL4ES (ZL2 classic) - string-rewrite GLSL to ESSL, EXPERIMENTAL";
 
 "preference.detail.renderer" = "Change the OpenGL render engine to use. Zink is temporarily disabled on iOS 16 and later to diagnose issues.";
 
 "preference.title.resolution" = "Resolution (%)";
 "preference.detail.resolution" = "Allows you to decrease the game resolution.";
-
-"preference.title.fsr1" = "FSR1 Upscaling";
-"preference.detail.fsr1" = "When Resolution is below 100%, replaces the default bilinear stretch with AMD FSR1 (edge-adaptive upscaling + sharpening): the game renders at the lower resolution and FSR1 restores detail on the way to the screen. Runs above EGL and outside the renderer, so it works with every backend. No effect while Resolution is 100%.";
-
 
 "preference.title.disable_game_vsync" = "Unlock framerate (disable VSync)";
 "preference.detail.disable_game_vsync" = "Minecraft enables VSync by default, which caps FPS at the screen refresh rate (60 or 120). When enabled, the launcher forces VSync off so the game can exceed the refresh rate. Turn off if you prefer VSync or want to reduce heat/battery drain.";
@@ -663,6 +663,14 @@
 "launch.cancel_confirm_message" = "Canceling will terminate the current game loading process and return to the launcher.";
 "launch.cancel_confirm_yes" = "Cancel";
 "launch.cancel_confirm_no" = "Keep waiting";
+"launch.progress.stage.prepare_env" = "Preparing environment...";
+"launch.progress.stage.jit_ready" = "Preparing JIT...";
+"launch.progress.stage.renderer" = "Resolving renderer & graphics API...";
+"launch.progress.stage.runtime" = "Loading runtime (Java / memory)...";
+"launch.progress.stage.args_ready" = "Assembling launch arguments...";
+"launch.progress.stage.jvm_starting" = "Starting Java VM...";
+"launch.progress.stage.waiting_first_frame" = "Waiting for the game window...";
+"launch.progress.stage.completed" = "Launch complete";
 
 // AI Fix Feature
 "ai.fix.conversation" = "Conversation";
@@ -1747,6 +1755,8 @@
 "i18n_str_1208" = "No versions available";
 "i18n_str_1209" = "Load failed. Please check the network.";
 "i18n_str_1210" = "Load failed: %@";
+// ★ [NEOFORGE-FIX] NeoForge 尚未为该 Minecraft 版本发版（诚实告知，不谎报版本）
+"neoforge.no_version_for_mc" = "No NeoForge build has been released for Minecraft %@ yet";
 "i18n_str_1211" = "Select installation method";
 "i18n_str_1212" = "Original (Vanilla)";
 "i18n_str_1213" = "Pure Minecraft, without any mod loader";
@@ -1915,6 +1925,8 @@
 "i18n_str_2017" = "Frosted Glass";
 "i18n_str_2018" = "Half Width";
 "i18n_str_2019" = "Compact";
+"i18n_str_9101" = "Tall";
+"i18n_str_9102" = "Large";
 "i18n_str_2020" = "Switch to Full Width";
 "i18n_str_2021" = "Hide this Tile";
 "i18n_str_2022" = "Purple";
@@ -1974,6 +1986,7 @@
 // Task 134: JIT enabler picker (ported from Air)
 "preference.debug.jit_enabler.auto" = "Auto (recommended)";
 "preference.debug.jit_enabler.stikjit" = "StikDebug / StikJIT";
+"preference.debug.jit_enabler.stikdebug" = "StikDebug (stikdebug://)";
 "preference.debug.jit_enabler.sidestore" = "SideStore";
 "preference.debug.jit_enabler.stosdebug" = "StosDebug";
 "preference.debug.jit_enabler.jitstreamer" = "JitStreamer-EB";
@@ -1994,3 +2007,32 @@
 "update_dialog.update" = "Update";
 "preference.title.auto_check_update" = "Check for Updates on Launch";
 "preference.detail.auto_check_update" = "Automatically check GitHub Releases when the launcher starts. At most once per hour; versions you chose to ignore are not shown again.";
+
+// ★ [GLASSUI] glass effect (switch + strength slider)
+"preference.title.glass_effect" = "Glass Effect";
+"preference.title.glass_strength" = "Glass Strength";
+
+// ★ [LANG-SWITCH] launcher language switch (follow system + auto-enumerated .lproj)
+"preference.title.launcher_language" = "Language";
+"preference.lang.title" = "Language";
+"preference.lang.follow_system" = "Follow System";
+"preference.lang.section.system" = "System";
+"preference.lang.section.available" = "Available Languages";
+"preference.lang.search_placeholder" = "Search languages";
+"preference.lang.restart_hint.title" = "Language Changed";
+"preference.lang.restart_hint.message" = "The interface has been refreshed to the new language. If a few screens still show the old language, restart the launcher for them to take full effect.";
+
+// ★ [JIT-WAIT] 主启动 JIT 等待/调起失败提示(launchJVM 失败分支 + ame139_requestJIT)
+"jit.wait.auto" = "Waiting for JIT to become ready. Enable JIT for this app with your JIT tool (TrollStore, StikDebug, SideStore / SideJIT, JitStreamer, …), then return to the launcher. Waiting up to 30 seconds…";
+"jit.wait.manual" = "Please go to your JIT tool now and enable JIT for this app. Waiting up to 30 seconds…";
+"jit.wait.trollstore" = "Enable JIT for this app in TrollStore, then return to the launcher. Waiting up to 30 seconds…";
+"jit.wait.stikdebug" = "Enable JIT for this app in StikDebug, then return to the launcher. Waiting up to 30 seconds…";
+"jit.wait.sidestore" = "Enable JIT for this app in SideStore / SideJIT, then return to the launcher. Waiting up to 30 seconds…";
+"jit.wait.jitstreamer" = "Enable JIT for this app through JitStreamer, then return to the launcher. Waiting up to 30 seconds…";
+"jit.wait.stosdebug" = "Enable JIT for this app with StosDebug, then return to the launcher. Waiting up to 30 seconds…";
+"jit.wait.abort.title" = "JIT not available";
+"jit.wait.timeout.message" = "Tried to launch your JIT enabler, but JIT was not ready within 30 seconds, so the launch was canceled. Enable JIT for this app and try again (you can also change the JIT enabler in Settings).";
+"jit.wait.timeout.foreground.message" = "Tried to launch your JIT enabler, but JIT was still not detected after you returned to the launcher (up to 30 seconds of active waiting in the foreground, 180 seconds total). The launch was canceled. Enable JIT for this app and try again (you can also change the JIT enabler in Settings).";
+"jit.wait.blocked.message" = "The JIT debugger is not responding (nothing is servicing the breakpoint). Make sure JIT is enabled in a way that keeps the debugger attached and uses the UniversalJIT26 script, then launch again.";
+"jit.wait.missing.tool" = "No JIT enabler tool was detected. Install or check %@, or change the JIT enabler in Settings, then try again.";
+"jit.wait.missing.generic" = "No JIT enabler tool was detected. Install a JIT tool (TrollStore, StikDebug, SideStore / SideJIT, JitStreamer, …), or change the JIT enabler in Settings, then try again.";

@@ -35,14 +35,6 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, assign) BOOL isToolResult;
 /// 工具执行是否成功（结果卡片用于区分 ✅/❌，默认成功）
 @property (nonatomic, assign) BOOL toolSucceeded;
-/// 该工具调用是否正在执行中（仅运行时标记，不写入磁盘；供气泡显示"正在调用…"）
-@property (nonatomic, assign) BOOL toolRunning;
-/// 推理模型的思考过程（delta.reasoning_content 累积；折叠显示，可写入磁盘）
-@property (nonatomic, copy, nullable) NSString *reasoning;
-/// 思考过程是否已展开（仅运行时标记，不写入磁盘）
-@property (nonatomic, assign) BOOL reasoningExpanded;
-/// 该消息是否未完整（截断/报错中断/杀进程中断，持久化；UI 据此显示"继续生成"）
-@property (nonatomic, assign) BOOL incomplete;
 
 /// 便捷构造
 + (instancetype)messageWithRole:(NSString *)role content:(NSString *)content;

@@ -49,6 +49,31 @@
 //   - Fragment shader 编译失败时忽略错误，让 BSL/Mellow 等光影包能运行
 #define RENDERER_NAME_LTW "libltw.dylib"
 
+// ★ [RENDERER-GAP] 以下三个渲染器常量来自队友仓库
+//   Gsjsjzhznsz/Air-Minecraft-iOS-Launcher（同一项目家族的更晚 fork，Task173/211/215）。
+//   本树原先没有这些常量/候选，故按"他们有我们没有"整批抄入。全部为【纯追加】：
+//   对应 dylib 未随包（由 Makefile dep_* / CMake 目标从 vendored 源码构建），
+//   LauncherPreferences 的存在性过滤会隐藏它们 —— 现有渲染器行为零变化。
+//   dylib 与 lwjgl 装载名配对见报告 D:\CTF\_RENDERER_GAP_REPORT.md。
+// ★ [DROP-NGG4ES] 原第四支 NG-GL4ES（Task206）已整支移除（竞争对手源码，不取）。
+
+// VGPU（PojavLauncherTeam/VGPU，gl4es 分支 + 强化着色器语法转换；旧版 MC <1.13 生态）。
+// 源码 vendored 于 Natives/external/vgpu（Task173 iOS 移植补丁），由 CMake 目标 vgpu 构建。
+#define RENDERER_NAME_VGPU "libvgpu.dylib"
+
+// VirGLRenderer（≤26.2）：Mesa virgl guest + 进程内 vtest server（ZL2 移植）。
+// 三件套由 Makefile dep_virgl 产出：libepoxy.dylib / libvtestserver.dylib / libOSMesaVirgl.dylib；
+// 桥接源码 Natives/ctxbridges/virgl_server.m（引导 vtest 服务端）。
+#define RENDERER_NAME_VIRGL "libOSMesaVirgl.dylib"
+
+// ★ [DROP-NGG4ES] 此处原为 RENDERER_NAME_NGGL4ES "libnggl4es.dylib"（ThirdParty/ZalithLauncher2/
+//   Krypton Wrapper），已连同其构建目标/候选表项/引导分支一并移除。
+
+// GL4ESZL2（PojavLauncherTeam/gl4es_extra_extra）—— ZL2 经典版 "gl4es"：
+// 纯 C 字符串改写式 GLSL→ESSL 转换（shaderconv.c），无 glslang/SPIRV-Cross 依赖。
+// 源码 vendored 于 ThirdParty/gl4es_extra_extra，Makefile dep_gl4eszl2 构建。
+#define RENDERER_NAME_GL4ESZL2 "libgl4eszl2.dylib"
+
 // Metal 渲染器（metallum / MetalUniversal）：图形后端由 metallum agent 走原生 Metal
 // （直接 MTLDevice），不经过 EGL 渲染器 —— 选中它时 JavaLauncher 只置
 // AMETHYST_METAL=1（agent 据此打开渲染 patch），并把 AMETHYST_RENDERER 回落
@@ -74,12 +99,6 @@
 // 参考：Swung0x48/Amethyst-iOS 提交 dc57bfd3d2 "feat: add MobileGL renderer support"。
 #define RENDERER_NAME_MOBILEGL "libMobileGL.dylib"
 #define RENDERER_NAME_MOBILEGL_GLES "libMobileGL-gles.dylib"
-
-// NG-GL4ES（"Krypton Wrapper"，BZLZHH/NG-GL4ES）—— ZalithLauncher 2 用的 gl4es 分支：
-// 能处理更高级的着色器、几乎全 MC 版本可跑（glslang + SPIRV-Cross 着色器管线）。
-// 与 holy gl4es 不同，它自带 ARB 着色器转译管线；EGL 仍由宿主 ANGLE 提供
-// （dylib 只做 GL 转译，零 EGL 动作）。vendored 源码见 ThirdParty/ZalithLauncher2。
-#define RENDERER_NAME_NGGL4ES "libnggl4es.dylib"
 
 // SimpleFPEWrapper（MobileGL-Dev，LGPL-3.0）—— 固定管线 (GL 1.x) 仿真层。
 // 接入方式对齐安卓 AngelAuraMC/Amethyst-Android @ feat/sfpew_angle：SFPEW 顶替
@@ -123,6 +142,29 @@ static inline bool isDesktopGLRenderer(const char *renderer) {
            (renderer && !strcmp(renderer, RENDERER_NAME_MTL_ANGLE));
 }
 
+// ★ [RENDERER-GAP] 新增渲染器的判定谓词（来自队友仓库，纯追加）。
+// gl4es 家族：导出全套桌面 GL API，运行时经 ANGLE/libGLESv2 解析后端。
+// 二者（VGPU / GL4ESZL2）与既有 GL4ES 同链路，共用同一套
+// proc_address 解析与 init 时机（见 Natives/ctxbridges/gl4es_family_boot.m）。
+static inline bool isVGPURenderer(const char *renderer) {
+    return renderer && !strcmp(renderer, RENDERER_NAME_VGPU);
+}
+// ★ [DROP-NGG4ES] 原 isNGGL4ESRenderer() 谓词已随该支移除。
+static inline bool isGL4ESZL2Renderer(const char *renderer) {
+    return renderer && !strcmp(renderer, RENDERER_NAME_GL4ESZL2);
+}
+static inline bool isGL4ESFamilyRenderer(const char *renderer) {
+    return isVGPURenderer(renderer) || isGL4ESZL2Renderer(renderer);
+}
+static inline bool isVirglRenderer(const char *renderer) {
+    return renderer && !strcmp(renderer, RENDERER_NAME_VIRGL);
+}
+// 是否任一"新增（gap）渲染器"。egl_bridge 的兜底/预载分支用它做排除，
+// 避免 libOSMesaVirgl.dylib 被既有 "libOSMesa" 前缀误判成 zink。
+static inline bool isRendererGapExtra(const char *renderer) {
+    return isGL4ESFamilyRenderer(renderer) || isVirglRenderer(renderer);
+}
+
 #define SPECIALBTN_KEYBOARD -1
 #define SPECIALBTN_TOGGLECTRL -2
 #define SPECIALBTN_MOUSEPRI -3
@@ -161,11 +203,54 @@ BOOL ame169_waitForJITCondition(BOOL (^condition)(void), NSTimeInterval timeout,
 void ame185_dispatchToMainSelfHealing(dispatch_block_t block, NSString *label);
 // used for large memory regions
 void* JIT26PrepareRegion(void *addr, size_t len);
+// ★ [POCKETJ-JIT] Universal JIT 协议第 0 号调用:请求调试器脱离
+//   (mov x16,#0; brk #0xf00d)。与 JIT26PrepareRegion 同族,是 PocketJ/StikJIT
+//   universal.js 的 commands[0]。⚠ 只能在【所有】初始 RX 区都已 PrepareRegion
+//   之后调用(见 utils.m 内注释与 Natives/pocketj_jit/PORTING_NOTES.md)。
+void JIT26Detach(void);
+// JIT26Detach 的 SIGTRAP 安全网版:调试器已脱离时 brk #0xf00d 无人应答,
+// 捕获后返回 NO(降级),不使进程致死(与 JIT26CreateRegionLegacySafe 同款)。
+BOOL JIT26DetachSafe(void);
+// ★ [POCKETJ-JIT] PocketJ 内置 StikJIT 的前置门禁(INTEGRATION.md「Gate every
+//   entry point」):iOS ≥17.4 + 宿主 get-task-allow + 可读配对文件。
+//   本仓库暂未接入 Helper 扩展,以下仅用于检测/日志/UI 提示,不做自附加调试器。
+BOOL AMEJITDeviceSupportsBuiltInStikJIT(void);
+BOOL AMEJITHasGetTaskAllow(void);
+NSString *AMEJITPairingFilePath(void);
+// ★ [JIT-PAIRING] 多候选路径 + 工具是否已装(与配对文件解耦)
+NSArray<NSString *> *AMEJITPairingFileCandidates(void);
+BOOL AMEJITEnablerAppInstalled(void);   // Documents/StikJIT/pairingFile.plist
+BOOL AMEJITHasPairingFile(void);
+void AMEJITLogPocketJReadiness(NSString *context);
 // same as JIT26PrepareRegion, but used for smaller memory regions
 // and retain content instead of filling 0x69
 void JIT26PrepareRegionForPatching(void *addr, size_t len);
 void JIT26SetDetachAfterFirstBr(BOOL value);
 void JIT26SendJITScript(NSString* script);
+
+// ★ [JIT-NOCRASH] 其余 JIT26 brk(#0xf00d)协议调用的 SIGTRAP 安全网包装。
+//   与 JIT26CreateRegionLegacySafe / JIT26DetachSafe 共用同一套 handler /
+//   sigjmp / armed 机制(分层、支持嵌套)。调试器在岗时行为与裸函数一致；无人
+//   应答时降级:返回 NO(或 NULL) 并仅在失败分支打日志,由调用方跳过该步,
+//   不再 SIGTRAP 致死。安全网只在"无人应答"时兜底,不干扰正常 JIT。
+//   JIT26PrepareRegionSafe 丢弃裸函数的 void* 返回值(无任何调用方使用),
+//   只回报"是否被调试器服务"。
+BOOL JIT26PrepareRegionSafe(void *addr, size_t len);
+BOOL JIT26PrepareRegionForPatchingSafe(void *addr, size_t len);
+BOOL JIT26SendJITScriptSafe(NSString *script);
+BOOL JIT26SetDetachAfterFirstBrSafe(BOOL value);
+
+// ★ [SHADER-SIGBUS] ==========================================================
+// 已 PrepareRegion 的 JIT 区登记表（只记录、不改变任何行为）。
+//
+// 用途：崩溃取证时把「PC/帧地址落在匿名 JIT 区」与「落在真实 dylib 镜像」
+// 区分开。上一轮 SIGBUS 的悬案正是这两种解释分不开（pc − region_base 恰好
+// == dylib 偏移 ⇒ 无法判断是"dylib 被映射进 JIT 区"还是"JIT 区恰好同址"）。
+// 有了这张表，`ame_write_fatal_trace` 可以直接标注每一帧的归属类别。
+// 表本身只是只读旁路：写入点在各 Safe 包装成功返回处，读取点只在崩溃路径。
+// ============================================================================
+void JIT26RecordPreparedRegion(void *addr, size_t len);
+BOOL JIT26AddressInPreparedRegion(const void *p);
 
 // Device JIT flags（同步自上游 AngelAuraMC/Amethyst-iOS）
 // 支持 iOS 26.6+ / 27 的现代 Preboot 路径 + ChipID 硬件 fallback + capability 查询
@@ -199,6 +284,19 @@ void openLink(UIViewController* sender, NSURL* link);
 void handle_fatal_exit(int code);
 
 NSString* localize(NSString* key, NSString* comment);
+
+// ★ [LANG-SWITCH] 启动器界面语言覆盖（独立于系统 AppleLanguages）：
+// 用户在「设置 > 语言」里选择后写入 NSUserDefaults（键名 ame_launcher_language），
+// localize() 会优先用它对应的 <lang>.lproj 包，取不到再回退系统语言。
+extern NSString * const AmeLauncherLanguageDefaultsKey;
+/// 用户选择的语言代码（如 @"zh-Hans"）；返回 nil 表示「跟随系统」。
+NSString *AmeLauncherPreferredLanguageOverride(void);
+/// 写入/清除语言覆盖。code 为 nil 或空串时清除（回到跟随系统）。
+void AmeLauncherSetPreferredLanguageOverride(NSString *code);
+/// 语言代码 → 人读显示名（用系统当前语言本地化）；取不到时回退返回 code 本身。
+NSString *AmeLauncherDisplayNameForLanguageCode(NSString *code);
+/// 枚举 App 包内实际存在 .lproj 且带 Localizable.strings 的语言代码（不含 Base），按显示名排序。
+NSArray<NSString *> *AmeLauncherAvailableLanguageCodes(void);
 // YES 表示 NSError 是"当前没有可用网络"，而非服务器返回了不喜欢的内容。
 // 账户刷新只认 NSURLErrorDataNotAllowed 会漏掉飞行模式/无 Wi-Fi 等常见离线形态。
 BOOL isConnectivityError(NSError *error);

@@ -368,15 +368,23 @@ static NSArray<NSDictionary *> *rendererCandidates(void) {
         @{@"key": @ RENDERER_NAME_METAL,
           @"name": localize(@"preference.title.renderer.debug.metal", nil),
           @"file": @ RENDERER_NAME_METAL},
-        // NG-GL4ES（"Krypton Wrapper"，ZL2 同款 gl4es——glslang+SPIRV-Cross 着色器
-        // 管线，官方口径几乎全版本可跑）。刻意追加在表末（与上方 metal 条目同规则）：
-        // 已有 profile / 全局偏好里存的 renderer 值（libxxx.dylib）在 pick 控件里
-        // 按下标配对，插到中间会让这些已存值显示错位。dylib 由 Makefile 的
-        // dep_nggl4es 目标随包构建——rendererLibraryExists 的存在性过滤天然处理
-        // 构建失败 / 裁剪场景（不会显示一个点了就崩的选项）。
-        @{@"key": @ RENDERER_NAME_NGGL4ES,
-          @"name": localize(@"preference.title.renderer.debug.nggl4es", nil),
-          @"file": @ RENDERER_NAME_NGGL4ES}
+        // ★ [RENDERER-GAP] 队友仓库（Gsjsjzhznsz/Air-Minecraft-iOS-Launcher）有而我们
+        // 没有的渲染器入口。全部追加在表末：既有的 profile/全局偏好里存的渲染器值
+        // （libxxx.dylib）在 pick 控件里按下标配对，追加在末尾不会让任何既有下标错位。
+        // 这些 dylib 未随包（由 Makefile dep_* / CMake 目标构建），
+        // availableRendererCandidates() 的存在性过滤会把它们隐藏 —— 默认界面/行为不变；
+        // 构建出对应 dylib 后设置页才会出现这些选项。
+        @{@"key": @ RENDERER_NAME_VGPU,
+          @"name": localize(@"preference.title.renderer.debug.vgpu", nil),
+          @"file": @ RENDERER_NAME_VGPU},
+        @{@"key": @ RENDERER_NAME_VIRGL,
+          @"name": localize(@"preference.title.renderer.debug.virgl", nil),
+          @"file": @ RENDERER_NAME_VIRGL},
+        // ★ [DROP-NGG4ES] 原 RENDERER_NAME_NGGL4ES 候选表项（preference.title.renderer.debug.nggl4es）
+        //   已随该支移除；其余三支（VGPU/VirGL/GL4ESZL2）原样保留。
+        @{@"key": @ RENDERER_NAME_GL4ESZL2,
+          @"name": localize(@"preference.title.renderer.debug.gl4eszl2", nil),
+          @"file": @ RENDERER_NAME_GL4ESZL2}
     ];
 }
 

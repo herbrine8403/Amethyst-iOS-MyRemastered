@@ -168,7 +168,13 @@ extern NSMutableDictionary *prefDict;
 }
 
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations {
-    return UIInterfaceOrientationMaskLandscape;
+    // ★ [PORTRAIT] 放开竖屏:原来是写死 Landscape ⇒ 竖屏进不去。
+    // 竖屏排布由 LauncherCardLayoutViewController 切换(三卡竖摞 + 菜单横排);
+    // 游戏(SurfaceViewController)单独锁横屏,保证游戏内不会竖过来。
+    if (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad) {
+        return UIInterfaceOrientationMaskAll;
+    }
+    return UIInterfaceOrientationMaskAllButUpsideDown;
 }
 
 @end

@@ -105,8 +105,9 @@
 - (void)sourceChanged:(UISegmentedControl *)sender {
     ServerDownloadAPI newAPI = (sender.selectedSegmentIndex == 1) ? ServerDownloadAPICurseForge : ServerDownloadAPIModrinth;
 
-    // CurseForge 切换前校验 API Key
-    if (newAPI == ServerDownloadAPICurseForge && ![CurseForgeAPI isAPIKeyConfigured]) {
+    // ★ [MODPACK-FIX] CurseForge 切换前校验：免 key 可用（无 key 时 baseURL 强制落 MCIM 镜像，
+    // 实测 200），门控改用 isSourceAvailable——key 仅官方直连需要。
+    if (newAPI == ServerDownloadAPICurseForge && ![CurseForgeAPI isSourceAvailable]) {
         InlineMessageView *msg = [InlineMessageView showInViewController:self
                                                                   title:localize(@"i18n_str_171", nil)
                                                                message:localize(@"i18n_str_172", nil)

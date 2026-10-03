@@ -5,7 +5,7 @@
 //  轻量 Markdown → NSAttributedString 转换器
 //  不依赖第三方库，纯 UIKit 实现。支持：h1-h3、粗体 **text**、斜体 *text*、
 //  行内代码 `code`、无序列表 - item、有序列表 1. item、链接 [text](url)、
-//  分隔线 ---、段落、引用块 > text、GFM 表格 | a | b |（等宽对齐渲染）。
+//  分隔线 ---、段落、引用块 > text。
 //
 
 #import <UIKit/UIKit.h>

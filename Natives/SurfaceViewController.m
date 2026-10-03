@@ -16,7 +16,6 @@
 #import "MinecraftResourceUtils.h"
 #import "PLProfiles.h"
 #import "SurfaceViewController.h"
-#import "fsr1/ame_fsr1.h"
 #import "utils.h"
 #import "GameMenuOverlayView.h"
 #import "TrackedTextField.h"
@@ -25,6 +24,8 @@
 #import "ios_uikit_bridge.h"
 #import "LanPortDetector.h"
 #import "BackgroundManager.h"
+// ★ [LAUNCH-PROGRESS] 启动阶段上报 API(遮罩订阅 AmeLaunchProgressChangedNotification)
+#import "AmeLaunchProgress.h"
 
 // 由 Natives/ctxbridges/gl_bridge.m 提供：SDL3（MC 26.3+）路径下 GL 拥有呈现层
 // 且 MC 以「点」回报窗口尺寸，需要把 CAMetalLayer 对齐 1x。GLFW 与 Vulkan 路径恒 NO。
@@ -304,6 +305,17 @@ static GameSurfaceView* pojavWindow;
 @property(nonatomic, assign) NSTimeInterval launchStartTime;
 @property(nonatomic, assign) BOOL launchOverlayDismissed;
 @property(nonatomic, strong) UIButton *launchCancelButton;     // 取消启动按钮
+
+// ★ [LAUNCH-PROGRESS] 确定型进度条 + 当前阶段文字 + 步骤骨架(见 AmeLaunchProgress.h)
+@property(nonatomic, strong) UIProgressView *launchProgressView;
+@property(nonatomic, strong) UILabel *launchStageLabel;
+@property(nonatomic, strong) NSMutableArray<UIView *> *launchStepDots;
+@property(nonatomic, strong) NSMutableArray<UILabel *> *launchStepLabels;
+
+// ★ [LAUNCH-PROGRESS] 方法前置声明：两者定义在文件后部，而 setupLaunchOverlay
+//   里用 @selector 引用 onLaunchProgressChanged —— 先声明避免 undeclared selector 告警。
+- (void)onLaunchProgressChanged;
+- (void)updateLaunchProgressUI;
 
 @end
 
@@ -1327,20 +1339,7 @@ static UIView *findSDL_uikitview(UIView *root);
         NSLog(@"[SurfaceVC] video.resolution invalid (%.4f) -> falling back to 100%%", resolutionScale);
         resolutionScale = 1.0f;
     }
-    // —— FSR1（启动器侧上采样）——
-    // FSR1 接管缩放时，几何分工与常规缩放相反：
-    //   * surface / drawable 必须是全分辨率 —— 它是 framebuffer 0，FSR1 要在这个
-    //     分辨率上输出，也是最终 present 的面
-    //   * 交给 MC 的 windowWidth/Height 仍是缩放后的值 —— MC 因此按低分辨率设
-    //     viewport，画面落在 surface 左下角，由 fsr1 在 swap 前上采样铺满
-    // 若此处仍按常规把 surface 也缩掉，FSR1 就没有全分辨率的目标可写，且
-    // CoreAnimation 会先做一次双线性拉伸，等于把 EASU 的边缘自适应丢掉。
-    const BOOL fsr1FullResSurface = ameFsr1NeedsFullResSurface();
-    const CGFloat fsrSurfaceContentsScale = fsr1FullResSurface
-        ? self.screenScale
-        : (self.screenScale * resolutionScale);
-
-    self.surfaceView.layer.contentsScale = fsrSurfaceContentsScale;
+    self.surfaceView.layer.contentsScale = self.screenScale * resolutionScale;
 
     physicalWidth = roundf(self.surfaceView.frame.size.width * self.screenScale);
     physicalHeight = roundf(self.surfaceView.frame.size.height * self.screenScale);
@@ -1377,28 +1376,15 @@ static UIView *findSDL_uikitview(UIView *root);
         // drawableSize —— 此期由 gl_bridge 的几何重对齐独占写权保持 present
         // 自洽；本函数若继续写会与之每帧拉锯 = 画面分裂（Air Task53 同款 gate）。
         // 重对齐成功后 surface==drawable==bounds 像素，本写入变为同值 no-op。
-        // FSR1 接管时写全分辨率（physical），否则维持原语义（windowWidth/Height）
-        const CGFloat drawW = fsr1FullResSurface ? MAX(physicalWidth, 1)  : MAX(windowWidth, 1);
-        const CGFloat drawH = fsr1FullResSurface ? MAX(physicalHeight, 1) : MAX(windowHeight, 1);
-        // FSR1 接管时**必须**写 drawableSize，不能被下面的失配 gate 拦掉：
-        // 此时 surface 是全分辨率、MC 按低分辨率绘制，二者「失配」正是 FSR1
-        // 上采样的输入前提，于是 Task53 的 ame_gl_surface_transposed() 恒为
-        // 真。若沿用该 gate，drawableSize 会被整段跳过、停留在上一次的低分
-        // 辨率值，而 ANGLE 已按新的 contentsScale(=screenScale) 把 EGL
-        // surface 建成全分辨率 —— present 的全分辨率 backbuffer 被塞进低分
-        // 辨率 drawable，CoreAnimation 再把它拉伸上屏，表现就是「画面跑到
-        // 左下角、被放大且超出屏幕」。FSR1 场景下 surface == drawable ==
-        // bounds x contentsScale == physical 恒成立，此处写入是治愈而非与
-        // 重对齐链拉锯。
         if (ame_gl_surface_owns_layer()) {
-            if (fsr1FullResSurface || !ame_gl_surface_transposed()) {
-                metalLayer.drawableSize = CGSizeMake(drawW, drawH);
-                NSLog(@"[SurfaceVC] drawableSize=%dx%d (contentsScale %.2f, resolution %.0f%%, fsr1FullResSurface=%d)",
+            if (!ame_gl_surface_transposed()) {
+                metalLayer.drawableSize = CGSizeMake(MAX(windowWidth, 1), MAX(windowHeight, 1));
+                NSLog(@"[SurfaceVC] drawableSize=%dx%d (contentsScale %.2f, resolution %.0f%%)",
                       (int)metalLayer.drawableSize.width, (int)metalLayer.drawableSize.height,
-                      metalLayer.contentsScale, resolutionScale * 100.0f, (int)fsr1FullResSurface);
+                      metalLayer.contentsScale, resolutionScale * 100.0f);
             }
         } else {
-            metalLayer.drawableSize = CGSizeMake(drawW, drawH);
+            metalLayer.drawableSize = CGSizeMake(MAX(windowWidth, 1), MAX(windowHeight, 1));
             NSLog(@"[SurfaceVC] drawableSize=%dx%d (contentsScale %.2f, resolution %.0f%%)",
                   (int)metalLayer.drawableSize.width, (int)metalLayer.drawableSize.height,
                   metalLayer.contentsScale, resolutionScale * 100.0f);
@@ -1601,14 +1587,20 @@ static BOOL ame87_mcVersionRequiresTextureBuffer(NSString *mcVersionId) {
     //   - 背景显示启动器的自定义壁纸（如果有）
     //   - 屏幕正中央显示一个大的旋转加载指示器
     //   - 指示器下方显示简短的标题文字（如"正在启动 Minecraft"）
-    //   - 不显示进度条、百分比、阶段文案、信息卡片等多余元素
     //   - 底部保留一个小的"取消启动"按钮
     //
-    // 之前的实现包含了图标、进度条、百分比、已耗时、信息卡片、
-    // 阶段轮转文案等大量元素，过于复杂。FCL 的设计理念是简洁：
-    // 用户只需要知道"正在加载"即可，不需要知道详细的阶段和进度。
+    // ★ [LAUNCH-PROGRESS] 变更(2026-10)：用户要求「不然走到哪都不知道」，
+    //   在标题下方补回【确定型进度条 + 当前阶段文案 + 步骤骨架】(8 个阶段小圆点)。
+    //   数据源是 Natives/AmeLaunchProgress.h 的阶段上报 API，由 JavaLauncher.m /
+    //   本文件的启动节点喂入；不再用「按时间轮转」的假进度(FCL 式简洁保留在
+    //   转圈+标题，其余为本次新增的确定性信息)。
+    //   注意：容器 userInteractionEnabled 仍为 NO，触摸穿透行为不变。
     self.launchStartTime = [NSDate timeIntervalSinceReferenceDate];
     self.launchOverlayDismissed = NO;
+
+    // ★ [LAUNCH-PROGRESS] 每次启动都把阶段重置到「准备环境」，避免上一局残留
+    //   （Completed）导致进度条一上来就是满格。
+    AmeLaunchProgressReset();
 
     // ========================================================================
     // 全屏遮罩容器
@@ -1674,6 +1666,71 @@ static BOOL ame87_mcVersionRequiresTextureBuffer(NSString *mcVersionId) {
     [centerContainer addSubview:self.launchTitleLabel];
 
     // ========================================================================
+    // ★ [LAUNCH-PROGRESS] 确定型进度条 + 当前阶段文字 + 步骤骨架
+    // ========================================================================
+    // 目的：用户明确要求「不然走到哪都不知道」—— 用确定型进度条(非转圈)+
+    //   当前阶段文案 + 每阶段一个小圆点的步骤骨架，一眼看出进度与卡点。
+    // 全部是展示型控件；遮罩 userInteractionEnabled = NO 不变，触摸照旧穿透。
+    self.launchStageLabel = [[UILabel alloc] init];
+    self.launchStageLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.launchStageLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
+    self.launchStageLabel.textColor = [UIColor colorWithWhite:0.80 alpha:1.0];
+    self.launchStageLabel.textAlignment = NSTextAlignmentCenter;
+    self.launchStageLabel.numberOfLines = 2;
+    self.launchStageLabel.text = localize(AmeLaunchStageLocalizationKey(AmeLaunchProgressCurrentStage()), nil);
+    [centerContainer addSubview:self.launchStageLabel];
+
+    self.launchProgressView = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
+    self.launchProgressView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.launchProgressView.progressTintColor = [UIColor systemBlueColor];
+    self.launchProgressView.trackTintColor = [UIColor colorWithWhite:1.0 alpha:0.18];
+    self.launchProgressView.layer.cornerRadius = 3.0;
+    self.launchProgressView.clipsToBounds = YES;
+    [self.launchProgressView setProgress:(float)AmeLaunchProgressCurrentFraction() animated:NO];
+    [centerContainer addSubview:self.launchProgressView];
+
+    // 步骤骨架：每个阶段一行(小圆点 + 阶段名)，已过/进行中/未过 三态。
+    self.launchStepDots = [NSMutableArray array];
+    self.launchStepLabels = [NSMutableArray array];
+    UIStackView *stepsStack = [[UIStackView alloc] init];
+    stepsStack.translatesAutoresizingMaskIntoConstraints = NO;
+    stepsStack.axis = UILayoutConstraintAxisVertical;
+    stepsStack.alignment = UIStackViewAlignmentLeading;
+    stepsStack.spacing = 6.0;
+    [centerContainer addSubview:stepsStack];
+
+    NSInteger stageCount = AmeLaunchProgressStageCount();
+    for (NSInteger i = 0; i < stageCount; i++) {
+        UIView *dot = [[UIView alloc] init];
+        dot.translatesAutoresizingMaskIntoConstraints = NO;
+        dot.layer.cornerRadius = 4.0;
+        dot.userInteractionEnabled = NO;
+        [dot.widthAnchor constraintEqualToConstant:8.0].active = YES;
+        [dot.heightAnchor constraintEqualToConstant:8.0].active = YES;
+
+        UILabel *rowLabel = [[UILabel alloc] init];
+        rowLabel.translatesAutoresizingMaskIntoConstraints = NO;
+        rowLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
+        rowLabel.text = localize(AmeLaunchStageLocalizationKey((AmeLaunchStage)i), nil);
+
+        UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[dot, rowLabel]];
+        row.axis = UILayoutConstraintAxisHorizontal;
+        row.alignment = UIStackViewAlignmentCenter;
+        row.spacing = 8.0;
+
+        [stepsStack addArrangedSubview:row];
+        [self.launchStepDots addObject:dot];
+        [self.launchStepLabels addObject:rowLabel];
+    }
+
+    // 订阅阶段广播(AmeLaunchProgress.m 统一在主队列投递)。
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(onLaunchProgressChanged)
+                                                 name:AmeLaunchProgressChangedNotification
+                                               object:nil];
+    [self updateLaunchProgressUI];
+
+    // ========================================================================
     // 取消启动按钮（底部，独立添加到 self.view 不受遮罩穿透影响）
     // ========================================================================
     self.launchCancelButton = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -1694,6 +1751,8 @@ static BOOL ame87_mcVersionRequiresTextureBuffer(NSString *mcVersionId) {
         // 中央容器：水平居中，垂直居中
         [centerContainer.centerXAnchor constraintEqualToAnchor:self.launchOverlayView.centerXAnchor],
         [centerContainer.centerYAnchor constraintEqualToAnchor:self.launchOverlayView.centerYAnchor],
+        // ★ [LAUNCH-PROGRESS] 固定卡片宽度：给进度条/步骤骨架一个稳定的版心(容器尺寸由它撑出)
+        [centerContainer.widthAnchor constraintEqualToConstant:280],
 
         // 旋转指示器：容器顶部居中
         [self.launchSpinner.topAnchor constraintEqualToAnchor:centerContainer.topAnchor],
@@ -1703,7 +1762,21 @@ static BOOL ame87_mcVersionRequiresTextureBuffer(NSString *mcVersionId) {
         [self.launchTitleLabel.topAnchor constraintEqualToAnchor:self.launchSpinner.bottomAnchor constant:16],
         [self.launchTitleLabel.leadingAnchor constraintEqualToAnchor:centerContainer.leadingAnchor],
         [self.launchTitleLabel.trailingAnchor constraintEqualToAnchor:centerContainer.trailingAnchor],
-        [self.launchTitleLabel.bottomAnchor constraintEqualToAnchor:centerContainer.bottomAnchor],
+
+        // ★ [LAUNCH-PROGRESS] 阶段文字 → 进度条 → 步骤骨架(自上而下串起来，撑出容器底部)
+        [self.launchStageLabel.topAnchor constraintEqualToAnchor:self.launchTitleLabel.bottomAnchor constant:6],
+        [self.launchStageLabel.leadingAnchor constraintEqualToAnchor:centerContainer.leadingAnchor],
+        [self.launchStageLabel.trailingAnchor constraintEqualToAnchor:centerContainer.trailingAnchor],
+
+        [self.launchProgressView.topAnchor constraintEqualToAnchor:self.launchStageLabel.bottomAnchor constant:14],
+        [self.launchProgressView.leadingAnchor constraintEqualToAnchor:centerContainer.leadingAnchor],
+        [self.launchProgressView.trailingAnchor constraintEqualToAnchor:centerContainer.trailingAnchor],
+        [self.launchProgressView.heightAnchor constraintEqualToConstant:6],
+
+        [stepsStack.topAnchor constraintEqualToAnchor:self.launchProgressView.bottomAnchor constant:16],
+        [stepsStack.leadingAnchor constraintEqualToAnchor:centerContainer.leadingAnchor],
+        [stepsStack.trailingAnchor constraintEqualToAnchor:centerContainer.trailingAnchor],
+        [stepsStack.bottomAnchor constraintEqualToAnchor:centerContainer.bottomAnchor],
 
         // 取消按钮：底部安全区域上方
         [self.launchCancelButton.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-24],
@@ -1765,10 +1838,61 @@ static BOOL ame87_mcVersionRequiresTextureBuffer(NSString *mcVersionId) {
     // 已不再创建 launchStageTimer，此方法不会被调用）。
 }
 
+// ★ [LAUNCH-PROGRESS] 阶段/进度广播回调（AmeLaunchProgress.m 保证在主队列投递）。
+- (void)onLaunchProgressChanged {
+    [self updateLaunchProgressUI];
+}
+
+// ★ [LAUNCH-PROGRESS] 依据上报的当前阶段，刷新进度条 / 阶段文字 / 步骤骨架三态。
+- (void)updateLaunchProgressUI {
+    if (self.launchOverlayDismissed) return;
+    if (!self.launchProgressView || !self.launchStageLabel) return;
+
+    AmeLaunchStage stage = AmeLaunchProgressCurrentStage();
+    double fraction = AmeLaunchProgressCurrentFraction();
+    NSString *key = AmeLaunchProgressCurrentKey();
+
+    NSString *stageText = (key.length > 0)
+        ? localize(key, nil)
+        : localize(AmeLaunchStageLocalizationKey(stage), nil);
+    self.launchStageLabel.text = stageText;
+
+    [self.launchProgressView setProgress:(float)fraction animated:YES];
+
+    for (NSUInteger i = 0; i < self.launchStepDots.count; i++) {
+        UIView *dot = self.launchStepDots[i];
+        UILabel *rowLabel = self.launchStepLabels[i];
+        BOOL done = (NSInteger)i < (NSInteger)stage;
+        BOOL current = (NSInteger)i == (NSInteger)stage;
+        if (done) {
+            dot.backgroundColor = [UIColor systemGreenColor];
+            dot.layer.borderWidth = 0.0;
+            rowLabel.textColor = [UIColor colorWithWhite:0.85 alpha:1.0];
+            rowLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
+        } else if (current) {
+            dot.backgroundColor = [UIColor systemBlueColor];
+            dot.layer.borderWidth = 0.0;
+            rowLabel.textColor = [UIColor whiteColor];
+            rowLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
+        } else {
+            dot.backgroundColor = [UIColor clearColor];
+            dot.layer.borderWidth = 1.0;
+            dot.layer.borderColor = [UIColor colorWithWhite:0.45 alpha:1.0].CGColor;
+            rowLabel.textColor = [UIColor colorWithWhite:0.45 alpha:1.0];
+            rowLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
+        }
+    }
+}
+
 /// 首帧渲染通知回调：淡出并移除启动遮罩层
 - (void)onFirstFrameRendered {
+    // ★ [LAUNCH-PROGRESS] 首帧渲染 = 启动完成，先把阶段推到 Completed。
+    AmeLaunchProgressSetStage(AmeLaunchStageCompleted);
     dispatch_async(dispatch_get_main_queue(), ^{
         if (self.launchOverlayDismissed) return;
+        // ★ [LAUNCH-PROGRESS] 撤遮罩前把进度条刷到满格 —— updateLaunchProgressUI 会
+        //   被 launchOverlayDismissed 早退挡住，所以必须在置位之前调用。
+        [self updateLaunchProgressUI];
         self.launchOverlayDismissed = YES;
 
         [self.launchSpinner stopAnimating];
@@ -1793,6 +1917,7 @@ static BOOL ame87_mcVersionRequiresTextureBuffer(NSString *mcVersionId) {
             [self.launchCancelButton removeFromSuperview];
             self.launchCancelButton = nil;
             [[NSNotificationCenter defaultCenter] removeObserver:self name:@"PojavFirstFrameRendered" object:nil];
+            [[NSNotificationCenter defaultCenter] removeObserver:self name:AmeLaunchProgressChangedNotification object:nil];
             NSLog(@"[SurfaceViewController] Launch overlay dismissed after %.1f seconds", elapsed);
         }];
     });
@@ -1806,6 +1931,7 @@ static BOOL ame87_mcVersionRequiresTextureBuffer(NSString *mcVersionId) {
 
         [self.launchSpinner stopAnimating];
         [[NSNotificationCenter defaultCenter] removeObserver:self name:@"PojavFirstFrameRendered" object:nil];
+        [[NSNotificationCenter defaultCenter] removeObserver:self name:AmeLaunchProgressChangedNotification object:nil];
 
         [self.launchOverlayView removeFromSuperview];
         self.launchOverlayView = nil;
@@ -2991,6 +3117,8 @@ CALayer *Amethyst_SDL3RenderLayer(void) {
 
     // 清理启动遮罩层资源
     [[NSNotificationCenter defaultCenter] removeObserver:self name:@"PojavFirstFrameRendered" object:nil];
+    // ★ [LAUNCH-PROGRESS] 一并移除阶段广播观察者(与上面同一处清理)
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:AmeLaunchProgressChangedNotification object:nil];
     self.launchOverlayView = nil;
     self.launchGradientLayer = nil;
 

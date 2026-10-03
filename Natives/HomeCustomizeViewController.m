@@ -26,6 +26,28 @@ static UIColor *hexColor(NSString *hex) {
                            alpha:1.0];
 }
 
+// MARK: - ★ [SIZE4] 尺寸四档 ↔ 分段控件下标映射
+
+static HomeTileSize AmeTileSizeForSegmentIndex(NSInteger idx) {
+    switch (idx) {
+        case 0:  return HomeTileSizeSmall;   // 1×1
+        case 1:  return HomeTileSizeWide;    // 2×1
+        case 2:  return HomeTileSizeTall;    // 1×2
+        case 3:  return HomeTileSizeLarge;   // 2×2
+        default: return HomeTileSizeSmall;
+    }
+}
+
+static NSInteger AmeSegmentIndexForTileSize(HomeTileSize size) {
+    switch (size) {
+        case HomeTileSizeWide:  return 1;
+        case HomeTileSizeTall:  return 2;
+        case HomeTileSizeLarge: return 3;
+        case HomeTileSizeSmall:
+        default:                return 0;
+    }
+}
+
 // MARK: - Customization Tile Cell
 
 @interface CustomizeTileCell : UITableViewCell
@@ -35,6 +57,13 @@ static UIColor *hexColor(NSString *hex) {
 @property (nonatomic, strong) UILabel *tileDetailLabel;
 @property (nonatomic, strong) UISwitch *visibilitySwitch;
 @property (nonatomic, strong) UILabel *sizeLabel;
+@property (nonatomic, strong) UISegmentedControl *sizeSegmented;   // ★ [SIZE4] 四档尺寸
+@property (nonatomic, weak)   HomeTileConfig *tile;                // ★ [SIZE4] 反向引用,便于改尺寸
+
+- (void)configureWithTile:(HomeTileConfig *)tile;                  // ★ [SIZE4] 前置声明
+- (void)sizeSegmentChanged:(UISegmentedControl *)sender;           // ★ [SIZE4] 分段回调
+- (NSString *)displayTitleForTile:(HomeTileConfig *)tile;
+- (NSString *)displayDetailForTile:(HomeTileConfig *)tile;
 @end
 
 @implementation CustomizeTileCell
@@ -90,6 +119,21 @@ static UIColor *hexColor(NSString *hex) {
         self.visibilitySwitch.transform = CGAffineTransformMakeScale(0.7, 0.7);
         self.visibilitySwitch.onTintColor = hexColor(@"#8B5CF6");
         [self.contentView addSubview:self.visibilitySwitch];
+
+        // ★ [SIZE4] 四档尺寸分段控件(1×1 / 2×1 / 1×2 / 2×2),每张卡独立选择。
+        self.sizeSegmented = [[UISegmentedControl alloc] initWithItems:@[
+            AmeTileSizeShortName(HomeTileSizeSmall),
+            AmeTileSizeShortName(HomeTileSizeWide),
+            AmeTileSizeShortName(HomeTileSizeTall),
+            AmeTileSizeShortName(HomeTileSizeLarge),
+        ]];
+        self.sizeSegmented.translatesAutoresizingMaskIntoConstraints = NO;
+        self.sizeSegmented.selectedSegmentIndex = 0;
+        if (@available(iOS 13.0, *)) { self.sizeSegmented.selectedSegmentTintColor = hexColor(@"#8B5CF6"); }
+        self.sizeSegmented.tintColor = [UIColor labelColor];
+        [self.sizeSegmented addTarget:self action:@selector(sizeSegmentChanged:)
+                     forControlEvents:UIControlEventValueChanged];
+        [self.contentView addSubview:self.sizeSegmented];
         
         [NSLayoutConstraint activateConstraints:@[
             [self.accentStrip.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor constant:16],
@@ -98,7 +142,7 @@ static UIColor *hexColor(NSString *hex) {
             [self.accentStrip.widthAnchor constraintEqualToConstant:4],
             
             [self.tileIconView.leadingAnchor constraintEqualToAnchor:self.accentStrip.trailingAnchor constant:12],
-            [self.tileIconView.centerYAnchor constraintEqualToAnchor:self.contentView.centerYAnchor],
+            [self.tileIconView.centerYAnchor constraintEqualToAnchor:self.tileTitleLabel.centerYAnchor],
             [self.tileIconView.widthAnchor constraintEqualToConstant:26],
             [self.tileIconView.heightAnchor constraintEqualToConstant:26],
             
@@ -110,13 +154,19 @@ static UIColor *hexColor(NSString *hex) {
             [self.tileDetailLabel.topAnchor constraintEqualToAnchor:self.tileTitleLabel.bottomAnchor constant:2],
             [self.tileDetailLabel.trailingAnchor constraintEqualToAnchor:self.tileTitleLabel.trailingAnchor],
             
-            [self.sizeLabel.centerYAnchor constraintEqualToAnchor:self.contentView.centerYAnchor],
+            [self.sizeLabel.centerYAnchor constraintEqualToAnchor:self.tileTitleLabel.centerYAnchor],
             [self.sizeLabel.widthAnchor constraintEqualToConstant:40],
             [self.sizeLabel.heightAnchor constraintEqualToConstant:18],
             [self.sizeLabel.trailingAnchor constraintEqualToAnchor:self.visibilitySwitch.leadingAnchor constant:-6],
             
-            [self.visibilitySwitch.centerYAnchor constraintEqualToAnchor:self.contentView.centerYAnchor],
+            [self.visibilitySwitch.centerYAnchor constraintEqualToAnchor:self.tileTitleLabel.centerYAnchor],
             [self.visibilitySwitch.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-28],
+
+            // ★ [SIZE4] 分段控件:占满标题列宽,贴在详情下方(不硬摆 frame,约束随行高自适应)。
+            [self.sizeSegmented.leadingAnchor constraintEqualToAnchor:self.tileTitleLabel.leadingAnchor],
+            [self.sizeSegmented.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-28],
+            [self.sizeSegmented.topAnchor constraintEqualToAnchor:self.tileDetailLabel.bottomAnchor constant:8],
+            [self.sizeSegmented.heightAnchor constraintEqualToConstant:28],
         ]];
         
         [[BackgroundManager sharedManager] applyEffectToView:self.contentView];
@@ -125,18 +175,29 @@ static UIColor *hexColor(NSString *hex) {
 }
 
 - (void)configureWithTile:(HomeTileConfig *)tile {
+    self.tile = tile;   // ★ [SIZE4] 记住归属卡,分段控件直接改它的 tileSize
     self.tileTitleLabel.text = [self displayTitleForTile:tile];
     self.tileDetailLabel.text = [self displayDetailForTile:tile];
     self.tileIconView.image = [UIImage systemImageNamed:tile.iconName ?: @"square.grid.2x2"];
     self.tileIconView.tintColor = [tile accentColor];
     self.accentStrip.backgroundColor = [tile accentColor];
     self.visibilitySwitch.on = tile.visible;
-    self.sizeLabel.text = tile.tileSize == HomeTileSizeCompact ? localize(@"i18n_str_2018", nil) : localize(@"i18n_str_281", nil);
+    // ★ [SIZE4] 徽标用几何名(1×1/2×1/1×2/2×2),四档都能显示;选中态回填分段控件。
+    self.sizeLabel.text = AmeTileSizeShortName(tile.tileSize);
+    self.sizeSegmented.selectedSegmentIndex = AmeSegmentIndexForTileSize(tile.tileSize);
     
     CGFloat alpha = tile.visible ? 1.0 : 0.45;
     self.tileTitleLabel.alpha = alpha;
     self.tileIconView.alpha = alpha;
     self.tileDetailLabel.alpha = alpha;
+}
+
+/// ★ [SIZE4] 分段控件回调:直接把当前卡切成对应档位(独立于其它卡),并刷新本行文案。
+- (void)sizeSegmentChanged:(UISegmentedControl *)sender {
+    HomeTileSize size = AmeTileSizeForSegmentIndex(sender.selectedSegmentIndex);
+    self.tile.tileSize = size;
+    self.sizeLabel.text = AmeTileSizeShortName(size);
+    self.tileDetailLabel.text = [self displayDetailForTile:self.tile];
 }
 
 - (NSString *)displayTitleForTile:(HomeTileConfig *)tile {
@@ -163,7 +224,8 @@ static UIColor *hexColor(NSString *hex) {
         case HomeTileTypeShortcut:       type = localize(@"i18n_str_286", nil); break;
         default:                         type = localize(@"i18n_str_121", nil); break;
     }
-    NSString *size = tile.tileSize == HomeTileSizeCompact ? localize(@"i18n_str_2019", nil) : localize(@"i18n_str_281", nil);
+    // ★ [SIZE4] 四档本地化名(复用旧 key 2018/281;Tall/Large 用新 key 9101/9102)。
+    NSString *size = AmeTileSizeDisplayName(tile.tileSize);
     return [NSString stringWithFormat:@"%@ · %@", type, size];
 }
 
@@ -250,7 +312,7 @@ static UIColor *hexColor(NSString *hex) {
     self.tableView.dataSource = self;
     self.tableView.delegate = self;
     self.tableView.separatorStyle = UITableViewCellSeparatorStyleNone;
-    self.tableView.rowHeight = 68;
+    self.tableView.rowHeight = 100;   // ★ [SIZE4] 68 → 100:为四档尺寸分段控件腾出底部一行
     self.tableView.editing = YES;  // 始终处于编辑模式以支持拖拽
     self.tableView.allowsSelectionDuringEditing = YES;
     self.tableView.showsVerticalScrollIndicator = NO;
@@ -316,7 +378,7 @@ static UIColor *hexColor(NSString *hex) {
             HomeTileConfig *newTile = [[HomeTileConfig alloc] init];
             newTile.tileId = [NSString stringWithFormat:@"shortcut_%@_%@", key, [[NSUUID UUID] UUIDString]];
             newTile.tileType = HomeTileTypeShortcut;
-            newTile.tileSize = HomeTileSizeCompact;
+            newTile.tileSize = HomeTileSizeCompact;   // ★ [SIZE4] == HomeTileSizeSmall(旧别名,默认 1×1)
             newTile.visible = YES;
             newTile.customTitle = info[@"title"];
             newTile.iconName = info[@"icon"];
@@ -400,13 +462,21 @@ static UIColor *hexColor(NSString *hex) {
                                                                    message:nil
                                                             preferredStyle:UIAlertControllerStyleActionSheet];
     
-    // 切换大小
-    NSString *sizeTitle = tile.tileSize == HomeTileSizeCompact ? localize(@"i18n_str_2020", nil) : localize(@"i18n_str_301", nil);
-    [sheet addAction:[UIAlertAction actionWithTitle:sizeTitle style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        tile.tileSize = (tile.tileSize == HomeTileSizeCompact) ? HomeTileSizeFull : HomeTileSizeCompact;
-        [self.tableView reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:index inSection:0]]
-                              withRowAnimation:UITableViewRowAnimationAutomatic];
-    }]];
+    // ★ [SIZE4] 尺寸四选一(原为 “Compact ⇄ Full” 一键切换);当前档位加 ✓ 前缀。
+    for (NSNumber *sizeNum in @[@(HomeTileSizeSmall), @(HomeTileSizeWide),
+                                @(HomeTileSizeTall),  @(HomeTileSizeLarge)]) {
+        HomeTileSize size = (HomeTileSize)sizeNum.integerValue;
+        NSString *sizeTitle = [NSString stringWithFormat:@"%@ %@ · %@",
+                               (tile.tileSize == size ? @"✓" : @" "),
+                               AmeTileSizeShortName(size),
+                               AmeTileSizeDisplayName(size)];
+        [sheet addAction:[UIAlertAction actionWithTitle:sizeTitle style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *action) {
+            tile.tileSize = size;
+            [self.tableView reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:index inSection:0]]
+                                  withRowAnimation:UITableViewRowAnimationAutomatic];
+        }]];
+    }
     
     // 修改标题 (仅快捷入口和部分磁贴)
     if (tile.tileType == HomeTileTypeShortcut || tile.tileType == HomeTileTypeVersionRelease || tile.tileType == HomeTileTypeVersionSnapshot) {
@@ -521,7 +591,10 @@ static UIColor *hexColor(NSString *hex) {
 }
 
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations {
-    return UIInterfaceOrientationMaskLandscape;
+    // ★ [PORTRAIT-UNLOCK] 放开竖屏:原来是写死 Landscape ⇒ iPhone 上竖屏进不来
+    //   (主页是该 VC,它锁横屏 ⇒ 整个 App 被钉在横屏)。游戏页仍单独锁横屏。
+    if (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad) { return UIInterfaceOrientationMaskAll; }
+    return UIInterfaceOrientationMaskAllButUpsideDown;
 }
 
 - (void)handleBackgroundUIEffectChanged:(NSNotification *)notification {

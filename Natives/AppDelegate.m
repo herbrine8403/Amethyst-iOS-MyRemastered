@@ -61,7 +61,7 @@ extern dispatch_group_t fatalExitGroup;
 
 - (UIInterfaceOrientationMask)application:(UIApplication *)application supportedInterfaceOrientationsForWindow:(UIWindow *)window {
     // Force landscape only
-    return UIInterfaceOrientationMaskLandscape;
+    return UIInterfaceOrientationMaskAllButUpsideDown;   // ★ [PORTRAIT] 窗口层放开(游戏页单独锁横屏)
 }
 
 @end

@@ -2,10 +2,6 @@
 #import <QuartzCore/QuartzCore.h>
 #import "SurfaceViewController.h"
 #import "LauncherPreferences.h"
-// 启动器侧 FSR1（Natives/fsr1/ame_fsr1.m）。与 egl_bridge.m 同一个头：
-// gl_bridge 的 Task60 对齐块需要 ameFsr1NeedsFullResSurface() 来判断
-// 「surface 该建全分辨率还是缩放分辨率」。
-#import "fsr1/ame_fsr1.h"
 
 #include <dlfcn.h>
 #include <string.h>
@@ -498,50 +494,6 @@ static BOOL ame55_verify_surface(ame_es_t es, EGLSurface s, CGSize expected,
            (h == (EGLint)MAX(1.0, round(expected.height)));
 }
 
-/// Task193（Forge 26.x hidden-test-window 形态）：层→表面单例。
-/// 病历（Air 727a291 latestlog.1，Forge-26.1.2-64.1.3 会话）：MC 26.x 的
-/// RenderPearl 在建主窗口前先建 hidden test window。SDL3 路径（26.3）上该
-/// 窗口被 SDL hook 复用主窗口（refs 计数，无第二次 EGL 表面创建）；但 GLFW
-/// shim 路径（26.1.2 Forge，lwjgl-glfw natives 被跳过、走启动器自带 shim）
-/// 会再次 pojavCreateContext → 第二次 eglCreateWindowSurface 打在同一个
-/// CAMetalLayer 上 → ANGLE 以 EGL_BAD_ALLOC 0x3003 拒绝（层已绑定表面）
-/// → "Failed to create window with OpenGL context" →
-/// "No supported graphics backend was found" → 进程退出。
-/// 修法：层→表面单例。对同一 layer 的后续创建请求直接复用首个表面（语义与
-/// SDL 复用路径对齐：单游戏视图单 layer，hidden test window 只做能力查询，
-/// 共享无副作用）。
-static CFTypeRef  g_ame193_layerCF      = NULL;
-static EGLSurface g_ame193_layerSurface = EGL_NO_SURFACE;
-
-/// 命中则返回一个仍然有效的既有表面，否则返回 EGL_NO_SURFACE（调用方照常创建）。
-static EGLSurface ame193_reuse_layer_surface(id layer) {
-    if (layer == NULL) return EGL_NO_SURFACE;
-    if (g_ame193_layerSurface == EGL_NO_SURFACE || g_ame193_layerCF == NULL) {
-        return EGL_NO_SURFACE;
-    }
-    CFTypeRef reqCF = (__bridge CFTypeRef)layer;
-    if (reqCF == NULL || !CFEqual(g_ame193_layerCF, reqCF)) return EGL_NO_SURFACE;
-    return g_ame193_layerSurface;
-}
-
-/// 记录首个 (layer, surface) 对，供后续同层请求复用。
-static void ame193_record_layer_surface(id layer, EGLSurface surface) {
-    if (layer == NULL || surface == EGL_NO_SURFACE) return;
-    if (g_ame193_layerCF != NULL) CFRelease(g_ame193_layerCF);
-    g_ame193_layerCF = (CFTypeRef)CFBridgingRetain(layer);
-    g_ame193_layerSurface = surface;
-}
-
-/// 销毁钩子：surface 一经 eglDestroySurface 立即失效缓存，
-/// 避免后续同 layer 创建请求拿到已销毁句柄（野指针）。Task55 的
-/// destroy-recreate 梯度正依赖本函数保持缓存与真实生命周期同步。
-static void ame193_forget_layer_surface(EGLSurface surface) {
-    if (surface == EGL_NO_SURFACE) return;
-    if (g_ame193_layerSurface != surface) return;
-    g_ame193_layerSurface = EGL_NO_SURFACE;
-    if (g_ame193_layerCF != NULL) { CFRelease(g_ame193_layerCF); g_ame193_layerCF = NULL; }
-}
-
 /// Task 55 梯度式表面重对齐（取代 Task53 的单式 destroy-recreate）。
 /// 调用方：MC 渲染线程（swap 路径、上下文 current）。
 /// 返回 YES = querySurface == layer bounds（真治愈；调用方复位 latch mode）。
@@ -646,7 +598,6 @@ static BOOL ame_task53_realign_surface(void) {
     EGLSurface old55 = cur55;
     handle.eglMakeCurrent(g_EglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx55);
     handle.eglDestroySurface(g_EglDisplay, old55);
-    ame193_forget_layer_surface(old55);
     while (handle.eglGetError() != EGL_SUCCESS) {}
     ame55_main_gap_ms(100);
 
@@ -677,7 +628,6 @@ static BOOL ame_task53_realign_surface(void) {
         NSLog(@"[GLGeo] Task55 stepB FAILED: eglMakeCurrent error 0x%x -- fused off",
               (unsigned int)(uintptr_t)handle.eglGetError());
         handle.eglDestroySurface(g_EglDisplay, new55);
-        ame193_forget_layer_surface(new55);
         bundle->gl.surface = EGL_NO_SURFACE;
         g_ame53_disabled = 1;
         return NO;
@@ -798,36 +748,15 @@ static void ame_task41_swap_forensics(EGLSurface surface, unsigned long swapInde
     // viewport 双维严格小于 surface：转置形态（一维大一维小，如 820x1180 vs
     // 1180x820）不满足 → 真正的几何事故仍会走自愈链。FSR 关闭或非 MG
     // 渲染器时 viewport==surface，豁免天然无操作。
-    // 启动器侧 FSR1（video.fsr1，见 Natives/fsr1/ame_fsr1.m）与 MG 内置 FSR1
-    // 在几何上是同一种形态：surface 保持全分辨率、MC 按低分辨率绘制，画面落
-    // 在 surface 一角再由 FSR1 上采样铺满。若不把它纳入豁免，本函数就会把这
-    // 个「按设计存在的失配」判成几何事故，Task49 geo-heal / Task55 realign
-    // 会试图把 surface 拉回 viewport 尺寸，而 transposed 标志恒为真又会挡住
-    // SurfaceViewController 对 drawableSize 的写入 —— 全分辨率 backbuffer 被
-    // 塞进低分辨率 drawable 再上屏，表现正是「画面跑到左下角、被放大且超出
-    // 屏幕」。真正的几何事故（转置：一维大一维小）不满足下方的双维严格小于
-    // 条件，仍会走自愈链；100% 分辨率下 viewport==surface，豁免天然无操作。
-    // 每帧重算而非缓存：设置页可以在运行中改开关/分辨率并重建 surface，
-    // 缓存会让豁免在 FSR1 已开启后仍停在关闭态。两个 getenv + 一次偏好读取
-    // 每帧一次，开销可忽略（日志仍只打一次）。
-    int s_task78_fsr_link = 0;
-    {
+    static int s_task78_fsr_link = -1;
+    if (s_task78_fsr_link < 0) {
         const char *ame78_renderer = getenv("AMETHYST_RENDERER");
         NSInteger ame78_fsr = getPrefInt(@"mobileglues.fsr1_setting");
-        BOOL ame78_on = getPrefBool(@"video.fsr1");
-        const char *ame78_env = getenv("AMETHYST_FSR1");
-        if (ame78_env != NULL) {
-            if (strcmp(ame78_env, "0") == 0) ame78_on = NO;
-            else if (strcmp(ame78_env, "1") == 0) ame78_on = YES;
-        }
-        const BOOL ame78_mg = (ame78_renderer != NULL &&
-                               strcmp(ame78_renderer, RENDERER_NAME_MOBILEGLUES) == 0 &&
-                               ame78_fsr > 0);
-        s_task78_fsr_link = (ame78_mg || ame78_on) ? 1 : 0;
-        static BOOL s_task78_link_logged = NO;
-        if (s_task78_fsr_link && !s_task78_link_logged) {
-            s_task78_link_logged = YES;
-            NSLog(@"[GLGeo] Task78 FSR linkage active: mg_fsr1_setting=%ld launcher_fsr1=%d -- viewport (render) < surface is the expected upscale geometry, compensation chain exempted", (long)ame78_fsr, (int)ame78_on);
+        s_task78_fsr_link = (ame78_renderer != NULL &&
+                             strcmp(ame78_renderer, RENDERER_NAME_MOBILEGLUES) == 0 &&
+                             ame78_fsr > 0) ? 1 : 0;
+        if (s_task78_fsr_link) {
+            NSLog(@"[GLGeo] Task78 FSR linkage active: renderer=MobileGlues fsr1_setting=%ld -- viewport (render) < surface is the expected upscale geometry, compensation chain exempted", (long)ame78_fsr);
         }
     }
     const BOOL geoMismatch = (viewport[2] > 0 && viewport[3] > 0 &&
@@ -1875,30 +1804,6 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
             // updateSavedResolution 单独缩至 surface/fsr_scale，本块只负责
             // surface/drawable 口径，不受 fsr_scale 影响。
             CGFloat rs60 = resolutionScale;
-            // —— FSR1（启动器侧上采样）：surface 必须是全分辨率 ——
-            // FSR1 的工作前提是「surface（framebuffer 0）全分辨率 + MC 按缩放
-            // 后的低分辨率绘制」：低分辨率画面落在 surface 左下角，由
-            // ameFsr1Present 在 swap 前 EASU 上采样铺满。交给 MC 的窗口尺寸
-            // 由 updateSavedResolution 单独缩到 resolutionScale，与此处无关。
-            //
-            // 若这里仍按 resolutionScale 把 surface 一起缩掉，有两个后果：
-            //   1) surface == MC viewport —— ameFsr1Present 判定「没有可上采样
-            //      的东西」直接空转（日志 [FSR1] idle），用户看到的就是
-            //      「开了跟没开一样」；
-            //   2) 更要命的是本块会覆盖 updateSavedResolution 刚写好的全分辨率
-            //      drawableSize（后者在 FSR1 下刻意写 physical），把 layer 拉回
-            //      低分辨率，而 ANGLE 已按新的 contentsScale(=screenScale) 把
-            //      EGL surface 建成全分辨率 —— present 的全分辨率 backbuffer 被
-            //      塞进低分辨率 drawable，CoreAnimation 再拉伸上屏，表现正是
-            //      「画面跑到左下角、被放大且超出屏幕」。
-            // FSR1 关闭或 resolution=100% 时该判定为假，rs60 与旧行为逐字一致
-            // （零回归）。
-            if (ameFsr1NeedsFullResSurface()) {
-                rs60 = 1.0;
-                NSLog(@"[GLGeo] Task60 FSR1 full-res surface: resolutionScale %.2f "
-                      @"NOT applied to the surface (render resolution goes to MC's window; "
-                      @"FSR1 upscales it at present)", resolutionScale);
-            }
             if (rs60 <= 0.0) rs60 = 1.0;  // 防御：全局未初始化（JavaGUI 等路径）
             oldDrawable50 = ml60.drawableSize;
             oldScale50 = layer.contentsScale;
@@ -1930,22 +1835,12 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
     };
     // 单次创建（无重试环）：原生 scale 对齐后 ANGLE 无论读 bounds×scale 还是
     // drawableSize 都得到与 MC viewport 相同的尺寸，无需执法。
-    // Task193：先查层→表面单例（Forge 26.x 在同一 layer 上二次建窗的形态）。
-    bundle->surface = ame193_reuse_layer_surface(layer);
-    if (bundle->surface) {
-        NSLog(@"[GLGeo] Task193: eglCreateWindowSurface REUSED surface=%p for layer=%p "
-              @"(second window on same layer -- Forge 26.x hidden-test-window shape; "
-              @"BAD_ALLOC 0x3003 avoided)",
-              (void *)bundle->surface, (__bridge void *)layer);
-    } else {
-        bundle->surface = handle.eglCreateWindowSurface(g_EglDisplay, bundle->config,
-            (__bridge EGLNativeWindowType)layer, mobileGL ? mobileGLSurfaceAttribs : NULL);
-        if (!bundle->surface) {
-            NSDebugLog(@"EGLBridge: eglCreateWindowSurface finished with error: 0x%x", handle.eglGetError());
-            free(bundle);
-            return NULL;
-        }
-        ame193_record_layer_surface(layer, bundle->surface);
+    bundle->surface = handle.eglCreateWindowSurface(g_EglDisplay, bundle->config,
+        (__bridge EGLNativeWindowType)layer, mobileGL ? mobileGLSurfaceAttribs : NULL);
+    if (!bundle->surface) {
+        NSDebugLog(@"EGLBridge: eglCreateWindowSurface finished with error: 0x%x", handle.eglGetError());
+        free(bundle);
+        return NULL;
     }
     // 黑屏取证（Task 32）：surface 创建成功时，把呈现目标的完整状态记入日志——
     // layer 指针/bounds/contentsScale/drawableSize/是否已在窗口层级。
@@ -2136,7 +2031,6 @@ void gl_terminate() {
     atomic_store(&g_ame50_gl_owns_layer, 0);
     handle.eglMakeCurrent(g_EglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     handle.eglDestroySurface(g_EglDisplay, currentBundle->gl.surface);
-    ame193_forget_layer_surface(currentBundle->gl.surface);
     handle.eglDestroyContext(g_EglDisplay, currentBundle->gl.context);
     handle.eglTerminate(g_EglDisplay);
     handle.eglReleaseThread();

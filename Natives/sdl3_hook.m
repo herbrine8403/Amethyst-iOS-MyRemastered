@@ -30,6 +30,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import "utils.h"
+#include "shader_cap_probe.h"   // ★ [SHADER-CAP] GL 能力探测/诚实上报/入口映射
 extern CALayer *Amethyst_SDL3RenderLayer(void);
 static void ame_applyLauncherResolutionToSDLLayer(void);
 
@@ -1996,6 +1997,31 @@ static bool ame_glSymbolTrusted(const void *sym) {
     return true;
 }
 
+// —— ★ [SHADER-CAP] 给能力探测模块的「从渲染器解析 GL 入口」回调 ——
+//
+// 与下方 ame_resolveGlEntry 同一口径：只认渲染器镜像里的实现（ame_glSymbolTrusted
+// 已排除系统框架桩与自家钩子）。解析期间抬升 ame_dlsymBypassDepth，避免重入
+// hooked dlsym 造成「包装当真实实现」的无限递归（本文件多处崩溃均源于此模式）。
+static void *ame_shaderCapResolveRaw(const char *name) {
+    if (name == NULL) return NULL;
+    void *rh = ame_rendererHandle();
+    if (rh == NULL) return NULL;
+    void *p = NULL;
+    ame_dlsymBypassDepth++;
+    p = dlsym(rh, name);
+    ame_dlsymBypassDepth--;
+    if (p == NULL || !ame_glSymbolTrusted(p)) return NULL;
+    return p;
+}
+
+// 幂等注入设置。探测/上报/别名映射都依赖这个解析器；未注入时模块全部空转（行为不变）。
+static void ame_shaderCapEnsureSetup(void) {
+    static int s_shaderCapSetupDone = 0;
+    if (s_shaderCapSetupDone) return;
+    s_shaderCapSetupDone = 1;
+    ame_shader_cap_setup(ame_shaderCapResolveRaw);
+}
+
 static ame_fn_glViewport ame_resolve_glViewport(void) {
     // 若已缓存的是系统桩（例如被 dlsym 路径的 RTLD_DEFAULT 回退污染），丢弃重解析。
     if (ame_real_glViewport != NULL &&
@@ -2025,6 +2051,13 @@ static ame_fn_glViewport ame_resolve_glViewport(void) {
 // 导致后部的包装从未被调用（日志里 glViewport 零输出即此证据）。
 static void ame_maybeWrapGl(const char *name, void **out) {
     if (name == NULL || out == NULL || *out == NULL) return;
+    // ★ [SHADER-CAP] 能力上报 / core→EXT 别名映射优先。模块在「未探测到渲染器真实
+    //   实现」或「能力未启用」时返回 NULL，此处随即走原有路径 —— 行为与改动前一致。
+    ame_shaderCapEnsureSetup();
+    {
+        void *cap = ame_shader_cap_resolve_entry(name);
+        if (cap != NULL) { *out = cap; return; }
+    }
     // glScissor 与 glViewport 是彼此独立的 GL 状态，必须一并修正，否则绘制
     // 会被残留的 scissor box 裁掉（详见 ame_glScissor 处注释）。
     if (strcmp(name, "glScissor") == 0) {
@@ -2593,6 +2626,10 @@ static bool ame_SDL_GL_MakeCurrent(void *window, void *context) {
 }
 
 static bool ame_SDL_GL_SwapWindow(void *window) {
+    // ★ [SHADER-CAP] 每帧安全点：首次探测 GL 能力（幂等；此时上下文必然 current）。
+    //   探测只读，不改行为；无上下文时模块会自行跳过并在下一帧重试。日志前缀 [SHADER-CAP]。
+    ame_shaderCapEnsureSetup();
+    ame_shader_cap_probe_run_once();
     // 每帧必经。放在交换之前：补发的事件由 MC 在下一帧消费，不影响本帧绘制。
     ame_maybeNudgeWindowResize();
     pojavSwapBuffers();
@@ -2882,6 +2919,15 @@ static void *ame_SDL_GL_GetProcAddress(const char *proc) {
     if (ame_isMobileGluesEgl() && proc[0] == 'e' && proc[1] == 'g' && proc[2] == 'l') {
         return ame_real_GL_GetProcAddress ? ame_real_GL_GetProcAddress(proc) : NULL;
     }
+    // ★ [SHADER-CAP] 能力上报 / core→EXT 别名映射优先。本函数是 MC 取 GL 入口的主路径，
+    //   在这里接管可保证 LWJGL 的 GL 能力表看到诚实补报的扩展。模块只在「探测到渲染器
+    //   真实实现」时返回非 NULL；否则原样走下方既有解析，行为不变。
+    //   注意：glGetError 一致性校验(26.3 "glGetError mismatch")不受影响 —— 我们不改该入口。
+    ame_shaderCapEnsureSetup();
+    {
+        void *cap = ame_shader_cap_resolve_entry(proc);
+        if (cap != NULL) return cap;
+    }
     // glViewport 走我们的包装：它是 MC 把窗口尺寸交给 GL 的最后一步，
     // 在此兜底可确保渲染区域恒等于 EGL surface（见 ame_glViewport 处注释）。
     // —— OSMesa 系（zink / gallium）不接管 viewport / scissor ——
@@ -3111,6 +3157,12 @@ static void *ame_resolveGlEntry(void *handle, const char *name) {
                 NSDebugLog(@"[SDLHook] GL entry '%s': RTLD_DEFAULT stub rejected, "
                             "using renderer impl %p", name, p);
             }
+            // ★ [SHADER-CAP] 上报包装 / 别名映射（模块未启用或该入口无真实实现时返回 NULL）。
+            ame_shaderCapEnsureSetup();
+            {
+                void *cap = ame_shader_cap_resolve_entry(name);
+                if (cap != NULL) return cap;
+            }
             return p;
         }
     }
@@ -3178,6 +3230,19 @@ void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
         }
         if (ame_real_glScissor != NULL) return (void *)ame_glScissor;
         return NULL;
+    }
+
+    // ★ [SHADER-CAP] 能力上报包装 / core→EXT 别名映射。
+    //   本分支必须放在 ame_resolveGlEntry 之前，且**不依赖「原路径不可信」**：
+    //   渲染器（如 Metal 路径的 ANGLE）以 RTLD_GLOBAL 载入时，dlsym(RTLD_DEFAULT,
+    //   "glGetString") 直接命中它的真实实现（ame_glSymbolTrusted 判定为可信），
+    //   ame_resolveGlEntry 会原样放行 —— 那样 LWJGL 的 GL 能力表就看不到诚实补报。
+    //   这里对全局查找路径（显式句柄查询一律不碰，见 ame_shouldMeddleGlEntry）做一次拦截；
+    //   模块只在探到渲染器真实实现且能力启用时返回非 NULL，否则行为完全不变。
+    if (ame_shouldMeddleGlEntry(handle) && ame_isGlEntryName(name)) {
+        ame_shaderCapEnsureSetup();
+        void *cap = ame_shader_cap_resolve_entry(name);
+        if (cap != NULL) return cap;
     }
 
     // LWJGL 3.4.x 取 GL 入口点时命中系统 OpenGLES 桩，导致 26.2 判定"无上下文"

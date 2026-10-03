@@ -15,6 +15,7 @@
 @property (nonatomic, strong) UIImageView *previewImageView;
 @property (nonatomic, strong) UISlider *opacitySlider;
 @property (nonatomic, weak) UILabel *opacityValueLabel;
+@property (nonatomic, weak) UILabel *glassStrengthValueLabel;   // ★ [GLASSUI] 玻璃强度数值标签
 @end
 
 @implementation BackgroundSettingsViewController
@@ -42,6 +43,11 @@
     
     // Setup sections
     [self setupSections];
+    
+    // ★ [GLASSUI] 玻璃设置回读:开关/强度由 BackgroundManager 在 init 时从 NSUserDefaults 载入
+    //   (键 background_glass_rim_enabled / background_glass_rim_strength,默认 开 / 1.0)。
+    //   本页不另存一份本地状态 —— UISwitch/UISlider 在 cellForRowAtIndexPath 里每次都按共享实例
+    //   的值同步(并在滑块 setter 里夹紧),所以「当前值」始终与设置一致。
     
     // Add close button
     self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
@@ -134,7 +140,9 @@
         @[localize(@"i18n_str_57", nil), localize(@"i18n_str_1296", nil), localize(@"i18n_str_1297", nil)],
         @[localize(@"i18n_str_60", nil)],
         @[localize(@"i18n_str_61", nil), localize(@"i18n_str_55", nil)],
-        @[localize(@"i18n_str_62", nil), localize(@"i18n_str_63", nil)]
+        @[localize(@"i18n_str_62", nil), localize(@"i18n_str_63", nil)],
+        // ★ [GLASSUI] 玻璃效果:row0=高光开关(UISwitch),row1=强度滑块(UISlider,0…1)
+        @[localize(@"preference.title.glass_effect", nil), localize(@"preference.title.glass_strength", nil)]
     ];
 }
 
@@ -277,6 +285,70 @@
         }
     }
     
+    // ★ [GLASSUI] 玻璃效果 section:row0=高光开关(row1 为强度滑块)
+    if (indexPath.section == 4) {
+        if (indexPath.row == 0) {
+            static NSString *glassSwitchCellIdentifier = @"GlassSwitchCell";   // ★ [GLASSUI]
+            UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:glassSwitchCellIdentifier];
+            if (!cell) {
+                cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:glassSwitchCellIdentifier];
+                cell.selectionStyle = UITableViewCellSelectionStyleNone;
+                UISwitch *sw = [[UISwitch alloc] init];
+                sw.tag = 400;   // ★ [GLASSUI]
+                [sw addTarget:self action:@selector(glassSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+                cell.accessoryView = sw;
+            }
+            cell.textLabel.text = self.sections[indexPath.section][indexPath.row];
+            cell.imageView.image = [UIImage systemImageNamed:@"sparkles"];
+            // 回读当前值并同步控件状态(避免「界面显示」与「真实设置」不一致)
+            UISwitch *sw = (UISwitch *)cell.accessoryView;
+            if ([sw isKindOfClass:[UISwitch class]]) { sw.on = manager.glassRimEnabled; }
+            [self styleCell:cell hasBackground:hasBackground];
+            return cell;
+        }
+
+        static NSString *glassSliderCellIdentifier = @"GlassSliderCell";   // ★ [GLASSUI]
+        UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:glassSliderCellIdentifier];
+        if (!cell) {
+            cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:glassSliderCellIdentifier];
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+
+            UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(16, 0, cell.bounds.size.width - 120, 30)];
+            slider.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+            slider.minimumValue = 0.0f;
+            slider.maximumValue = 1.0f;   // ★ 与 BackgroundManager 的 clamp 区间一致
+            slider.tag = 410;             // ★ [GLASSUI]
+            [slider addTarget:self action:@selector(glassStrengthSliderChanged:) forControlEvents:UIControlEventValueChanged];
+
+            UILabel *valueLabel = [[UILabel alloc] initWithFrame:CGRectMake(cell.bounds.size.width - 80, 0, 60, 30)];
+            valueLabel.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+            valueLabel.textAlignment = NSTextAlignmentRight;
+            valueLabel.tag = 411;         // ★ [GLASSUI]
+            valueLabel.font = [UIFont monospacedDigitSystemFontOfSize:14 weight:UIFontWeightRegular];
+
+            [cell.contentView addSubview:slider];
+            [cell.contentView addSubview:valueLabel];
+            cell.contentView.layoutMargins = UIEdgeInsetsMake(8, 16, 8, 16);
+        }
+
+        [self styleCell:cell hasBackground:hasBackground];
+        cell.textLabel.text = nil;
+        cell.imageView.image = [UIImage systemImageNamed:@"slider.horizontal.3"];
+
+        UISlider *slider = [cell.contentView viewWithTag:410];
+        if ([slider isKindOfClass:[UISlider class]]) {
+            slider.value = manager.glassRimStrength;      // 回读当前值(已夹紧)
+            slider.enabled = manager.glassRimEnabled;     // 关闭玻璃时滑块置灰(HIG)
+        }
+        UILabel *valueLabel = [cell.contentView viewWithTag:411];
+        if ([valueLabel isKindOfClass:[UILabel class]]) {
+            valueLabel.text = [NSString stringWithFormat:@"%.0f%%", manager.glassRimStrength * 100];
+            valueLabel.textColor = hasBackground ? [UIColor whiteColor] : [UIColor labelColor];
+        }
+        self.glassStrengthValueLabel = valueLabel;
+        return cell;
+    }
+
     // 其他部分
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:cellIdentifier];
     if (!cell) {
@@ -356,6 +428,34 @@
     [[BackgroundManager sharedManager] refreshUIEffect];
 }
 
+#pragma mark - ★ [GLASSUI] 玻璃开关 / 强度
+
+// 开关:开 = 按当前强度恢复高光;关 = 摘除高光(AmeDetachGlassRim 那条路径)。
+// setter 内已做「持久化 + 写全局强度 + 立即重刷」,这里只同步同页控件的可用态。
+- (void)glassSwitchChanged:(UISwitch *)sw {
+    [BackgroundManager sharedManager].glassRimEnabled = sw.on;
+
+    UITableViewCell *cell = [self.tableView cellForRowAtIndexPath:[NSIndexPath indexPathForRow:1 inSection:4]];
+    if ([cell isKindOfClass:[UITableViewCell class]]) {
+        UISlider *slider = [cell.contentView viewWithTag:410];
+        if ([slider isKindOfClass:[UISlider class]]) {
+            slider.enabled = sw.on;
+            slider.value = [BackgroundManager sharedManager].glassRimStrength;
+        }
+    }
+}
+
+// 强度:setter 内 clamp(0…1)+ 持久化 + 立即重刷;这里只更新数值标签。
+- (void)glassStrengthSliderChanged:(UISlider *)slider {
+    [BackgroundManager sharedManager].glassRimStrength = slider.value;
+
+    UITableViewCell *cell = (UITableViewCell *)slider.superview.superview;
+    if ([cell isKindOfClass:[UITableViewCell class]]) {
+        UILabel *valueLabel = [cell.contentView viewWithTag:411];
+        valueLabel.text = [NSString stringWithFormat:@"%.0f%%", [BackgroundManager sharedManager].glassRimStrength * 100];
+    }
+}
+
 #pragma mark - Table View Delegate
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -368,6 +468,19 @@
     if (indexPath.section == 0 && hasBackground) {
         if (indexPath.row == 0) {
             [self showUIEffectPicker];
+        }
+        return;
+    }
+    
+    // ★ [GLASSUI] 点整行也能切换玻璃开关(与点 UISwitch 等效;HIG 习惯)
+    if (indexPath.section == 4) {
+        if (indexPath.row == 0) {
+            UITableViewCell *cell = [self.tableView cellForRowAtIndexPath:indexPath];
+            UISwitch *sw = (UISwitch *)cell.accessoryView;
+            if ([sw isKindOfClass:[UISwitch class]]) {
+                [sw setOn:!sw.on animated:YES];
+                [self glassSwitchChanged:sw];
+            }
         }
         return;
     }

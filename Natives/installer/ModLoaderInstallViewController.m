@@ -20,6 +20,147 @@
 #import "ScreenUtils.h"
 #import <QuartzCore/QuartzCore.h>
 
+#pragma mark - ★ [PCL-ALIGN] 版本列表拉取工具（与 ForgeInstallViewController.m 同一实现风格）
+//
+// 背景：本文件的 ModLoaderVersionPickerViewController 才是“下载→下载实例→选加载器”实际
+// 走的取版本路径。旧 loadForgeVersions 用“双源并发竞速 + 无缓存 + 单次 20s”，用户报
+// “PCL 一次能拿到 forge，我们要好几次”。此处对齐 PCL2 ModDownload.vb / ModNet.vb：
+//   ① BMCLAPI 轻接口 /forge/minecraft/<mc> 优先（数据量小、秒回）；
+//   ② 全量 maven-metadata.xml 仅兜底（BMCLAPI 主 → 官方备，短超时单次）；
+//   ③ 成功结果写磁盘缓存（与 ForgeInstallViewController.m 同目录/命名）。
+
+// ★ [PCL-ALIGN] 同步 GET（带超时 + 线性退避重试），非 2xx 视为失败；全失败返回 nil。
+static NSData *PALFetchWithRetry(NSString *urlString, NSInteger maxAttempts, NSTimeInterval timeout) {
+    if (urlString.length == 0) return nil;
+    if (maxAttempts < 1) maxAttempts = 1;
+    if (timeout <= 0) timeout = 12.0;
+    NSString *userAgent = @"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
+    for (NSInteger attempt = 1; attempt <= maxAttempts; attempt++) {
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
+        req.timeoutInterval = timeout;
+        req.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+        [req setValue:userAgent forHTTPHeaderField:@"User-Agent"];
+        __block NSData *d = nil;
+        __block NSInteger status = 0;
+        NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req
+            completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+                d = data;
+                if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
+                    status = ((NSHTTPURLResponse *)response).statusCode;
+                }
+                dispatch_semaphore_signal(sem);
+            }];
+        [task resume];
+        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)((timeout + 5.0) * NSEC_PER_SEC)));
+        BOOL httpOK = (status == 0 || (status >= 200 && status < 300));
+        if (d.length > 0 && httpOK) return d;
+        NSLog(@"[PCL-ALIGN] Forge fetch attempt %ld/%ld failed (http=%ld, bytes=%lu) %@",
+              (long)attempt, (long)maxAttempts, (long)status, (unsigned long)d.length, urlString);
+        if (attempt < maxAttempts) [NSThread sleepForTimeInterval:1.2 * (double)attempt];
+    }
+    return nil;
+}
+
+// ★ [PCL-ALIGN] 版本列表磁盘缓存（PCL2 用 CacheCow FileStore 做 HTTP 缓存，效果等价）。
+//   路径：Caches/pcl_align_version_cache/<vendor>_<mc>.json，内容 {ts, versions[]}。有效期 6h。
+static NSString *PALVersionCacheDirectory(void) {
+    static NSString *dir = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *base = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
+        if (base.length == 0) base = NSTemporaryDirectory();
+        dir = [base stringByAppendingPathComponent:@"pcl_align_version_cache"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    });
+    return dir;
+}
+static NSString *PALVersionCachePath(NSString *vendor, NSString *gameVersion) {
+    NSString *raw = [NSString stringWithFormat:@"%@_%@",
+                     vendor.length ? vendor : @"Unknown",
+                     gameVersion.length ? gameVersion : @"all"];
+    NSCharacterSet *bad = [[NSCharacterSet alphanumericCharacterSet] invertedSet];
+    NSString *safe = [[raw componentsSeparatedByCharactersInSet:bad] componentsJoinedByString:@"_"];
+    return [PALVersionCacheDirectory() stringByAppendingPathComponent:[safe stringByAppendingString:@".json"]];
+}
+static NSArray<NSString *> *PALCacheRead(NSString *vendor, NSString *gameVersion, NSTimeInterval ttl) {
+    NSData *data = [NSData dataWithContentsOfFile:PALVersionCachePath(vendor, gameVersion)];
+    if (data.length == 0) return nil;
+    id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if (![obj isKindOfClass:[NSDictionary class]]) return nil;
+    NSDictionary *dict = (NSDictionary *)obj;
+    NSArray *versions = dict[@"versions"];
+    NSNumber *ts = dict[@"ts"];
+    if (![versions isKindOfClass:[NSArray class]] || versions.count == 0) return nil;
+    if (ttl > 0 && ([NSDate date].timeIntervalSince1970 - ts.doubleValue) > ttl) return nil;
+    NSMutableArray<NSString *> *out = [NSMutableArray new];
+    for (id v in versions) {
+        if ([v isKindOfClass:[NSString class]] && [v length] > 0) [out addObject:v];
+    }
+    return out.count > 0 ? out : nil;
+}
+static void PALCacheWrite(NSString *vendor, NSString *gameVersion, NSArray<NSString *> *versions) {
+    if (versions.count == 0) return;
+    NSDictionary *obj = @{ @"ts": @([NSDate date].timeIntervalSince1970),
+                           @"vendor": vendor ?: @"",
+                           @"gameVersion": gameVersion ?: @"",
+                           @"versions": versions };
+    NSData *data = [NSJSONSerialization dataWithJSONObject:obj options:0 error:nil];
+    if (data.length == 0) return;
+    [data writeToFile:PALVersionCachePath(vendor, gameVersion) atomically:YES];
+}
+
+// ★ [PCL-ALIGN] Forge 全量 maven-metadata.xml 解析器：返回与 gameVersion 匹配的“纯 Forge 版本号”。
+//   口径与旧 delegate 一致：<version>1.20.1-47.2.0</version> → "47.2.0"（供 picker 显示，
+//   下游 ForgeInstallViewController 会补全 <mc>-<forge> 前缀）。
+@interface PALForgeMetaParser : NSObject <NSXMLParserDelegate>
+@property (nonatomic, copy) NSString *gameVersion;
+@property (nonatomic, strong) NSMutableArray<NSString *> *versions;
+@property (nonatomic, strong) NSMutableString *current;
+@property (nonatomic, assign) BOOL inVersion;
+@end
+@implementation PALForgeMetaParser
+- (instancetype)init {
+    if ((self = [super init])) { _versions = [NSMutableArray new]; }
+    return self;
+}
+- (void)parser:(NSXMLParser *)parser didStartElement:(NSString *)elementName namespaceURI:(NSString *)namespaceURI qualifiedName:(NSString *)qName attributes:(NSDictionary *)attributeDict {
+    if ([elementName isEqualToString:@"version"]) {
+        _inVersion = YES;
+        _current = [NSMutableString new];
+    }
+}
+- (void)parser:(NSXMLParser *)parser foundCharacters:(NSString *)string {
+    if (_inVersion && string) [_current appendString:string];
+}
+- (void)parser:(NSXMLParser *)parser didEndElement:(NSString *)elementName namespaceURI:(NSString *)namespaceURI qualifiedName:(NSString *)qName {
+    if (![elementName isEqualToString:@"version"]) return;
+    _inVersion = NO;
+    NSString *raw = [_current stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    _current = nil;
+    if (raw.length == 0) return;
+    NSString *prefix = [NSString stringWithFormat:@"%@-", _gameVersion ?: @""];
+    NSString *forgeVer = nil;
+    if ([raw hasPrefix:prefix]) forgeVer = [raw substringFromIndex:prefix.length];
+    else if ([raw isEqualToString:_gameVersion]) forgeVer = raw;
+    if (forgeVer.length > 0 && ![_versions containsObject:forgeVer]) [_versions addObject:forgeVer];
+}
+@end
+static NSArray<NSString *> *PALParseForgeMetaXML(NSData *data, NSString *gameVersion) {
+    if (data.length == 0) return @[];
+    // 校验响应是 XML 而非 HTML 错误页（BMCLAPI 限流 429 / 5xx 时可能返回 HTML）
+    NSUInteger previewLen = MIN(256, data.length);
+    NSString *preview = [[NSString alloc] initWithData:[data subdataWithRange:NSMakeRange(0, previewLen)] encoding:NSUTF8StringEncoding];
+    NSString *lower = preview.lowercaseString ?: @"";
+    if ([lower containsString:@"<html"] || [lower containsString:@"<!doctype"] || [lower containsString:@"<head"]) return @[];
+    PALForgeMetaParser *p = [PALForgeMetaParser new];
+    p.gameVersion = gameVersion;
+    NSXMLParser *parser = [[NSXMLParser alloc] initWithData:data];
+    parser.delegate = p;
+    [parser parse];
+    return [p.versions copy];
+}
+
 #pragma mark - Data Models
 
 /// 加载器元数据
@@ -530,81 +671,143 @@
     [_currentTask resume];
 }
 
-#pragma mark Forge (并发竞速，参照原 loadForgeVersionsReal)
+#pragma mark Forge (★ [PCL-ALIGN] BMCLAPI 轻接口优先 + 全量 maven-metadata 兜底)
 
 - (void)loadForgeVersions {
-    // 参照 FCL/HMCL：并发竞速同时发起官方源和 BMCL API 请求，谁先成功用谁
-    NSString *bmclURL = @"https://bmclapi2.bangbang93.com/maven/net/minecraftforge/forge/maven-metadata.xml";
-    NSString *officialURL = @"https://maven.minecraftforge.net/net/minecraftforge/forge/maven-metadata.xml";
+    // ★ [PCL-ALIGN] 对齐 PCL2：BMCLAPI /forge/minecraft/<mc> 轻接口优先 →
+    //   全量 maven-metadata.xml 仅兜底（BMCLAPI 主 → 官方备，短超时单次）+ 磁盘缓存。
+    NSString *mc = _gameVersion ?: @"";
+    NSLog(@"[PCL-ALIGN] ModLoaderInstallViewController.loadForgeVersions begin: mc=%@ (impl=ModLoaderInstallViewController.m)", mc);
+    if (mc.length == 0) {
+        [self finishLoadingWithVersions:@[] error:nil];
+        return;
+    }
 
     _forgeVersionList = [NSMutableArray array];
-    _isParsingForge = YES;
+    _isParsingForge = NO;  // XML 解析改由 PALForgeMetaParser 在后台线程完成
 
     __weak typeof(self) weakSelf = self;
-    __block BOOL settled = NO;
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
 
-    NSString *userAgent = @"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
-
-    void (^processData)(NSData *) = ^(NSData *data) {
-        @synchronized(weakSelf) {
-            if (settled) return;
-            settled = YES;
-        }
-        if (!data || data.length == 0) return;
-        NSXMLParser *parser = [[NSXMLParser alloc] initWithData:data];
-        parser.delegate = weakSelf;
-        [parser parse];
-    };
-
-    NSMutableURLRequest *bmclRequest = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:bmclURL]];
-    bmclRequest.timeoutInterval = 20.0;
-    [bmclRequest setValue:userAgent forHTTPHeaderField:@"User-Agent"];
-    _bmclTask = [[NSURLSession sharedSession] dataTaskWithRequest:bmclRequest completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        if (error || !data) {
-            @synchronized(weakSelf) { if (settled) return; }
-            return;
-        }
-        processData(data);
-    }];
-
-    NSMutableURLRequest *officialRequest = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:officialURL]];
-    officialRequest.timeoutInterval = 20.0;
-    [officialRequest setValue:userAgent forHTTPHeaderField:@"User-Agent"];
-    _currentTask = [[NSURLSession sharedSession] dataTaskWithRequest:officialRequest completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        if (error || !data) {
-            @synchronized(weakSelf) { if (settled) return; }
-            // 给 BMCLAPI 5s 宽限期
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                @synchronized(weakSelf) {
-                    if (settled) return;
-                    settled = YES;
-                }
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    __strong typeof(weakSelf) strongSelf = weakSelf;
-                    if (!strongSelf) return;
-                    [strongSelf finishLoadingWithVersions:@[] error:error];
-                });
+        // ① 磁盘缓存（6h）
+        NSArray<NSString *> *cached = PALCacheRead(@"Forge", mc, 6 * 3600.0);
+        if (cached.count > 0) {
+            NSLog(@"[PCL-ALIGN] Forge list cache HIT vendor=Forge mc=%@ (%lu)", mc, (unsigned long)cached.count);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [strongSelf finishLoadingWithVersions:cached error:nil];
             });
             return;
         }
-        processData(data);
-    }];
+        NSLog(@"[PCL-ALIGN] Forge list cache MISS vendor=Forge mc=%@", mc);
 
-    [_bmclTask resume];
-    [_currentTask resume];
+        NSMutableArray<NSString *> *collected = [NSMutableArray new];
+        NSString *lastSource = nil;
+
+        // ② 最快：BMCLAPI 按版本轻接口（返回纯 Forge 版本号，如 "47.2.0"）
+        NSString *encodedMC = [mc stringByReplacingOccurrencesOfString:@"-" withString:@"_"];
+        NSString *fastURL = [NSString stringWithFormat:@"https://bmclapi2.bangbang93.com/forge/minecraft/%@", encodedMC];
+        NSData *fastData = PALFetchWithRetry(fastURL, 3, 10.0);
+        if (fastData) {
+            NSArray *tokens = [NSJSONSerialization JSONObjectWithData:fastData options:0 error:nil];
+            if ([tokens isKindOfClass:[NSArray class]]) {
+                for (id t in tokens) {
+                    if (![t isKindOfClass:[NSDictionary class]]) continue;
+                    NSString *ver = ((NSDictionary *)t)[@"version"];
+                    if ([ver isKindOfClass:[NSString class]] && ver.length > 0 && ![collected containsObject:ver]) {
+                        [collected addObject:ver];
+                    }
+                }
+            }
+            NSLog(@"[PCL-ALIGN] Forge source=BMCLAPI-fast URL=%@ bytes=%lu parsed=%lu",
+                  fastURL, (unsigned long)fastData.length, (unsigned long)collected.count);
+        } else {
+            NSLog(@"[PCL-ALIGN] Forge source=BMCLAPI-fast URL=%@ fetch FAILED", fastURL);
+        }
+        if (collected.count > 0) lastSource = @"BMCLAPI-fast";
+
+        // ③ 兜底：全量 maven-metadata.xml（BMCLAPI 主 → 官方备）
+        if (collected.count == 0) {
+            NSArray<NSArray<NSString *> *> *pairs = @[
+                @[@"https://bmclapi2.bangbang93.com/maven/net/minecraftforge/forge/maven-metadata.xml", @"BMCLAPI-metadata"],
+                @[@"https://maven.minecraftforge.net/net/minecraftforge/forge/maven-metadata.xml", @"official-metadata"],
+            ];
+            for (NSArray<NSString *> *pair in pairs) {
+                NSData *data = PALFetchWithRetry(pair[0], 1, 12.0);
+                if (!data) {
+                    NSLog(@"[PCL-ALIGN] Forge source=%@ URL=%@ fetch FAILED", pair[1], pair[0]);
+                    continue;
+                }
+                NSArray<NSString *> *vers = PALParseForgeMetaXML(data, mc);
+                NSLog(@"[PCL-ALIGN] Forge source=%@ URL=%@ bytes=%lu parsed=%lu",
+                      pair[1], pair[0], (unsigned long)data.length, (unsigned long)vers.count);
+                if (vers.count > 0) {
+                    [collected addObjectsFromArray:vers];
+                    lastSource = pair[1];
+                    break;
+                }
+            }
+        }
+
+        NSArray<NSString *> *sorted = [collected sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+            // 降序，让最新版本在前
+            return [b compare:a options:NSNumericSearch];
+        }];
+        if (sorted.count > 0) PALCacheWrite(@"Forge", mc, sorted);
+        NSLog(@"[PCL-ALIGN] Forge list done: mc=%@ source=%@ count=%lu",
+              mc, lastSource ?: @"none", (unsigned long)sorted.count);
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [strongSelf finishLoadingWithVersions:sorted
+                                            error:(sorted.count > 0 ? nil
+                                                   : [NSError errorWithDomain:@"Forge" code:1
+                                                                     userInfo:@{NSLocalizedDescriptionKey:@"No Forge version list available"}])];
+        });
+    });
 }
 
 #pragma mark NeoForge
 
 - (void)loadNeoForgeVersions {
+    // ★ [PCL-ALIGN] 本页 NeoForge 版本列表委托给 NeoForgeVersionFetcher（已同步对标 PCL：
+    //   BMCLAPI 轻接口优先 + 两/三种 JSON 形态通吃 + rawVersion 归一化 + 6h 磁盘缓存）。
+    NSLog(@"[PCL-ALIGN] ModLoaderInstallViewController.loadNeoForgeVersions begin: mc=%@ (delegates to NeoForgeVersionFetcher.m)", _gameVersion ?: @"");
     __weak typeof(self) weakSelf = self;
+    // ★ [NEOFORGE-FIX] 捕获当前 MC 版本：空结果提示需要它（例如 MC 26.4 实测 /neoforge/list/26.4 返回 []，
+    //   NeoForge 尚未为该版本发版）。不能把“没有适配”谎报成有版本，也不该空转/无限加载。
+    NSString *mcForLog = [_gameVersion copy];
     [NeoForgeVersionFetcher fetchVersionsForGameVersion:_gameVersion completion:^(NSArray *versions, NSError *error) {
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) return;
+            // ★ [NEOFORGE-FIX] error.code==2 表示“源里确实有数据，但没有任何一条归属到当前 MC” ⇒
+            //   该 MC 版本暂无 NeoForge 适配（诚实告知），而不是“加载失败/请检查网络”。
+            if ((versions == nil || versions.count == 0) &&
+                error && [error.domain isEqualToString:@"NeoForge"] && error.code == 2) {
+                [strongSelf finishNeoForgeUnavailableForGameVersion:mcForLog];
+                return;
+            }
             [strongSelf finishLoadingWithVersions:versions ?: @[] error:error];
         });
     }];
+}
+
+// ★ [NEOFORGE-FIX] NeoForge 无适配版本时的专用提示：明确“该 MC 版本暂无 NeoForge 适配”，
+//   不谎报版本、不空列表、不无限加载。文案 neoforge.no_version_for_mc 含 %@（MC 版本号）。
+- (void)finishNeoForgeUnavailableForGameVersion:(NSString *)gameVersion {
+    [_loadingIndicator stopAnimating];
+    _isParsingForge = NO;
+    _versions = @[];
+    _emptyLabel.hidden = YES;
+    _errorLabel.hidden = NO;
+    if (gameVersion.length > 0) {
+        _errorLabel.text = [NSString stringWithFormat:localize(@"neoforge.no_version_for_mc", nil), gameVersion];
+    } else {
+        _errorLabel.text = localize(@"i18n_str_1208", nil);
+    }
+    [_tableView reloadData];
+    NSLog(@"[PCL-ALIGN] ModLoaderInstallViewController NeoForge unavailable: mc=%@ → 提示 neoforge.no_version_for_mc（该版本暂无 NeoForge 适配）", gameVersion ?: @"");
 }
 
 #pragma mark OptiFine (BMCLAPI 列表)

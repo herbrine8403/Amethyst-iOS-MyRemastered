@@ -72,6 +72,11 @@ typedef NS_ENUM(NSInteger, BackgroundUIEffect) {
 - (void)makeSplitViewControllerTransparent:(UISplitViewController *)splitVC;
 
 // Apply UI effect to any UIView (blur or translucent based on settings)
+/// ★ [RIM-UI] 高光描边开关(默认开;背景设置页可关)
+@property(nonatomic, assign) BOOL glassRimEnabled;
+/// ★ [RIM-UI] 高光强度 0…1(默认 1.0;设置页可调,0 等于关)
+@property(nonatomic, assign) CGFloat glassRimStrength;
+
 - (void)applyEffectToView:(UIView *)view;
 - (void)applyEffectToCollectionViewCell:(UICollectionViewCell *)cell;
 - (void)applyEffectToCell:(UITableViewCell *)cell;

@@ -11,8 +11,8 @@
 #import "AiToolRegistry.h"
 #import "AiSafetyManager.h"
 
-/// 工具循环最多轮数（单次对话内模型→工具→模型往返上限）
-static const NSInteger kMaxToolRounds = 100;
+/// 工具循环最多轮数
+static const NSInteger kMaxToolRounds = 10;
 /// 同一工具调用最多尝试次数（含失败）
 static const NSInteger kMaxToolAttempts = 3;
 
@@ -26,13 +26,6 @@ static NSString * const kAiSessionMessagesDidChangeNotification = @"AiSessionMes
 @property (nonatomic, assign) BOOL running;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *attempts; // toolCallID -> 已尝试次数
 @property (nonatomic, assign) NSInteger toolRound;                                   // 当前工具轮数
-
-/// 单轮请求（含瞬时系统指令与上下文压缩；transientNote 仅作用于本轮请求体）
-- (void)startRoundInSession:(AiSession *)session
-                   provider:(AiProvider *)provider
-        transientSystemNote:(nullable NSString *)transientNote
-               chunkHandler:(void (^)(NSString *partial))chunkHandler
-         completionHandler:(void (^)(NSError *error))completionHandler;
 @end
 
 @implementation AiAgent
@@ -108,44 +101,6 @@ static NSString * const kAiSessionMessagesDidChangeNotification = @"AiSessionMes
     }
 }
 
-/// 上下文压缩：只保留最近能塞进配额的消息（配额=contextWindow*0.8），返回保留起点下标
-- (NSUInteger)payloadStartIndexForMessages:(NSArray<AiMessage *> *)messages
-                              systemTokens:(NSUInteger)systemTokens
-                             contextWindow:(NSInteger)contextWindow {
-    NSUInteger count = messages.count;
-    if (count == 0 || contextWindow <= 0) return 0;
-    NSUInteger budget = (NSUInteger)(contextWindow * 0.8);
-    // 工具定义与成对开销的保守预留（openAIToolSchemas 体积不小）
-    NSUInteger overhead = systemTokens + 600;
-    if (overhead >= budget) return 0;
-    NSMutableArray<NSNumber *> *toks = [NSMutableArray arrayWithCapacity:count];
-    NSUInteger total = 0;
-    for (AiMessage *m in messages) {
-        NSUInteger t = [[self class] estimatedTokensForMessage:m];
-        [toks addObject:@(t)];
-        total += t;
-    }
-    if (overhead + total <= budget) return 0;
-    // 从尾部累加后缀和，找到能塞进配额的最早起点
-    NSUInteger suffix = 0;
-    NSUInteger keepFrom = count;
-    for (NSUInteger idx = count; idx > 0; idx--) {
-        suffix += toks[idx - 1].unsignedIntegerValue;
-        if (overhead + suffix <= budget) {
-            keepFrom = idx - 1;
-        } else {
-            break;
-        }
-    }
-    if (keepFrom >= count) keepFrom = count > 0 ? count - 1 : 0;
-    // 孤儿修正：起点落在 tool 结果消息上则后移（其 tool_calls 父消息已被裁掉，请求会非法）
-    while (keepFrom < count && ((AiMessage *)messages[keepFrom]).isToolResult) keepFrom++;
-    // 至少保留最后 4 条（别把刚发的用户消息裁掉）
-    NSUInteger minKeep = MIN((NSUInteger)4, count);
-    if (keepFrom + minKeep > count) keepFrom = count - minKeep;
-    return keepFrom;
-}
-
 /// 解析工具参数 JSON 字符串为字典（失败返回空字典）
 - (NSDictionary *)parseArgumentsJSON:(NSString *)jsonString {
     if (jsonString.length == 0) return @{};
@@ -156,39 +111,6 @@ static NSString * const kAiSessionMessagesDidChangeNotification = @"AiSessionMes
         return obj;
     }
     return @{};
-}
-
-+ (NSUInteger)estimatedTokensForText:(NSString *)text {
-    if (text.length == 0) return 0;
-    NSUInteger ascii = 0, other = 0;
-    for (NSUInteger k = 0; k < text.length; k++) {
-        unichar ch = [text characterAtIndex:k];
-        if (ch < 128) {
-            ascii++;
-        } else {
-            other++;
-        }
-    }
-    // 代理对（Emoji）会被计成 2 个 other ≈ 2 token，量级合理
-    return (NSUInteger)ceil(ascii / 4.0 + other);
-}
-
-+ (NSUInteger)estimatedTokensForMessage:(AiMessage *)message {
-    if (!message) return 0;
-    NSUInteger t = 4; // 单条消息的 role/结构开销
-    t += [self estimatedTokensForText:message.content];
-    t += [self estimatedTokensForText:message.reasoning];
-    t += [self estimatedTokensForText:message.toolArguments];
-    t += [self estimatedTokensForText:message.toolName];
-    return t;
-}
-
-+ (NSUInteger)estimatedTokensForMessages:(NSArray<AiMessage *> *)messages {
-    NSUInteger total = 0;
-    for (AiMessage *m in messages) {
-        total += [self estimatedTokensForMessage:m];
-    }
-    return total;
 }
 
 /// 发送用户消息，驱动工具循环
@@ -227,49 +149,7 @@ static NSString * const kAiSessionMessagesDidChangeNotification = @"AiSessionMes
     [session.messages addObject:userMessage];
 
     [self startRoundInSession:session
-                      provider:provider
-                  chunkHandler:chunkHandler
-            completionHandler:completionHandler];
-}
-
-/// 从上一条未完成回复处继续生成（截断续写/中断恢复；不追加用户消息）
-- (void)continueGenerationInSession:(AiSession *)session
-                           provider:(AiProvider *)provider
-                       chunkHandler:(void (^)(NSString *partial))chunkHandler
-                 completionHandler:(void (^)(NSError *error))completionHandler {
-    if (!session || session.messages.count == 0) {
-        if (completionHandler) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                completionHandler([NSError errorWithDomain:@"AiAgent" code:1 userInfo:@{NSLocalizedDescriptionKey: @"没有可继续的内容"}]);
-            });
-        }
-        return;
-    }
-    if (!provider) {
-        if (completionHandler) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                completionHandler([NSError errorWithDomain:@"AiAgent" code:1 userInfo:@{NSLocalizedDescriptionKey: @"未选择 AI 提供商"}]);
-            });
-        }
-        return;
-    }
-    if (self.running) {
-        if (completionHandler) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                completionHandler([NSError errorWithDomain:@"AiAgent" code:3 userInfo:@{NSLocalizedDescriptionKey: @"上一条回复尚未完成，请稍候或先点停止"}]);
-            });
-        }
-        return;
-    }
-
-    self.running = YES;
-    self.toolRound = 0;
-    [self.attempts removeAllObjects];
-
-    // 不追加用户消息，直接以现有历史开新一轮；瞬时指令只作用于本轮请求体，不污染历史
-    [self startRoundInSession:session
                      provider:provider
-          transientSystemNote:@"上一条助手回复尚未完整输出（可能因长度截断或中断），请接着它继续输出剩余内容，不要重复已经输出过的部分。"
                  chunkHandler:chunkHandler
            completionHandler:completionHandler];
 }
@@ -277,21 +157,9 @@ static NSString * const kAiSessionMessagesDidChangeNotification = @"AiSessionMes
 #pragma mark - 工具循环：单轮请求
 
 - (void)startRoundInSession:(AiSession *)session
-                    provider:(AiProvider *)provider
-                chunkHandler:(void (^)(NSString *partial))chunkHandler
-          completionHandler:(void (^)(NSError *error))completionHandler {
-    [self startRoundInSession:session
-                     provider:provider
-          transientSystemNote:nil
-                 chunkHandler:chunkHandler
-           completionHandler:completionHandler];
-}
-
-- (void)startRoundInSession:(AiSession *)session
-                    provider:(AiProvider *)provider
-         transientSystemNote:(nullable NSString *)transientNote
-                chunkHandler:(void (^)(NSString *partial))chunkHandler
-          completionHandler:(void (^)(NSError *error))completionHandler {
+                   provider:(AiProvider *)provider
+               chunkHandler:(void (^)(NSString *partial))chunkHandler
+         completionHandler:(void (^)(NSError *error))completionHandler {
     if (!self.running) return;
 
     // 轮数护栏
@@ -329,27 +197,17 @@ static NSString * const kAiSessionMessagesDidChangeNotification = @"AiSessionMes
             "你可以并行执行多个工具调用；下载类工具可后台执行（wait=false）后继续做其它事，稍后用 check_downloads 查进度。"
             "当用户的请求可以通过这些工具完成时，请主动调用合适的工具去执行，而不是只给出文字建议；也请结合工具返回结果继续推进任务。"];
     }
-    // 瞬时指令（如续写）只作用于本轮请求体，不写入会话历史
-    if (transientNote.length > 0) {
-        systemPrompt = [systemPrompt stringByAppendingString:[NSString stringWithFormat:@"\n\n【本次指令】%@", transientNote]];
-    }
     if (systemPrompt.length > 0) {
         [payloadMessages addObject:[AiMessage messageWithRole:@"system" content:systemPrompt]];
     }
-    // 上下文压缩：超配额时只保留最近能塞进 contextWindow*0.8 的消息（tool 结果孤儿自动后移起点）
-    NSUInteger keepFrom = [self payloadStartIndexForMessages:session.messages
-                                                systemTokens:[[self class] estimatedTokensForText:systemPrompt]
-                                               contextWindow:provider.contextWindow];
-    for (NSUInteger mi = keepFrom; mi < session.messages.count; mi++) {
-        AiMessage *m = session.messages[mi];
+    for (AiMessage *m in session.messages) {
         if (m.streaming) continue;
         [payloadMessages addObject:m];
     }
 
-    // 3. 创建助手占位消息（streaming 标记；incomplete=YES 直到本轮完整结束，支撑"继续生成"）
+    // 3. 创建助手占位消息（streaming 标记）
     AiMessage *assistantMessage = [AiMessage messageWithRole:@"assistant" content:@""];
     assistantMessage.streaming = YES;
-    assistantMessage.incomplete = YES;
     [session.messages addObject:assistantMessage];
 
     __weak typeof(self) weakSelf = self;
@@ -374,28 +232,18 @@ static NSString * const kAiSessionMessagesDidChangeNotification = @"AiSessionMes
         if (!strongSelf) return;
 
         assistantMessage.streaming = NO;
-        // 推理过程落盘（折叠显示用；无则保持原值）
-        id reasoningText = [fullResponse isKindOfClass:[NSDictionary class]] ? fullResponse[@"reasoning"] : nil;
-        if ([reasoningText isKindOfClass:[NSString class]] && [(NSString *)reasoningText length] > 0) {
-            assistantMessage.reasoning = reasoningText;
-        }
 
-        // 停止请求：直接收尾并复位工具运行态，不触发 completionHandler（UI 已由停止按钮复位）
-        // 占位消息保持 incomplete=YES，可继续生成
+        // 停止请求：直接收尾，不触发 completionHandler（UI 已由停止按钮复位）
         if (!strongSelf.running) {
-            for (AiMessage *m in session.messages) m.toolRunning = NO;
             [strongSelf saveSession:session];
             return;
         }
 
         if (error) {
-            // 出错：不追加错误消息到 history，仅 completionHandler 通知 UI 弹错；
-            // 保留 incomplete=YES（占位有内容则自身携带，被移除则标到新尾巴），可继续生成
+            // 出错：不追加错误消息到 history，仅 completionHandler 通知 UI 弹错
             if (assistantMessage.content.length == 0) {
                 [session.messages removeObject:assistantMessage];
             }
-            AiMessage *tail = session.messages.lastObject;
-            tail.incomplete = YES;
             [strongSelf saveSession:session];
             strongSelf.running = NO;
             if (completionHandler) completionHandler(error);
@@ -412,23 +260,7 @@ static NSString * const kAiSessionMessagesDidChangeNotification = @"AiSessionMes
                         chunkHandler:chunkHandler
                   completionHandler:completionHandler];
         } else {
-            // 无工具调用，正常结束：若 finish_reason 为 length/content_filter，
-            // 说明被 maxTokens/内容过滤截断，追加一句中文提示，避免“话说一半就停”无解释。
-            // 截断则保持 incomplete=YES（可继续生成），否则标记完整。
-            id finishReason = [fullResponse isKindOfClass:[NSDictionary class]] ? fullResponse[@"finish_reason"] : nil;
-            BOOL truncated = NO;
-            if ([finishReason isKindOfClass:[NSString class]]) {
-                if ([finishReason isEqualToString:@"length"]) {
-                    truncated = YES;
-                    NSString *hint = @"\n\n⚠️ 回答因达到最大 Token 被截断（显示不全），可在 AI 提供商设置里调大 maxTokens 后重试，或点输入框上方的「继续生成」。";
-                    assistantMessage.content = [(assistantMessage.content ?: @"") stringByAppendingString:hint];
-                } else if ([finishReason isEqualToString:@"content_filter"]) {
-                    truncated = YES;
-                    NSString *hint = @"\n\n⚠️ 回答被内容过滤截断（显示不全），请换个问法重试。";
-                    assistantMessage.content = [(assistantMessage.content ?: @"") stringByAppendingString:hint];
-                }
-            }
-            assistantMessage.incomplete = truncated;
+            // 无工具调用，正常结束
             [strongSelf saveSession:session];
             strongSelf.running = NO;
             if (completionHandler) completionHandler(nil);
@@ -460,8 +292,6 @@ static NSString * const kAiSessionMessagesDidChangeNotification = @"AiSessionMes
 
     // 把首个调用挂到助手消息上（isToolCall），其余调用以 toolCallMessage 追加，
     // 序列化时这些连续的 isToolCall 助手消息被合并为同一条 assistant tool_calls 数组（见 AiAPIClient）。
-    // toolCallMessages 与 orderedCalls 一一对应（0 号位即 assistantMessage），供结果落盘时复位运行态。
-    NSMutableArray *toolCallMessages = [NSMutableArray array];
     for (NSUInteger i = 0; i < orderedCalls.count; i++) {
         NSDictionary *call = orderedCalls[i];
         NSString *callID = call[@"id"];
@@ -473,15 +303,10 @@ static NSString * const kAiSessionMessagesDidChangeNotification = @"AiSessionMes
             assistantMessage.toolCallID = callID;
             assistantMessage.toolName = name ?: @"";
             assistantMessage.toolArguments = args;
-            assistantMessage.incomplete = NO;
-            assistantMessage.toolRunning = YES;
-            [toolCallMessages addObject:assistantMessage];
         } else {
             AiMessage *tc = [AiMessage toolCallMessageWithName:name ?: @"" arguments:args];
             tc.toolCallID = callID;
-            tc.toolRunning = YES;
             [session.messages addObject:tc];
-            [toolCallMessages addObject:tc];
         }
     }
     [self saveSession:session];
@@ -502,16 +327,11 @@ static NSString * const kAiSessionMessagesDidChangeNotification = @"AiSessionMes
     __block NSUInteger appendCursor = 0;   // 下一个待 append 的槽位（保证 tool 结果按工具序落盘）
     __block NSUInteger completedCount = 0;
 
-    // 填槽并从 appendCursor 起连续 append（保序且尽量即时）；
-    // 结果落盘时复位对应调用消息的 toolRunning，并标 incomplete=YES（等后续跟进才算完整）
+    // 填槽并从 appendCursor 起连续 append（保序且尽量即时）
     void (^storeResult)(NSUInteger, AiMessage *) = ^(NSUInteger idx, AiMessage *msg) {
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (!strongSelf) return;
         if (idx < slots.count) slots[idx] = msg;
-        if (idx < toolCallMessages.count && [toolCallMessages[idx] isKindOfClass:[AiMessage class]]) {
-            ((AiMessage *)toolCallMessages[idx]).toolRunning = NO;
-        }
-        if ([msg isKindOfClass:[AiMessage class]]) msg.incomplete = YES;
         while (appendCursor < total &&
                ![[slots objectAtIndex:appendCursor] isKindOfClass:[NSNull class]]) {
             [session.messages addObject:[slots objectAtIndex:appendCursor]];

@@ -69,7 +69,12 @@ bool redirectFunctionDirect(char *name, void *patchAddr, void *target) {
 // redirectFunction for iOS 26+ (TXM)
 bool redirectFunctionMirrored(char *name, void *patchAddr, void *target) {
     if (DeviceHasJITFlags(JIT_FLAG_FORCE_MIRRORED | JIT_FLAG_HAS_TXM)) {
-        JIT26PrepareRegionForPatching(patchAddr, sizeof(patch));
+        // ★ [JIT-NOCRASH] 该步靠调试器服务 brk #0xf00d；裸调用在调试器不在岗时
+        // 会 SIGTRAP 直接致死。走安全网：降级则本轮补丁整体跳过(返回 FALSE)。
+        if (!JIT26PrepareRegionForPatchingSafe(patchAddr, sizeof(patch))) {
+            NSDebugLog(@"[DyldLVBypass] PrepareRegionForPatching degraded (no debugger servicing brk) -- skip hook %s", name);
+            return FALSE;
+        }
     }
     // mirror `addr` (rx, JIT applied) to `mirrored` (rw)
     vm_address_t mirrored = 0;
@@ -171,8 +176,35 @@ void* hooked_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off
     if (map == MAP_FAILED) {
         //printf("[DyldLVBypass] mmap(prot=%d, flags=%d, fd=%d)\n", prot, flags, fd);
         map = __mmap(addr, len, prot, flags | MAP_PRIVATE | MAP_ANON, 0, 0);
+        // ★ [SHADER-SIGBUS] 走到这条兜底路径意味着：该 RX 段【不是文件后备】
+        // （直连 mmap + mprotect(RX) 都失败了），随后它的内容由"镜像 + memcpy"
+        // 写进去 —— 正是本文件第 269 行注释里"修改执行页可能导致 SIGBUS"的场景
+        // （项目历史上 glslang 从 jar 解包出的未签名副本就死在这里）。
+        // 这里只【记录】是哪份文件（fcntl F_GETPATH），不改变任何行为：下一次
+        // 真机日志一眼就能看出"哪个 dylib 走了危险路径"。
+        do {
+            static int s_ameSigbusMmapLogs = 0;
+            if (s_ameSigbusMmapLogs < 12) {
+                ++s_ameSigbusMmapLogs;
+                char fpath[1024] = {0};
+                const char *who = "(unknown fd / not a file)";
+                if (fd >= 0 && orig_fcntl != NULL &&
+                    orig_fcntl(fd, F_GETPATH, fpath) == 0 && fpath[0] != '\0') {
+                    who = fpath;
+                }
+                NSLog(@"[DyldLVBypass][SHADER-SIGBUS] RX mmap fell back to anon+mirror: "
+                      @"len=%zu file=%s (mprotect(RX) failed; pages are rewritten "
+                      @"through a mirror -- executing them may SIGBUS)", len, who);
+            }
+        } while (0);
         if (DeviceHasJITFlags(JIT_FLAG_FORCE_MIRRORED | JIT_FLAG_HAS_TXM)) {
-            JIT26PrepareRegion(map, len);
+            // ★ [JIT-NOCRASH] 裸 PrepareRegion 在调试器不在岗时 SIGTRAP 致死；
+            // 安全网降级 ⇒ 放弃这次 RX 映射(否则随后执行非可执行页会 SIGBUS)。
+            if (!JIT26PrepareRegionSafe(map, len)) {
+                NSDebugLog(@"[DyldLVBypass] PrepareRegion degraded (no debugger servicing brk) -- munmap and fail mmap");
+                munmap(map, len);
+                return MAP_FAILED;
+            }
         }
         
         void *memoryLoadedFile = __mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, offset);

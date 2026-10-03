@@ -18,7 +18,7 @@ NS_ASSUME_NONNULL_BEGIN
 /// @param messages 对话上下文（system/user/assistant）
 /// @param tools 工具定义（Phase 3 使用，本期通常传 nil）
 /// @param onChunk 流式片段回调（delta 为本次累计的内容增量；toolCalls 透传，Phase 3 使用）
-/// @param onComplete 请求结束回调（fullResponse 含 @"content" 全文，可选 @"finish_reason"；error 为空表示成功）
+/// @param onComplete 请求结束回调（fullResponse 含 @"content" 全文；error 为空表示成功）
 - (void)streamChatWithProvider:(AiProvider *)provider
                       messages:(NSArray<AiMessage *> *)messages
                          tools:(nullable NSArray<NSDictionary *> *)tools

@@ -17,6 +17,12 @@ extern NSString *const CurseForgeResponseSnippetKey;
 /// 用于 UI 门控判断，与实际请求时的 apiKey getter 保持一致
 + (BOOL)isAPIKeyConfigured;
 
+// ★ [MODPACK-FIX] CurseForge 源可用性（UI 门控用）。key 仅官方直连需要；
+//   未配 key 时 baseURL 强制落 MCIM 镜像（免 key，实测 200），源对所有人可用。
+//   「切源前先查 key」的门控必须用本方法，而不是 isAPIKeyConfigured —— 否则
+//   无 key 构建（= 所有 CI/sideload 构建）在 CurseForge 源上一律被挡成报错死路。
++ (BOOL)isSourceAvailable;
+
 // ========== 同步方法（兼容旧代码，注意会阻塞线程） ==========
 /// 搜索项目（同步，内部使用 dispatch_group_wait，建议在后台队列调用）
 - (NSMutableArray *)searchModWithFilters:(NSDictionary<NSString *, NSString *> *)searchFilters

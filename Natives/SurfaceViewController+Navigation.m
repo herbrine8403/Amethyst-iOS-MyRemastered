@@ -45,7 +45,10 @@ static const void *kMenuDimViewKey = &kMenuDimViewKey;
         @"game.menu.force_close",          // 强制关闭
         @"game.menu.log_output",            // 日志输出
         @"game.menu.custom_controls",       // 按键布局编辑
-        @"game.menu.multiplayer",           // 联机（陶瓦联机 Terracotta，右上角可切换 ZeroTier）
+        // ★ [FIX-A] 已按用户指示删除「联机 / 多人游戏」菜单项
+        //   (用户:多人游戏还在维护、没有实际入口)。原 index 3 = game.menu.multiplayer 菜单项,
+        //   已删除 ⇒ 其后各项 index 顺次前移一位(见 didSelectMenuItem:)。只摘 UI 入口,
+        //   底层联机能力代码(MultiplayerManager / Terracotta / ZeroTier 等)一行未动。
         @"game.menu.toggle_stats",          // FPS/内存显示开关
         @"game.menu.toggle_controls",       // 隐藏/显示控制按钮
         @"game.menu.toggle_virtual_mouse",  // 虚拟鼠标开关
@@ -251,6 +254,10 @@ static const void *kMenuDimViewKey = &kMenuDimViewKey;
 /// 对标 FCL 流程：启动游戏后通过悬浮球菜单进入联机界面，
 /// 选择当房主（创建世界→开放局域网→输入端口→生成邀请码）
 /// 或当房客（输入邀请码→加入网络→MC 多人游戏直连 127.0.0.1:25565）。
+///
+/// ★ [FIX-A] 入口已下线(用户指示:多人游戏"还在维护、没有实际入口"):menuArray 里那条
+///   「联机」已删除 ⇒ 本方法不再被 didSelectMenuItem: 调用,保留备查(与 LauncherMenuViewController
+///   的 showMultiplayer / showZeroTier 同一处理口径)。底层联机能力代码一行未动。
 - (void)actionOpenMultiplayer {
     // ZeroTier/Terracotta 联机暂时移除（排查启动崩溃）
     [self dismissMenu];
@@ -377,6 +384,8 @@ static const void *kMenuDimViewKey = &kMenuDimViewKey;
 }
 
 - (void)didSelectMenuItem:(int)item {
+    // ★ [FIX-A] case 下标与 menuArray 一一对应;原 index 3(联机/多人游戏)已删除,
+    //   其后各项顺次前移一位(用户指示:多人游戏还在维护、没有实际入口)。
     switch (item) {
         case 0: // 强制关闭
             [self actionForceClose];
@@ -387,27 +396,24 @@ static const void *kMenuDimViewKey = &kMenuDimViewKey;
         case 2: // 按键布局编辑
             [self actionOpenCustomControls];
             break;
-        case 3: // 联机（陶瓦联机 Terracotta，与 HMCL/FCL/ZL2 互通；右上角可切换到 ZeroTier）
-            [self actionOpenMultiplayer];
-            break;
-        case 4: // FPS/内存显示开关
+        case 3: // FPS/内存显示开关
             if ([self.gameMenuOverlay isKindOfClass:[GameMenuOverlayView class]]) {
                 [(GameMenuOverlayView *)self.gameMenuOverlay toggleStatsLabel];
             }
             break;
-        case 5: // 隐藏/显示控制按钮
+        case 4: // 隐藏/显示控制按钮
             [self actionToggleControls];
             break;
-        case 6: // 虚拟鼠标开关
+        case 5: // 虚拟鼠标开关
             [self actionToggleVirtualMouse];
             break;
-        case 7: // 游戏内键盘
+        case 6: // 游戏内键盘
             [self actionToggleKeyboard];
             break;
-        case 8: // 分辨率调整
+        case 7: // 分辨率调整
             [self actionAdjustResolution];
             break;
-        case 9: // 设置
+        case 8: // 设置
             [self actionOpenPreferences];
             break;
     }

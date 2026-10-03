@@ -13,9 +13,6 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface AIMessageCell : UITableViewCell
 
-/// 思考过程折叠块被点击时的回调（VC 据此翻转 message.reasoningExpanded 并刷新该行）
-@property (nonatomic, copy, nullable) void (^onReasoningToggle)(AiMessage *message);
-
 /// 配置气泡内容与排版（isToolCall/isToolResult 渲染为居中紧凑系统卡片）
 - (void)configureWithMessage:(AiMessage *)message markdownEnabled:(BOOL)enabled;
 

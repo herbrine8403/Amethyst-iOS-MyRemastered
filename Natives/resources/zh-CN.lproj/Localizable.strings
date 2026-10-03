@@ -245,7 +245,6 @@
 "preference.title.renderer.debug.zink" = "Zink（Mesa 25.0.7）- OpenGL 4.1";
 "preference.title.renderer.debug.ltw" = "LTW （1.17+）- gl2es（严重不稳定）";
 "preference.title.renderer.debug.vulkan" = "MoltenVK（26.2+）- Vulkan 1.4";
-"preference.title.renderer.debug.nggl4es" = "Krypton Wrapper（≤26.2）- ZL2 同款 gl4es，老版本首选（原 NG-GL4ES）";
 
 "preference.detail.renderer" = "更改使用的渲染器";
 
@@ -653,6 +652,14 @@
 "launch.cancel_confirm_message" = "取消启动将终止当前的游戏加载流程并返回启动器。";
 "launch.cancel_confirm_yes" = "确认取消";
 "launch.cancel_confirm_no" = "继续等待";
+"launch.progress.stage.prepare_env" = "正在准备环境...";
+"launch.progress.stage.jit_ready" = "正在准备 JIT...";
+"launch.progress.stage.renderer" = "正在解析渲染器与图形 API...";
+"launch.progress.stage.runtime" = "正在加载运行环境(Java / 内存)...";
+"launch.progress.stage.args_ready" = "正在组装启动参数...";
+"launch.progress.stage.jvm_starting" = "正在启动 Java 虚拟机...";
+"launch.progress.stage.waiting_first_frame" = "正在等待游戏画面...";
+"launch.progress.stage.completed" = "启动完成";
 
 // AI Fix Feature
 "ai.fix.conversation" = "对话窗口";
@@ -1348,7 +1355,7 @@
 "i18n_str_523" = "整合包已保存到：\n%@";
 "i18n_str_524" = "分享";
 "i18n_str_525" = "导入已取消";
-"i18n_str_526" = "文件不存在（该功能为半成品，如遇此问题请不要使用该功能）";
+"i18n_str_526" = "文件不存在";
 "i18n_str_527" = "无法打开压缩文件";
 "i18n_str_528" = "无效的整合包格式。缺少 modrinth.index.json、mmc-pack.json、manifest.json 或 .minecraft 目录结构";
 "i18n_str_529" = "无法解析 MCBBS packmeta/manifest";
@@ -1356,7 +1363,7 @@
 "i18n_str_531" = "mmc-pack.json 缺少 components 数组";
 "i18n_str_532" = "无法解析 modrinth.index.json";
 "i18n_str_533" = "无法解析 manifest.json";
-"i18n_str_534" = "整合包文件不存在（该功能为半成品，如遇此问题请不要使用该功能）";
+"i18n_str_534" = "整合包文件不存在";
 "i18n_str_537" = "正在下载 %lu 个 mod 文件";
 "i18n_str_540" = "%@ (游戏文件)";
 "i18n_str_541" = "游戏文件下载失败";
@@ -1737,6 +1744,8 @@
 "i18n_str_1208" = "暂无可用版本";
 "i18n_str_1209" = "加载失败，请检查网络";
 "i18n_str_1210" = "加载失败：%@";
+// ★ [NEOFORGE-FIX] NeoForge 尚未为该 Minecraft 版本发版（诚实告知，不谎报版本）
+"neoforge.no_version_for_mc" = "Minecraft %@ 暂无 NeoForge 适配版本";
 "i18n_str_1211" = "选择安装方式";
 "i18n_str_1212" = "原版 (Vanilla)";
 "i18n_str_1213" = "纯净 Minecraft，不包含任何模组加载器";
@@ -1904,6 +1913,8 @@
 "i18n_str_2017" = "毛玻璃";
 "i18n_str_2018" = "半宽";
 "i18n_str_2019" = "紧凑";
+"i18n_str_9101" = "竖长";
+"i18n_str_9102" = "大块";
 "i18n_str_2020" = "切换为全宽";
 "i18n_str_2021" = "隐藏此磁贴";
 "i18n_str_2022" = "紫色";
@@ -1983,3 +1994,32 @@
 "update_dialog.update" = "更新";
 "preference.title.auto_check_update" = "启动时检查更新";
 "preference.detail.auto_check_update" = "启动启动器时自动检查 GitHub Releases。每小时最多检查一次，被你选择忽略的版本不会再提示。";
+
+// ★ [GLASSUI] glass effect (switch + strength slider)
+"preference.title.glass_effect" = "玻璃效果";
+"preference.title.glass_strength" = "玻璃强度";
+
+// ★ [LANG-SWITCH] 启动器界面语言切换(跟随系统 + 自动枚举 .lproj)
+"preference.title.launcher_language" = "语言";
+"preference.lang.title" = "语言";
+"preference.lang.follow_system" = "跟随系统";
+"preference.lang.section.system" = "系统";
+"preference.lang.section.available" = "可用语言";
+"preference.lang.search_placeholder" = "搜索语言";
+"preference.lang.restart_hint.title" = "语言已切换";
+"preference.lang.restart_hint.message" = "界面已按新语言刷新。若个别页面仍显示旧语言，请重启启动器使其完全生效。";
+
+// ★ [JIT-WAIT] 主启动 JIT 等待/调起失败提示(launchJVM 失败分支 + ame139_requestJIT)
+"jit.wait.auto" = "正在等待 JIT 就绪。请用你的 JIT 工具为本 App 启用 JIT（TrollStore、StikDebug、SideStore / SideJIT、JitStreamer 等），然后回到启动器。最长等待 30 秒……";
+"jit.wait.manual" = "请现在到你的 JIT 工具里为本 App 启用 JIT。最长等待 30 秒……";
+"jit.wait.trollstore" = "请在 TrollStore 里为本 App 启用 JIT，然后回到启动器。最长等待 30 秒……";
+"jit.wait.stikdebug" = "请在 StikDebug 里为本 App 启用 JIT，然后回到启动器。最长等待 30 秒……";
+"jit.wait.sidestore" = "请在 SideStore / SideJIT 里为本 App 启用 JIT，然后回到启动器。最长等待 30 秒……";
+"jit.wait.jitstreamer" = "请通过 JitStreamer 为本 App 启用 JIT，然后回到启动器。最长等待 30 秒……";
+"jit.wait.stosdebug" = "请用 StosDebug 为本 App 启用 JIT，然后回到启动器。最长等待 30 秒……";
+"jit.wait.abort.title" = "JIT 不可用";
+"jit.wait.timeout.message" = "已尝试为你调起 JIT 使能工具，但 30 秒内未就绪，启动已优雅中止。请为本 App 启用 JIT 后重试（也可在设置里切换 JIT 获取方式）。";
+"jit.wait.timeout.foreground.message" = "已为你调起 JIT 使能工具，但回到前台后仍未检测到 JIT（前台活跃等待共 30 秒、总计最多 180 秒），启动已优雅中止。请为本 App 启用 JIT 后重试（也可在设置里切换 JIT 获取方式）。";
+"jit.wait.blocked.message" = "JIT 调试器未响应（brk 无人服务）。请确认已用带 UniversalJIT26 脚本、且调试器保持附加的方式启用 JIT 后再启动。";
+"jit.wait.missing.tool" = "未检测到 JIT 使能工具。请安装或确认已安装 %@，或在设置里更换 JIT 获取方式后重试。";
+"jit.wait.missing.generic" = "未检测到 JIT 使能工具。请安装一个 JIT 工具（TrollStore、StikDebug、SideStore / SideJIT、JitStreamer 等），或在设置里更换 JIT 获取方式后重试。";

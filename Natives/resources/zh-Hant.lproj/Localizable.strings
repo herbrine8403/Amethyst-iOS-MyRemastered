@@ -245,7 +245,11 @@
 "preference.title.renderer.debug.zink" = "Zink (Mesa 25.0.7) － 輸出OpenGL 4.1";
 "preference.title.renderer.debug.ltw" = "LTW - OpenGL Core→ES 转译（1.17+）";
 "preference.title.renderer.debug.vulkan" = "MoltenVK（26.2+）- 导出 Vulkan 1.4";
-"preference.title.renderer.debug.nggl4es" = "Krypton Wrapper（≤26.2）- ZL2 同款 gl4es，舊版本首選（原 NG-GL4ES）";
+/* ★ [RENDERER-GAP] imported from Gsjsjzhznsz/Air-Minecraft-iOS-Launcher */
+"preference.title.renderer.debug.vgpu" = "VGPU（≤1.12）- gl4es 分支，強化著色器語法，實驗性";
+"preference.title.renderer.debug.virgl" = "VirGL（≤26.2）- Mesa virgl guest + vtest 服務端，實驗性";
+/* ★ [DROP-NGG4ES] 原 "preference.title.renderer.debug.nggl4es" 文案已隨該支移除。 */
+"preference.title.renderer.debug.gl4eszl2" = "GL4ES（ZL2 經典版）- 字串改寫 GLSL→ESSL，實驗性";
 
 "preference.detail.renderer" = "改變要使用的OpenGL渲染引擎";
 
@@ -653,6 +657,14 @@
 "launch.cancel_confirm_message" = "取消启动将终止当前的游戏加载流程并返回启动器。";
 "launch.cancel_confirm_yes" = "确认取消";
 "launch.cancel_confirm_no" = "继续等待";
+"launch.progress.stage.prepare_env" = "正在準備環境...";
+"launch.progress.stage.jit_ready" = "正在準備 JIT...";
+"launch.progress.stage.renderer" = "正在解析渲染器與圖形 API...";
+"launch.progress.stage.runtime" = "正在載入執行環境(Java / 記憶體)...";
+"launch.progress.stage.args_ready" = "正在組裝啟動參數...";
+"launch.progress.stage.jvm_starting" = "正在啟動 Java 虛擬機...";
+"launch.progress.stage.waiting_first_frame" = "正在等待遊戲畫面...";
+"launch.progress.stage.completed" = "啟動完成";
 
 // AI Fix Feature
 "ai.fix.conversation" = "对话窗口";
@@ -1737,6 +1749,8 @@
 "i18n_str_1208" = "暂无可用版本";
 "i18n_str_1209" = "加载失败，请检查网络";
 "i18n_str_1210" = "加载失败：%@";
+// ★ [NEOFORGE-FIX] NeoForge 尚未为该 Minecraft 版本发版（诚实告知，不谎报版本）
+"neoforge.no_version_for_mc" = "Minecraft %@ 暫無 NeoForge 適配版本";
 "i18n_str_1211" = "选择安装方式";
 "i18n_str_1212" = "原版 (Vanilla)";
 "i18n_str_1213" = "纯净 Minecraft，不包含任何模组加载器";
@@ -1904,6 +1918,8 @@
 "i18n_str_2017" = "毛玻璃";
 "i18n_str_2018" = "半宽";
 "i18n_str_2019" = "紧凑";
+"i18n_str_9101" = "竖长";
+"i18n_str_9102" = "大块";
 "i18n_str_2020" = "切换为全宽";
 "i18n_str_2021" = "隐藏此磁贴";
 "i18n_str_2022" = "紫色";
@@ -1983,3 +1999,32 @@
 "update_dialog.update" = "更新";
 "preference.title.auto_check_update" = "啟動時檢查更新";
 "preference.detail.auto_check_update" = "啟動啟動器時自動檢查 GitHub Releases。每小時最多檢查一次，被你選擇忽略的版本將不再提示。";
+
+// ★ [GLASSUI] glass effect (switch + strength slider)
+"preference.title.glass_effect" = "玻璃效果";
+"preference.title.glass_strength" = "玻璃强度";
+
+// ★ [LANG-SWITCH] 啟動器介面語言切換(跟隨系統 + 自動列舉 .lproj)
+"preference.title.launcher_language" = "語言";
+"preference.lang.title" = "語言";
+"preference.lang.follow_system" = "跟隨系統";
+"preference.lang.section.system" = "系統";
+"preference.lang.section.available" = "可用語言";
+"preference.lang.search_placeholder" = "搜尋語言";
+"preference.lang.restart_hint.title" = "語言已切換";
+"preference.lang.restart_hint.message" = "介面已依新語言重新整理。若個別頁面仍顯示舊語言，請重新啟動啟動器讓其完全生效。";
+
+// ★ [JIT-WAIT] 主启动 JIT 等待/调起失败提示(launchJVM 失败分支 + ame139_requestJIT)
+"jit.wait.auto" = "正在等待 JIT 就緒。請用你的 JIT 工具為本 App 啟用 JIT（TrollStore、StikDebug、SideStore / SideJIT、JitStreamer 等），然後回到啟動器。最長等待 30 秒……";
+"jit.wait.manual" = "請現在到你的 JIT 工具裡為本 App 啟用 JIT。最長等待 30 秒……";
+"jit.wait.trollstore" = "請在 TrollStore 裡為本 App 啟用 JIT，然後回到啟動器。最長等待 30 秒……";
+"jit.wait.stikdebug" = "請在 StikDebug 裡為本 App 啟用 JIT，然後回到啟動器。最長等待 30 秒……";
+"jit.wait.sidestore" = "請在 SideStore / SideJIT 裡為本 App 啟用 JIT，然後回到啟動器。最長等待 30 秒……";
+"jit.wait.jitstreamer" = "請透過 JitStreamer 為本 App 啟用 JIT，然後回到啟動器。最長等待 30 秒……";
+"jit.wait.stosdebug" = "請用 StosDebug 為本 App 啟用 JIT，然後回到啟動器。最長等待 30 秒……";
+"jit.wait.abort.title" = "JIT 無法使用";
+"jit.wait.timeout.message" = "已嘗試為你調起 JIT 使能工具，但 30 秒內未就緒，啟動已優雅中止。請為本 App 啟用 JIT 後重試（也可在設定裡切換 JIT 取得方式）。";
+"jit.wait.timeout.foreground.message" = "已為你調起 JIT 使能工具，但回到前台後仍未偵測到 JIT（前台活躍等待共 30 秒、總計最多 180 秒），啟動已優雅中止。請為本 App 啟用 JIT 後重試（也可在設定裡切換 JIT 取得方式）。";
+"jit.wait.blocked.message" = "JIT 偵錯器未回應（brk 無人服務）。請確認已用帶 UniversalJIT26 指令碼、且偵錯器保持附加的方式啟用 JIT 後再啟動。";
+"jit.wait.missing.tool" = "未偵測到 JIT 使能工具。請安裝或確認已安裝 %@，或在設定裡更換 JIT 取得方式後重試。";
+"jit.wait.missing.generic" = "未偵測到 JIT 使能工具。請安裝一個 JIT 工具（TrollStore、StikDebug、SideStore / SideJIT、JitStreamer 等），或在設定裡更換 JIT 取得方式後重試。";

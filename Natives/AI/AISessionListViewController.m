@@ -37,11 +37,43 @@
                                                                action:@selector(newSessionAction)];
     self.navigationItem.leftBarButtonItem = newItem;
 
+    // ★ [LAND-BUG] 本页除「从 AI 会话内 push」外，还会被 LauncherMenuViewController.showAI
+    //   以 UIModalPresentationFullScreen 模态整页弹出；FullScreen 模态不支持下滑关闭，
+    //   而本页原先只有左上「+」、没有任何返回/关闭入口 ⇒ 进入后「退不出去」。
+    //   关闭按钮在 viewWillAppear 里按“是否模态呈现”补上（push 进入时保持用导航返回键），
+    //   见下方 viewWillAppear: / landBugCloseTapped。
+
     [self setupTable];
     [self setupSearch];
     [self setupEmptyState];
 
     [self reloadDisplayedSessions];
+}
+
+#pragma mark - ★ [LAND-BUG] 模态呈现时的关闭入口
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    // 模态整页弹出时（nav 是 presented 的那个），补一个右上「关闭」；
+    // push 进入时 presentingViewController 为 nil，不注入，避免覆盖导航返回键。
+    UINavigationController *nav = self.navigationController;
+    if (nav.presentingViewController != nil && nav.viewControllers.firstObject == self &&
+        self.navigationItem.rightBarButtonItem == nil) {
+        UIBarButtonItem *close = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemClose
+                                                                              target:self
+                                                                              action:@selector(landBugCloseTapped)];
+        close.accessibilityLabel = @"关闭";
+        self.navigationItem.rightBarButtonItem = close;
+    }
+}
+
+- (void)landBugCloseTapped {
+    UINavigationController *nav = self.navigationController;
+    if (nav.presentingViewController) {
+        [nav dismissViewControllerAnimated:YES completion:nil];
+    } else {
+        [self dismissViewControllerAnimated:YES completion:nil];
+    }
 }
 
 #pragma mark - 布局

@@ -244,11 +244,19 @@
 #pragma mark - 文件选择
 
 - (void)selectModpackFile {
-    NSArray<UTType *> *contentTypes = @[
-        [UTType typeWithFilenameExtension:@"mrpack"],
-        [UTType typeWithFilenameExtension:@"zip"]
-    ];
-    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:contentTypes];
+    // ★ [MODPACK-LOCAL] 放宽可选类型：除动态 .mrpack / .zip 外，补上系统 zip / 归档类型，
+    // 避免部分 iOS 版本把 .mrpack 识别为未知类型、或把 .zip 归到 public.archive 时选不中。
+    NSMutableArray<UTType *> *contentTypes = [NSMutableArray array];
+    UTType *mrpackType = [UTType typeWithFilenameExtension:@"mrpack"];
+    UTType *zipType = [UTType typeWithFilenameExtension:@"zip"];
+    if (mrpackType) [contentTypes addObject:mrpackType];
+    if (zipType) [contentTypes addObject:zipType];
+    if (@available(iOS 14.0, *)) {
+        if (UTTypeZIP) [contentTypes addObject:UTTypeZIP];
+        if (UTTypeArchive) [contentTypes addObject:UTTypeArchive];
+    }
+    NSLog(@"[MODPACK-LOCAL] 打开文件选择器，可接受类型数=%lu", (unsigned long)contentTypes.count);
+    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:contentTypes.copy];
     picker.delegate = self;
     picker.allowsMultipleSelection = NO;
     [self presentViewController:picker animated:YES completion:nil];
@@ -261,16 +269,21 @@
     NSURL *fileURL = urls.firstObject;
     NSString *fileExtension = fileURL.pathExtension.lowercaseString;
 
+    NSLog(@"[MODPACK-LOCAL] 选中文件: %@ (ext=%@)", fileURL.absoluteString ?: @"(nil)", fileExtension);
+
     if (![fileExtension isEqualToString:@"mrpack"] && ![fileExtension isEqualToString:@"zip"]) {
+        NSLog(@"[MODPACK-LOCAL] 扩展名不被接受: %@", fileExtension);
         [self showAlertWithTitle:localize(@"i18n_str_569", nil) message:localize(@"i18n_str_570", nil)];
         return;
     }
 
-    BOOL accessGranted = [fileURL startAccessingSecurityScopedResource];
-    if (!accessGranted) {
-        [self showAlertWithTitle:localize(@"i18n_str_571", nil) message:localize(@"i18n_str_572", nil)];
-        return;
-    }
+    // ★ [MODPACK-LOCAL] security-scoped 访问处理：
+    // 必须在读取前 startAccessingSecurityScopedResource，且必须成对 stop。
+    // 注意：对「已在 app 沙盒内 / 部分本地 provider」的文件，start 可能合法地返回 NO，
+    // 因此不再据此直接报「访问被拒绝」而中断——改由下游实体化步骤判定真实可读性，
+    // 并在失败时给出具体原因（否则会把可读文件误报为不可访问）。
+    BOOL scoped = [fileURL startAccessingSecurityScopedResource];
+    NSLog(@"[MODPACK-LOCAL] startAccessingSecurityScopedResource=%d", scoped);
 
     // 解析阶段：轻量 HUD（本地 zip 读取，通常 < 1s）
     [self showLoadingHUD:localize(@"i18n_str_255", nil)];
@@ -284,19 +297,29 @@
         } @catch (NSException *exception) {
             error = [NSError errorWithDomain:@"ModpackImportError" code:9999
                                     userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:localize(@"i18n_str_573", nil), exception.reason]}];
+        } @finally {
+            // ★ [MODPACK-LOCAL] 只在真正 start 成功时 stop，保证成对；
+            // @finally 保证异常路径也会 stop（不会泄漏一次 security scope）。
+            if (scoped) {
+                [fileURL stopAccessingSecurityScopedResource];
+                NSLog(@"[MODPACK-LOCAL] stopAccessingSecurityScopedResource 已执行");
+            }
         }
-
-        [fileURL stopAccessingSecurityScopedResource];
 
         dispatch_async(dispatch_get_main_queue(), ^{
             if (error || !modpackInfo) {
                 [self hideLoadingHUD];
+                NSLog(@"[MODPACK-LOCAL] 解析失败: %@", error.localizedDescription ?: @"(no error)");
                 [self showAlertWithTitle:localize(@"i18n_str_206", nil) message:error.localizedDescription ?: localize(@"i18n_str_574", nil)];
                 return;
             }
             self.currentImportingModpack = modpackInfo;
             [self hideLoadingHUD];
-            [self showModpackPreview:modpackInfo fileURL:fileURL];
+            // ★ [MODPACK-LOCAL] 预览/导入一律指向解析期已落盘的沙盒副本（filePath），
+            // 不再依赖已失效的外部授权路径。
+            NSString *localPath = modpackInfo[@"filePath"];
+            NSURL *previewURL = (localPath.length > 0) ? [NSURL fileURLWithPath:localPath] : fileURL;
+            [self showModpackPreview:modpackInfo fileURL:previewURL];
         });
     });
 }

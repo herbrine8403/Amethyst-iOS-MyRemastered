@@ -36,6 +36,8 @@
 #import "LauncherPreferences.h"
 #import "PLLogOutputView.h"
 #import "PLProfiles.h"
+// ★ [LAUNCH-PROGRESS] 启动阶段上报(遮罩进度条/阶段文字/步骤骨架的数据源)
+#import "AmeLaunchProgress.h"
 
 #define fm NSFileManager.defaultManager
 
@@ -70,6 +72,28 @@ BOOL validateVirtualMemorySpace(size_t size) {
 // 前向声明：handler 需要在定义之前引用内存采样与镜像 dump。
 static void ameCrashSampleMemLocked(const char *tag);
 static void ameCrashDumpImagesFrom(uint32_t start);
+// ★ [JIT-ENABLE-ACTION] 前置声明:定义在本文件后部(2161 行)。C 风格文件里"先使用后定义"必须声明,
+//   否则报 call to undeclared function(本项目踩过)。
+static BOOL ame139_requestJIT(BOOL forceStikJIT);
+
+// ★ [JIT-WAIT] launchJVM 失败分支「调起使能工具 → 等就绪 → 重试一次」的等待上限(秒)。
+//   定义在使用点(launchJVM)之前 ⇒ 无需再写前置声明;改超时只改这一处。
+static const NSTimeInterval kAmeJITWaitTimeout = 30.0;
+
+// ★ [JIT-WAIT2] 前台感知等待的绝对墙上限(秒):活跃预算(30s)只在 App 处于前台时
+//   累计,后台不计时也不放弃;这一道墙上限兜底,防止用户一去不回把启动无限挂住。
+static const NSTimeInterval kAmeJITWaitWallTimeout = 180.0;
+
+// ★ [JIT-WAIT2] 前台感知的 JIT 就绪等待(取代此处原 ame169_waitForJITCondition 调用:
+//   只在 UIApplicationStateActive 时累计时间 + 回前台立刻重判 + 双上限)。定义在本
+//   文件后部(ameJITWaitMessageKeyForEnabler 之后),C 风格「先使用后定义」必须前置声明。
+static BOOL ameJIT2WaitForReadyActive(NSTimeInterval activeTimeout,
+                                      NSTimeInterval wallTimeout,
+                                      NSString *label);
+
+// ★ [JIT-WAIT] 依 debug.jit_enabler 当前值选择「等待 JIT 就绪」提示文案的 i18n 键。
+//   前置声明:定义在本文件后部(ame139_requestJIT 之前),C 风格文件「先使用后定义」必须声明。
+static NSString *ameJITWaitMessageKeyForEnabler(NSString *enabler);
 
 static int gAmeCrashFd = -1;
 // 已 dump 过的镜像数量（后台采样线程增量追加用）。必须定义在 handler 之前：
@@ -712,6 +736,7 @@ BOOL JVMUsedInProcess(void) {
     return gJvmUsedInProcess;
 }
 
+
 // ============================================================================
 // Task97：把进程 CWD 对齐到游戏目录
 //
@@ -777,6 +802,59 @@ NSInteger ame98_mcMajorFromVersionId(NSString *versionId) {
     }
     return 0;
 }
+
+// ★ [METALLUM-264] 从任意形态的版本 ID 提取 26.x 的次版本号（"26.<minor>"）。
+// 口径与 metallum agent 的 mc26Minor() 完全一致：定位 "26." 后的连续数字。
+// 非 26.x / 无法解析返回 -1。用于 metallum 版本家族路由（见下）。
+static NSInteger ame98_mcMinorFromVersionId(NSString *versionId) {
+    if (![versionId isKindOfClass:[NSString class]] || versionId.length == 0) {
+        return -1;
+    }
+    NSRange r = [versionId rangeOfString:@"26."];
+    if (r.location == NSNotFound) {
+        return -1;
+    }
+    NSUInteger i = r.location + r.length;
+    NSUInteger n = versionId.length;
+    NSMutableString *digits = [NSMutableString string];
+    while (i < n) {
+        unichar ch = [versionId characterAtIndex:i];
+        if (ch < '0' || ch > '9') break;
+        [digits appendFormat:@"%C", ch];
+        i++;
+    }
+    if (digits.length == 0) {
+        return -1;
+    }
+    return [digits integerValue];
+}
+
+// ★ [METALLUM-264] metallum 版本家族解析（与 agent mcFamily() 同一口径）：
+//   "1211" = 1.21.x | "261" = 26.1 | "262" = 26.2 | "263" = 26.3 及其后（含 26.4+）
+// 26.4 归入 263 家族（renderpearl.api 命名空间 + SDL3 窗口未换代）。
+// 启动器显式把该家族透传给 agent（-Dmetallum.route.family=…），避免 agent 端
+// 靠零散 contains("26.3") 去猜（旧写法对 26.4 会漏判）。
+// 覆盖优先级最高（排障 / 回退，不必重装 app）：
+//   环境变量 METALLUM_ROUTE_FAMILY=1211|261|262|263
+static NSString *ameMetallumRouteFamily(NSString *versionId) {
+    const char *override = getenv("METALLUM_ROUTE_FAMILY");
+    if (override != NULL && override[0] != '\0') {
+        NSString *ov = [[NSString stringWithUTF8String:override] lowercaseString];
+        if ([ov isEqualToString:@"1211"] || [ov isEqualToString:@"261"] ||
+            [ov isEqualToString:@"262"] || [ov isEqualToString:@"263"]) {
+            return ov;
+        }
+    }
+    if ([versionId containsString:@"1.21"]) {
+        return @"1211";
+    }
+    NSInteger minor = ame98_mcMinorFromVersionId(versionId);
+    if (minor < 0) return @"262";   // 未知 / 空 ⇒ 既有 26.2 兜底
+    if (minor <= 1) return @"261";  // 26.0 / 26.1
+    if (minor == 2) return @"262";  // 26.2
+    return @"263";                  // 26.3 及其后（含 26.4+）
+}
+
 
 // SFPEW（固定管线仿真层）适用的 MC 版本判定：仅 GL 1.x 固定管线时代，即 <= 1.16.x。
 // MC 1.17 起渲染切到 GL 3.2 core + shader/VAO，不再有 immediate mode（glBegin/glEnd、
@@ -996,6 +1074,8 @@ static void ame99_installAppKitMenuStubs(void) {
 
 int launchJVM(NSString *accountId, id launchTarget, int width, int height, int minVersion) {
     NSLog(@"[JavaLauncher] Beginning JVM launch");
+    // ★ [LAUNCH-PROGRESS] 阶段1/8：准备环境(默认环境/自定义环境变量/崩溃捕获武装…)
+    AmeLaunchProgressSetStage(AmeLaunchStagePrepareEnv);
 
     // 防御检查：headless JVM（Forge/NeoForge 直装 processors 阶段）已在当前进程
     // 创建过 JVM。进程内 JVM 只能创建一次，再次 JLI_Launch 必然崩溃。
@@ -1029,10 +1109,115 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         static void *result;
         if(!result) result = JIT26CreateRegionLegacySafe(getpagesize());
         if (result == NULL) {
-            NSLog(@"[JIT26] JIT26CreateRegionLegacy returned NULL -- JIT26 debugger not servicing brk; aborting launch gracefully");
-            showDialog(localize(@"Error", nil), @"JIT 调试器未响应（brk 无人服务）。请确认已用带 UniversalJIT26 脚本的方式启用 JIT 后再启动。\nJIT debugger is not responding. Enable JIT with the UniversalJIT26 script and try again.");
-            [PLLogOutputView handleExitCode:1];
-            return 1;
+            NSLog(@"[JIT26] JIT26CreateRegionLegacy returned NULL -- JIT26 debugger not servicing brk; requesting JIT and waiting before aborting launch");
+            // ★ [JIT-ENABLE-ACTION] 原来是死胡同:只弹一句"请确认已用带 UniversalJIT26 脚本的方式
+            //   启用 JIT"就 return。但无 TrollStore 的普通侧载设备(iPadOS 26:no-sandbox=NO、
+            //   expanded-virtual-addressing=NO)根本没有自建 JIT 的路,用户看到这句话也无从下手 ——
+            //   实测日志(iPad Air 5 / iPadOS 26.6.1):
+            //     [JIT26] JIT26CreateRegionLegacy returned NULL -- JIT26 debugger not servicing brk
+            //   改为复用 headless 安装器那条已验证的路:ame139_requestJIT 会按偏好(默认 auto ⇒
+            //   stikjit/sidestore/trollstore/stosdebug 等)打开使能 URL 并弹等待说明。
+            //
+            // ★ [JIT-WAIT] 但「只调起、不等待、立刻 return」仍会崩:ame139_requestJIT 只是用
+            //   openURL 把活交给外部工具(StikDebug 等),调起之后没等调试器真的就岗。此时继续
+            //   往下走,后续 brk(尤其 Natives/dyld_bypass_validation.m 里那几处未包安全网的
+            //   裸 brk)无人服务 ⇒ SIGTRAP 硬崩。用户原话:「把你拉去 StikDebug 要让启动器等待
+            //   一下,不然会直接崩」。
+            //   现语义 = ① 先判「是否已经就绪」→ ② 调起使能工具 → ③ 等就绪(30s 上限) →
+            //   ④ 重试一次;成功则【继续原有启动流程】,只有超时/重试仍失败才优雅放弃。
+            //   成功路径一行未动,只重写这段失败分支。
+            BOOL ameSkipWait = getPrefBool(@"debug.debug_skip_wait_jit");
+            if (ameSkipWait) {
+                // ★ [JIT-WAIT] 保留 debug_skip_wait_jit 偏好语义(别的路径也在用):用户显式要求
+                //   「不要等待 JIT」⇒ 按原样只调起、不新增等待、不重试。
+                NSLog(@"[JIT-WAIT] debug_skip_wait_jit set -- keeping legacy behavior (request JIT, no wait/retry)");
+                ame139_requestJIT(NO);
+                [PLLogOutputView handleExitCode:1];
+                return 1;
+            }
+
+            // ① ★ [JIT-WAIT] 先判「JIT 是否已经就绪」:已就绪就直接重试建区并继续,不白跳一次
+            //    外部 App。覆盖 dynamic-codesigning / jailbroken / no-sandbox(TrollStore 自建
+            //    JIT),以及调试器仍在岗(ptrace / 任务级异常端口)。
+            //    若这次直接重试仍失败 ⇒ 说明只是粘滞的 CS_DEBUGGED 残留(调试器已离场),
+            //    下面照常调起使能工具并等待,不把这类用户挡在开始之前。
+            BOOL ameAlreadyReady = isJITEnabled(NO)
+                || JIT26IsLikelyDebuggerKeepAttached()
+                || getEntitlementValue(@"com.apple.private.security.no-sandbox");
+            if (ameAlreadyReady) {
+                NSLog(@"[JIT-WAIT] JIT already reports ready (isJITEnabled=%d keepAttached=%d) -- retrying region without launching any enabler",
+                      isJITEnabled(NO), JIT26IsLikelyDebuggerKeepAttached());
+                result = JIT26CreateRegionLegacySafe(getpagesize());   // ★ 重试一次(写回 static 缓存)
+                if (result != NULL) {
+                    NSLog(@"[JIT-WAIT] direct retry succeeded (%p) -- continuing launch without an enabler", result);
+                } else {
+                    NSLog(@"[JIT-WAIT] direct retry still NULL -- sticky CS_DEBUGGED; falling through to enabler + bounded wait");
+                }
+            }
+
+            // ② ★ [JIT-WAIT] 仍未就绪:调起使能工具(按 debug.jit_enabler,默认 auto),再等就绪。
+            BOOL ameWaitedForJIT = NO;
+            BOOL ameJitBecameReady = NO;
+            if (result == NULL) {
+                NSString *ameEnabler = getPrefObject(@"debug.jit_enabler");
+                if (![ameEnabler isKindOfClass:NSString.class] || ameEnabler.length == 0) {
+                    ameEnabler = @"auto";
+                }
+                NSLog(@"[JIT-WAIT2] requesting JIT via enabler=%@ then waiting up to %.0fs ACTIVE (wall cap %.0fs) for it to become ready",
+                      ameEnabler, (double)kAmeJITWaitTimeout, (double)kAmeJITWaitWallTimeout);
+                // ★ [JIT-WAIT2] 后台任务断言:ame139_requestJIT 会用 stikjit:// 把 App 切到
+                //   后台(用户在 StikDebug 里操作)。不申请后台时间,iOS 会立刻挂起本进程 ⇒
+                //   等待循环停摆,回到前台只剩一个已烧穿的墙钟预算,用户实测误报「没有 JIT」。
+                //   用 UIBackgroundTaskInvalid 哨兵保证 endBackgroundTask 恰好结束一次。
+                UIBackgroundTaskIdentifier ameJIT2_bgt =
+                    [UIApplication.sharedApplication beginBackgroundTaskWithName:@"launch-jit-wait" expirationHandler:^{}];
+                if (!ame139_requestJIT(NO)) {
+                    // ★ [JIT-WAIT] 没能调起使能工具(未安装 / 无法打开):requestJIT 已弹出
+                    //   「未检测到 JIT 使能工具」+ 按 debug.jit_enabler 的安装提示,直接优雅
+                    //   放弃,不再白等。
+                    NSLog(@"[JIT-WAIT2] no JIT enabler was launched -- aborting without waiting");
+                    if (ameJIT2_bgt != UIBackgroundTaskInvalid) {
+                        [UIApplication.sharedApplication endBackgroundTask:ameJIT2_bgt];
+                        ameJIT2_bgt = UIBackgroundTaskInvalid;
+                    }
+                    [PLLogOutputView handleExitCode:1];
+                    return 1;
+                }
+                ameWaitedForJIT = YES;
+                // ③ ★ [JIT-WAIT2] 前台感知等待:只在 App 前台(Active)时累计活跃时间
+                //    (kAmeJITWaitTimeout=30s 活跃预算),后台/冻结不计时也不放弃;监听
+                //    DidBecomeActive,回到前台立刻重判一次,就绪即马上跳出继续启动。
+                //    绝对墙上限 kAmeJITWaitWallTimeout=180s 兜底(防用户一去不回)。
+                ameJitBecameReady = ameJIT2WaitForReadyActive(kAmeJITWaitTimeout,
+                                                              kAmeJITWaitWallTimeout,
+                                                              @"launchJVM-jit26");
+                // ★ [JIT-WAIT2] 等待一结束就释放后台断言(紧接着的重试建区是纯 CPU 活,
+                //   不再需要额外后台时间);哨兵防重复结束。
+                if (ameJIT2_bgt != UIBackgroundTaskInvalid) {
+                    [UIApplication.sharedApplication endBackgroundTask:ameJIT2_bgt];
+                    ameJIT2_bgt = UIBackgroundTaskInvalid;
+                }
+                // 就绪(或超时)后都重试一次;成功则继续原有启动流程。
+                result = JIT26CreateRegionLegacySafe(getpagesize());   // ★ 重试一次(写回 static 缓存)
+                NSLog(@"[JIT-WAIT2] retry after wait -> %p (becameReady=%d waited=%d)",
+                      result, ameJitBecameReady, ameWaitedForJIT);
+            }
+
+            // ④ ★ [JIT-WAIT] 超时未就绪 或 就绪了但建区仍失败 ⇒ 才弹框放弃(文案区分两种情况)。
+            if (result == NULL) {
+                NSLog(@"[JIT-WAIT2] still NULL after request/wait/retry -- aborting launch gracefully (becameReady=%d)",
+                      ameJitBecameReady);
+                if (ameWaitedForJIT && !ameJitBecameReady) {
+                    // ★ [JIT-WAIT2] 超时未就绪:文案强调「已回到前台仍未检测到 JIT」(前台
+                    //   活跃等待窗口耗尽,而非墙钟一刀切),并列出可能的方式(不只点名 StikDebug)。
+                    showDialog(localize(@"jit.wait.abort.title", nil), localize(@"jit.wait.timeout.foreground.message", nil));
+                } else {
+                    // 就绪了但建区仍失败:保留原有关于 UniversalJIT26 / brk 的解释。
+                    showDialog(localize(@"jit.wait.abort.title", nil), localize(@"jit.wait.blocked.message", nil));
+                }
+                [PLLogOutputView handleExitCode:1];
+                return 1;
+            }
         }
         if ((uint32_t)result != 0x690000E0) {
             munmap(result, getpagesize());
@@ -1054,11 +1239,22 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
             [PLLogOutputView handleExitCode:1];
             return 1;
         }
-        JIT26SendJITScript([NSString stringWithContentsOfFile:[NSBundle.mainBundle pathForResource:@"UniversalJIT26Extension" ofType:@"js"]]);
-        JIT26SetDetachAfterFirstBr(!jit26AlwaysAttached);
+        // ★ [JIT-NOCRASH] 下发脚本 / 设置脱离均靠调试器服务 brk #0xf00d；裸调用在
+        // 调试器不在岗时会 SIGTRAP 直接致死。走安全网；降级只打日志并跳过该步，
+        // 后续 brk(PrepareRegion 等)同样会降级而非硬崩。
+        if (!JIT26SendJITScriptSafe([NSString stringWithContentsOfFile:[NSBundle.mainBundle pathForResource:@"UniversalJIT26Extension" ofType:@"js"]])) {
+            NSLog(@"[JIT26] [JIT-NOCRASH] UniversalJIT26 script NOT delivered (brk #0xf00d unanswered) -- continuing in degraded mode");
+        }
+        if (!JIT26SetDetachAfterFirstBrSafe(!jit26AlwaysAttached)) {
+            NSLog(@"[JIT26] [JIT-NOCRASH] SetDetachAfterFirstBr NOT applied -- continuing in degraded mode");
+        }
         // make sure we don't get stuck in EXC_BAD_ACCESS
         task_set_exception_ports(mach_task_self(), EXC_MASK_BAD_ACCESS, 0, EXCEPTION_DEFAULT, MACHINE_THREAD_STATE);
     }
+
+    // ★ [LAUNCH-PROGRESS] 阶段2/8：JIT 就绪(建区 + 挂 UniversalJIT26 脚本)。
+    //   非 iOS26 / 无需 Debug JIT Mapping 时上面整块被跳过，这里等价于「本步已过」。
+    AmeLaunchProgressSetStage(AmeLaunchStageJITReady);
 
     if (!requiresDebugJITMapping || jit26AlwaysAttached) {
         if (jit26AlwaysAttached) {
@@ -1130,6 +1326,8 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
             renderer = @"auto";
         }
         NSLog(@"[JavaLauncher] RENDERER is set to %@\n", renderer);
+        // ★ [LAUNCH-PROGRESS] 阶段3/8：渲染器与图形 API(渲染器已解析，graphicsApi 紧随其后)
+        AmeLaunchProgressSetStage(AmeLaunchStageRenderer);
         setenv("AMETHYST_RENDERER", renderer.UTF8String, 1);
 
         // Apply Zink-specific environment variables if Zink renderer is selected
@@ -1137,7 +1335,9 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         // MESA_GLSL_VERSION_OVERRIDE、MESA_EXTENSION_OVERRIDE、mesa_glthread、shader cache 等。
         // ZinkConfig 默认 Auto 级别会保留所有光影所需的 GL 扩展（compute/tessellation/geometry
         // shader 等），仅禁用 MoltenVK 支持不佳的 Transform Feedback，不影响 Iris/OptiFine。
-        if ([renderer hasPrefix:@"libOSMesa"]) {
+        // ★ [RENDERER-GAP] 排除 libOSMesaVirgl.dylib（virgl guest 同样命中 libOSMesa
+        // 前缀，但它要 GALLIUM_DRIVER=virgl，不能被 ZinkConfig 覆盖）。
+        if ([renderer hasPrefix:@"libOSMesa"] && ![renderer isEqualToString:@ RENDERER_NAME_VIRGL]) {
             [ZinkConfig applyZinkEnvironmentFromPreferences];
             NSString *configSummary = [ZinkConfig activeConfigSummary];
             NSLog(@"[ZinkConfig] ========== Zink Renderer Active (Mesa 25) ==========");
@@ -1162,6 +1362,16 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
             setenv("POJAVEXEC_EGL", RENDERER_NAME_LTW, 1);
             NSLog(@"[JavaLauncher] LTW renderer active: using LTW defaults (same as Android)");
         }
+
+        // ★ [RENDERER-GAP] 队友仓库新增渲染器的启动器侧处理（纯追加）。
+        // VirGL：GALLIUM_DRIVER/VTEST_SOCKET_NAME 由 egl_bridge 的
+        // ame_virgl_start_server()（经 ame_gap_virgl_boot）统一设置，此处仅日志标记，
+        // 并配合下方 zink 分支排除 libOSMesaVirgl.dylib（否则会被 libOSMesa 前缀误伤）。
+        if ([renderer isEqualToString:@ RENDERER_NAME_VIRGL]) {
+            NSLog(@"[JavaLauncher] [RENDERER-GAP] VirGL renderer active: GALLIUM_DRIVER=virgl + in-process vtest server");
+        }
+        // ★ [DROP-NGG4ES] 原 NG-GL4ES 专属处理（NGG_DIR_PATH 指向 POJAV_HOME/ngg）
+        //   已随该支移除；VirGL 等其余 gap 渲染器处理原样保留。
 
         // Apply MobileGL-specific environment variables
         // MobileGL（MobileGL-Dev，LGPL-3.0）两个变体共用同一个 libMobileGL.dylib 二进制，
@@ -1263,23 +1473,6 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         if (isMithrilRenderer(renderer.UTF8String)) {
             NSLog(@"[JavaLauncher] Mithril renderer active: EGL/GL from libmithril.dylib (Vulkan backend)");
         }
-
-        // NG-GL4ES（"Krypton Wrapper"，ZL2 同款 gl4es）。NGG_DIR_PATH 指向
-        // POJAV_HOME 下的 ngg/（上游默认 /sdcard/NGG 在 iOS 必然 fopen 失败——
-        // config_refresh 对缺失文件静默返回，无 config.json 时行为与默认完全
-        // 一致；指到可写目录只是让高级用户可以放 config.json 调参）。
-        // 其余零环境需求：EGL 由宿主 gl_bridge 提供（egl_bridge 的渲染器分支
-        // 零 EGL 动作），dylib 由 LWJGL 作为 opengl.libname 加载。
-        if ([renderer isEqualToString:@ RENDERER_NAME_NGGL4ES]) {
-            const char *ngg_home = getenv("POJAV_HOME");
-            if (ngg_home && *ngg_home) {
-                char ngg_path[1024];
-                snprintf(ngg_path, sizeof(ngg_path), "%s/ngg", ngg_home);
-                setenv("NGG_DIR_PATH", ngg_path, 1);
-            }
-            NSLog(@"[JavaLauncher] NG-GL4ES renderer active (NGG_DIR_PATH=%s)",
-                  getenv("NGG_DIR_PATH") ?: "<unset>");
-        }
         // Setup AMETHYST_GRAPHICS_API（MC 26.2+ Graphics API：default/vulkan/opengl）
         // 仅 MC 26.2+ 识别此选项，旧版本 MC 会忽略 options.txt 中的 graphicsApi 字段。
         //
@@ -1309,6 +1502,37 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
             getenv("POJAV_HOME"), getPrefObject(@"general.game_directory"),
             [PLProfiles resolveKeyForCurrentProfile:@"gameDir"]]
             .stringByStandardizingPath;
+
+        // 内置 MetalUniversal mod 预置: bundle 的 mods_preload/ 首次启动拷贝到实例 mods/
+        // (vanilla 实例不加载 mods, 无害; Fabric 实例自动生效 —— 开箱即用)
+        // 按 MC 版本过滤: 文件名含 "12111" 的 mod 仅拷给 1.21.11 实例, 其余仅拷给 26.x 实例
+        NSString *versionId = nil;
+        if ([launchTarget isKindOfClass:NSDictionary.class]) {
+            versionId = launchTarget[@"id"];
+        } else {
+            versionId = launchTarget;
+        }
+        BOOL mc12111 = (versionId && [versionId containsString:@"1.21.11"]);
+        BOOL mc26 = (versionId && [versionId hasPrefix:@"26"]);
+        NSString *preloadDir = [[NSBundle mainBundle] pathForResource:@"mods_preload" ofType:nil];
+        if (preloadDir) {
+            NSString *modsDir = [gameDir stringByAppendingPathComponent:@"mods"];
+            [[NSFileManager defaultManager] createDirectoryAtPath:modsDir
+                                      withIntermediateDirectories:YES attributes:nil error:nil];
+            NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:preloadDir error:nil];
+            for (NSString *f in files) {
+                BOOL is12111Mod = [f containsString:@"12111"];
+                if (is12111Mod && !mc12111) continue;   // 1.21.11 专用 mod, 非 1.21.11 实例跳过
+                if (!is12111Mod && mc12111) continue;   // 26.x 专用 mod, 1.21.11 实例跳过
+                NSString *srcPath = [preloadDir stringByAppendingPathComponent:f];
+                NSString *dstPath = [modsDir stringByAppendingPathComponent:f];
+                if (![[NSFileManager defaultManager] fileExistsAtPath:dstPath]) {
+                    if ([[NSFileManager defaultManager] copyItemAtPath:srcPath toPath:dstPath error:nil]) {
+                        NSLog(@"[JavaLauncher] Preloaded bundled mod: %@", f);
+                    }
+                }
+            }
+        }
     } else {
         defaultJRETag = @"execute_jar";
         gameDir = @(getenv("POJAV_GAME_DIR"));
@@ -1355,6 +1579,8 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
     // Task141：启动内存单一事实源（见 ame141_currentLaunchAllocMem）。
     int allocmem = ame141_currentLaunchAllocMem();
     NSLog(@"[JavaLauncher] Max RAM allocation is set to %d MB", allocmem);
+    // ★ [LAUNCH-PROGRESS] 阶段4/8：运行环境(Java 已定位 + JAVA_HOME 已设 + 内存已定)
+    AmeLaunchProgressSetStage(AmeLaunchStageRuntime);
     if (!validateVirtualMemorySpace(allocmem)) {
         UIKit_returnToSplitView();
         if (getEntitlementValue(@"com.apple.developer.kernel.increased-memory-limit")) {
@@ -1656,115 +1882,51 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
   
     NSString *librariesPath = [NSString stringWithFormat:@"%@/libs", NSBundle.mainBundle.bundlePath];
     PUSH_MARGV_FORMAT(@"-javaagent:%@/patchjna_agent.jar=", librariesPath);
-    // [Metallum agent] 原生 Metal 后端（26.2 / 26.3）：
-    //   * jar 由 JavaApp/libs/others/ 随包落在 app/libs/（见根 Makefile 的 payload 目标），
-    //     agent 自带 metallum 类集与 natives/ios（libmetallum.dylib、libspvc.dylib），
-    //     运行期自行解出到沙盒，不需要 Frameworks 另行放置。
-    //   * 注入范围由 agent 自己判定（premain 按 MC 版本 / 加载器分流：26.2 走
-    //     classes262 类集、Fabric 缺桩时跳过相应步骤、Forge 走 dummy provider
-    //     且不注入自带 slf4j）。
-    //   * jar 不在 libs/ 时安静跳过，便于回滚与 A/B。
-    //   * [fix/java8-agent] 只对 MC major >= 26 挂载：agent 的 class 文件版本是
-    //     65.0（Java 21+ 编译），而老版本 MC 走 Java 8（class 上限 52.0）——
-    //     此前"老版本 MC 没有目标类，转换器天然 no-op"的假设漏掉了 agent
-    //     本身在 Java 8 上就加载不了这件事（UnsupportedClassVersionError ->
-    //     "processing of -javaagent failed" -> JVM 直接 abort，premain 阶段
-    //     全灭，GL/SFPEW 代码根本没机会跑）。1.7.10 + SFPEW 两路会话的
-    //     latestlog（43177bd 实测）即死于此。
-    //     26.x 强制 Java 25（ResolveLwjglVersion 同款 major 判定），class 65 可加载。
-    if ([[NSFileManager defaultManager] fileExistsAtPath:
-            [librariesPath stringByAppendingPathComponent:@"metallum_agent.jar"]]) {
-        NSString *metallumMcVersionId = nil;
-        if ([launchTarget isKindOfClass:NSDictionary.class]) {
-            metallumMcVersionId = [launchTarget[@"id"] description];
-        } else if ([launchTarget isKindOfClass:NSString.class]) {
-            metallumMcVersionId = (NSString *)launchTarget;
+    // ★ [AGENT-GATE] 上游 5.1.0 的 "MC major >= 26" 闸门(含版本 id 解析)保留,
+    //   叠加我们追加的渲染器闸门:渲染器不是 Metal/Metallum 时,agent 自己在 premain
+    //   里也只装配 SDL 桩 ⇒ 白担 classpath 风险,直接跳过注入。
+    //   不做加载器判断(上游语义:由 agent 按 MC 版本 / 加载器自行分流)。
+    NSString *launchId = [launchTarget isKindOfClass:NSDictionary.class]
+        ? [launchTarget[@"id"] description] : (NSString *)launchTarget;
+    NSInteger metallumMcMajor = ame98_mcMajorFromVersionId(launchId);
+    BOOL mcIs26Plus = (metallumMcMajor >= 26);
+    // ★ [METALLUM-264] 26.4 适配：显式解析并透传"版本家族"，agent 不再靠零散
+    //   contains("26.3") 猜版本（旧写法把 26.4 误判到 26.2 家族 ⇒ 类集/字节码补丁全错）。
+    //   26.4 归入 263 家族（renderpearl.api + SDL3，与 26.3 同族）。
+    //   可用环境变量 METALLUM_ROUTE_FAMILY=1211|261|262|263 覆盖（排障/回退）。
+    NSString *metallumFamily = ameMetallumRouteFamily(launchId);
+    const char *rendC = getenv("AMETHYST_RENDERER");
+    NSString *renderer = rendC ? @(rendC) : @"";
+    NSString *rendererLower = renderer.lowercaseString;
+    // ★ [AGENT-GATE-FIX] 不能只读 AMETHYST_RENDERER 判 Metal!
+    //   选了 Metal 时上游会把 AMETHYST_RENDERER 故意改写成 auto(→ANGLE),
+    //   那只为给 Surface 提供 GL 上下文;真正的"我选了 Metal"信号是
+    //   AMETHYST_METAL=1 —— agent 自己也只认这个开关来打开渲染 patch。
+    //   只读 AMETHYST_RENDERER 会把 Metal 误判成 ANGLE ⇒ 跳过 agent ⇒ 渲染 patch
+    //   全关 ⇒ 只能用 ANGLE 渲染 ⇒ MC 26.2 的 flat_clouds/clouds 管线编译失败而崩溃
+    //   (实测 2026-10-03,日志:[AGENT-GATE] 渲染器=libtinygl4angle.dylib ⇒ 跳过)。
+    const char *metalC = getenv("AMETHYST_METAL");
+    BOOL metalFlagOn = (metalC != NULL && strcmp(metalC, "1") == 0);
+    BOOL rendererIsMetallum = metalFlagOn ||
+                              [rendererLower containsString:@"metallum"] ||
+                              [rendererLower containsString:@"metal"];
+    BOOL wantsMetallumAgent = mcIs26Plus && rendererIsMetallum;
+    if (!wantsMetallumAgent) {
+        NSLog(@"[AGENT-GATE] MC=%@(major=%ld) 渲染器=%@ AMETHYST_METAL=%@ ⇒ %@,跳过 metallum_agent 注入",
+              launchId, (long)metallumMcMajor, renderer,
+              metalFlagOn ? @"1" : @"(未置)",
+              mcIs26Plus ? @"渲染器非 Metal" : @"版本不足 26");
+    }
+    if (wantsMetallumAgent
+        && [fm fileExistsAtPath:[librariesPath stringByAppendingPathComponent:@"metallum_agent.jar"]]) {
+        NSLog(@"[AGENT-GATE] 注入 metallum_agent(MC=%@ major=%ld 家族=%@ 渲染器=%@ AMETHYST_METAL=%@)",
+              launchId, (long)metallumMcMajor, metallumFamily, renderer, metalFlagOn ? @"1" : @"(未置)");
+        PUSH_MARGV_FORMAT(@"-javaagent:%@/metallum_agent.jar=", librariesPath);
+        if (launchId.length > 0) {
+            PUSH_MARGV_FORMAT(@"-Dmetallum.mc.version=%@", launchId);
         }
-        NSInteger metallumMcMajor = ame98_mcMajorFromVersionId(metallumMcVersionId);
-        if (metallumMcMajor >= 26) {
-            PUSH_MARGV_FORMAT(@"-javaagent:%@/metallum_agent.jar=", librariesPath);
-            // 把实例的 MC 版本 id 传给 agent（按版本选 metallum 类映射）
-            if (metallumMcVersionId.length > 0) {
-                PUSH_MARGV_FORMAT(@"-Dmetallum.mc.version=%@", metallumMcVersionId);
-            }
-            NSLog(@"[JavaLauncher] Metallum agent enabled: -javaagent:metallum_agent.jar (mcVersion=%@)",
-                  metallumMcVersionId);
-
-            // [MetalFX] 把设置页四个开关落盘成 metallum metalfx 侧唯一认的那份配置。
-            //
-            // 契约来自 metalfx 源码 MetalFxConfig（com.metallum.client.metal.fx）：
-            //   * 路径  <gameDir>/config/metallum_fx.properties
-            //           （= FabricLoader.getGameDir()/config/，与 -Duser.dir 同源）
-            //   * 键    spatialUpscaling / frameInterpolation / temporalUpscaling
-            //           / acknowledged
-            //   * 值    枚举名大写
-            // mod 只读这一个文件 —— 启动器没有 -D 通路，也没有别的注入点。此前四个
-            // 开关开了完全没反应，就是因为这一段从来没写：偏好存下来了，但没人把它
-            // 变成游戏侧能读到的配置文件。
-            //
-            // 关闭时必须删掉旧文件：否则用户上一轮开过、这一轮关掉，mod 仍按残留配置
-            // 启用 MetalFX，开关形同虚设（这正是"老设备不能被搞崩"要防的）。
-            {
-                // 注意：本文件顶部有 `#define fm NSFileManager.defaultManager`。
-                // 这里绝不能再写 `NSFileManager *fm = ...` —— 宏展开后
-                // `fm` 变成 `NSFileManager.defaultManager`，声明直接语法错误
-                // （曾导致 CI gmake exit 2）。直接用 fm 即可。
-                NSString *fxDir = [gameDir stringByAppendingPathComponent:@"config"];
-                NSString *fxPath = [fxDir stringByAppendingPathComponent:@"metallum_fx.properties"];
-                if (!getPrefBool(@"video.metalfx_enable")) {
-                    if ([fm fileExistsAtPath:fxPath]) {
-                        NSError *rmErr = nil;
-                        [fm removeItemAtPath:fxPath error:&rmErr];
-                        NSLog(@"[MetalFX] disabled: removed stale config %@ (err=%@)", fxPath, rmErr);
-                    }
-                } else {
-                    NSInteger spatialIdx = getPrefInt(@"video.metalfx_spatial");
-                    if (spatialIdx < 0 || spatialIdx > 4) spatialIdx = 0;
-                    // 顺序与 MetalFxConfig.SpatialMode 严格一一对应：
-                    // OFF(1.0) QUALITY(0.77) BALANCED(0.67) PERFORMANCE(0.56)
-                    // ULTRA_PERFORMANCE(0.33)
-                    NSString *spatial = @"OFF";
-                    if (spatialIdx == 1) {
-                        spatial = @"QUALITY";
-                    } else if (spatialIdx == 2) {
-                        spatial = @"BALANCED";
-                    } else if (spatialIdx == 3) {
-                        spatial = @"PERFORMANCE";
-                    } else if (spatialIdx == 4) {
-                        spatial = @"ULTRA_PERFORMANCE";
-                    }
-                    NSString *temporal = getPrefBool(@"video.metalfx_temporal") ? @"AUTO" : @"OFF";
-                    NSString *interp  = getPrefBool(@"video.metalfx_interpolation") ? @"AUTO" : @"OFF";
-                    // acknowledged=true：用户在启动器里主动开启即视为已知晓风险。
-                    // 否则 mod 的 MetalFxWarningScreen 会在游戏内弹一次确认框，iOS
-                    // 上触屏未必点得到，可能卡住主菜单。
-                    NSString *body = [NSString stringWithFormat:
-                        @"# Written by launcher (video.metalfx_*)\n"
-                        @"spatialUpscaling=%@\n"
-                        @"frameInterpolation=%@\n"
-                        @"temporalUpscaling=%@\n"
-                        @"acknowledged=true\n", spatial, interp, temporal];
-                    NSError *mkErr = nil;
-                    [fm createDirectoryAtPath:fxDir withIntermediateDirectories:YES
-                                   attributes:nil error:&mkErr];
-                    NSError *wrErr = nil;
-                    BOOL ok = [body writeToFile:fxPath atomically:YES
-                                       encoding:NSUTF8StringEncoding error:&wrErr];
-                    NSLog(@"[MetalFX] config %@ -> spatial=%@ temporal=%@ interpolation=%@ (mkErr=%@ wrErr=%@)",
-                          ok ? @"written" : @"WRITE FAILED", spatial, temporal, interp, mkErr, wrErr);
-                    // 时域超分是"替换"空间超分而非叠加：isTemporalUpscalingActive()
-                    // 要求 spatialMode.isEnabled()，spatial=OFF 时 temporal 空转。
-                    if (spatialIdx == 0 && ![temporal isEqualToString:@"OFF"]) {
-                        NSLog(@"[MetalFX] note: temporalUpscaling=%@ has no effect -- it replaces "
-                              @"(not stacks on) spatial upscaling, so it needs a non-OFF spatial mode",
-                              temporal);
-                    }
-                }
-            }
-        } else {
-            NSLog(@"[JavaLauncher] Metallum agent skipped: MC major %ld < 26 (agent needs Java 21+ class files, this session runs Java 8)",
-                  (long)metallumMcMajor);
-        }
+        // ★ [METALLUM-264] 显式家族路由（agent 端 mcFamily() 优先读该属性）。
+        PUSH_MARGV_FORMAT(@"-Dmetallum.route.family=%@", metallumFamily);
     }
     if(getPrefBool(@"general.cosmetica")) {
         PUSH_MARGV_FORMAT(@"-javaagent:%@/arc_dns_injector.jar=23.95.137.176", librariesPath);
@@ -2102,6 +2264,8 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
 
     NSString *lwjglDir = [NSString stringWithFormat:@"%@/lwjgl-%@", librariesPath, lwjglVersion];
     NSLog(@"[JavaLauncher] Using LWJGL jar at %@/lwjgl.jar", lwjglDir);
+    // ★ [LAUNCH-PROGRESS] 阶段5/8：组装启动参数(渲染器/JVM flags/LWJGL/margv 已备齐)
+    AmeLaunchProgressSetStage(AmeLaunchStageArgsReady);
 
     // 校验目标 LWJGL 目录是否存在，避免静默崩溃。
     // 注意：lwjgl-<ver>/ 是目录，不能用带 "/*" 的 classpath 条目做存在性判断。
@@ -2169,6 +2333,8 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
     ame99_installAppKitMenuStubs();
 
     NSLog(@"[Init] Calling JLI_Launch");
+    // ★ [LAUNCH-PROGRESS] 阶段6/8：启动 JVM(JLI_Launch 即将接管启动线程)
+    AmeLaunchProgressSetStage(AmeLaunchStageJVMStarting);
 
     // Cr4shed known issue: exit after crash dump,
     // reset signal handler so that JVM can catch them
@@ -2183,6 +2349,11 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
 
     // 标记进程内 JVM 已创建（此后任何 JLI_Launch 都会崩溃，需重启 app）
     gJvmUsedInProcess = YES;
+
+    // ★ [LAUNCH-PROGRESS] 阶段7/8：等待游戏画面。
+    //   JLI_Launch 起 JVM 后本线程即阻塞在这个调用里，直到 MC 出首帧
+    //   (egl_bridge 的 PojavFirstFrameRendered 会把阶段推到「完成」并撤遮罩)。
+    AmeLaunchProgressSetStage(AmeLaunchStageWaitingFirstFrame);
 
     return pJLI_Launch(++margc, margv,
                    0, NULL, // sizeof(const_jargs) / sizeof(char *), const_jargs,
@@ -2209,11 +2380,164 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
 // 逐个执行 processor 的（ForgeProcessorRunner 复刻该行为）。
 //
 // 注意：调用后进程内 JVM 已创建，游戏启动必须重启 app（见 gJvmUsedInProcess）。
-// Task 139（参照 Air 移植）：按 debug.jit_enabler 偏好打开 JIT 申请 URL 并弹
-// 等待框。forceStikJIT=YES 时忽略偏好、固定走 stikjit:// 带脚本再附（TXM
-// 再附路径）。openURL 与弹框必须在主线程：headless 通常在后台队列，
-// 加守卫防主线程误调时 dispatch_sync 死锁。
-static void ame139_requestJIT(BOOL forceStikJIT) {
+// ★ [JIT-WAIT] 依 debug.jit_enabler 选择「等待 JIT 就绪」提示文案的 i18n 键。
+//   与顶部前置声明成对;C 风格文件「先声明后使用」。
+static NSString *ameJITWaitMessageKeyForEnabler(NSString *enabler) {
+    if ([enabler isEqualToString:@"manual"]) return @"jit.wait.manual";
+    if ([enabler isEqualToString:@"trollstore"]) return @"jit.wait.trollstore";
+    if ([enabler isEqualToString:@"sidestore"]) return @"jit.wait.sidestore";
+    if ([enabler isEqualToString:@"jitstreamer"]) return @"jit.wait.jitstreamer";
+    if ([enabler isEqualToString:@"stosdebug"]) return @"jit.wait.stosdebug";
+    if ([enabler isEqualToString:@"stikdebug"] || [enabler isEqualToString:@"stikjit"]) return @"jit.wait.stikdebug";
+    return @"jit.wait.auto";
+}
+
+// ★ [JIT-WAIT2] 前台感知的 JIT 就绪等待。
+//   背景(用户实测):没开 JIT 时启动 ⇒ launchJVM 用 stikjit:// 把 App 切到后台去开
+//   JIT,原来这段等待用墙钟一刀切(kAmeJITWaitTimeout=30s):用户在 StikDebug 里花掉
+//   >30s,一回到前台就立刻判定超时 ⇒ 误报「没有 JIT」。本函数取代此处的
+//   ame169_waitForJITCondition 调用,把计时改成「活跃时间」,并保证回前台立即重判:
+//     · 只在 UIApplicationStateActive 时累计时间;后台不计时(也不放弃),只打周期日志;
+//     · 冻结/挂起间隙(墙钟空转 >2s)同样不计入活跃预算;
+//     · 监听 UIApplicationDidBecomeActiveNotification:回到前台立刻再判一次条件
+//       (不必等下一个 200ms 轮询节拍),就绪 ⇒ 立即跳出、由调用方重试建区并继续启动;
+//     · 双上限:活跃预算 activeTimeout + 绝对墙上限 wallTimeout(兜底,防一去不回)。
+//   条件固定用 JIT26IsLikelyDebuggerKeepAttached()(活调试器是否在岗)。
+//   调用方负责持有后台任务断言(beginBackgroundTask),否则 iOS 会立即挂起本循环。
+static BOOL ameJIT2WaitForReadyActive(NSTimeInterval activeTimeout,
+                                      NSTimeInterval wallTimeout,
+                                      NSString *label) {
+    NSString *ameJIT2_tag = label ?: @"JIT";
+    NSDate *ameJIT2_wallStart = [NSDate date];
+    NSDate *ameJIT2_lastIter  = [NSDate date];
+    NSTimeInterval ameJIT2_activeAccum = 0.0;   // 累计活跃秒数(仅前台、无挂起间隙)
+    NSTimeInterval ameJIT2_lastLog = 0.0;       // 上次周期日志的墙上秒(避开对 math.h 的依赖)
+    BOOL ameJIT2_wasActive = (UIApplication.sharedApplication.applicationState == UIApplicationStateActive);
+    BOOL ameJIT2_loggedBgReady = NO;             // 后台探针命中只记一次,避免日志刷屏
+
+    // ★ [JIT-WAIT2] 回前台立即重判:监听 DidBecomeActive 置 ping,循环读到就马上再判
+    //   一次条件。queue:nil ⇒ 在投递线程(主线程)同步执行,不依赖可能被启动流程楔死的
+    //   主队列派发,比 NSOperationQueue mainQueue 更不易丢。
+    __block volatile BOOL ameJIT2_resumePing = NO;
+    id ameJIT2_obs = [[NSNotificationCenter defaultCenter]
+        addObserverForName:UIApplicationDidBecomeActiveNotification
+                    object:nil
+                     queue:nil
+                usingBlock:^(NSNotification *ameJIT2_note) {
+                    (void)ameJIT2_note;
+                    ameJIT2_resumePing = YES;
+                }];
+
+    NSLog(@"[JIT-WAIT2] %@ wait begin: activeBudget=%.0fs wallCap=%.0fs startForeground=%d",
+          ameJIT2_tag, (double)activeTimeout, (double)wallTimeout, ameJIT2_wasActive);
+
+    BOOL ameJIT2_ready = NO;
+    for (;;) {
+        NSTimeInterval ameJIT2_gap = -[ameJIT2_lastIter timeIntervalSinceNow];
+        ameJIT2_lastIter = [NSDate date];
+        NSTimeInterval ameJIT2_wallNow = -[ameJIT2_wallStart timeIntervalSinceNow];
+        BOOL ameJIT2_active = (UIApplication.sharedApplication.applicationState == UIApplicationStateActive);
+        BOOL ameJIT2_probe = JIT26IsLikelyDebuggerKeepAttached();
+
+        // ① 就绪判定(仅前台接受):每次轮询/回前台 ping 都先判一次条件。后台即便探针
+        //    命中也不在此结束 —— 调用方一旦在后台提前释放后台断言,iOS 可能立刻挂起,
+        //    后面「重试建区 + 继续启动」会被冻住。后台只记录、不计时、不放弃。
+        if (ameJIT2_active && ameJIT2_probe) {
+            NSLog(@"[JIT-WAIT2] %@ condition satisfied in FOREGROUND (active=%.1fs wall=%.1fs) -- continuing launch",
+                  ameJIT2_tag, ameJIT2_activeAccum, ameJIT2_wallNow);
+            ameJIT2_ready = YES;
+            break;
+        }
+        if (!ameJIT2_active && ameJIT2_probe && !ameJIT2_loggedBgReady) {
+            ameJIT2_loggedBgReady = YES;
+            NSLog(@"[JIT-WAIT2] %@ probe already attached but app is in BACKGROUND -- deferring until foreground",
+                  ameJIT2_tag);
+        }
+
+        if (ameJIT2_resumePing) {
+            ameJIT2_resumePing = NO;
+            NSLog(@"[JIT-WAIT2] %@ foreground resume re-check (active=%.1fs wall=%.1fs)",
+                  ameJIT2_tag, ameJIT2_activeAccum, ameJIT2_wallNow);
+        }
+        if (ameJIT2_active != ameJIT2_wasActive) {
+            NSLog(@"[JIT-WAIT2] %@ app %s while waiting (active=%.1fs wall=%.1fs)",
+                  ameJIT2_tag, ameJIT2_active ? "returned to FOREGROUND" : "went to BACKGROUND",
+                  ameJIT2_activeAccum, ameJIT2_wallNow);
+            ameJIT2_wasActive = ameJIT2_active;
+        }
+
+        // ② 活跃时间累计:仅当当前前台 且 本轮无挂起间隙(gap<=2s)才计入。后台/冻结期
+        //    墙钟照走但不算预算 ⇒ 用户开 JIT 花多久都不冤枉。
+        if (ameJIT2_active && ameJIT2_gap <= 2.0) {
+            ameJIT2_activeAccum += ameJIT2_gap;
+        }
+
+        // ③ 双上限。活跃预算只在「当前仍在前台」时才判,保证后台绝不放弃(用户可能还在
+        //    使能工具里操作)。
+        if (wallTimeout > 0.0 && ameJIT2_wallNow >= wallTimeout) {
+            NSLog(@"[JIT-WAIT2] %@ wait hit WALL cap after %.0fs (active=%.1fs) -- giving up",
+                  ameJIT2_tag, ameJIT2_wallNow, ameJIT2_activeAccum);
+            break;
+        }
+        if (ameJIT2_active && activeTimeout > 0.0 && ameJIT2_activeAccum >= activeTimeout) {
+            NSLog(@"[JIT-WAIT2] %@ active budget exhausted after %.1fs active (wall=%.1fs) -- giving up",
+                  ameJIT2_tag, ameJIT2_activeAccum, ameJIT2_wallNow);
+            break;
+        }
+        if (ameJIT2_wallNow - ameJIT2_lastLog >= 10.0) {
+            ameJIT2_lastLog = ameJIT2_wallNow;
+            NSLog(@"[JIT-WAIT2] %@: still waiting (active=%.1fs wall=%.1fs foreground=%d)",
+                  ameJIT2_tag, ameJIT2_activeAccum, ameJIT2_wallNow, ameJIT2_active);
+        }
+        usleep(1000 * 200);
+    }
+
+    [[NSNotificationCenter defaultCenter] removeObserver:ameJIT2_obs];
+    return ameJIT2_ready;
+}
+
+// ★ [JIT-WAIT] 依 debug.jit_enabler 选择「未检测到 JIT 使能工具」提示里的工具名;
+//   返回 nil 表示用通用文案(列出所有可能的方式)。
+static NSString *ameJITEnablerDisplayName(NSString *enabler) {
+    if ([enabler isEqualToString:@"trollstore"]) return @"TrollStore";
+    if ([enabler isEqualToString:@"stikdebug"] || [enabler isEqualToString:@"stikjit"]) return @"StikDebug";
+    if ([enabler isEqualToString:@"sidestore"]) return @"SideStore (SideJIT)";
+    if ([enabler isEqualToString:@"jitstreamer"]) return @"JitStreamer";
+    if ([enabler isEqualToString:@"stosdebug"]) return @"StosDebug";
+    return nil;
+}
+
+// ★ [JIT-WAIT] 该 URL scheme 是否已登记在 Info.plist 的 LSApplicationQueriesSchemes 里。
+//   canOpenURL 只对登过的 scheme 可信:没登的 scheme 即使用户装了工具也会返回 NO,
+//   所以预检只对白名单内做(与 Info.plist 现有条目一致)。
+static BOOL ameJITSchemeCanBeProbed(NSString *scheme) {
+    static NSArray<NSString *> *probeable = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        probeable = @[@"stikjit", @"stikdebug", @"sidestore", @"stosdebug"];
+    });
+    return scheme != nil && [probeable containsObject:scheme];
+}
+
+// Task 139（参照 Air 移植）：按 debug.jit_enabler 偏好打开 JIT 申请 URL 并弹等待框。
+// forceStikJIT=YES 时忽略偏好、固定走 stikjit:// 带脚本再附（TXM 再附路径）。
+// openURL 与弹框必须在主线程：headless 通常在后台队列，加守卫防主线程误调时 dispatch_sync 死锁。
+//
+// ★ [JIT-WAIT] 返回值(新增):YES = 调用方应进入「等待 JIT 就绪」(工具确实被调起,或 manual
+//   方式本就要用户手动开启);NO = 没能调起(未安装 / 无法打开 / 没选到 URL)—— 调用方应
+//   直接优雅放弃,不要再白等一个超时窗口。
+// ★ [JIT-WAIT] 修复的缺陷:原先 openURL 用 completionHandler:nil,未安装任何 JIT 工具时
+//   iOS 静默失败,启动器却【无条件】弹「正在等待」⇒ 用户白等一整个超时窗口才被告知失败。
+//   现在:① canOpenURL 可选预检(白名单内);② openURL 带 completionHandler 拿 success 这个
+//   事实;③ 等待框只在确实调起(或 manual)时显示;④ 调起失败立刻弹「未检测到 JIT 使能工具」
+//   + 按当前 debug.jit_enabler 给对应安装项,并让调用方跳过等待。
+static BOOL ame139_requestJIT(BOOL forceStikJIT) {
+    __block NSString *chosenEnabler = nil;
+    __block BOOL hasURL = NO;         // 选中了非空 URL
+    __block BOOL precheckFailed = NO; // canOpenURL 明确说打不开(工具没装)
+    __block BOOL urlOpened = NO;      // openURL completionHandler 的 success
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+
     dispatch_block_t work = ^{
         NSString *enabler = nil;
         if (forceStikJIT) {
@@ -2224,10 +2548,16 @@ static void ame139_requestJIT(BOOL forceStikJIT) {
                 enabler = @"auto";
             }
         }
+        chosenEnabler = enabler;
         BOOL noScript = getPrefBool(@"debug.jit26_script_disable");
         NSString *bundleId = NSBundle.mainBundle.bundleIdentifier;
         NSLog(@"[JIT] [Headless] Task139 enabler=%@ noScript=%d forceStikJIT=%d",
               enabler, noScript, forceStikJIT);
+        // ★ [POCKETJ-JIT] 前置门禁(INTEGRATION.md「Gate every entry point」):
+        //   在启动任何 JIT 获取方式前,记录宿主 get-task-allow / iOS 版本 /
+        //   配对文件状态。只记日志,不改既有流程(内置 StikJIT Helper 扩展尚未
+        //   接入,见 Natives/pocketj_jit/PORTING_NOTES.md)。
+        AMEJITLogPocketJReadiness(@"headless-requestJIT");
         NSURL *url = nil;
         if ([enabler isEqualToString:@"trollstore"]) {
             url = [NSURL URLWithString:[NSString stringWithFormat:
@@ -2250,6 +2580,17 @@ static void ame139_requestJIT(BOOL forceStikJIT) {
         } else if ([enabler isEqualToString:@"jitstreamer"]) {
             url = [NSURL URLWithString:[NSString stringWithFormat:
                 @"http://[fd00::]:9172/launch_app/%@", bundleId]];
+        } else if ([enabler isEqualToString:@"stikdebug"]) {
+            // ★ [POCKETJ-JIT] PocketJ(INTEGRATION.md「Configure the JIT methods ·
+            //   StikDebug」)的 URL 形式:
+            //     stikdebug://enable-jit?bundle-id=..&pid=..&script-name=<name>
+            //   与下面的 stikjit:// 的区别:用 script-name 指定脚本文件名
+            //   (开发者选定、不给用户配),不再内联 base64 script-data。
+            //   适配只注册 stikdebug:// 的 StikDebug 版本。脚本名 universal.js
+            //   即本包内 UniversalJIT26.js(同一份 PocketJ/StikJIT universal.js)。
+            url = [NSURL URLWithString:[NSString stringWithFormat:
+                @"stikdebug://enable-jit?bundle-id=%@&pid=%d&script-name=universal.js",
+                bundleId, getpid()]];
         } else if ([enabler isEqualToString:@"manual"]) {
             // 手动模式：不跳转，仅弹窗告知（维持旧语义）。
         } else if (@available(iOS 17.4, *)) {
@@ -2268,16 +2609,85 @@ static void ame139_requestJIT(BOOL forceStikJIT) {
             url = [NSURL URLWithString:[NSString stringWithFormat:
                 @"sidestore://sidejit-enable?pid=%d", getpid()]];
         }
-        if (url) {
-            [UIApplication.sharedApplication openURL:url options:@{} completionHandler:nil];
+        if (url != nil) {
+            hasURL = YES;
+            // ★ [JIT-WAIT] 可选预检:scheme 已登记时先 canOpenURL,探不到 ⇒ 工具没装;
+            //   直接给安装提示,比等 completion 更快也更明确。
+            if (ameJITSchemeCanBeProbed(url.scheme) &&
+                ![UIApplication.sharedApplication canOpenURL:url]) {
+                precheckFailed = YES;
+                NSLog(@"[JIT-WAIT] canOpenURL(%@) == NO -- JIT enabler app not installed", url.scheme);
+                dispatch_semaphore_signal(sem);
+                return;
+            }
+            // ★ [JIT-WAIT] 原为 completionHandler:nil(未装工具时静默失败);改为拿 success 这个事实。
+            [UIApplication.sharedApplication openURL:url options:@{}
+                completionHandler:^(BOOL success) {
+                    urlOpened = success;
+                    NSLog(@"[JIT-WAIT] openURL scheme=%@ -> success=%d", url.scheme, success);
+                    dispatch_semaphore_signal(sem);
+                }];
+        } else {
+            dispatch_semaphore_signal(sem);
         }
-        showDialog(localize(@"i18n_str_437", nil), localize(@"i18n_str_439", nil));
     };
-    if ([NSThread isMainThread]) {
+
+    BOOL onMain = [NSThread isMainThread];
+    BOOL gotReply = NO;
+    if (onMain) {
+        // ★ [JIT-WAIT] 主线程上不能阻塞等 completionHandler(handler 也走主队列 ⇒ 死锁):
+        //   内联执行 work,completion 只留日志;launched 的判定退回 canOpenURL 事实。
         work();
     } else {
+        // headless 通常在后台队列;openURL 与弹框必须在主线程 ⇒ 与旧行为一致地 dispatch_sync。
         dispatch_sync(dispatch_get_main_queue(), work);
+        long wr = dispatch_semaphore_wait(sem,
+            dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)));
+        gotReply = (wr == 0);
+        if (!gotReply) {
+            NSLog(@"[JIT-WAIT] openURL completion not received within 3s -- assuming the tool was launched");
+        }
     }
+
+    BOOL isManual = [chosenEnabler isEqualToString:@"manual"];
+    BOOL launched = NO;   // 事实:使能工具确实被系统接管
+    if (isManual) {
+        launched = NO;                 // manual 单列(下面直接进等待)
+    } else if (precheckFailed) {
+        launched = NO;
+    } else if (!hasURL) {
+        launched = NO;
+    } else if (onMain) {
+        launched = YES;                // 主线程拿不到 success ⇒ 保守按已调起
+    } else if (!gotReply) {
+        launched = YES;                // 回执超时 ⇒ 保守按已调起
+    } else {
+        launched = urlOpened;
+    }
+
+    if (isManual) {
+        // ★ [JIT-WAIT] manual / 该方式本就不跳转:仍要等(用户可能在别处手动开),
+        //   等待框明确「请现在到你的 JIT 工具里为本 App 启用 JIT,最长等 30 秒」。
+        NSLog(@"[JIT-WAIT] enabler=manual -- waiting for the user to enable JIT elsewhere");
+        showDialog(localize(@"i18n_str_437", nil), localize(@"jit.wait.manual", nil));
+        return YES;
+    }
+    if (launched) {
+        // ★ 等待框只在确实调起时显示;文案按 debug.jit_enabler 给对应那条,并列出可能的方式。
+        showDialog(localize(@"i18n_str_437", nil),
+                   localize(ameJITWaitMessageKeyForEnabler(chosenEnabler), nil));
+        return YES;
+    }
+    // ★ [JIT-WAIT] 没调起:明确「未检测到 JIT 使能工具」,并按当前 debug.jit_enabler 给安装项,
+    //   而不是弹「正在等待」让用户白等。
+    NSString *toolName = ameJITEnablerDisplayName(chosenEnabler);
+    if (toolName.length > 0) {
+        showDialog(localize(@"jit.wait.abort.title", nil),
+                   [NSString stringWithFormat:localize(@"jit.wait.missing.tool", nil), toolName]);
+    } else {
+        showDialog(localize(@"jit.wait.abort.title", nil), localize(@"jit.wait.missing.generic", nil));
+    }
+    return NO;
 }
 
 int launchHeadlessJVM(NSString *mainClass, NSArray<NSString *> *args, int minJavaVersion) {
@@ -2303,7 +2713,12 @@ int launchHeadlessJVM(NSString *mainClass, NSArray<NSString *> *args, int minJav
             NSLog(@"[JavaLauncher] launchHeadlessJVM: debug_skip_wait_jit set, proceeding without JIT");
         } else {
             NSLog(@"[JavaLauncher] launchHeadlessJVM: Task139 JIT not enabled -- auto-requesting via configured enabler");
-            ame139_requestJIT(NO);
+            if (!ame139_requestJIT(NO)) {
+                // ★ [JIT-WAIT] 没能调起使能工具(未安装/无法打开):requestJIT 已弹出安装提示,
+                //   直接明确报错,不再空等 120 秒。
+                NSLog(@"[JavaLauncher] launchHeadlessJVM: no JIT enabler launched -- aborting without waiting");
+                return -1;
+            }
             // 有界等待 120s（ame169：心跳+挂起豁免）；超时则明确报错而非无限转圈。
             if (!ame169_waitForJITCondition(^BOOL{ return isJITEnabled(NO); }, 120.0, @"Headless JIT")) {
                 NSLog(@"[JavaLauncher] launchHeadlessJVM: Task139 JIT wait timed out");
@@ -2365,8 +2780,15 @@ int launchHeadlessJVM(NSString *mainClass, NSArray<NSString *> *args, int minJav
             showDialog(localize(@"Error", nil), @"Support for legacy script has been removed. Please switch to Universal JIT script. To import it, long-press on Amethyst when enabling JIT in StikDebug and tap \"Assign Script\", then go to Amethyst's Documents directory and pick it. (on sideloaded StikDebug, the builtin script is named Amethyst-MeloNX.js)");
             return -1;
         }
-        JIT26SendJITScript([NSString stringWithContentsOfFile:[NSBundle.mainBundle pathForResource:@"UniversalJIT26Extension" ofType:@"js"]]);
-        JIT26SetDetachAfterFirstBr(!jit26AlwaysAttached);
+        // ★ [JIT-NOCRASH] 下发脚本 / 设置脱离均靠调试器服务 brk #0xf00d；裸调用在
+        // 调试器不在岗时会 SIGTRAP 直接致死。走安全网；降级只打日志并跳过该步，
+        // 后续 brk(PrepareRegion 等)同样会降级而非硬崩。
+        if (!JIT26SendJITScriptSafe([NSString stringWithContentsOfFile:[NSBundle.mainBundle pathForResource:@"UniversalJIT26Extension" ofType:@"js"]])) {
+            NSLog(@"[JIT26] [JIT-NOCRASH] UniversalJIT26 script NOT delivered (brk #0xf00d unanswered) -- continuing in degraded mode");
+        }
+        if (!JIT26SetDetachAfterFirstBrSafe(!jit26AlwaysAttached)) {
+            NSLog(@"[JIT26] [JIT-NOCRASH] SetDetachAfterFirstBr NOT applied -- continuing in degraded mode");
+        }
         task_set_exception_ports(mach_task_self(), EXC_MASK_BAD_ACCESS, 0, EXCEPTION_DEFAULT, MACHINE_THREAD_STATE);
     }
 

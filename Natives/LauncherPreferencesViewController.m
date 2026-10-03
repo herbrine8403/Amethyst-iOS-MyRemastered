@@ -21,6 +21,7 @@
 #import "UpdateChecker.h"
 #import "CurseForgeAPIKeyViewController.h"
 #import "CustomControlsViewController.h"
+#import "LauncherLanguageViewController.h"   // ★ [LANG-SWITCH] 语言选择子页
 #import "AI/AIProviderConfigViewController.h"
 #import "AI/AISessionListViewController.h"
 #import "AI/AISystemPromptEditorViewController.h"
@@ -263,6 +264,13 @@
     self.searchEnabled = YES;
 
     self.getPreference = ^id(NSString *section, NSString *key){
+        // ★ [LANG-SWITCH] 语言项：显示名用 NSLocale 现取；实际值存 NSUserDefaults
+        // 自定义键 (ame_launcher_language)，与通用偏好存储解耦。跟随系统时展示当前系统语言名。
+        if ([section isEqualToString:@"general"] && [key isEqualToString:@"launcher_language"]) {
+            NSString *code = AmeLauncherPreferredLanguageOverride();
+            NSString *sysCode = [NSLocale preferredLanguages].firstObject ?: @"";
+            return AmeLauncherDisplayNameForLanguageCode(code.length ? code : sysCode);
+        }
         // AI 助手分区：直接与 AiSettings 打通（AiSettings 读写 NSUserDefaults，不走通用偏好存储）
         if ([section isEqualToString:@"ai"]) {
             if ([key isEqualToString:@"safety_mode"]) {
@@ -281,6 +289,11 @@
         return getPrefObject(keyFull);
     };
     self.setPreference = ^(NSString *section, NSString *key, id value){
+        // ★ [LANG-SWITCH] 语言项由子页 LauncherLanguageViewController 直接写 NSUserDefaults，
+        // 这里拦截，避免误写入通用偏好存储（保持单一数据源）。
+        if ([section isEqualToString:@"general"] && [key isEqualToString:@"launcher_language"]) {
+            return;
+        }
         // AI 助手分区：回写到 AiSettings
         if ([section isEqualToString:@"ai"]) {
             if ([key isEqualToString:@"safety_mode"]) {
@@ -404,6 +417,18 @@
                   // 仅设置 window.overrideUserInterfaceStyle，账号数据不受影响。
                   [[NSNotificationCenter defaultCenter] postNotificationName:@"UIThemeChanged" object:value];
               }
+            },
+            // ★ [LANG-SWITCH] 启动器界面语言：跟随系统 + 自动枚举包内 .lproj。
+            // 不写 title（让父类在生成 cell 时按 preference.title.<key> 现取 localize，
+            // 切换语言后 reloadData 即可即时刷新文案）；实际值由子页直接写
+            // NSUserDefaults 自定义键 (ame_launcher_language)，不走通用偏好存储。
+            @{@"key": @"launcher_language",
+              @"hasDetail": @NO,
+              @"icon": @"globe",
+              @"type": self.typeChildPane,
+              @"enableCondition": whenNotInGame,
+              @"canDismissWithSwipe": @YES,
+              @"class": LauncherLanguageViewController.class
             },
             @{@"key": @"custom_accent_color",
               @"title": localize(@"i18n_str_383", nil),
@@ -734,18 +759,6 @@
               @"type": self.typeSlider,
               @"min": @(25),
               @"max": @(150)
-            },
-            // 启动器侧 FSR1（EASU 边缘自适应上采样 + RCAS 锐化）。
-            // 它接管 video.resolution 的缩放：把原本由 CoreAnimation 做的双线性
-            // 拉伸换成 FSR1，低分辨率渲染 + 高质量还原，换帧率。
-            // 位置在 EGL 之上、渲染器之外，只依赖当前上下文能解析到的 GL 入口点，
-            // 因此不挑后端（MG / MobileGlues / ANGLE / LTW / SFPEW 通用）。
-            // 只有 video.resolution < 100% 时才真正介入；100% 时无东西可上采样。
-            @{@"key": @"fsr1",
-              @"hasDetail": @YES,
-              @"icon": @"arrow.up.left.and.arrow.up.right",
-              @"type": self.typeSwitch,
-              @"enableCondition": whenNotInGame
             },
             // 帧率限制选项已移除：CADisplayLink 始终采用 30-120Hz 自适应范围，
             // 由屏幕硬件能力决定实际帧率（60Hz 设备仍为 60，120Hz ProMotion 设备可达 120）。
@@ -1180,6 +1193,10 @@
                 @"pickKeys": @[
                     @"auto",
                     @"stikjit",
+                    // ★ [POCKETJ-JIT] 新增:只注册 stikdebug:// 的 StikDebug 版本
+                    //   (PocketJ INTEGRATION.md 的 StikDebug 形式,带 script-name)。
+                    //   pickKeys / pickList 必须一一对应,勿只改一边。
+                    @"stikdebug",
                     @"sidestore",
                     @"stosdebug",
                     @"jitstreamer",
@@ -1189,6 +1206,7 @@
                 @"pickList": @[
                     localize(@"preference.debug.jit_enabler.auto", nil),
                     localize(@"preference.debug.jit_enabler.stikjit", nil),
+                    localize(@"preference.debug.jit_enabler.stikdebug", nil),
                     localize(@"preference.debug.jit_enabler.sidestore", nil),
                     localize(@"preference.debug.jit_enabler.stosdebug", nil),
                     localize(@"preference.debug.jit_enabler.jitstreamer", nil),
@@ -1334,6 +1352,20 @@
                                              selector:@selector(openCurseForgeAPIKeySettings)
                                                  name:@"OpenCurseForgeAPIKeySettings"
                                                object:nil];
+
+    // ★ [LANG-SWITCH] 语言切换后刷新本页文案（标题/详情都经 localize 现取 ⇒ 即时生效）。
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(handleLauncherLanguageChanged:)
+                                                 name:@"AmeLauncherLanguageChanged"
+                                               object:nil];
+}
+
+#pragma mark - ★ [LANG-SWITCH] 语言切换
+
+- (void)handleLauncherLanguageChanged:(NSNotification *)notification {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self.tableView reloadData];
+    });
 }
 
 #pragma mark - Hero Header（顶部 App 信息卡片）
@@ -1490,6 +1522,8 @@
 - (void)dealloc {
     [[NSNotificationCenter defaultCenter] removeObserver:self name:@"BackgroundUIEffectChanged" object:nil];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:@"OpenCurseForgeAPIKeySettings" object:nil];
+    // ★ [LANG-SWITCH]
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:@"AmeLauncherLanguageChanged" object:nil];
 }
 
 - (void)viewWillAppear:(BOOL)animated {

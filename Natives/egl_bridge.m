@@ -1,6 +1,4 @@
 #import "SurfaceViewController.h"
-#import "fsr1/ame_fsr1.h"
-#import "metalfx/ame_mfx.h"
 
 #include "jni.h"
 #include <assert.h>
@@ -22,6 +20,9 @@
 #include "ctxbridges/bridge_tbl.h"
 #include "ctxbridges/osmesa_internal.h"
 #include "utils.h"
+// ★ [RENDERER-GAP] 新增渲染器引导（VGPU/GL4ESZL2/VirGL）——纯追加。
+// ★ [DROP-NGG4ES] 原队列中的 NG-GL4ES 已整支移除。
+#include "ctxbridges/gl4es_family_boot.h"
 
 // 默认 GL 路径，pojavInit() 会重新设置
 int clientAPI = GLFW_OPENGL_API;
@@ -226,107 +227,6 @@ static int pojavFinishOpenGLInit(int result) {
     return result;
 }
 
-// ---- NG-GL4ES（"Krypton Wrapper"，ZL2 同款 gl4es）后端钉扎 + 初始化时序 ----
-//
-// vendored 源码：ThirdParty/NG-GL4ES（BZLZHH/NG-GL4ES，MIT），随包构建为
-// libnggl4es.dylib（Makefile dep_nggl4es）。它只做 GL 转译，EGL 全部由宿主
-// ANGLE 提供（本文件的渲染器分支零 EGL 动作）。
-//
-// 初始化时序（对齐参考仓库 Air Task208 的装机定谳，切勿改回构造器方案）：
-//   渲染器 dylib 由 pojavInitOpenGLInternal 尾部的统一预加载
-//   dlopen("@rpath/libnggl4es.dylib", RTLD_GLOBAL) 载入——发生在
-//   br_init_context 之前，此时线程上【没有任何 EGL 上下文】。若沿用上游的
-//   constructor(101) initialize_gl4es，硬件探测 GetHardwareExtensions 会在
-//   dlopen 期间就跑：glGetString 经 vendored proc_address 的 __APPLE__ 分支
-//   dlsym(RTLD_NEXT) 解析到系统 /usr/lib/libGLESv2（无上下文 → 返回 NULL）
-//   → hardext.c 的 strstr(Exts, ...) SIGSEGV。
-//   因此 vendored 构建带 -DNO_INIT_CONSTRUCTOR（构造器退役），改由本函数在
-//   【上下文真正 current 之后】显式调用导出的 initialize_gl4es()。挂点选
-//   pojavMakeCurrent 尾部（br_make_current 返回即 current；GLFW/LWJGL2 与
-//   SDL3 两条路径都汇到这里）。
-//   调用前先注册 set_getprocaddress(ame_ngProcResolver)：proc_address 的宿主
-//   resolver 分支优先于 __APPLE__ 的 dlsym(RTLD_NEXT)，从根上关闭系统
-//   GLESv2 的劫持通道（硬件探测 + 之后所有惰性解析一并免疫）。
-static void *ame_ngGles2 = NULL;                    // 捆绑 libGLESv2.framework 句柄
-static void *ame_ngEgl = NULL;                      // 捆绑 libEGL.framework 句柄
-static void *(*ame_ngEgpa)(const char *) = NULL;    // 捆绑 eglGetProcAddress
-
-static void *ame_ngProcResolver(const char *name) {
-    if (name == NULL) return NULL;
-    if (name[0] == 'g' && name[1] == 'l') {
-        if (ame_ngEgpa != NULL) {
-            void *p = ame_ngEgpa(name);
-            if (p != NULL) return p;
-        }
-        if (ame_ngGles2 != NULL) {
-            void *p = dlsym(ame_ngGles2, name);
-            if (p != NULL) return p;
-        }
-        return NULL;   // gl* 绝不回落 RTLD_DEFAULT —— 那是系统 GLESv2 的劫持通道
-    }
-    if (strncmp(name, "egl", 3) == 0 && ame_ngEgl != NULL) {
-        void *p = dlsym(ame_ngEgl, name);
-        if (p != NULL) return p;
-    }
-    return dlsym(RTLD_DEFAULT, name);
-}
-
-static void ame_nggl4es_boot(void) {
-    static volatile int s_ame_ng_done = 0;
-    if (s_ame_ng_done) return;
-    const char *r = getenv("AMETHYST_RENDERER");
-    if (r == NULL || strcmp(r, RENDERER_NAME_NGGL4ES) != 0) return;
-
-    // RTLD_NOLOAD：预加载已把镜像载入，这里只取句柄（引用计数 +1，
-    // 不会二次跑初始化——NO_INIT_CONSTRUCTOR 下本也无构造器）。
-    void *ng = dlopen("@rpath/" RENDERER_NAME_NGGL4ES, RTLD_NOW | RTLD_NOLOAD | RTLD_GLOBAL);
-    if (ng == NULL) {
-        NSLog(@"[egl_bridge] NG-GL4ES: image not loaded (RTLD_NOLOAD) -- initialize_gl4es NOT called");
-        return;
-    }
-
-    // 后端钉扎：resolver 必须先于 initialize_gl4es 注册（硬件探测的
-    // LOAD_GLES 就要走它）。句柄全局只开一次。
-    if (ame_ngEgpa == NULL) {
-        ame_ngGles2 = dlopen("@executable_path/Frameworks/libGLESv2.framework/libGLESv2",
-                             RTLD_NOW | RTLD_LOCAL);
-        ame_ngEgl = dlopen("@executable_path/Frameworks/libEGL.framework/libEGL",
-                           RTLD_NOW | RTLD_LOCAL);
-        ame_ngEgpa = ame_ngEgl
-            ? (void *(*)(const char *))dlsym(ame_ngEgl, "eglGetProcAddress")
-            : NULL;
-    }
-    int resolver_ok = 0;
-    if (ame_ngEgpa != NULL) {
-        void (*sgpa)(void *(*)(const char *)) =
-            (void (*)(void *(*)(const char *)))dlsym(ng, "set_getprocaddress");
-        if (sgpa != NULL) {
-            sgpa(ame_ngProcResolver);
-            resolver_ok = 1;
-        }
-    }
-
-    // 门：确认线程上确有 current 上下文（经捆绑 ANGLE EGL 查询）。
-    if (ame_ngEgl != NULL) {
-        void *(*getCurCtx)(void) = (void *(*)(void))dlsym(ame_ngEgl, "eglGetCurrentContext");
-        if (getCurCtx != NULL && getCurCtx() == NULL) {
-            NSLog(@"[egl_bridge] NG-GL4ES: boot deferred -- no current EGL context on this thread");
-            return;
-        }
-    }
-
-    void (*init)(void) = (void (*)(void))dlsym(ng, "initialize_gl4es");
-    if (init == NULL) {
-        NSLog(@"[egl_bridge] NG-GL4ES: initialize_gl4es symbol missing -- cannot init");
-        return;
-    }
-    init();   // 上下文已 current：硬件探测 / 能力缓存全部落真上下文
-    s_ame_ng_done = 1;
-    NSLog(@"[egl_bridge] NG-GL4ES: initialize_gl4es() called post-MakeCurrent "
-          @"(resolver=%@, handle=%p) -- hardware probe ran on the real game context",
-          resolver_ok ? @"YES" : @"NO(egpa-missing)", ng);
-}
-
 static int pojavInitOpenGLInternal(BOOL setLwjglProperty) {
     if (s_openGLInited) {
         // 幂等：重复初始化会二次 dlopen 渲染器、二次 br_init()（eglInitialize），
@@ -380,16 +280,24 @@ static int pojavInitOpenGLInternal(BOOL setLwjglProperty) {
         NSLog(@"[egl_bridge] SFPEW renderer: FPE shim over host EGL, SFPEW_EGL=%s",
               getenv("SFPEW_EGL") ?: "<unset>");
         set_gl_bridge_tbl();
-    } else if ([renderer isEqualToString:@ RENDERER_NAME_NGGL4ES]) {
-        // NG-GL4ES（"Krypton Wrapper"，ZL2 同款 gl4es）：glslang + SPIRV-Cross
-        // 着色器管线，官方口径几乎全 MC 版本可跑（gl4es 家族里最强的一支）。
-        // EGL 仍全部由宿主 gl_bridge 从 ANGLE 框架提供——本分支零 EGL 动作，
-        // dylib 只承担 GL 转译。初始化不在 dlopen 期进行（无上下文会 SIGSEGV），
-        // 改由 pojavMakeCurrent 尾部的 ame_nggl4es_boot() 在真上下文上调用
-        // initialize_gl4es()（vendored 构建带 -DNO_INIT_CONSTRUCTOR）。
-        NSLog(@"[egl_bridge] NG-GL4ES renderer: gl4es-family GL-on-ES translation "
-              @"(Krypton Wrapper, glslang+SPIRV-Cross shader pipeline)");
+    } else if (isGL4ESFamilyRenderer(renderer.UTF8String)) {
+        // ★ [RENDERER-GAP] VGPU / GL4ESZL2：gl4es 家族。导出全套桌面 GL API，
+        // 运行时经 ANGLE 框架解析 EGL/GLES 后端 —— 与既有 holy gl4es 完全同链路。
+        // 初始化时机（LZ2 的 initialize_gl4es）在 pojavMakeCurrent 尾部由
+        // ame_gap_gl4es_family_boot() 处理；VGPU 自带惰性装载器。
+        // ★ [DROP-NGG4ES] 原 gl4es 家族第三支 NG-GL4ES 已整支移除。
+        NSLog(@"[egl_bridge] [RENDERER-GAP] gl4es-family renderer: %@ (ANGLE host EGL)", renderer);
         set_gl_bridge_tbl();
+    } else if (isVirglRenderer(renderer.UTF8String)) {
+        // ★ [RENDERER-GAP] VirGL（libOSMesaVirgl.dylib）：Mesa virgl guest + 进程内 vtest
+        // 服务端（ZalithLauncher2 移植）。呈现复用 osm_bridge 的 zink 链路
+        // （OSMesaMakeCurrent + swap 时 glReadPixels 权威回读 + CGImage 上屏）。
+        // 必须排在下方 "libOSMesa" 前缀分支【之前】：否则会被误设 GALLIUM_DRIVER=zink。
+        NSLog(@"[egl_bridge] [RENDERER-GAP] VirGL renderer: bootstrapping in-process vtest server");
+        if (ame_gap_virgl_boot() != 0) {
+            NSLog(@"[egl_bridge] [RENDERER-GAP] VirGL vtest bootstrap nonzero -- continuing on osm bridge");
+        }
+        set_osm_bridge_tbl();
     } else if ([renderer isEqualToString:@ RENDERER_NAME_MITHRIL]) {
         // Mithril 渲染器：EGL 1.5 + GL 3.3 Core 全部由 libmithril.dylib 提供
         // （Vulkan backend，经 MoltenVK 到 Metal）。
@@ -409,7 +317,9 @@ static int pojavInitOpenGLInternal(BOOL setLwjglProperty) {
         NSLog(@"[egl_bridge] MobileGL renderer: backend=%s",
             getenv("MOBILEGL_BACKEND_TYPE") ?: "<unset>");
         set_gl_bridge_tbl();
-    } else if ([renderer hasPrefix:@"libOSMesa"]) {
+    } else if ([renderer hasPrefix:@"libOSMesa"] && !isVirglRenderer(renderer.UTF8String)) {
+        // ★ [RENDERER-GAP] 排除 libOSMesaVirgl.dylib（VirGL 已在上面单独分支处理，
+        // 其 GALLIUM_DRIVER=virgl 由 ame_gap_virgl_boot 设置，不能被 zink 覆盖）。
         setenv("GALLIUM_DRIVER","zink",1);
         set_osm_bridge_tbl();
     } else if ([renderer isEqualToString:@ RENDERER_NAME_VULKAN]) {
@@ -737,20 +647,6 @@ static void pojavEnforceViewportAtSwap(void) {
     if (!pojavEglSurfacePixelSize(&eglW, &eglH)) return;
     if (eglW <= 0 || eglH <= 0) return;
 
-    // FSR1 生效时，MC 应当按「渲染分辨率」绘制，画面落在 surface（全分辨率）
-    // 左下角的一块矩形里，由 fsr1 在 present 前上采样铺满。此时正确的 viewport
-    // 是渲染分辨率而不是 surface 尺寸 —— 若此处仍按 surface 纠正，游戏就会
-    // 按全分辨率渲染，FSR1 失去意义，且 fsr1 读到的源区域也不再是缩放后的画面。
-    // ameFsr1RenderSize 在 FSR1 未生效时把 out 写成 surface 尺寸并返回 false，
-    // 故这条路径对关闭态完全无副作用。
-    {
-        int rw = 0, rh = 0;
-        if (ameFsr1RenderSize(eglW, eglH, &rw, &rh) && rw > 0 && rh > 0) {
-            eglW = rw;
-            eglH = rh;
-        }
-    }
-
     typedef void (*fn_getiv_t)(uint32_t, int32_t *);
     typedef void (*fn_vp_t)(int32_t, int32_t, int32_t, int32_t);
     // 先看当前绑定的 framebuffer。这是判定能否安全纠正的依据：
@@ -972,35 +868,6 @@ void pojavSwapBuffers() {
     }
 
     if (!br_swap_buffers) return;
-
-    // MetalFX 能力探针（阶段 0）：只在首次真正要走 swap 时跑一次 —— 此时 EGL
-    // 上下文已就绪，能拿到 EGLDisplay 去查 ANGLE 的 Metal 互操作扩展。
-    // 纯打印，不建资源、不改渲染行为；探测结果决定后续能否做 MetalFX 超分。
-    ameMfxProbe();
-
-    // 启动器侧 FSR1：present 之前把渲染分辨率的内容上采样铺满 surface。
-    // 位置必须在 viewport 守护之后 —— 守护保证当前 viewport 等于渲染分辨率，
-    // fsr1 正是拿 viewport 当源区域（自适应，不依赖理论值）。
-    // 编译风暴期间同样跳过：那时画面还没稳定，多一趟全屏 pass 纯属浪费。
-    // 几何前提与是否上采样无关：只要 FSR1 接管了几何（surface 全分辨率 +
-    // MC 低分辨率绘制），任何跳过了上采样 pass 的帧都必须走保底铺满，否则
-    // 画面缩在 surface 一角 —— 而 surface 只创建一次，不会自愈。
-    {
-        static BOOL fsrSizeLogged = NO;
-        int fsrW = 0, fsrH = 0;
-        if (pojavEglSurfacePixelSize(&fsrW, &fsrH) && fsrW > 0 && fsrH > 0) {
-            if (heavyWorkAllowed) {
-                ameFsr1Present(fsrW, fsrH);
-            } else {
-                ameFsr1KeepFullScreen(fsrW, fsrH);
-            }
-        } else if (!fsrSizeLogged) {
-            fsrSizeLogged = YES;
-            NSLog(@"[FSR1] skipped: EGL surface pixel size unavailable (%dx%d)",
-                  fsrW, fsrH);
-        }
-    }
-
     br_swap_buffers();
 }
 
@@ -1082,10 +949,12 @@ void pojavMakeCurrent(basic_render_window_t* window) {
     }
     NSLog(@"[egl_bridge] pojavMakeCurrent: window=%p", window);
     br_make_current(window);
-    // NG-GL4ES 初始化点——br_make_current 返回即上下文 current。
-    // 非 nggl4es 渲染器时 ame_nggl4es_boot 立即返回（一次 getenv 比较，零副作用）。
-    // 幂等：boot 内部 s_ame_ng_done 门。
-    ame_nggl4es_boot();
+    // ★ [RENDERER-GAP] 新增 gl4es 家族（GL4ESZL2）需在【真实游戏上下文
+    // 已 current】之后显式调用 initialize_gl4es（其 vendored 构建带 NO_INIT_CONSTRUCTOR，
+    // 构造器不跑；若在上下文之前初始化，硬件探测的 glGetString 会命中系统 stub → 崩溃）。
+    // 非 gap 渲染器时内部一次 getenv 比较即返回，对现有渲染器零影响。
+    // ★ [DROP-NGG4ES] 原队列中的 NG-GL4ES 已整支移除。
+    ame_gap_gl4es_family_boot();
 }
 
 void* pojavCreateContext(basic_render_window_t* contextSrc) {

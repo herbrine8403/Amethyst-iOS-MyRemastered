@@ -157,6 +157,33 @@ static UIColor *CFKErrorColor(void) {
 
 #pragma mark - 生命周期
 
+// ★ [LAND-BUG] 本页由 4 处调用方以 UIModalPresentationFormSheet + UINavigationController 整页弹出
+//   （LauncherPreferencesViewController ×2、DownloadViewController、ServerListViewController）。
+//   iPhone 上 formSheet 会自适应为全屏，而本页原先没有设置任何 navigationItem，
+//   底部「保存」按钮也只保存不 dismiss ⇒ 保存完仍然退不出去。
+//   此处补一个左上「关闭」按钮（模态时注入，push 进入时不注入）。
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    UINavigationController *nav = self.navigationController;
+    if (nav.presentingViewController != nil && nav.viewControllers.firstObject == self &&
+        self.navigationItem.leftBarButtonItem == nil) {
+        UIBarButtonItem *landBugCloseItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemClose
+                                                                                          target:self
+                                                                                          action:@selector(landBugCloseTapped)];
+        landBugCloseItem.accessibilityLabel = @"关闭";
+        self.navigationItem.leftBarButtonItem = landBugCloseItem;
+    }
+}
+
+- (void)landBugCloseTapped {
+    UINavigationController *nav = self.navigationController;
+    if (nav.presentingViewController) {
+        [nav dismissViewControllerAnimated:YES completion:nil];
+    } else {
+        [self dismissViewControllerAnimated:YES completion:nil];
+    }
+}
+
 - (void)viewDidLoad {
     [super viewDidLoad];
     // 适配自定义启动器背景：将当前视图控制器透明化，使全局背景壁纸能够透出

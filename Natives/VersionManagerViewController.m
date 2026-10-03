@@ -847,7 +847,18 @@ static NSInteger const kSectionVersions    = 1;
 }
 
 - (void)createNewVersion {
-    [[NSNotificationCenter defaultCenter] postNotificationName:@"ShowDownloadPage" object:nil];
+    // ★ [TABFIX] 旧行为:发 ShowDownloadPage 通知,让 LauncherRootViewController 换自己的内容。
+    //   但本页现在是【独立标签】,那个通知是在用户看不见的主页里换内容 ——
+    //   表现就是「点 + 没反应」+「切回主页发现变成实例下载页」(用户实测)。
+    //   正解:直接切到"下载"标签(它本来就是 DownloadViewController)。
+    UITabBarController *tbc = self.tabBarController;
+    if (tbc) {
+        NSLog(@"[TABFIX] '+' ⇒ 切到下载标签(index 1)");
+        tbc.selectedIndex = 1;
+    } else {
+        // 兜底:不在标签栏里(老流程)时保持原行为
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"ShowDownloadPage" object:nil];
+    }
 }
 
 #pragma mark - Empty State

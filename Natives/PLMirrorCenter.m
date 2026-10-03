@@ -183,6 +183,13 @@ BOOL PLMirrorIsChinaMainland(void) {
     return @"https://api.curseforge.com/v1";
 }
 
+// ★ [MODPACK-FIX] 恒定返回 CurseForge 的 MCIM 镜像基址（免 key）。
+//   供 CurseForgeAPI 在「未配置 API key」时强制回落——官方 api.curseforge.com
+//   对无 x-api-key 的请求恒 403，而镜像无 key 实测 200（字段实证见 CurseForgeAPI.m）。
++ (NSString *)mcimCurseForgeAPIBaseURL {
+    return [NSString stringWithFormat:@"%@/curseforge/v1", PLMirrorMCIMRootURL];
+}
+
 + (PLMirrorPolicy)policyForType:(PLMirrorResourceType)type {
     // 优先读取新版分资源类型策略键（值 auto / official_first / mirror_first）
     NSString *key = nil;
