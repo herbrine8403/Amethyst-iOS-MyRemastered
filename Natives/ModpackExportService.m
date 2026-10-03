@@ -870,7 +870,7 @@
         NSDictionary *profiles = PLProfiles.current.profiles;
         NSDictionary *prof = profiles[profile];
         if (![prof isKindOfClass:[NSDictionary class]]) return nil;
-        NSString *gameDir = prof[@"gameDir"];
+        NSString *gameDir = [PLProfiles effectiveGameDirForProfile:prof];
         if (![gameDir isKindOfClass:[NSString class]] || gameDir.length == 0) return nil;
         if ([gameDir isEqualToString:@"."]) {
             const char *env = getenv("POJAV_GAME_DIR");

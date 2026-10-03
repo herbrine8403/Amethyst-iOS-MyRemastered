@@ -179,6 +179,13 @@
 "preference.title.confirm" = "你確定嗎？";
 
 "preference.title.game_directory" = "遊戲資料夾";
+
+"preference.isolation.title" = "版本隔離";
+"preference.isolation.message" = "依版本隔離遊戲資料（對齊 PCL2）。完全隔離會把 mods、存檔、config 等放進 versions/<版本> 目錄。";
+"preference.isolation.none" = "不隔離";
+"preference.isolation.mod" = "僅 Mod 隔離";
+"preference.isolation.full" = "完全隔離";
+"preference.isolation.custom" = "自訂隔離目錄…";
 "preference.title.confirm.delete_game_directory" = "實例%@會被永久刪除，且不能回復。";
 "preference.multidir.add_directory" = "新增遊戲目錄";
 

@@ -179,6 +179,13 @@
 "preference.title.confirm" = "Are you sure?";
 
 "preference.title.game_directory" = "Game directory";
+
+"preference.isolation.title" = "版本隔离";
+"preference.isolation.message" = "按版本隔离游戏数据（对齐 PCL2）。完全隔离会把 mods、存档、config 等放进 versions/<版本> 目录。";
+"preference.isolation.none" = "不隔离";
+"preference.isolation.mod" = "仅 Mod 隔离";
+"preference.isolation.full" = "完全隔离";
+"preference.isolation.custom" = "自定义隔离目录…";
 "preference.title.confirm.delete_game_directory" = "The instance %@ will be deleted forever and cannot be restored.";
 "preference.multidir.add_directory" = "add game directory";
 

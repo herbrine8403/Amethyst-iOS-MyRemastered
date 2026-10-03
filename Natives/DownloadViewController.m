@@ -5711,45 +5711,12 @@ static NSString *PLSha1FromPrimaryFile(NSDictionary *primaryFile) {
 }
 
 - (NSString *)currentInstanceModsPath {
-    // 参考 ModService.m 的 existingModsFolderForProfile: 逻辑：
-    // 1. 优先读取 profile 的 gameDir，拼接 /mods
-    // 2. 若 profile 无 gameDir 或 gameDir 为 "."，回退到 $POJAV_GAME_DIR/mods
-    NSString *instanceName = PLProfiles.current.selectedProfileName;
-    if (!instanceName) instanceName = @"default";
-
-    NSString *modsDir = nil;
-
-    @try {
-        NSDictionary *profiles = PLProfiles.current.profiles;
-        NSDictionary *prof = profiles[instanceName];
-        if ([prof isKindOfClass:[NSDictionary class]]) {
-            NSString *gameDir = prof[@"gameDir"];
-            if ([gameDir isKindOfClass:[NSString class]] && gameDir.length > 0 && ![gameDir isEqualToString:@"."]) {
-                // gameDir 是相对路径时，相对于 POJAV_GAME_DIR 解析
-                NSString *baseDir;
-                const char *env = getenv("POJAV_GAME_DIR");
-                if (env) {
-                    baseDir = [NSString stringWithUTF8String:env];
-                } else {
-                    baseDir = NSHomeDirectory();
-                }
-
-                if ([gameDir isAbsolutePath]) {
-                    modsDir = [gameDir stringByAppendingPathComponent:@"mods"];
-                } else {
-                    modsDir = [[baseDir stringByAppendingPathComponent:gameDir] stringByAppendingPathComponent:@"mods"];
-                }
-            }
-        }
-    } @catch (NSException *ex) { }
-
-    if (!modsDir) {
-        // 回退到 $POJAV_GAME_DIR/mods（与 FCL 默认行为一致）
-        const char *env = getenv("POJAV_GAME_DIR");
-        NSString *gameDir = env ? [NSString stringWithUTF8String:env] : NSHomeDirectory();
-        modsDir = [gameDir stringByAppendingPathComponent:@"mods"];
-    }
-
+    // 版本隔离：mods 目录统一交给 PLProfiles 解析
+    // 不隔离 / 完全隔离 → <有效游戏目录>/mods；仅 Mod 隔离 → versions/<版本>/mods
+    NSString *instanceName = PLProfiles.current.selectedProfileName ?: @"default";
+    NSDictionary *prof = PLProfiles.current.profiles[instanceName];
+    if (![prof isKindOfClass:[NSDictionary class]]) prof = @{};
+    NSString *modsDir = [PLProfiles absoluteModsDirForProfile:prof];
     [[NSFileManager defaultManager] createDirectoryAtPath:modsDir withIntermediateDirectories:YES attributes:nil error:nil];
     return modsDir;
 }

@@ -75,7 +75,7 @@
         NSDictionary *profiles = PLProfiles.current.profiles;
         NSDictionary *prof = profiles[profile];
         if ([prof isKindOfClass:[NSDictionary class]]) {
-            NSString *gameDir = prof[@"gameDir"];
+            NSString *gameDir = [PLProfiles effectiveGameDirForProfile:prof];
             if ([gameDir isKindOfClass:[NSString class]] && gameDir.length > 0) {
                 return gameDir;
             }
@@ -100,7 +100,7 @@
         NSDictionary *profiles = PLProfiles.current.profiles;
         NSDictionary *prof = profiles[profile];
         if ([prof isKindOfClass:[NSDictionary class]]) {
-            NSString *gameDir = prof[@"gameDir"];
+            NSString *gameDir = [PLProfiles effectiveGameDirForProfile:prof];
             if ([gameDir isKindOfClass:[NSString class]] && gameDir.length > 0) {
                 NSString *savesPath = [gameDir stringByAppendingPathComponent:@"saves"];
                 BOOL isDir = NO;
@@ -134,7 +134,7 @@
         NSDictionary *profiles = PLProfiles.current.profiles;
         NSDictionary *prof = profiles[profile];
         if ([prof isKindOfClass:[NSDictionary class]]) {
-            NSString *gameDir = prof[@"gameDir"];
+            NSString *gameDir = [PLProfiles effectiveGameDirForProfile:prof];
             if ([gameDir isKindOfClass:[NSString class]] && gameDir.length > 0) {
                 savesPath = [gameDir stringByAppendingPathComponent:@"saves"];
             }

@@ -70,7 +70,7 @@ static NSString * localizeProfileTitle(NSString *title) {
             @"清除JVM参数": @"i18n_str_2038",
             @"名称": @"preference.profile.title.name",
             @"游戏版本": @"i18n_str_2031",
-            @"游戏目录": @"preference.title.game_directory",
+            @"版本隔离": @"preference.isolation.title",
             @"模组管理": @"i18n_str_2039",
             @"光影管理": @"i18n_str_2016",
             @"资源包管理": @"i18n_str_2040",
@@ -354,7 +354,7 @@ static NSString * localizeProfileTitle(NSString *title) {
 
     // ===== 副标题（游戏目录，12pt regular，secondaryLabelColor）=====
     UILabel *subtitleLabel = [[UILabel alloc] init];
-    NSString *gameDir = self.profile[@"gameDir"] ?: @".";
+    NSString *gameDir = [PLProfiles effectiveGameDirForProfile:self.profile];
     NSString *instanceName = getPrefObject(@"general.game_directory") ?: @"default";
     subtitleLabel.text = [NSString stringWithFormat:@"%@ → /instances/%@", gameDir, instanceName];
     subtitleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
@@ -447,7 +447,7 @@ static NSString * localizeProfileTitle(NSString *title) {
                 NSString *currentVersion = self.profile[@"lastVersionId"];
                 label.text = currentVersion.length > 0 ? currentVersion : localize(@"i18n_str_864", nil);
             } else {
-                NSString *gameDir = self.profile[@"gameDir"] ?: @".";
+                NSString *gameDir = [PLProfiles effectiveGameDirForProfile:self.profile];
                 NSString *instanceName = getPrefObject(@"general.game_directory") ?: @"default";
                 label.text = [NSString stringWithFormat:@"%@ → /instances/%@", gameDir, instanceName];
             }
@@ -526,7 +526,7 @@ static NSString * localizeProfileTitle(NSString *title) {
     //   3: 高级设置  - 渲染器 / 图形 API / Java / 内存 / JVM 参数
     //   4: 服务器    - 服务器地址
     self.sections = @[
-        @[@"名称", @"游戏版本", @"游戏目录"],
+        @[@"名称", @"游戏版本", @"版本隔离"],
         @[@"模组管理", @"光影管理", @"资源包管理", @"数据包管理", @"世界管理"],
         @[@"Fabric API", @"OptiFine"],
         [advancedRows copy],
@@ -629,6 +629,10 @@ static NSString * localizeProfileTitle(NSString *title) {
     }
     // 保存游戏目录（版本隔离用）：gameDir 为 nil 时默认 "."，与 main 分支行为一致
     existing[@"gameDir"] = self.profile[@"gameDir"] ?: @".";
+    // 版本隔离模式（none/mod/full）；由「版本隔离」行写入
+    if (self.profile[@"isolation"]) {
+        existing[@"isolation"] = self.profile[@"isolation"];
+    }
     // existing 中的 name 和 lastVersionId 字段保持原始值不变
     PLProfiles.current.profiles[profName] = existing;
     [PLProfiles.current save];
@@ -716,11 +720,10 @@ static NSString * localizeProfileTitle(NSString *title) {
                 cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
                 cell.accessoryView = [self buildVersionTextField];
                 cell.detailTextLabel.text = nil;
-            } else if ([title isEqualToString:@"游戏目录"]) {
+            } else if ([title isEqualToString:@"版本隔离"]) {
                 cell.imageView.image = [UIImage systemImageNamed:@"folder"];
                 cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-                NSString *gameDir = self.profile[@"gameDir"] ?: @".";
-                cell.detailTextLabel.text = gameDir;
+                cell.detailTextLabel.text = [self isolationDisplayName];
             }
             break;
 
@@ -1127,8 +1130,8 @@ static NSString * localizeProfileTitle(NSString *title) {
             } else if ([title isEqualToString:@"游戏版本"]) {
                 // 聚焦版本选择器
                 if (self.versionTextField) [self.versionTextField becomeFirstResponder];
-            } else if ([title isEqualToString:@"游戏目录"]) {
-                [self editGameDir];
+            } else if ([title isEqualToString:@"版本隔离"]) {
+                [self editIsolationMode];
             }
             break;
 
@@ -1198,15 +1201,72 @@ static NSString * localizeProfileTitle(NSString *title) {
 
 #pragma mark - Actions
 
-/// 编辑游戏目录（仿 main 分支 LauncherProfileEditorViewController 的 gameDir 文本框）
-/// gameDir="." 表示使用当前 POJAV_GAME_DIR（即"游戏目录切换"选中的实例目录）
-/// 也可以输入相对路径（相对于 POJAV_GAME_DIR）或绝对路径来实现版本隔离
-- (void)editGameDir {
+#pragma mark - 版本隔离
+
+/// 当前隔离模式的展示名（自定义完全隔离时带出目录）
+- (NSString *)isolationDisplayName {
+    NSString *mode = [PLProfiles isolationModeForProfile:self.profile];
+    if ([mode isEqualToString:PLIsolationFull]) {
+        NSString *gameDir = self.profile[@"gameDir"];
+        BOOL custom = [gameDir isKindOfClass:[NSString class]] && gameDir.length > 0 && ![gameDir isEqualToString:@"."];
+        NSString *name = localize(@"preference.isolation.full", nil);
+        return custom ? [NSString stringWithFormat:@"%@ (%@)", name, gameDir] : name;
+    }
+    if ([mode isEqualToString:PLIsolationMod]) return localize(@"preference.isolation.mod", nil);
+    return localize(@"preference.isolation.none", nil);
+}
+
+/// 版本隔离：不隔离 / 仅Mod隔离 / 完全隔离 / 自定义目录（对齐 PCL2 三档）
+- (void)editIsolationMode {
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:localize(@"preference.isolation.title", nil)
+                                                                  message:localize(@"preference.isolation.message", nil)
+                                                           preferredStyle:UIAlertControllerStyleActionSheet];
+
+    __weak __typeof(self) weakSelf = self;
+    void (^apply)(NSString *, NSString *) = ^(NSString *newMode, NSString *customGameDir) {
+        [weakSelf applyIsolationMode:newMode customGameDir:customGameDir];
+    };
+
+    [sheet addAction:[UIAlertAction actionWithTitle:localize(@"preference.isolation.none", nil) style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        apply(PLIsolationNone, nil);
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:localize(@"preference.isolation.mod", nil) style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        apply(PLIsolationMod, nil);
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:localize(@"preference.isolation.full", nil) style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        apply(PLIsolationFull, nil);
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:localize(@"preference.isolation.custom", nil) style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        [weakSelf promptCustomIsolationDir];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:localize(@"resman.common.cancel", nil) style:UIAlertActionStyleCancel handler:nil]];
+
+    // iPad 上 actionSheet 必须提供 popover 锚点
+    sheet.popoverPresentationController.sourceView = self.view;
+    sheet.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 1, 1);
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+/// 落地隔离模式：写 PLProfiles（含按需建目录）并同步内存 working copy
+- (void)applyIsolationMode:(NSString *)mode customGameDir:(NSString *)customGameDir {
+    NSString *profName = self.originalName ?: self.profile[@"name"];
+    if (profName.length == 0) return;
+    [PLProfiles setIsolationMode:mode customGameDir:customGameDir forProfileName:profName];
+
+    // 同步 working copy，避免 saveSettings 把 gameDir 覆盖回旧值
+    self.profile[@"isolation"] = mode;
+    self.profile[@"gameDir"] = (customGameDir.length > 0) ? customGameDir : @".";
+    [self reloadAllTableViews];
+    [self updateHeroCard];
+}
+
+/// 自定义完全隔离目录（留空或 "." 视为自动 versions/<版本>）
+- (void)promptCustomIsolationDir {
     NSString *currentGameDir = self.profile[@"gameDir"] ?: @".";
     NSString *currentInstance = getPrefObject(@"general.game_directory") ?: @"default";
 
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:localize(@"i18n_str_2004", nil)
+        alertControllerWithTitle:localize(@"preference.isolation.custom", nil)
                          message:[NSString stringWithFormat:
                                   [[[localize(@"i18n_str_897", nil)
                                       stringByAppendingString:localize(@"i18n_str_2010", nil)]
@@ -1223,25 +1283,16 @@ static NSString * localizeProfileTitle(NSString *title) {
         textField.clearButtonMode = UITextFieldViewModeWhileEditing;
     }];
 
-    [alert addAction:[UIAlertAction actionWithTitle:localize(@"i18n_str_898", nil) style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
-        self.profile[@"gameDir"] = @".";
-        [self saveSettings];
-        [self reloadAllTableViews];
-        [self updateHeroCard];
-    }]];
-
+    __weak __typeof(self) weakSelf = self;
     [alert addAction:[UIAlertAction actionWithTitle:localize(@"resman.common.cancel", nil) style:UIAlertActionStyleCancel handler:nil]];
-
     [alert addAction:[UIAlertAction actionWithTitle:localize(@"i18n_str_44", nil) style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
         NSString *newGameDir = alert.textFields.firstObject.text;
         newGameDir = [newGameDir stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (newGameDir.length == 0) {
-            newGameDir = @".";
+        if (newGameDir.length == 0 || [newGameDir isEqualToString:@"."]) {
+            [weakSelf applyIsolationMode:PLIsolationFull customGameDir:nil];
+        } else {
+            [weakSelf applyIsolationMode:PLIsolationFull customGameDir:newGameDir];
         }
-        self.profile[@"gameDir"] = newGameDir;
-        [self saveSettings];
-        [self reloadAllTableViews];
-        [self updateHeroCard];
     }]];
 
     [self presentViewController:alert animated:YES completion:nil];
@@ -1316,27 +1367,8 @@ static NSString * localizeProfileTitle(NSString *title) {
 
 /// 当前 profile 的 mods 目录路径
 - (NSString *)currentProfileModsPath {
-    NSString *gameDir = self.profile[@"gameDir"];
-    NSString *baseDir;
-    const char *env = getenv("POJAV_GAME_DIR");
-    if (env) {
-        baseDir = [NSString stringWithUTF8String:env];
-    } else {
-        baseDir = NSHomeDirectory();
-    }
-
-    NSString *modsBase;
-    if ([gameDir isKindOfClass:[NSString class]] && gameDir.length > 0 && ![gameDir isEqualToString:@"."]) {
-        if ([gameDir isAbsolutePath]) {
-            modsBase = gameDir;
-        } else {
-            modsBase = [baseDir stringByAppendingPathComponent:gameDir];
-        }
-    } else {
-        modsBase = baseDir;
-    }
-
-    NSString *modsDir = [modsBase stringByAppendingPathComponent:@"mods"];
+    // 版本隔离：mods 目录统一交给 PLProfiles 解析（仅 Mod 隔离时会指向 versions/<版本>/mods）
+    NSString *modsDir = [PLProfiles absoluteModsDirForProfile:self.profile ?: @{}];
     [[NSFileManager defaultManager] createDirectoryAtPath:modsDir withIntermediateDirectories:YES attributes:nil error:nil];
     return modsDir;
 }

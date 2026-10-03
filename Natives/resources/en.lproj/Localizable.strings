@@ -179,6 +179,13 @@
 "preference.title.confirm" = "Are you sure?";
 
 "preference.title.game_directory" = "Game directory";
+
+"preference.isolation.title" = "Version isolation";
+"preference.isolation.message" = "Isolate game data per version, like PCL2. Full isolation keeps mods, saves and config inside versions/<version>.";
+"preference.isolation.none" = "No isolation";
+"preference.isolation.mod" = "Mods only";
+"preference.isolation.full" = "Full isolation";
+"preference.isolation.custom" = "Custom directory…";
 "preference.title.confirm.delete_game_directory" = "The instance %@ will be deleted forever and cannot be restored.";
 "preference.multidir.add_directory" = "Add game directory";
 
