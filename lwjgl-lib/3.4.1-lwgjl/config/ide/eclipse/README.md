@@ -1,1 +1,0 @@
-The Eclipse project files in this directory *must* be copied to the **repository root** to work properly.

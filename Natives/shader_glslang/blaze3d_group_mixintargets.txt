@@ -1,4 +1,0 @@
-# ★ [BLAZE3D-ONDEMAND] 组内 mixin 靶子 —— agent BLAZE3D_MIXIN_TARGETS 硬跳过,
-#   运行时再经 Class.forName 探测(能解析即跳过), 两者都保证【绝不原始 define】。
-com/mojang/blaze3d/vertex/VertexFormat
-com/mojang/blaze3d/vertex/VertexFormatElement

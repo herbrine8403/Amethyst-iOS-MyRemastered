@@ -1,9 +1,0 @@
-LWJGL {
-    # Expose symbols required by the JVM
-    global:
-        *org_lwjgl_*;
-        JNI_On*;
-
-    # Hide everything else
-    local: *;
-};

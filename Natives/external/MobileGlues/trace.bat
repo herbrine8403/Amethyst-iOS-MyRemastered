@@ -1,1 +1,0 @@
-python .\record_android_trace.py -c .\mg.pbtx -o trace_file.perfetto-trace

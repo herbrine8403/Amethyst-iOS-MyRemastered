@@ -14,7 +14,7 @@
 </div>
 
 <p align="center">
-  <a href="./README.md">English</a> | <a href="./README_CN.md">Chinese</a>
+  <a href="./README.md">English</a> | <a href="./README_CN.md">Chinese</a> | <a href="./README_JA.md">Japanese</a>
 </p>
 
 > [!IMPORTANT]
