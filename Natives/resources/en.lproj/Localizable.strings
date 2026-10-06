@@ -306,6 +306,7 @@
 "preference.title.renderer.debug.metal" = "Metal (metallum)";
 "preference.title.renderer.debug.vgpu" = "VGPU (<=1.12) - gl4es fork, enhanced shader syntax, EXPERIMENTAL";
 "preference.title.renderer.debug.virgl" = "VirGL (<=26.2) - Mesa virgl guest + vtest server, EXPERIMENTAL";
+"preference.title.renderer.debug.nggl4es" = "Krypton Wrapper（≤26.2）- ZL2 同款 gl4es，老版本首选（原 NG-GL4ES）";
 "preference.title.renderer.debug.gl4eszl2" = "GL4ES (ZL2 classic) - string-rewrite GLSL to ESSL, EXPERIMENTAL";
 "preference.detail.renderer" = "更改使用的渲染器";
 "preference.title.resolution" = "分辨率缩放 (%)";
