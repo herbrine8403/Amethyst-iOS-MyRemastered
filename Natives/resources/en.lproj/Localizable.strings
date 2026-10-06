@@ -122,6 +122,9 @@
 "login.msa.progress.acquireXboxProfile" = "(4/6) 获取 Xbox 配置文件";
 "login.msa.progress.acquireMCToken" = "(5/6) 请求 Minecraft 令牌";
 "login.msa.progress.checkMCProfile" = "(6/6) 检查 Minecraft 配置文件";
+"login.msa.error.network.token" = "无法连接登录服务器（%@）。请检查网络后重试。";
+"login.msa.error.xbl.rejected" = "无法请求 Xbox Live 令牌：Xbox Live 拒绝了该账户的访问令牌。请确认此微软账户已创建 Xbox 档案（首次登录请先在 xbox.com 或 Xbox App 登录一次），或稍后重试。";
+"login.msa.error.mc.token" = "无法请求 Minecraft 令牌：该微软账户可能没有 Minecraft: Java 版所有权，或 Xbox 档案尚未创建。";
 "login.3rdparty.progress.auth" = "(1/2)正在通过第三方服务器进行认证";
 "login.3rdparty.progress.refresh" = "(2/2)正在刷新第三方认证";
 "login.3rdparty.2fa.title" = "二次验证";
@@ -147,6 +150,96 @@
 "preference.section.java" = "Java 调整";
 "preference.title.confirm" = "确认吗？";
 "preference.title.game_directory" = "游戏目录";
+/* ★ [VER-ISOLATE-PCL] 版本隔离 */
+"preference.title.version_isolation" = "默认版本隔离";
+"preference.profile.title.version_isolation" = "版本隔离";
+"preference.detail.version_isolation" = "开启后，版本默认按隔离策略把 mods / config / 存档放在 versions/<版本>/ 下；已有版本保持各自设置。";
+"preference.detail.versionIsolation" = "开启后，该版本的 mods / config / 存档独立存放于 versions/<版本>/，与其它版本互不干涉；关闭即恢复共享（不会搬动任何文件）。";
+/* ★ [VER-ISOLATE-MIGRATE] 版本隔离数据迁移（逐实例、复制式、可中断重跑；默认不自动搬） */
+"preference.profile.title.migrate_version_data" = "迁移版本数据";
+"preference.detail.migrate_version_data" = "把该实例的 mods／config／存档等复制进隔离目录 versions/<版本>/。只复制、不删源；已存在的同名文件绝不静默覆盖。";
+"preference.migrate.need_isolation" = "请先打开上方的「版本隔离」并保存再迁移；否则数据仍会与其它版本共享。";
+"preference.migrate.no_target" = "该实例使用了自定义游戏目录，没有可迁移到的隔离目录。";
+"preference.migrate.nothing" = "没有可迁移的数据（该版本已隔离，或这里没有 mods／config／存档）。";
+"preference.migrate.confirm.message" = "%1$lu 项、共 %2$lu 个文件（%3$@）将被复制到：\n%4$@\n\n只复制、不删源；已存在的同名文件会跳过并保留两边。";
+"preference.migrate.item.title" = "%1$@（%2$lu 个文件，%3$@）";
+"preference.migrate.all" = "全部迁移";
+"preference.migrate.result.title" = "迁移完成";
+"preference.migrate.line" = "%1$@：复制 %2$lu · 已存在 %3$lu · 冲突 %4$lu · 改名 %5$lu";
+"preference.migrate.summary" = "共复制 %1$lu 个文件；跳过已存在 %2$lu 个；冲突 %3$lu 个；改名保留 %4$lu 个。源文件已保留。";
+"preference.migrate.issues" = "说明：";
+"preference.migrate.cleanup_source" = "删除已复制的源文件";
+"preference.migrate.removed" = "源文件已校验通过后删除。";
+// ★ [VI-MIGRATE-AUTO] 自动识别迁移
+"preference.migrate.auto.title" = "自动识别迁移";
+"preference.migrate.auto.subtitle" = "选一个文件夹自动识别归属（版本+加载器），确认后再复制";
+"preference.migrate.auto.source" = "源文件夹";
+"preference.migrate.auto.groups" = "识别结果（点整行勾选/取消；目标由自动识别决定）";
+"preference.migrate.auto.pick" = "选择要扫描的文件夹";
+"preference.migrate.auto.no.source" = "（尚未选择文件夹）";
+"preference.migrate.auto.source.shared" = "共享游戏根";
+"preference.migrate.auto.source.instance" = "实例";
+"preference.migrate.auto.source.other" = "输入其它文件夹…";
+"preference.migrate.auto.group.unrecognized" = "未识别";
+"preference.migrate.auto.group.unmatched" = "未匹配到实例";
+"preference.migrate.auto.group.detail" = "%1$lu 个文件 · %2$@ · %3$@";
+"preference.migrate.auto.run" = "迁移选中";
+"preference.migrate.auto.confirm.title" = "确认迁移";
+"preference.migrate.auto.confirm.msg" = "将把 %1$lu 组 / %2$lu 个文件（%3$@）复制到 %4$lu 个实例目录。只复制、不删源；已存在的同名文件会跳过。";
+"preference.migrate.auto.done.title" = "迁移完成";
+"preference.migrate.auto.done.msg" = "复制 %1$lu · 已存在 %2$lu · 冲突 %3$lu · 改名 %4$lu";
+"preference.migrate.auto.need.pick" = "请先选择一个源文件夹。";
+"preference.migrate.auto.none.selected" = "没有勾选任何组。";
+"preference.vi.state.auto" = "自动";
+"preference.vi.state.isolated" = "隔离";
+"preference.vi.state.shared" = "共享";
+"preference.migrate.filter.title" = "筛选";
+"preference.migrate.filter.summary" = "可见 %1$lu 组 · 已勾选 %2$lu 组（%3$@）";
+"preference.migrate.type.all" = "全部";
+"preference.migrate.type.mods" = "模组";
+"preference.migrate.type.saves" = "存档";
+"preference.migrate.type.resourcepacks" = "资源包";
+"preference.migrate.type.shaderpacks" = "光影";
+"preference.migrate.type.datapacks" = "数据包";
+"preference.migrate.type.config" = "配置";
+"preference.migrate.type.other" = "其他";
+"preference.migrate.origin.title" = "按来源筛选";
+"preference.migrate.origin.all" = "全部";
+"preference.migrate.origin.loader" = "加载器自带";
+"preference.migrate.origin.player" = "玩家添加";
+"preference.migrate.origin.mod" = "Mod 生成";
+"preference.migrate.origin.unknown" = "未识别";
+"preference.migrate.origin.detail" = "【%1$@】%2$@";
+"preference.migrate.origin.note" = "来源＝该项从哪来。默认只勾选【玩家添加】且已匹配到实例的项；【加载器自带】【Mod 生成】【未识别】默认不勾选。";
+"preference.vi.explain.title" = "当前判定";
+"preference.vi.explain.explicit.on" = "手动开启：数据已进入该版本目录。";
+"preference.vi.explain.explicit.off" = "手动关闭：与实例内其它版本共用同一游戏目录。";
+"preference.vi.explain.sniff.hit" = "自动判定：已隔离（本版本目录下 %1$@ 已有内容）。";
+"preference.vi.explain.sniff.miss" = "自动判定：本版本目录下没有 mods / saves，跟随全局默认（当前：%1$@）。";
+"preference.vi.explain.noversion" = "无法确定具体版本 id，本版本回退共享目录。";
+"preference.vi.shared.boundary" = "隔离后 mods / config / saves / 资源包 / 光影 / 数据包 / 日志 进入版本目录；assets、libraries（以及 Java 运行时 / 启动库）始终共享。";
+"preference.vi.recover.hint" = "关闭后立即回到原目录，数据不会丢。";
+"preference.vi.wizard.title" = "版本隔离向导";
+"preference.vi.wizard.intro" = "现在可以给每个实例开启版本隔离 —— 数据各存各的、互不干扰。按你的 %1$lu 个实例情况，我们建议：";
+"preference.vi.wizard.section" = "实例与建议";
+"preference.vi.wizard.sniff.hit" = "该版本目录下已有 %1$@";
+"preference.vi.wizard.sniff.miss" = "该版本目录下没有 mods / saves";
+"preference.vi.wizard.sniff.noversion" = "没有具体版本 id";
+"preference.vi.wizard.row.detail" = "%1$@ · 建议：%2$@";
+"preference.vi.wizard.footer" = "只会写入设置，不会移动任何文件。数据仍在原处，可随时改回。";
+"preference.vi.wizard.skip" = "跳过";
+"preference.vi.wizard.apply" = "一键应用";
+"preference.vi.wizard.done.title" = "已应用";
+"preference.vi.wizard.done.msg" = "已为 %1$lu 个实例写入隔离设置（只写设置、未搬文件）。";
+"preference.vi.wizard.feature.title" = "新功能：现在可以开启版本隔离";
+"preference.vi.wizard.dontshow" = "以后不再提示";
+"preference.vi.wizard.dontshow.footer" = "选择此项后本向导不再自动弹出；仍可随时在实例设置页里重新打开。仅「跳过」只是关掉本次。";
+"preference.vi.wizard.reopen" = "版本隔离向导";
+"preference.vi.wizard.reopen.subtitle" = "重新查看并调整各实例的隔离设置";
+"preference.vi.flow.migrate.title" = "是否把该实例的数据迁移到隔离目录？";
+"preference.vi.flow.migrate.msg" = "将自动识别该版本的 mod / 存档 / 资源包等并复制到隔离目录（只复制、不删源）。";
+"preference.vi.flow.migrate.go" = "去迁移（自动识别）";
+"preference.vi.flow.migrate.later" = "暂不";
 "preference.title.confirm.delete_game_directory" = "目录 %@ 将被永久删除，并且无法恢复。";
 "preference.multidir.add_directory" = "添加游戏目录";
 "preference.title.check_sha" = "检查游戏完整性";
@@ -295,6 +388,9 @@
 "preference.title.tap_click_mode-right" = "恒右键";
 "preference.title.tap_click_button_right" = "轻触合成为右键";
 "preference.detail.tap_click_button_right" = "旧键（兼容）。开启＝强制轻触为右键，等同「轻触发键方式＝恒右键」。";
+// ★ [TAP-BTN] 非按键区域轻触默认动作开关
+"preference.title.tap_default_left" = "轻触默认发左键（非按键区域）";
+"preference.detail.tap_default_left" = "关闭（默认）：轻触发键按准星目标智能判定。开启：点非按键区域（游戏视野）的轻触恒发左键。当「轻触发键方式」已选恒左键/恒右键时，本开关不生效。";
 "preference.title.button_scale" = "屏幕按钮缩放 (%)";
 "preference.detail.button_scale" = "如果按钮过小则放大按钮，通常平板用户需要更改此选项。";
 "preference.title.mouse_scale" = "鼠标缩放 (%)";
@@ -303,6 +399,9 @@
 "preference.detail.mouse_speed" = "修改虚拟鼠标的移动速度";
 "preference.title.virtmouse_enable" = "虚拟鼠标";
 "preference.detail.virtmouse_enable" = "启用此选项以在游戏启动时显示虚拟鼠标";
+// ★ [ISSUE-152] 隐藏游戏内悬浮球(小齿轮)开关（设置页 自定义控制键 分区）
+"preference.title.menu_button_visible" = "显示游戏内悬浮球";
+"preference.detail.menu_button_visible" = "关闭后隐藏游戏内的设置悬浮球（小齿轮）。重新显示：设置 → 自定义控制键 → 显示游戏内悬浮球。";
 "preference.title.slideable_hotbar" = "可滑动快捷栏";
 "preference.detail.slideable_hotbar" = "使快捷栏像鼠标滚轮一样可滑动";
 "preference.title.custom_mouse_pointer" = "自定义鼠标指针";
@@ -330,6 +429,8 @@
 "preference.title.env_variables" = "环境变量";
 "preference.detail.env_variables" = "在启动 Minecraft 时设置自定义环境变量。小心，这可能会使游戏崩溃。";
 "preference.placeholder.env_variables" = "指定变量...";
+"preference.title.dyld_bypass" = "绕过 dyld 库校验";
+"preference.detail.dyld_bypass" = "默认关闭。开启后会改写 dyld 的 mmap/fcntl，实测在 iOS 16.2 上会让启动器卡死在 dlopen(libjli)。除非确知本机需要，否则请保持关闭。改动需完全重启 App 生效。";
 "preference.title.auto_ram" = "自动设置内存大小";
 "preference.detail.auto_ram" = "启用内存自动调节";
 "preference.warn.auto_ram" = "在未越狱的设备禁用此选项上可能会导致应用不稳定。请谨慎更改此选项。";
@@ -730,6 +831,7 @@
 "resman.mods.sort.modified" = "修改时间";
 "resman.mods.empty" = "还没有 Mod";
 "resman.mods.search_empty" = "没有匹配的 Mod";
+"resman.download.filter_empty" = "筛选无结果";
 "resman.mods.none_selected" = "未选择任何 Mod";
 "resman.mods.no_local_for_update" = "没有本地 Mod 可检查更新。";
 "resman.mods.no_version_info" = "无法获取当前版本信息。";
@@ -1197,6 +1299,8 @@
 "i18n_str_464" = "无加载器";
 "i18n_str_465" = "CurseForge 不可用";
 "i18n_str_466" = "未配置 CurseForge API Key。请在设置中配置后重试，或继续使用 Modrinth 源。";
+/* ★ [MODSRC-403] 有 key 但被官方/镜像以 401/403 拒绝时的用户提示（区分「无效或未填」，指向设置页）。 */
+"i18n_str_9103" = "CurseForge API Key 无效或未填写，请到设置里检查后重试";
 "i18n_str_467" = "无法获取版本信息，请检查网络连接或切换下载源";
 "i18n_str_468" = "未找到可下载的版本，可尝试切换下载源（Modrinth/CurseForge）或更换筛选条件";
 "i18n_str_469" = "导出已取消";
@@ -1467,10 +1571,10 @@
 "i18n_str_1007" = "ZeroTier 联机";
 "i18n_str_1008" = "创建房间";
 "i18n_str_1009" = "加入房间";
-"i18n_str_1010" = "先在 Minecraft 中点击「对局域网开放」，记下显示的端口号，填入下方后点击创建。";
+"i18n_str_1010" = "先在 Minecraft 中点击「对局域网开放」，端口会自动检测并填入下方；检测不到时可手动填写，然后点击创建。";
 "i18n_str_1013" = "邀请码";
 "i18n_str_1014" = "玩家列表";
-"i18n_str_1015" = "请输入有效端口";
+"i18n_str_1015" = "未检测到端口，请先在游戏里「对局域网开放」（也可手动填写）";
 "i18n_str_1016" = "请输入邀请码";
 "i18n_str_1017" = "邀请码无效";
 "i18n_str_1018" = "邀请码已复制";
@@ -1483,6 +1587,9 @@
 "i18n_str_1026" = "暂无玩家信息";
 "i18n_str_1027" = "房主";
 "i18n_str_1028" = "访客";
+"i18n_str_2068" = "我";
+"i18n_str_2069" = "房客";
+"i18n_str_2070" = "已自动检测到局域网端口 %@";
 "i18n_str_1029" = "未联机";
 "i18n_str_1031" = "加入房间中…";
 "i18n_str_1033" = "联机出错";
@@ -1847,7 +1954,7 @@
 "preference.auto" = "自动";
 "preference.auto_select" = "自动选择";
 "i18n_str_jit26_pending" = "JIT：已启用（启动时自动附加）";
-"jit.timeout_retry_msg" = "等待 JIT 超时（120 秒），JIT 工具可能未响应。点重试可再试一次，也可手动附加调试器后重试。";
+"jit.timeout_retry_msg" = "JIT 工具可能已提示完成，但本机自检未通过（未能申请到可写 JIT 区，attach 不等于真的能用）。点重试可再试一次，也可重启 App、或换用 TrollStore 直启后重试。";
 "jit.retry" = "重试";
 "preference.debug.jit_enabler.auto" = "自动（推荐）";
 "preference.debug.jit_enabler.stikjit" = "StikDebug / StikJIT";
@@ -1857,6 +1964,10 @@
 "preference.debug.jit_enabler.jitstreamer" = "JitStreamer-EB";
 "preference.debug.jit_enabler.trollstore" = "TrollStore";
 "preference.debug.jit_enabler.manual" = "手动（自行附加调试器）";
+"preference.debug.jit_enabler.sidejitserver" = "SideJITServer（快捷指令）"; // ★ [JIT-ADAPT]
+"preference.debug.jit_enabler.altstore" = "AltStore / AltJIT"; // ★ [JIT-ADAPT]
+"preference.debug.jit_enabler.sideloadly" = "Sideloadly"; // ★ [JIT-ADAPT]
+"preference.debug.jit_enabler.jailbreak" = "越狱（Dopamine / palera1n / checkra1n / unc0ver）"; // ★ [JIT-ADAPT]
 "preference.title.jit_enabler" = "JIT 开启工具";
 "preference.detail.jit_enabler" = "选择用于开启 JIT 的工具。没有安装 StikDebug 的用户请改选 SideStore、StosDebug、JitStreamer-EB 或 TrollStore，否则点击启动可能没有任何反应。默认自动：按设备状态依次尝试 TrollStore、StikDebug、SideStore。";
 "preference.title.jit26_script_disable" = "禁用 iOS 26 JS 脚本 JIT";
@@ -1888,10 +1999,19 @@
 "preference.lang.section.system" = "系统";
 "preference.lang.section.available" = "可用语言";
 "preference.lang.search_placeholder" = "搜索语言";
+// ★ [I18N-PARTIAL] 部分翻译语言标注（单一事实源：AmeLauncherPartiallyTranslatedLanguageCodes）
+"preference.lang.partial_suffix" = "（部分翻译）";
+"preference.lang.partial_note" = "部分界面仍为中文";
 "preference.lang.restart_hint.title" = "语言已切换";
 "preference.lang.restart_hint.message" = "界面已按所选语言重新加载。";
 "jit.wait.auto" = "正在等待 JIT 就绪。请用你的 JIT 工具为本 App 启用 JIT（TrollStore、StikDebug、SideStore / SideJIT、JitStreamer 等），然后回到启动器。最长等待 30 秒……";
-"jit.wait.manual" = "请现在到你的 JIT 工具里为本 App 启用 JIT。最长等待 30 秒……";
+"jit.wait.manual" = "请用电脑附加调试器（Xcode → Debug → Attach to Process / Wait for Debugger，或用 idevicedebug / lldb + 配对文件），或在你的 JIT 工具里为本 App 启用 JIT，然后回到启动器。最长等待 30 秒……";
+"jit.guide.title" = "启用 JIT";
+// ★ [JIT-ADAPT] 逐工具引导：这些工具本机没有 URL 可调，必须由用户在自己的 App/电脑上开。
+"jit.wait.sidejitserver" = "请在本机运行 SideJITServer 快捷指令（电脑上跑 SideJITServer + pymobiledevice3，二者同 Wi-Fi 或走 VPN），选中本 App，然后回到启动器。最长等待 30 秒……";
+"jit.wait.altstore" = "请让本机与 AltServer 处于同一 Wi-Fi（iOS 17+ 需 USB），打开 AltStore →「我的 App」→ 长按本 App →「Enable JIT」，然后回到启动器。最长等待 30 秒……";
+"jit.wait.sideloadly" = "请在电脑上保持 Sideloadly 运行（Sideloadly Daemon；同 Wi-Fi 或 USB），让本 App 在前台，再从 Sideloadly 为本 App 选择 Enable JIT，然后回到启动器。最长等待 30 秒……";
+"jit.wait.jailbreak" = "请到越狱的 JIT 设置里开启（Dopamine：Allow JIT in Apps；palera1n / checkra1n / unc0ver：确认本 App 保留 get-task-allow），然后回到启动器。最长等待 30 秒……";
 "jit.wait.trollstore" = "请在 TrollStore 里为本 App 启用 JIT，然后回到启动器。最长等待 30 秒……";
 "jit.wait.stikdebug" = "请在 StikDebug 里为本 App 启用 JIT，然后回到启动器。最长等待 30 秒……";
 "jit.wait.sidestore" = "请在 SideStore / SideJIT 里为本 App 启用 JIT，然后回到启动器。最长等待 30 秒……";
@@ -1913,8 +2033,7 @@
 "preference.title.debug_always_attached_jit" = "Keep attached to StikDebug";
 "preference.title.renderer.release.mg" = "MobileGlues";
 "login.warn.title.ios19_jitdead" = "Amethyst is not supported on iOS 26 or later.";
-"login.warn.message.ios19_jitdead" = "Due to changes in iOS that inhibit the ability to enable JIT, Amethyst cannot work in its current state and requires heavy research to find a new path forward.
-Pressing OK will close the app.";
+"login.warn.message.ios19_jitdead" = "Due to changes in iOS that inhibit the ability to enable JIT, Amethyst cannot work in its current state and requires heavy research to find a new path forward.\nPressing OK will close the app."; // ★ [AUDIT-FIX]
 "preference.group.runtime" = "内存与性能";
 "preference.group.java" = "Java 与启动参数";
 
@@ -1926,33 +2045,35 @@ Pressing OK will close the app.";
 "ai.system_prompt.title" = "系统提示词";
 "ai.assistant.title" = "AI 助手";
 "ai.session.new" = "新会话";
-"i18n_str_2068" = "把自己的世界开放给好友，自动生成邀请码";
-"i18n_str_2069" = "输入好友分享的邀请码，直接进他的世界";
-"i18n_str_2070" = "自动检测端口";
-"i18n_str_2072" = "正在检测端口…";
-"i18n_str_2073" = "请在 Minecraft 中：暂停 → 对局域网开放。检测到端口后会自动创建房间";
-"i18n_str_2074" = "已检测到端口 %u";
-"i18n_str_2075" = "选择一种方式开始联机";
-"i18n_str_2076" = "扫描本机端口";
-"i18n_str_2077" = "正在扫描本机端口…";
-"i18n_str_2078" = "已检查 %lu / %lu 个端口";
-"i18n_str_2079" = "未找到 Minecraft 端口，请先在游戏内「对局域网开放」";
-"i18n_str_2080" = "取消";
-"i18n_str_2081" = "复制";
-"i18n_str_2082" = "把邀请码发给好友，他们就能加入你的世界";
-"i18n_str_2083" = "在 Minecraft 的「多人游戏」中添加这个地址即可进入";
-"i18n_str_2084" = "开始创建";
-"i18n_str_2085" = "邀请码格式正确";
-"i18n_str_2087" = "未知错误";
-"i18n_str_2088" = "输入好友分享的邀请码";
-"i18n_str_2089" = "邀请码";
-"i18n_str_2090" = "服务器地址";
+/* ★ [I18N-MISS] 设置页 3 行文案在 ea419d4fb 上游重构中丢失了 preference.title/detail 键 ⇒ 界面直接显示生键：启动器背景 / CurseForge API 密钥 / 公告展示详细度。本次从上游恢复，并同步 4 语(含 sfpew_overlay 同类生键) */
+"preference.title.launcher_background" = "启动器背景";
+"preference.detail.launcher_background" = "设置启动器背景（图片/视频），或恢复默认纯色背景。";
+"preference.title.curseforge_api_key" = "CurseForge API 密钥";
+"preference.detail.curseforge_api_key" = "设置 CurseForge API 密钥，用于浏览/下载 CurseForge 模组与整合包；未设置时使用内置默认密钥。";
+"preference.title.announcement_preview_level" = "公告展示详细度";
+"preference.detail.announcement_preview_level" = "控制公告在主界面展示的详细程度。";
+"preference.title.sfpew_overlay" = "SimpleFPEWrapper 叠加层";
+"preference.detail.sfpew_overlay" = "在 GLES 后端上叠加 SimpleFPEWrapper 固定管线（GL 1.x）仿真层，兼容旧版资源；gl4es / zink / Vulkan 等后端不适用。";
+/* ★ [I18N-MISS] 语言切换确认弹窗(SceneDelegate 语言流程)键全 6 语都缺 ⇒ 切语言后弹窗直接显示生键。本次补齐 */
+"preference.lang.switched.title" = "语言已切换";
+"preference.lang.switched.message" = "界面已按所选语言重新加载。";
 
-/* ===== [MP-GUIDE] 陶瓦联机教程 / 手动端口兜底（Task MP-GUIDE） ===== */
-"i18n_str_2091" = "联机教程";
-"i18n_str_2092" = "第一次联机？先看这里，三步就能和朋友一起玩";
-"i18n_str_2093" = "检测不到？手动输入端口";
-"i18n_str_2094" = "【联机原理】\n陶瓦（Terracotta）联机不需要 ZeroTier、不需要公网 IP，也无需额外账号。房主的世界通过陶瓦中继，好友凭一串邀请码即可加入，与 HMCL / FCL 的陶瓦联机互通。";
-"i18n_str_2095" = "【当房主】\n1. 进入一个单人世界，按暂停 →「对局域网开放」；\n2. 记下聊天栏里显示的端口号（例如 5xxxx）；\n3. 回到本页选「创建房间」，保持「自动检测端口」开启即可自动填入，检测不到时请手动输入该端口；\n4. 房间创建成功后复制邀请码，发给好友。";
-"i18n_str_2096" = "【当访客】\n1. 在本页选「加入房间」，输入房主发来的邀请码；\n2. 连接成功后打开 Minecraft →「多人游戏」→「添加服务器」；\n3. 地址填本页显示的服务器地址，即可进入房主的世界。";
-"i18n_str_2097" = "【小提示】\n· 房主需保持游戏运行，退出世界会断开所有好友；\n· 端口只能自动检测「当前这次」开放的局域网会话，重启世界后请重新检测；\n· 双方必须使用相同或兼容的 Minecraft 版本与模组。";
+"login.title" = "账户管理"; // ★ [AUDIT-FIX]
+"login.cancelled" = "登录已取消"; // ★ [AUDIT-FIX]
+
+/* ★ [AUDIT-DECIDE] 新增键（简体） */
+"custom_controls.control_menu.copy.ok" = "已复制"; // ★ [AUDIT-DECIDE]
+"custom_controls.control_menu.copy.ok.message" = "控件配置已复制到剪贴板。可将其另存为 .json 文件后用「加载」导入。"; // ★ [AUDIT-DECIDE]
+"custom_controls.control_menu.copy.error.none" = "没有可复制的控件"; // ★ [AUDIT-DECIDE]
+"custom_controls.button_edit.width" = "宽"; // ★ [AUDIT-DECIDE]
+"custom_controls.button_edit.height" = "高"; // ★ [AUDIT-DECIDE]
+"login.sign_in" = "登录"; // ★ [AUDIT-DECIDE]
+"login.error.account_load" = "无法载入账户数据。"; // ★ [AUDIT-DECIDE]
+"launcher.pref.jre.none" = "无"; // ★ [AUDIT-DECIDE]
+"launcher.pref.gamedir.rename" = "重命名"; // ★ [AUDIT-DECIDE]
+"curseforge.api_key" = "API 密钥"; // ★ [AUDIT-DECIDE]
+"home.instances.sort" = "排序 ⇅"; // ★ [AUDIT-DECIDE]
+"home.instances.new" = "＋ 新建"; // ★ [AUDIT-DECIDE]
+"home.instances.launch" = "启动"; // ★ [AUDIT-DECIDE]
+"multiplayer.unavailable.title" = "联机功能不可用"; // ★ [AUDIT-DECIDE]
+"multiplayer.unavailable.message" = "libterracotta 库未链接。请按 README 中「陶瓦联机集成」章节下载 xcframework 后重新构建。"; // ★ [AUDIT-DECIDE]
