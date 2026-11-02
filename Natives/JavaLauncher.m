@@ -1907,6 +1907,10 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
     // Tools.java / MinecraftResourceUtils.m 已强制将 JNA 替换为 5.13.0
     // （MC 26.3+ 要求的 5.17.0 在 iOS 上会导致 native crash）。
     // 保留 boot.library.path 以便未来内置 iOS arm64 版 libjnidispatch。
+    // NOTE: on TXM devices JNA's extract-from-jar fallback fails ("code signature invalid"
+    // for <natives>/jna/jna*.tmp), so Frameworks/ must contain a libjnidispatch built for iOS
+    // whose version matches the JNA jar (Natives/resources/Frameworks/libjnidispatch.dylib,
+    // rebuilt with scripts/build_jnidispatch_ios.sh).
     PUSH_MARGV_FORMAT(@"-Djna.boot.library.path=%@", frameworksPath);
 
     // ============================================================================
