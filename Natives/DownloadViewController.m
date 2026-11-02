@@ -33,6 +33,7 @@
 #import "AssetVersionViewController.h"
 #import "WorldService.h"
 #import "installer/FabricInstallViewController.h"
+#import "installer/FabricUtils.h"
 #import "installer/ForgeInstallViewController.h"
 #import "installer/ForgeDirectInstaller.h"
 #import "installer/NeoForgeDirectInstaller.h"
@@ -463,6 +464,16 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 
 @interface DownloadViewController () <UICollectionViewDataSource, UICollectionViewDelegate, UITableViewDataSource, UITableViewDelegate, UISearchBarDelegate, ModVersionViewControllerDelegate, ShaderVersionViewControllerDelegate, AssetVersionViewControllerDelegate>
 
+/// Fabric/Quilt profile 拉取成功后的写入与 Fabric API 收尾（供镜像候选链回调）
+- (void)ame_finishFabricLikeInstallWithProfile:(NSDictionary *)profileJson
+                                    gameVersion:(NSString *)gameVersion
+                                  loaderVersion:(NSString *)loaderVersion
+                                     installAPI:(BOOL)installAPI
+                                   fabricTaskId:(NSString *)fabricTaskId
+                                    displayName:(NSString *)displayName
+                                        isQuilt:(BOOL)isQuilt
+                                        manager:(DownloadTaskManager *)manager;
+
 @property (nonatomic, strong) UISegmentedControl *tabSegment;
 @property (nonatomic, strong) UISegmentedControl *versionFilterSegment;
 // versionFilterSegment 高度约束：版本 tab 显示（约 32pt），其他 tab 设为 0，
@@ -771,9 +782,10 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
     self.tabSegment = [[UISegmentedControl alloc] initWithItems:@[localize(@"i18n_str_39", nil), localize(@"i18n_str_1283", nil), localize(@"i18n_str_1284", nil), localize(@"i18n_str_1285", nil), localize(@"i18n_str_1286", nil), localize(@"i18n_str_1287", nil), localize(@"i18n_str_119", nil)]];
     self.tabSegment.translatesAutoresizingMaskIntoConstraints = NO;
     self.tabSegment.selectedSegmentIndex = 0;
-    // 调小字体，确保 7 个 tab 在 iPhone 竖屏也能完整显示
-    NSDictionary *textAttrs = @{NSFontAttributeName: [UIFont systemFontOfSize:12 weight:UIFontWeightMedium]};
+    // 调小字体，确保 7 个 tab 在 iPhone 竖屏也能完整显示（英文短标签 + 11pt）
+    NSDictionary *textAttrs = @{NSFontAttributeName: [UIFont systemFontOfSize:11 weight:UIFontWeightMedium]};
     [self.tabSegment setTitleTextAttributes:textAttrs forState:UIControlStateNormal];
+    [self.tabSegment setTitleTextAttributes:textAttrs forState:UIControlStateSelected];
     [self.tabSegment addTarget:self action:@selector(tabChanged:) forControlEvents:UIControlEventValueChanged];
     [self.view addSubview:self.tabSegment];
 
@@ -1334,7 +1346,7 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 
     // ===== 2. 游戏版本选择按钮 =====
     self.sidebarVersionButton = [self createSidebarSelectButtonWithTitle:localize(@"i18n_str_2031", nil)
-                                                                    value:@"全部版本"
+                                                                    value:localize(@"i18n_str_2032", @"All versions")
                                                                   selector:@selector(sidebarVersionButtonClicked:)];
     [self.filterSidebarContainer addSubview:self.sidebarVersionButton];
     self.sidebarVersionTitleLabel = [self findSubviewInButton:self.sidebarVersionButton withTag:100];
@@ -1348,7 +1360,7 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
 
     // ===== 3. 模组加载器选择按钮 =====
     self.sidebarLoaderButton = [self createSidebarSelectButtonWithTitle:localize(@"i18n_str_160", nil)
-                                                                   value:@"全部"
+                                                                   value:localize(@"resman.mods.filter.all", @"All")
                                                                  selector:@selector(sidebarLoaderButtonClicked:)];
     [self.filterSidebarContainer addSubview:self.sidebarLoaderButton];
     self.sidebarLoaderTitleLabel = [self findSubviewInButton:self.sidebarLoaderButton withTag:100];
@@ -2574,8 +2586,18 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
             if (![type isEqualToString:@"release"]) continue;
             NSString *versionId = version[@"id"];
             if (![versionId isKindOfClass:[NSString class]] || versionId.length == 0) continue;
-            // 跳过过于旧的版本（1.8 之前的版本 mod 支持极少）
-            if ([versionId hasPrefix:@"1."] == NO) continue;
+            // 接受 1.x 与年份制 release（26.3 / 26.4 …）。旧实现只认 "1."，
+            // 导致 26.x 从模组筛选版本列表中消失，Fabric API/模组无法按 26.3 过滤。
+            BOOL isLegacy = [versionId hasPrefix:@"1."];
+            BOOL isYearRelease = NO;
+            if (!isLegacy && versionId.length >= 2) {
+                unichar c0 = [versionId characterAtIndex:0];
+                unichar c1 = [versionId characterAtIndex:1];
+                isYearRelease = (c0 >= '2' && c0 <= '9' && c1 >= '0' && c1 <= '9' &&
+                                 ([versionId rangeOfString:@"."].location != NSNotFound ||
+                                  [versionId rangeOfString:@"w"].location != NSNotFound));
+            }
+            if (!isLegacy && !isYearRelease) continue;
             // 跳过已经在列表中的（避免 profileMcVersion 重复）
             if ([versions containsObject:versionId]) continue;
             [versions addObject:versionId];
@@ -2991,13 +3013,9 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
         return;
     }
 
-    // 用户决策（参考 ZL2 的保守策略）：安装模组加载器前检测对应原版是否已安装，
-    // 未安装时不再自动代装原版，而是提醒用户先手动安装原版。
-    // 原因：原版自动预装 + 加载器安装的复合流程中，若原版安装失败/被中断，
-    // 加载器版本虽写入但继承的原版缺失，实例管理会出现"找不到刚安装的版本"等问题；
-    // 提醒方式让用户明确先完成原版安装，流程更可控。
-    // 注：加载器版本 JSON 均含 "inheritsFrom" 字段，启动时 Java 端会读取
-    // versions/{inheritsFrom}/{inheritsFrom}.json 合并，原版缺失会导致启动崩溃。
+    // 加载器 JSON 含 inheritsFrom，原版缺失会导致启动崩溃。
+    // 对 Fabric/Quilt（年份制 26.x 尤其常见）：提供一键「先装原版再装加载器」，
+    // 避免用户卡在“Vanilla not installed”却不知如何继续（26.3 + Fabric 0.20.1 主路径）。
     if (![self isVanillaVersionInstalled:versionId]) {
         NSDictionary *loaderDisplayNames = @{
             @"fabric": @"Fabric",
@@ -3007,15 +3025,53 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
             @"optifine": @"OptiFine"
         };
         NSString *loaderDisplayName = loaderDisplayNames[loaderType] ?: loaderType;
+        BOOL canAutoChain = [loaderType isEqualToString:@"fabric"] || [loaderType isEqualToString:@"quilt"];
+
         UIAlertController *alert = [UIAlertController
-            alertControllerWithTitle:localize(@"i18n_str_195", nil)
+            alertControllerWithTitle:localize(@"loader.install_vanilla_then_loader_title", @"Vanilla Required")
                              message:[NSString stringWithFormat:
-                                      localize(@"i18n_str_196", nil),
-                                      loaderDisplayName, versionId]
+                                      localize(@"loader.install_vanilla_then_loader_msg",
+                                               @"%@ needs vanilla Minecraft %@.\n\nInstall vanilla %@ now, then continue with %@ %@?"),
+                                      loaderDisplayName, versionId, versionId, loaderDisplayName,
+                                      loaderVersion.length ? loaderVersion : @""]
                       preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:localize(@"i18n_str_197", nil)
-                                                  style:UIAlertActionStyleDefault
+
+        if (canAutoChain) {
+            NSString *actionTitle = [NSString stringWithFormat:
+                                     localize(@"loader.install_vanilla_first", @"Install Vanilla %@ Then %@"),
+                                     versionId, loaderDisplayName];
+            __weak typeof(self) weakSelf = self;
+            [alert addAction:[UIAlertAction actionWithTitle:actionTitle
+                                                      style:UIAlertActionStyleDefault
+                                                    handler:^(UIAlertAction * _Nonnull action) {
+                __strong typeof(weakSelf) strongSelf = weakSelf;
+                if (!strongSelf) return;
+                [strongSelf ensureVanillaInstalled:version completion:^(BOOL success) {
+                    __strong typeof(weakSelf) ss = weakSelf;
+                    if (!ss) return;
+                    if (!success) {
+                        [ss showError:[NSString stringWithFormat:localize(@"i18n_str_194", nil), versionId]];
+                        return;
+                    }
+                    // 原版装好后继续加载器安装
+                    [ss proceedWithVersion:version
+                                loaderType:loaderType
+                          installFabricAPI:installFabricAPI
+                           installOptiFine:installOptiFine
+                             loaderVersion:loaderVersion];
+                }];
+            }]];
+        }
+
+        [alert addAction:[UIAlertAction actionWithTitle:localize(@"i18n_str_197", @"Got It")
+                                                  style:UIAlertActionStyleCancel
                                                 handler:nil]];
+        // 保留旧文案作补充说明（非 canAutoChain 时仍提示手动安装）
+        if (!canAutoChain) {
+            alert.message = [NSString stringWithFormat:
+                             localize(@"i18n_str_196", nil),
+                             loaderDisplayName, versionId];
+        }
         [self presentViewController:alert animated:YES completion:nil];
         return;
     }
@@ -3466,10 +3522,8 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
     // redesign-download-ui Phase 3 Task 3.2：注册任务 + 阶段上报 + 自动弹统一进度页，
     // 替代私有 InstallerProgressViewController。原版预装（若发生）是独立任务独立进度页，
     // 加载器安装仅上报自身 3 步（获取 profile→下载加载器库→写入版本 JSON）。
-    // 阶段下标与 PLTaskStagesFabricExtra() 一致。
+    // 阶段下标与 PLTaskStagesFabricExtra() 一致（0=profile，写入/API 在 ame_finish… 内）。
     static const NSUInteger kFabricStageProfile = 0;
-    static const NSUInteger kFabricStageLoaderLibs = 1;
-    static const NSUInteger kFabricStageWriteJSON = 2;
 
     NSString *fabricTaskName = [NSString stringWithFormat:@"%@-%@-%@", loaderTag, gameVersion, loaderVersion];
     __block NSString *fabricTaskId = [self registerInstallerTaskWithResourceName:fabricTaskName
@@ -3489,119 +3543,200 @@ typedef NS_ENUM(NSInteger, ModernAssetType) {
     __weak typeof(self) weakSelf = self;
     __block NSURLSessionDataTask *dataTask = nil;
 
-    NSString *urlString = [NSString stringWithFormat:@"%@/%@/%@/profile/json", metaBase, gameVersion, loaderVersion];
-    NSURL *url = [NSURL URLWithString:urlString];
+    // 经 FabricUtils 生成官方 + 镜像候选，提高 26.x / 0.20.1 等新版本在国内网络下的可达性
+    NSString *vendorName = isQuilt ? @"Quilt" : @"Fabric";
+    NSArray<NSURL *> *profileCandidates = [FabricUtils candidateURLsForVendor:vendorName
+                                                             minecraftVersion:gameVersion
+                                                               loaderVersion:loaderVersion];
+    if (profileCandidates.count == 0) {
+        NSString *urlString = [NSString stringWithFormat:@"%@/%@/%@/profile/json", metaBase, gameVersion, loaderVersion];
+        NSURL *fallbackURL = [NSURL URLWithString:urlString];
+        profileCandidates = fallbackURL ? @[fallbackURL] : @[];
+    }
 
-    // profile JSON 较小，使用 dataTask；进度通过阶段驱动（无法精确测算）
-    dataTask = [[NSURLSession sharedSession] dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            __strong typeof(weakSelf) strongSelf = weakSelf;
-            if (!strongSelf) return;
+    __block NSUInteger candidateIndex = 0;
+    __block void (^tryNextProfileCandidate)(void) = nil;
+    tryNextProfileCandidate = ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (candidateIndex >= profileCandidates.count) {
+            [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageProfile status:PLTaskStageStatusFailed];
+            NSError *err = [NSError errorWithDomain:@"FabricInstall" code:2 userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_204", nil)}];
+            [[DownloadTaskManager sharedManager] setTaskWithId:fabricTaskId completedWithError:err];
+            [strongSelf finishInstallerProgressWithError:[NSString stringWithFormat:localize(@"i18n_str_205", nil), displayName]];
+            return;
+        }
+        NSURL *url = profileCandidates[candidateIndex++];
+        NSLog(@"[FabricInstall] fetching profile %@ (%@ %@) candidate %lu/%lu: %@",
+              displayName, gameVersion, loaderVersion,
+              (unsigned long)candidateIndex, (unsigned long)profileCandidates.count, url.absoluteString);
 
-            if (error) {
-                [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageProfile status:PLTaskStageStatusFailed];
-                [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageProfile progress:0 message:error.localizedDescription];
-                if (error.code == NSURLErrorCancelled) {
-                    [[DownloadTaskManager sharedManager] setTaskWithId:fabricTaskId completedWithError:nil];
-                    [[DownloadTaskManager sharedManager] setTaskWithId:fabricTaskId state:DownloadTaskStateCancelled];
-                } else {
-                    NSError *err = [NSError errorWithDomain:@"FabricInstall" code:error.code userInfo:@{NSLocalizedDescriptionKey: error.localizedDescription ?: localize(@"i18n_str_202", nil)}];
-                    [[DownloadTaskManager sharedManager] setTaskWithId:fabricTaskId completedWithError:err];
+        // profile JSON 较小，使用 dataTask；进度通过阶段驱动（无法精确测算）
+        dataTask = [[NSURLSession sharedSession] dataTaskWithURL:url completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                __strong typeof(weakSelf) ss = weakSelf;
+                if (!ss) return;
+
+                NSInteger statusCode = 0;
+                if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
+                    statusCode = [(NSHTTPURLResponse *)response statusCode];
                 }
-                [strongSelf finishInstallerProgressWithError:[NSString stringWithFormat:localize(@"i18n_str_203", nil), displayName, error.localizedDescription ?: localize(@"i18n_str_202", nil)]];
-                return;
-            }
+                BOOL httpBad = (statusCode >= 400);
+                if (error || !data || httpBad) {
+                    if (error.code == NSURLErrorCancelled) {
+                        [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageProfile status:PLTaskStageStatusFailed];
+                        [[DownloadTaskManager sharedManager] setTaskWithId:fabricTaskId completedWithError:nil];
+                        [[DownloadTaskManager sharedManager] setTaskWithId:fabricTaskId state:DownloadTaskStateCancelled];
+                        [ss finishInstallerProgressWithError:[NSString stringWithFormat:localize(@"i18n_str_203", nil), displayName, error.localizedDescription ?: localize(@"i18n_str_202", nil)]];
+                        return;
+                    }
+                    // 换下一候选（官方失败 → 镜像）
+                    if (candidateIndex < profileCandidates.count) {
+                        NSLog(@"[FabricInstall] candidate failed (err=%@ http=%ld), trying next",
+                              error.localizedDescription, (long)statusCode);
+                        tryNextProfileCandidate();
+                        return;
+                    }
+                    NSString *errMsg = error.localizedDescription ?: localize(@"i18n_str_202", nil);
+                    [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageProfile status:PLTaskStageStatusFailed];
+                    [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageProfile progress:0 message:errMsg];
+                    NSError *err = [NSError errorWithDomain:@"FabricInstall" code:error ? error.code : statusCode
+                                                  userInfo:@{NSLocalizedDescriptionKey: errMsg}];
+                    [[DownloadTaskManager sharedManager] setTaskWithId:fabricTaskId completedWithError:err];
+                    [ss finishInstallerProgressWithError:[NSString stringWithFormat:localize(@"i18n_str_203", nil), displayName, errMsg]];
+                    return;
+                }
 
-            if (!data) {
-                [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageProfile status:PLTaskStageStatusFailed];
-                NSError *err = [NSError errorWithDomain:@"FabricInstall" code:2 userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_204", nil)}];
-                [[DownloadTaskManager sharedManager] setTaskWithId:fabricTaskId completedWithError:err];
-                [strongSelf finishInstallerProgressWithError:[NSString stringWithFormat:localize(@"i18n_str_205", nil), displayName]];
-                return;
-            }
+                // 解析 JSON（阶段0 收尾）
+                NSError *jsonError;
+                NSDictionary *profileJson = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
+                if (!profileJson || jsonError) {
+                    if (candidateIndex < profileCandidates.count) {
+                        tryNextProfileCandidate();
+                        return;
+                    }
+                    [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageProfile status:PLTaskStageStatusFailed];
+                    [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageProfile progress:0 message:jsonError.localizedDescription];
+                    NSError *err = [NSError errorWithDomain:@"FabricInstall" code:3 userInfo:@{NSLocalizedDescriptionKey: jsonError.localizedDescription ?: localize(@"i18n_str_206", nil)}];
+                    [[DownloadTaskManager sharedManager] setTaskWithId:fabricTaskId completedWithError:err];
+                    [ss finishInstallerProgressWithError:[NSString stringWithFormat:localize(@"i18n_str_207", nil), displayName]];
+                    return;
+                }
+                [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageProfile status:PLTaskStageStatusCompleted];
+                [ss ame_finishFabricLikeInstallWithProfile:profileJson
+                                               gameVersion:gameVersion
+                                             loaderVersion:loaderVersion
+                                                installAPI:installAPI
+                                              fabricTaskId:fabricTaskId
+                                               displayName:displayName
+                                                   isQuilt:isQuilt
+                                                   manager:manager];
+            });
+        }];
+        DownloadTaskItem *fabricTaskItem = [[DownloadTaskManager sharedManager] taskWithId:fabricTaskId];
+        if (fabricTaskItem) {
+            fabricTaskItem.rawTask = dataTask;
+        }
+        [dataTask resume];
+    };
 
-            // 解析 JSON（阶段0 收尾）
-            NSError *jsonError;
-            NSDictionary *profileJson = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
-            if (!profileJson || jsonError) {
-                [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageProfile status:PLTaskStageStatusFailed];
-                [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageProfile progress:0 message:jsonError.localizedDescription];
-                NSError *err = [NSError errorWithDomain:@"FabricInstall" code:3 userInfo:@{NSLocalizedDescriptionKey: jsonError.localizedDescription ?: localize(@"i18n_str_206", nil)}];
-                [[DownloadTaskManager sharedManager] setTaskWithId:fabricTaskId completedWithError:err];
-                [strongSelf finishInstallerProgressWithError:[NSString stringWithFormat:localize(@"i18n_str_207", nil), displayName]];
-                return;
-            }
-            [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageProfile status:PLTaskStageStatusCompleted];
-
-            // 写入版本 JSON（阶段2）
-            [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageWriteJSON status:PLTaskStageStatusRunning];
-            [manager updateTaskWithId:fabricTaskId currentStageIndex:kFabricStageWriteJSON];
-
-            NSString *versionId = profileJson[@"id"];
-            NSString *jsonPath = [NSString stringWithFormat:@"%s/versions/%@/%@.json", getenv("POJAV_GAME_DIR"), versionId, versionId];
-            [[NSFileManager defaultManager] createDirectoryAtPath:[jsonPath stringByDeletingLastPathComponent]
-                                      withIntermediateDirectories:YES
-                                                       attributes:nil
-                                                            error:nil];
-
-            NSError *saveError;
-            NSData *jsonData = [NSJSONSerialization dataWithJSONObject:profileJson options:NSJSONWritingPrettyPrinted error:&saveError];
-            [jsonData writeToFile:jsonPath options:NSDataWritingAtomic error:&saveError];
-            if (saveError) {
-                [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageWriteJSON status:PLTaskStageStatusFailed];
-                [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageWriteJSON progress:0 message:saveError.localizedDescription];
-                NSError *err = [NSError errorWithDomain:@"FabricInstall" code:4 userInfo:@{NSLocalizedDescriptionKey: saveError.localizedDescription}];
-                [[DownloadTaskManager sharedManager] setTaskWithId:fabricTaskId completedWithError:err];
-                [strongSelf finishInstallerProgressWithError:[NSString stringWithFormat:localize(@"i18n_str_208", nil), saveError.localizedDescription]];
-                return;
-            }
-
-            // 注册 profile（阶段2 收尾）
-            NSMutableDictionary *profile = [NSMutableDictionary dictionary];
-            profile[@"name"] = versionId;
-            profile[@"lastVersionId"] = versionId;
-            // 改回原来的"游戏目录切换"机制：所有版本共享根目录（gameDir="."）
-            // 用户通过设置中的"游戏目录切换"功能手动切换不同的 gameDir
-            profile[@"gameDir"] = @".";
-            profile[@"type"] = @"custom";
-            profile[@"created"] = [NSDate date].description;
-            [PLProfiles.current saveProfile:profile withName:versionId];
-            PLProfiles.current.selectedProfileName = versionId;
-            [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageWriteJSON status:PLTaskStageStatusCompleted];
-
-            // 仅 Fabric 安装 Fabric API；Quilt 用 QSL/QFAPI，不安装（阶段1 Skipped）
-            if (installAPI && !isQuilt) {
-                [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageLoaderLibs status:PLTaskStageStatusRunning];
-                [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageLoaderLibs progress:-1 message:localize(@"i18n_str_209", nil)];
-                [manager updateTaskWithId:fabricTaskId currentStageIndex:kFabricStageLoaderLibs];
-                [strongSelf downloadFabricAPI:gameVersion completion:^(BOOL success, NSError *apiError) {
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        __strong typeof(weakSelf) strongSelf2 = weakSelf;
-                        if (!strongSelf2) return;
-                        if (success) {
-                            [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageLoaderLibs status:PLTaskStageStatusCompleted];
-                            [[DownloadTaskManager sharedManager] setTaskWithId:fabricTaskId completedWithError:nil];
-                            [strongSelf2 finishInstallerProgressWithSuccess:[NSString stringWithFormat:localize(@"i18n_str_210", nil), displayName, loaderVersion]];
-                        } else {
-                            [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageLoaderLibs status:PLTaskStageStatusFailed];
-                            [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageLoaderLibs progress:0 message:apiError.localizedDescription];
-                            NSError *err = [NSError errorWithDomain:@"FabricInstall" code:5 userInfo:@{NSLocalizedDescriptionKey: apiError.localizedDescription ?: localize(@"i18n_str_211", nil)}];
-                            [[DownloadTaskManager sharedManager] setTaskWithId:fabricTaskId completedWithError:err];
-                            [strongSelf2 finishInstallerProgressWithSuccess:[NSString stringWithFormat:localize(@"i18n_str_212", nil), displayName, loaderVersion, apiError.localizedDescription ?: localize(@"i18n_str_97", nil)]];
-                        }
-                    });
-                }];
-            } else {
-                [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageLoaderLibs status:PLTaskStageStatusSkipped];
-                [[DownloadTaskManager sharedManager] setTaskWithId:fabricTaskId completedWithError:nil];
-                [strongSelf finishInstallerProgressWithSuccess:[NSString stringWithFormat:localize(@"i18n_str_213", nil), displayName, loaderVersion]];
-            }
-        });
-    }];
-    DownloadTaskItem *fabricTaskItem = [[DownloadTaskManager sharedManager] taskWithId:fabricTaskId];
-    fabricTaskItem.rawTask = dataTask;
     [[DownloadTaskManager sharedManager] setTaskWithId:fabricTaskId state:DownloadTaskStateDownloading];
-    [dataTask resume];
+    tryNextProfileCandidate();
+}
+
+/// Fabric/Quilt profile JSON 已取到后的写入 + Fabric API 安装收尾
+- (void)ame_finishFabricLikeInstallWithProfile:(NSDictionary *)profileJson
+                                    gameVersion:(NSString *)gameVersion
+                                  loaderVersion:(NSString *)loaderVersion
+                                     installAPI:(BOOL)installAPI
+                                   fabricTaskId:(NSString *)fabricTaskId
+                                    displayName:(NSString *)displayName
+                                        isQuilt:(BOOL)isQuilt
+                                        manager:(DownloadTaskManager *)manager {
+    static const NSUInteger kFabricStageLoaderLibs = 1;
+    static const NSUInteger kFabricStageWriteJSON = 2;
+
+    __weak typeof(self) weakSelf = self;
+
+    // 写入版本 JSON（阶段2）
+    [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageWriteJSON status:PLTaskStageStatusRunning];
+    [manager updateTaskWithId:fabricTaskId currentStageIndex:kFabricStageWriteJSON];
+
+    NSString *versionId = profileJson[@"id"];
+    NSString *jsonPath = [NSString stringWithFormat:@"%s/versions/%@/%@.json", getenv("POJAV_GAME_DIR"), versionId, versionId];
+    [[NSFileManager defaultManager] createDirectoryAtPath:[jsonPath stringByDeletingLastPathComponent]
+                              withIntermediateDirectories:YES
+                                               attributes:nil
+                                                    error:nil];
+
+    NSError *saveError;
+    NSData *jsonData = [NSJSONSerialization dataWithJSONObject:profileJson options:NSJSONWritingPrettyPrinted error:&saveError];
+    [jsonData writeToFile:jsonPath options:NSDataWritingAtomic error:&saveError];
+    if (saveError) {
+        [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageWriteJSON status:PLTaskStageStatusFailed];
+        [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageWriteJSON progress:0 message:saveError.localizedDescription];
+        NSError *err = [NSError errorWithDomain:@"FabricInstall" code:4 userInfo:@{NSLocalizedDescriptionKey: saveError.localizedDescription}];
+        [[DownloadTaskManager sharedManager] setTaskWithId:fabricTaskId completedWithError:err];
+        [self finishInstallerProgressWithError:[NSString stringWithFormat:localize(@"i18n_str_208", nil), saveError.localizedDescription]];
+        return;
+    }
+
+    // 注册 profile（阶段2 收尾）
+    NSMutableDictionary *profile = [NSMutableDictionary dictionary];
+    profile[@"name"] = versionId;
+    profile[@"lastVersionId"] = versionId;
+    // 改回原来的"游戏目录切换"机制：所有版本共享根目录（gameDir="."）
+    profile[@"gameDir"] = @".";
+    profile[@"type"] = @"custom";
+    profile[@"created"] = [NSDate date].description;
+    // 年份制 26.x（如 fabric-loader-0.20.1-26.3）官方要求 Java 25。
+    {
+        NSInteger javaMajor = 8;
+        NSArray *gvParts = [gameVersion componentsSeparatedByString:@"."];
+        if (gvParts.count >= 1) {
+            NSInteger yearMajor = [gvParts[0] integerValue];
+            if (yearMajor >= 26) {
+                javaMajor = 25;
+            } else if (yearMajor == 1 && gvParts.count >= 2) {
+                NSInteger minor = [gvParts[1] integerValue];
+                NSInteger patch = (gvParts.count >= 3) ? [gvParts[2] integerValue] : 0;
+                if (minor >= 21 || (minor >= 20 && patch >= 5)) javaMajor = 21;
+                else if (minor >= 17) javaMajor = 17;
+            }
+        }
+        profile[@"javaVersion"] = [NSString stringWithFormat:@"%ld", (long)javaMajor];
+    }
+    [PLProfiles.current saveProfile:profile withName:versionId];
+    PLProfiles.current.selectedProfileName = versionId;
+    [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageWriteJSON status:PLTaskStageStatusCompleted];
+
+    // 仅 Fabric 安装 Fabric API；Quilt 用 QSL/QFAPI，不安装（阶段1 Skipped）
+    if (installAPI && !isQuilt) {
+        [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageLoaderLibs status:PLTaskStageStatusRunning];
+        [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageLoaderLibs progress:-1 message:localize(@"i18n_str_209", nil)];
+        [manager updateTaskWithId:fabricTaskId currentStageIndex:kFabricStageLoaderLibs];
+        [self downloadFabricAPI:gameVersion completion:^(BOOL success, NSError *apiError) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                __strong typeof(weakSelf) strongSelf2 = weakSelf;
+                if (!strongSelf2) return;
+                if (success) {
+                    [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageLoaderLibs status:PLTaskStageStatusCompleted];
+                    [[DownloadTaskManager sharedManager] setTaskWithId:fabricTaskId completedWithError:nil];
+                    [strongSelf2 finishInstallerProgressWithSuccess:[NSString stringWithFormat:localize(@"i18n_str_210", nil), displayName, loaderVersion]];
+                } else {
+                    [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageLoaderLibs status:PLTaskStageStatusFailed];
+                    [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageLoaderLibs progress:0 message:apiError.localizedDescription];
+                    NSError *err = [NSError errorWithDomain:@"FabricInstall" code:5 userInfo:@{NSLocalizedDescriptionKey: apiError.localizedDescription ?: localize(@"i18n_str_211", nil)}];
+                    [[DownloadTaskManager sharedManager] setTaskWithId:fabricTaskId completedWithError:err];
+                    [strongSelf2 finishInstallerProgressWithSuccess:[NSString stringWithFormat:localize(@"i18n_str_212", nil), displayName, loaderVersion, apiError.localizedDescription ?: localize(@"i18n_str_97", nil)]];
+                }
+            });
+        }];
+    } else {
+        [manager updateTaskWithId:fabricTaskId stageAtIndex:kFabricStageLoaderLibs status:PLTaskStageStatusSkipped];
+        [[DownloadTaskManager sharedManager] setTaskWithId:fabricTaskId completedWithError:nil];
+        [self finishInstallerProgressWithSuccess:[NSString stringWithFormat:localize(@"i18n_str_213", nil), displayName, loaderVersion]];
+    }
 }
 
 // 安装完成时的统一处理（redesign-download-ui Phase 3：统一进度页自动展示完成态并自动关闭，
