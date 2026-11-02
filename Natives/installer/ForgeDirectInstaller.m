@@ -455,8 +455,17 @@ NSString *const ForgeDirectInstallerErrorDomain = @"ForgeDirectInstallerErrorDom
 }
 
 /// 从 versionId 中推断所需 Java 主版本号
-/// versionId 形如 "1.20.1-forge-47.3.0"、"Forge-1.20.1-47.3.0"、"1.18.2-forge-40.2.0"
+/// versionId 形如 "1.20.1-forge-47.3.0"、"Forge-1.20.1-47.3.0"、"fabric-loader-0.20.1-26.3"
 + (NSInteger)inferJavaMajorVersionFromVersionId:(NSString *)versionId {
+    // 年份制 26.x（Minecraft 2026+）官方要求 Java 25
+    NSRegularExpression *yearRegex = [NSRegularExpression regularExpressionWithPattern:@"(?:^|[-_])(\\d{2})(?=[.w])"
+                                                                               options:0
+                                                                                 error:nil];
+    NSTextCheckingResult *yearMatch = [yearRegex firstMatchInString:versionId options:0 range:NSMakeRange(0, versionId.length)];
+    if (yearMatch && yearMatch.numberOfRanges >= 2) {
+        NSInteger yearMajor = [[versionId substringWithRange:[yearMatch rangeAtIndex:1]] integerValue];
+        if (yearMajor >= 26) return 25;
+    }
     // 提取 1.x.x 格式的 MC 版本（锚定开头或分隔符，避免误匹配 loader 版本号中的 "1.x"）
     NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"(?:^|[-_])1\\.(\\d+)(?:\\.(\\d+))?"
                                                                            options:0

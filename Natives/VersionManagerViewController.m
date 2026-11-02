@@ -454,8 +454,16 @@ static NSInteger const kSectionVersions    = 1;
         self.iconContainer.backgroundColor = [UIColor systemGreenColor];
         self.nameLabel.text = localize(@"i18n_str_1053", nil);
         self.detailLabel.text = localize(@"i18n_str_1054", nil);
+        self.nameLabel.adjustsFontSizeToFitWidth = YES;
+        self.nameLabel.minimumScaleFactor = 0.75;
         self.selectedBadge.hidden = YES;
         self.chevronView.hidden = YES;
+        // 隐藏的 chevron 仍占 trailing 约束空间 ⇒ 临时压到 0 宽，让标题用满卡片
+        for (NSLayoutConstraint *c in self.chevronView.constraints) {
+            if (c.firstAttribute == NSLayoutAttributeWidth || c.secondAttribute == NSLayoutAttributeWidth) {
+                c.constant = 0;
+            }
+        }
         // 规范 5.3：推荐态描边 1.0pt accentColor 0.4
         self.contentContainer.layer.borderColor = [[UIColor systemGreenColor] colorWithAlphaComponent:0.6].CGColor;
         self.contentContainer.layer.borderWidth = 1.0;
@@ -463,7 +471,13 @@ static NSInteger const kSectionVersions    = 1;
         return;
     }
 
+    self.nameLabel.adjustsFontSizeToFitWidth = NO;
     self.chevronView.hidden = NO;
+    for (NSLayoutConstraint *c in self.chevronView.constraints) {
+        if (c.firstAttribute == NSLayoutAttributeWidth || c.secondAttribute == NSLayoutAttributeWidth) {
+            c.constant = 11;
+        }
+    }
     self.iconView.image = [UIImage systemImageNamed:@"folder.fill"];
     self.iconView.tintColor = [UIColor whiteColor];
     self.iconContainer.backgroundColor = [UIColor systemBlueColor];
@@ -1249,7 +1263,8 @@ static NSInteger const kSectionVersions    = 1;
         if (sectionIndex == kSectionGameDir) {
             // 游戏目录区段：横向滚动卡片列表
             // 规范 4.1：卡片宽度 160pt（iPad 180pt），高度 70pt（给图标容器留呼吸空间）
-            CGFloat itemWidth = isiPad ? 180 : 160;
+            // iPhone 加宽到 188：容纳 "New folder" 等英文短标题，避免 "New dire…" 截断
+            CGFloat itemWidth = isiPad ? 200 : 188;
             CGFloat itemHeight = 70;
             NSCollectionLayoutSize *itemSize = [NSCollectionLayoutSize sizeWithWidthDimension:[NSCollectionLayoutDimension absoluteDimension:itemWidth]
                                                                                        heightDimension:[NSCollectionLayoutDimension absoluteDimension:itemHeight]];

@@ -110,7 +110,7 @@ static const NSInteger kNewsPageSize = 24;
         _readMoreLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
         _readMoreLabel.textColor = [UIColor systemBlueColor];
         // ★ [I18N-ORDER] 统一入口 localize()(不再绕过语言解析)
-        _readMoreLabel.text = localize(@"mc_news.read_more", @"查看详情");
+        _readMoreLabel.text = localize(@"mc_news.read_more", @"Read more");
         _readMoreLabel.textAlignment = NSTextAlignmentRight;
         [self.contentView addSubview:_readMoreLabel];
 
@@ -209,7 +209,7 @@ static const NSInteger kNewsPageSize = 24;
     UIBarButtonItem *landBugCloseItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemClose
                                                                                       target:self
                                                                                       action:@selector(landBugCloseTapped)];
-    landBugCloseItem.accessibilityLabel = @"关闭";
+    landBugCloseItem.accessibilityLabel = localize(@"Close", @"Close");
     self.navigationItem.leftBarButtonItem = landBugCloseItem;
 
     // 适配自定义启动器背景
@@ -276,7 +276,7 @@ static const NSInteger kNewsPageSize = 24;
     self.retryButton = [UIButton buttonWithType:UIButtonTypeSystem];
     self.retryButton.translatesAutoresizingMaskIntoConstraints = NO;
     // ★ [I18N-ORDER] 统一入口 localize()(不再绕过语言解析)
-    [self.retryButton setTitle:localize(@"mc_news.retry", @"重试") forState:UIControlStateNormal];
+    [self.retryButton setTitle:localize(@"mc_news.retry", @"Retry") forState:UIControlStateNormal];
     self.retryButton.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
     [self.retryButton addTarget:self action:@selector(loadFirstPage) forControlEvents:UIControlEventTouchUpInside];
     self.retryButton.hidden = YES;
@@ -366,7 +366,7 @@ static const NSInteger kNewsPageSize = 24;
         if (error) {
             if (strongSelf.items.count == 0) {
                 // ★ [I18N-ORDER] 统一入口 localize()(不再绕过语言解析)
-                strongSelf.errorLabel.text = [NSString stringWithFormat:@"%@\n%@", localize(@"mc_news.load_failed", @"加载失败"), error.localizedDescription ?: @""];
+                strongSelf.errorLabel.text = [NSString stringWithFormat:@"%@\n%@", localize(@"mc_news.load_failed", @"Failed to load"), error.localizedDescription ?: @""];
                 strongSelf.errorLabel.hidden = NO;
                 strongSelf.retryButton.hidden = NO;
             }

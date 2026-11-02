@@ -867,10 +867,10 @@ static const CGFloat kPortraitCardCorner      = 16.0;   // 竖屏底部卡圆角
     // 陶瓦联机界面（与 HMCL/FCL/ZL2 互通）；libterracotta 未链接时提示
     if (![TerracottaBridge isAvailable]) {
         UIAlertController *alert = [UIAlertController
-            alertControllerWithTitle:@"联机功能不可用"
-                              message:@"libterracotta 库未链接，请按 README 中「陶瓦联机集成」章节下载 xcframework 后重新构建。"
+            alertControllerWithTitle:localize(@"mp.terracotta.unavailable_title", @"Multiplayer unavailable")
+                              message:localize(@"mp.terracotta.unavailable_msg", @"libterracotta is not linked. Download the xcframework (see README “Terracotta multiplayer”) and rebuild.")
                        preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [alert addAction:[UIAlertAction actionWithTitle:localize(@"OK", @"OK") style:UIAlertActionStyleDefault handler:nil]];
         [self presentViewController:alert animated:YES completion:nil];
         return;
     }

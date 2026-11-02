@@ -149,6 +149,10 @@ static NSString *ameSafeZipDestination(NSString *fileName, NSString *baseDir) {
 + (NSInteger)javaMajorVersionForMC:(NSString *)mcVersion {
     NSArray *parts = [mcVersion componentsSeparatedByString:@"."];
     if (parts.count < 2) return 8;
+    // 年份制（"26.3"）此前误把 parts[1]=3 当 1.x minor → Java 8
+    NSInteger yearMajor = [parts[0] integerValue];
+    if (yearMajor >= 26) return 25;
+    if (yearMajor != 1) return 17;
     NSInteger major = [parts[1] integerValue];
     if (major >= 21) return 21;       // 1.21+
     if (major >= 20 && parts.count >= 3 && [parts[2] integerValue] >= 5) return 21; // 1.20.5+

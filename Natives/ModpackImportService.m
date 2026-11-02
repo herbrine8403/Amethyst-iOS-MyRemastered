@@ -2715,10 +2715,14 @@ static NSString *ameSafeZipDestination(NSString *fileName, NSString *baseDir) {
 }
 
 /// 根据 MC 版本推断所需 Java 主版本号
-/// 1.20.5+ → 21, 1.18+ → 17, 1.17 → 17（项目未捆绑 Java 16，Java 17 可向后兼容），1.16.5- → 8
+/// 年份制 26.x → 25；1.20.5+/1.21+ → 21；1.17+/1.18+ → 17；1.16.5- → 8
 - (NSInteger)javaMajorVersionForMC:(NSString *)mcVersion {
     NSArray *parts = [mcVersion componentsSeparatedByString:@"."];
     if (parts.count < 2) return 8;
+    // 年份制（"26.3"）此前误把 parts[1]=3 当 1.x minor → Java 8
+    NSInteger yearMajor = [parts[0] integerValue];
+    if (yearMajor >= 26) return 25;
+    if (yearMajor != 1) return 17; // 未知非 1.x 保守取 17
     NSInteger major = [parts[1] integerValue];
     if (major >= 21) return 21;       // 1.21+
     if (major >= 20 && parts.count >= 3 && [parts[2] integerValue] >= 5) return 21; // 1.20.5+

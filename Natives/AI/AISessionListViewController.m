@@ -27,7 +27,12 @@
 - (void)viewDidLoad {
     [super viewDidLoad];
 
-    self.title = localize(@"ai.session_list.title", @"会话列表");   // ★ [HOST-BUG-A]
+    // 导航栏标题用完整文案；tabBarItem.title 必须保持短标签（"AI"）。
+    // 旧写法 self.title = "Chats" 会同步覆盖 tabBarItem.title ⇒ 底栏挤成 "Ch…"。
+    self.navigationItem.title = localize(@"ai.session_list.title", @"Chats");
+    if (self.tabBarItem) {
+        self.tabBarItem.title = localize(@"tab.ai", @"AI");
+    }
     self.navigationItem.largeTitleDisplayMode = UINavigationItemLargeTitleDisplayModeNever;
     self.view.backgroundColor = [[UIColor labelColor] colorWithAlphaComponent:0.04];
     [[BackgroundManager sharedManager] makeViewControllerTransparent:self];
