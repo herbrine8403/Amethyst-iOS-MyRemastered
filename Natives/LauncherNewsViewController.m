@@ -76,7 +76,8 @@ static NSString * const AmeHomeCardLayoutChangedNotification = @"AmeHomeCardLayo
 //   横竖屏都用紧凑胶囊,不再是整条大渐变底)。数值取自 mix.html 的竖屏 A 方案:
 //   真机高 ≈32~36pt、胶囊圆角 = 高/2、淡底 + 细描边 + ▶ 图标。
 static const CGFloat kNoRightCapsuleHeight = 36.0;
-static const CGFloat kNoRightCapsuleMaxW   = 320.0;   // 横屏不要拉成整条 ⇒ 上限 320 居中
+static const CGFloat kNoRightCapsuleMaxW   = 220.0;   // 居中紧凑胶囊；过宽会压住 Multiplayer 等底行磁贴
+static const CGFloat kNoRightCapsulePortraitMaxW = 200.0;
 
 // ★ [TOPBAR2] 顶栏右侧动作 pill 排:JIT 状态 · 执行 Jar · 选择版本 · 下载中心 · ⚙自定义。
 //   相邻 pill 的水平间距：横竖屏同一值 ⇒ 一条链式约束即可两朝向通用(无同属性双钉)。
@@ -1322,6 +1323,7 @@ static NSString *festivalGreeting(void) {
 @property (nonatomic, strong) UILabel *norightJITPill;          // 顶栏右侧 JIT 状态 pill(「⚙自定义」左侧)
 @property (nonatomic, strong) UIButton *norightLaunchCapsule;   // 主页底部「启动游戏」紧凑胶囊
 @property (nonatomic, strong) NSLayoutConstraint *norightCapsuleWidth;
+@property (nonatomic, strong) NSLayoutConstraint *norightCapsuleBottom;
 @property (nonatomic, copy)   NSString *norightVersionText;     // 欢迎卡里的版本号(来自右栏状态广播)
 
 // ★ [TOPBAR2] 顶栏动作 pill 排(JIT 状态侧边;JIT pill 本身仍是 norightJITPill)。
@@ -1810,14 +1812,16 @@ static NSString *festivalGreeting(void) {
     [self.view addSubview:self.norightLaunchCapsule];
     [self.view bringSubviewToFront:self.norightLaunchCapsule];
 
-    self.norightCapsuleWidth = [self.norightLaunchCapsule.widthAnchor constraintEqualToConstant:kNoRightCapsuleMaxW];
+    self.norightCapsuleWidth = [self.norightLaunchCapsule.widthAnchor constraintEqualToConstant:kNoRightCapsulePortraitMaxW];
+    // 钉在安全区底之上，并额外抬高以避开 iOS 浮动标签栏（applyHomeSafeAreaInsets 会按实测 tabBar 高度更新 constant）
+    self.norightCapsuleBottom = [self.norightLaunchCapsule.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-56];
     // 800 兜底:任何情况下不越出屏幕左右 16pt(可被 solver 静默让步 ⇒ 不会报冲突)
     NSLayoutConstraint *norightCapsuleLeadGuard = [self.norightLaunchCapsule.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.view.leadingAnchor constant:16];
     NSLayoutConstraint *norightCapsuleTrailGuard = [self.norightLaunchCapsule.trailingAnchor constraintLessThanOrEqualToAnchor:self.view.trailingAnchor constant:-16];
     norightCapsuleLeadGuard.priority = 800;
     norightCapsuleTrailGuard.priority = 800;
     [NSLayoutConstraint activateConstraints:@[
-        [self.norightLaunchCapsule.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor constant:-8],
+        self.norightCapsuleBottom,
         [self.norightLaunchCapsule.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
         [self.norightLaunchCapsule.heightAnchor constraintEqualToConstant:kNoRightCapsuleHeight],
         self.norightCapsuleWidth,
@@ -3203,21 +3207,32 @@ static NSString *festivalGreeting(void) {
     // ★ [GLASS-LIQUID] 深浅色切换后重刷顶栏胶囊:系统材质路径不自绘,自绘路径才刷新描边/白底
     AmeApplyGlassChipStyle(self.customizeButton, AmeRadiusPill, NO);   // ★ [HOME6]
 
+    // ★ [NORIGHT] 按浮动标签栏实测高度抬高启动胶囊，避免压住 Multiplayer 磁贴 / 底栏。
+    CGFloat tabBarH = 0;
+    if (self.tabBarController.tabBar && !self.tabBarController.tabBar.hidden) {
+        tabBarH = CGRectGetHeight(self.tabBarController.tabBar.bounds);
+    }
+    if (tabBarH < 49.0) tabBarH = 49.0; // 首帧 layout 前 bounds 可能为 0
+    CGFloat capsuleClearance = tabBarH + 12.0; // 标签栏上方再留 12pt 呼吸
+    if (self.norightCapsuleBottom) {
+        self.norightCapsuleBottom.constant = -capsuleClearance;
+    }
+
     UICollectionView *cv = self.collectionView;
     if (cv) {
         // 顶部由 headerView 承担;左右交给 section contentInsets(bentoSectionWithGroup:);底部在此兜底。
-        // ★ [NORIGHT] 底部再补「启动胶囊高 + 呼吸」⇒ 最后一张卡不会被底部启动胶囊压住。
-        CGFloat norightBottomRoom = kNoRightCapsuleHeight + 10.0;
+        // ★ [NORIGHT] 底部再补「启动胶囊高 + 标签栏抬高 + 呼吸」⇒ 最后一张卡不会被启动胶囊压住。
+        CGFloat norightBottomRoom = kNoRightCapsuleHeight + capsuleClearance + 10.0;
         cv.contentInset = UIEdgeInsetsMake(0, 0, sa.bottom + kBentoEdgeV + norightBottomRoom, 0);
         cv.verticalScrollIndicatorInsets = UIEdgeInsetsMake(0, 0, sa.bottom, 0);
     }
 
-    // ★ [NORIGHT] 底部启动胶囊宽度:竖屏接近满宽、横屏收到 320(紧凑胶囊,不拉成整条)。
-    //   只用一条**等宽**约束的 constant 表达 ⇒ 同一个属性只有一条约束(无双钉)。
+    // ★ [NORIGHT] 底部启动胶囊宽度:竖屏/横屏都用紧凑居中胶囊，避免铺满压住底行磁贴。
     if (self.norightCapsuleWidth) {
         CGFloat avail = self.view.bounds.size.width - 32.0;
-        if (avail <= 0) avail = kNoRightCapsuleMaxW;
-        self.norightCapsuleWidth.constant = MIN(avail, kNoRightCapsuleMaxW);
+        CGFloat maxW = [self homeIsLandscape] ? kNoRightCapsuleMaxW : kNoRightCapsulePortraitMaxW;
+        if (avail <= 0) avail = maxW;
+        self.norightCapsuleWidth.constant = MIN(avail, maxW);
     }
 
     [self activateHeaderConstraintsForLandscape:[self homeIsLandscape]];

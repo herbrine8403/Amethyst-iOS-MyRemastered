@@ -1906,32 +1906,15 @@ static NSString * localizeProfileTitle(NSString *title) {
 - (NSString *)currentGameVersion {
     NSString *lastVersionId = self.profile[@"lastVersionId"];
     if (![lastVersionId isKindOfClass:[NSString class]] || lastVersionId.length == 0) return nil;
-    // 解析 loader 前的游戏版本：1.21.1-forge-47.3.0 → 1.21.1
-    // fabric-loader-0.16.0-1.21 → 1.21
-    NSArray<NSString *> *loaders = @[@"forge", @"fabric", @"neoforge", @"quilt", @"fabric-loader"];
-    NSString *result = lastVersionId;
-    for (NSString *loader in loaders) {
-        NSString *delimiter = [NSString stringWithFormat:@"-%@-", loader];
-        NSRange range = [result rangeOfString:delimiter options:NSCaseInsensitiveSearch];
-        if (range.location != NSNotFound) {
-            result = [result substringToIndex:range.location];
-            break;
-        }
-        // 处理 "fabric-loader-0.16.0-1.21" 形式：取最后一个版本号
-        if ([result.lowercaseString hasPrefix:[NSString stringWithFormat:@"%@-", loader]]) {
-            // fabric-loader-0.16.0-1.21 → 取最后的 "1.21"
-            NSArray *parts = [result componentsSeparatedByString:@"-"];
-            if (parts.count >= 2) {
-                // 找到形如 1.x.x 的部分
-                for (NSString *part in [parts reverseObjectEnumerator]) {
-                    if ([part hasPrefix:@"1."]) {
-                        return part;
-                    }
-                }
-            }
-        }
+    // 统一走 parseVersionId：同时覆盖 1.x 与年份制 26.x
+    // （旧实现只认 hasPrefix:@"1."，导致 fabric-loader-0.20.1-26.3 解析失败，
+    //  Fabric API / 组件安装拿到整段 loader id 后在 Modrinth 查不到结果。）
+    NSDictionary *parsed = [ModpackExportService parseVersionId:lastVersionId];
+    NSString *mc = parsed[@"minecraft"];
+    if ([mc isKindOfClass:[NSString class]] && mc.length > 0) {
+        return mc;
     }
-    return result;
+    return lastVersionId;
 }
 
 - (void)installFabricAPIStandalone {

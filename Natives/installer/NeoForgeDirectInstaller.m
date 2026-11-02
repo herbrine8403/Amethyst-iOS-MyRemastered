@@ -581,6 +581,16 @@ NSString *const NeoForgeDirectInstallerErrorDomain = @"NeoForgeDirectInstallerEr
 ///   - UI 路径: "NeoForge-{loader}"，如 "NeoForge-47.1.0"、"NeoForge-21.5.75"
 /// 需兼顾两种格式，先尝试直接匹配 MC 版本，失败则从 NeoForge loader 版本号反推 MC 版本
 + (NSInteger)inferJavaMajorVersionFromVersionId:(NSString *)versionId {
+    // 0. 年份制 Minecraft 26.x → Java 25（与 ForgeProcessorExecutor / Fabric 路径对齐）
+    NSRegularExpression *yearRegex = [NSRegularExpression regularExpressionWithPattern:@"(?:^|[-_])(\\d{2})(?=[.w])"
+                                                                               options:0
+                                                                                 error:nil];
+    NSTextCheckingResult *yearMatch = [yearRegex firstMatchInString:versionId options:0 range:NSMakeRange(0, versionId.length)];
+    if (yearMatch && yearMatch.numberOfRanges >= 2) {
+        NSInteger yearMajor = [[versionId substringWithRange:[yearMatch rangeAtIndex:1]] integerValue];
+        if (yearMajor >= 26) return 25;
+    }
+
     // 1. 先尝试匹配 "1.x.x" 格式的 MC 版本（覆盖整合包路径，以及 UI 路径中可能含 1.x.x 的边界情况）
     //    使用锚定开头（^|[-_]) 避免误匹配 loader 版本号中的 "1.x" 子串
     NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"(?:^|[-_])1\\.(\\d+)(?:\\.(\\d+))?"

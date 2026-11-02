@@ -15,9 +15,9 @@
 	     「设置 > App > 语言」把中文界面当高棉语列给用户。km.lproj 文件仍在包内但不再声明。 -->
 	<key>CFBundleLocalizations</key>
 	<array>
+		<string>en</string>
 		<string>zh-Hans</string>
 		<string>zh-Hant</string>
-		<string>en</string>
 		<string>ja</string>
 	</array>
 	<key>CFBundleDisplayName</key>

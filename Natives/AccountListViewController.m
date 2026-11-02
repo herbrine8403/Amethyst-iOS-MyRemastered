@@ -42,7 +42,7 @@
     // 适配自定义启动器背景：将当前视图控制器透明化，使全局背景壁纸能够透出
     [[BackgroundManager sharedManager] makeViewControllerTransparent:self];
 
-    self.title = localize(@"login.title", @"账户管理");
+    self.title = localize(@"login.title", @"Accounts");
     self.view.backgroundColor = [UIColor clearColor];
 
     if (self.accountList == nil) {
@@ -184,12 +184,12 @@
     //   幂等:已注入过就不再注入。按钮挂在本 VC 的 navigationItem 上 ⇒ 只有本页可见,
     //   push 出去的登录页用的是它自己的 navigationItem,不受影响。
     if (!self.navigationItem.rightBarButtonItem) {
-        UIBarButtonItem *avatarItem = [[UIBarButtonItem alloc] initWithTitle:localize(@"i18n_str_416", @"自定义头像")
+        UIBarButtonItem *avatarItem = [[UIBarButtonItem alloc] initWithTitle:localize(@"i18n_str_416", @"Custom Avatar")
                                                                       style:UIBarButtonItemStylePlain
                                                                      target:self
                                                                      action:@selector(ameAccountAvatarSettingsTapped)];
         avatarItem.tintColor = [UIColor labelColor];
-        avatarItem.accessibilityLabel = localize(@"i18n_str_416", @"自定义头像");
+        avatarItem.accessibilityLabel = localize(@"i18n_str_416", @"Custom Avatar");
         self.navigationItem.rightBarButtonItem = avatarItem;
     }
 
@@ -223,7 +223,7 @@
 - (void)setupAddAccountButton {
     UIButton *addBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     addBtn.translatesAutoresizingMaskIntoConstraints = NO;
-    [addBtn setTitle:localize(@"login.option.add", @"添加账户") forState:UIControlStateNormal];
+    [addBtn setTitle:localize(@"login.option.add", @"Add account") forState:UIControlStateNormal];
     addBtn.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
     [addBtn setImage:[UIImage systemImageNamed:@"plus"] forState:UIControlStateNormal];
     addBtn.tintColor = [UIColor whiteColor];
@@ -271,13 +271,13 @@
                               badgeLabel:(UILabel *)badgeLabel {
     NSString *username = accountData[@"username"];
     if ([username hasPrefix:@"Demo."]) {
-        badgeLabel.text = localize(@"login.option.demo", @"演示");
+        badgeLabel.text = localize(@"login.option.demo", @"Demo");
         badgeLabel.backgroundColor = [UIColor colorWithRed:0.55 green:0.35 blue:0.85 alpha:1.0];
     } else if (accountData[@"clientToken"] != nil) {
-        badgeLabel.text = localize(@"login.option.3rdparty", @"第三方");
+        badgeLabel.text = localize(@"login.option.3rdparty", @"Third-party");
         badgeLabel.backgroundColor = [UIColor colorWithRed:0.92 green:0.55 blue:0.18 alpha:1.0];
     } else if (accountData[@"xboxGamertag"] == nil) {
-        badgeLabel.text = localize(@"login.option.local", @"本地");
+        badgeLabel.text = localize(@"login.option.local", @"Local");
         badgeLabel.backgroundColor = [UIColor colorWithWhite:0.45 alpha:1.0];
     } else {
         // 微软账户
@@ -316,12 +316,12 @@
     // 副标题：Demo 账户显示"演示账户"，第三方显示服务器名，微软显示 Xbox gamertag，本地显示"离线模式"
     if ([displayName hasPrefix:@"Demo."]) {
         displayName = [displayName substringFromIndex:5];
-        subtitle = localize(@"login.option.demo", @"演示账户");
+        subtitle = localize(@"login.option.demo", @"Demo account");
     } else if (accountData[@"clientToken"] != nil) {
         // 第三方账户：显示其 authserver 地址
-        subtitle = accountData[@"authserver"] ?: localize(@"login.option.3rdparty", @"第三方账户");
+        subtitle = accountData[@"authserver"] ?: localize(@"login.option.3rdparty", @"Third-party account");
     } else if (accountData[@"xboxGamertag"] == nil) {
-        subtitle = localize(@"login.option.local", @"离线模式");
+        subtitle = localize(@"login.option.local", @"Local account");
     } else {
         subtitle = accountData[@"xboxGamertag"] ?: @"Microsoft";
     }

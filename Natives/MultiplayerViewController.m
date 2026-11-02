@@ -317,7 +317,7 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
                                                                      style:UIBarButtonItemStylePlain
                                                                     target:self
                                                                     action:@selector(closeTapped)];
-    closeButton.accessibilityLabel = MPLocalized(@"mp.close", @"关闭");
+    closeButton.accessibilityLabel = MPLocalized(@"mp.close", @"Close");
     self.navigationItem.leftBarButtonItem = closeButton;
 
     // 注意：启动器模式右上角不需要按钮（Network ID 通过 Section 0 设置）
@@ -372,8 +372,8 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
         // 检查 ZeroTier 框架可用性
         if (![[MultiplayerManager sharedManager] isFrameworkAvailable]) {
             [sender setOn:NO animated:YES];
-            [self showSimpleAlertWithTitle:MPLocalized(@"mp.core.unavailable_title", @"联机核心不可用")
-                                    message:MPLocalized(@"mp.core.unavailable_msg", @"ZeroTier 联机核心未加载，无法启用联机。请使用包含真实 zt.framework 的构建版本。")];
+            [self showSimpleAlertWithTitle:MPLocalized(@"mp.core.unavailable_title", @"Multiplayer core unavailable")
+                                    message:MPLocalized(@"mp.core.unavailable_msg", @"ZeroTier multiplayer core is not loaded. Please use a build that includes the real zt.framework.")];
             return;
         }
 
@@ -391,8 +391,8 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
                 // 这样下次打开启动器时开关仍会显示 ON 并自动重试。
                 // 之前会调用 setMultiplayerEnabled:NO，导致用户需要每次重新手动启用。
                 [strongSelf.enableSwitch setOn:NO animated:YES];
-                [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.node.start_failed_title", @"启动失败")
-                                              message:error.localizedDescription ?: MPLocalized(@"mp.node.start_failed_msg", @"ZeroTier 节点启动失败，请重试。")];
+                [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.node.start_failed_title", @"Start failed")
+                                              message:error.localizedDescription ?: MPLocalized(@"mp.node.start_failed_msg", @"Failed to start the ZeroTier node. Please try again.")];
             } else {
                 // 启动成功：刷新表格以更新开关行的辅助文字
                 [strongSelf.tableView reloadData];
@@ -421,33 +421,33 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
 
     // 检查 ZeroTier 框架可用性
     if (![[MultiplayerManager sharedManager] isFrameworkAvailable]) {
-        [self showSimpleAlertWithTitle:MPLocalized(@"mp.core.unavailable_title", @"联机核心不可用")
-                                message:MPLocalized(@"mp.core.unavailable_msg", @"ZeroTier 联机核心未加载，无法设置 Network ID。")];
+        [self showSimpleAlertWithTitle:MPLocalized(@"mp.core.unavailable_title", @"Multiplayer core unavailable")
+                                message:MPLocalized(@"mp.core.unavailable_msg", @"ZeroTier multiplayer core is not loaded, so Network ID cannot be set.")];
         return;
     }
 
     NSString *current = [[MultiplayerManager sharedManager] presetNetworkId] ?: @"";
 
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:MPLocalized(@"mp.network_id.title", @"设置 Network ID")
-                                                                   message:MPLocalized(@"mp.network_id.message", @"在 central.zerotier.com 创建网络后填入 16 位 Network ID，开房时自动使用")
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:MPLocalized(@"mp.network_id.title", @"Set Network ID")
+                                                                   message:MPLocalized(@"mp.network_id.message", @"Create a network at central.zerotier.com, then enter the 16-character Network ID. It will be used automatically when hosting.")
                                                             preferredStyle:UIAlertControllerStyleAlert];
 
     [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
         textField.text = current;
-        textField.placeholder = MPLocalized(@"mp.network_id.placeholder", @"16 位十六进制 Network ID");
+        textField.placeholder = MPLocalized(@"mp.network_id.placeholder", @"16-character hex Network ID");
         textField.autocapitalizationType = UITextAutocapitalizationTypeNone;
         textField.autocorrectionType = UITextAutocorrectionTypeNo;
         textField.keyboardType = UIKeyboardTypeASCIICapable;
         textField.clearButtonMode = UITextFieldViewModeWhileEditing;
     }];
 
-    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"common.cancel", @"取消")
+    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"common.cancel", @"Cancel")
                                               style:UIAlertActionStyleCancel
                                             handler:nil]];
 
     // 快速模式按钮：自动生成 Ad-hoc 网络 ID，无需注册账号
     __weak typeof(self) weakSelf = self;
-    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"mp.network_id.use_adhoc", @"使用快速模式（无需注册）")
+    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"mp.network_id.use_adhoc", @"Use Quick Mode (no signup)")
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *action) {
         __strong typeof(weakSelf) strongSelf = weakSelf;
@@ -455,16 +455,16 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
 
         // 检查 ZeroTier 框架可用性
         if (![[MultiplayerManager sharedManager] isFrameworkAvailable]) {
-            [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.core.unavailable_title", @"联机核心不可用")
-                                          message:MPLocalized(@"mp.core.unavailable_msg", @"ZeroTier 联机核心未加载，无法使用快速模式。")];
+            [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.core.unavailable_title", @"Multiplayer core unavailable")
+                                          message:MPLocalized(@"mp.core.unavailable_msg", @"ZeroTier multiplayer core is not loaded, so Quick Mode cannot be used.")];
             return;
         }
 
         // 生成 Ad-hoc 网络 ID
         NSString *adhocNetId = [[MultiplayerManager sharedManager] generateAdhocNetworkId];
         if (!adhocNetId.length) {
-            [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.network_id.adhoc_failed_title", @"生成失败")
-                                          message:MPLocalized(@"mp.network_id.adhoc_failed_msg", @"无法生成快速模式 Network ID，请改用标准模式")];
+            [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.network_id.adhoc_failed_title", @"Generation failed")
+                                          message:MPLocalized(@"mp.network_id.adhoc_failed_msg", @"Could not generate a Quick Mode Network ID. Please use Standard Mode instead.")];
             return;
         }
 
@@ -473,13 +473,13 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
         [strongSelf.tableView reloadData];
 
         // 提示用户
-        [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.network_id.adhoc_success_title", @"已启用快速模式")
+        [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.network_id.adhoc_success_title", @"Quick Mode enabled")
                                       message:[NSString stringWithFormat:@"%@\n\n%@",
-                                               MPLocalized(@"mp.network_id.adhoc_success_msg", @"已自动生成 Network ID，无需注册账号即可联机。注意：快速模式稳定性不如标准模式，IP 可能变化。"),
+                                               MPLocalized(@"mp.network_id.adhoc_success_msg", @"A Network ID was generated automatically. No account is required. Note: Quick Mode is less stable than Standard Mode, and the IP may change."),
                                                [NSString stringWithFormat:@"Network ID: %@", adhocNetId]]];
     }]];
 
-    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"common.save", @"保存")
+    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"common.save", @"Save")
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *action) {
         __strong typeof(weakSelf) strongSelf = weakSelf;
@@ -497,8 +497,8 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
 
         // 校验格式
         if (![[MultiplayerManager sharedManager] isValidNetworkId:value]) {
-            [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.network_id.invalid_title", @"格式不正确")
-                                          message:MPLocalized(@"mp.network_id.invalid_msg", @"Network ID 应为 16 位十六进制字符串")];
+            [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.network_id.invalid_title", @"Invalid format")
+                                          message:MPLocalized(@"mp.network_id.invalid_msg", @"Network ID must be a 16-character hexadecimal string.")];
             return;
         }
 
@@ -527,63 +527,63 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
 
     // 构建教程内容：两种模式对比
     NSString *modeStandard = [NSString stringWithFormat:@"%@（%@）\n%@",
-                              MPLocalized(@"mp.guide.mode_standard", @"标准模式"),
-                              MPLocalized(@"mp.guide.stable", @"稳定"),
-                              MPLocalized(@"mp.guide.mode_standard_desc", @"在 central.zerotier.com 注册账号并创建组织，获得固定的 Network ID。IP 稳定、支持授权管理、每人独立网络。")];
+                              MPLocalized(@"mp.guide.mode_standard", @"Standard Mode"),
+                              MPLocalized(@"mp.guide.stable", @"Stable"),
+                              MPLocalized(@"mp.guide.mode_standard_desc", @"Sign up at central.zerotier.com and create an organization to get a fixed Network ID. Stable IP, member authorization, and a private network per user.")];
 
     NSString *modeFast = [NSString stringWithFormat:@"%@（%@）\n%@",
-                          MPLocalized(@"mp.guide.mode_fast", @"快速模式"),
-                          MPLocalized(@"mp.guide.unstable", @"不稳定"),
-                          MPLocalized(@"mp.guide.mode_fast_desc", @"使用 Ad-hoc 网络自动生成 Network ID，无需注册账号。但只有 IPv6 地址、公开网络安全性弱、IP 可能变化。")];
+                          MPLocalized(@"mp.guide.mode_fast", @"Quick Mode"),
+                          MPLocalized(@"mp.guide.unstable", @"Unstable"),
+                          MPLocalized(@"mp.guide.mode_fast_desc", @"Uses an ad-hoc network to auto-generate a Network ID with no signup. IPv6-only, weaker public-network security, and the IP may change.")];
 
     // 标准模式步骤
-    NSString *standardTitle = [NSString stringWithFormat:@"\n【%@】", MPLocalized(@"mp.guide.mode_standard", @"标准模式")];
+    NSString *standardTitle = [NSString stringWithFormat:@"\n【%@】", MPLocalized(@"mp.guide.mode_standard", @"Standard Mode")];
 
     NSString *step1 = [NSString stringWithFormat:@"1. %@\n   %@",
-                       MPLocalized(@"mp.guide.step1_title", @"注册 ZeroTier 账号"),
-                       MPLocalized(@"mp.guide.step1_desc", @"访问 central.zerotier.com（新版 Central），注册并登录账号（免费，支持 Google/GitHub/Microsoft 登录）")];
+                       MPLocalized(@"mp.guide.step1_title", @"Create a ZeroTier account"),
+                       MPLocalized(@"mp.guide.step1_desc", @"Visit central.zerotier.com (new Central), sign up and sign in (free; Google/GitHub/Microsoft supported).")];
 
     NSString *step2 = [NSString stringWithFormat:@"2. %@\n   %@",
-                       MPLocalized(@"mp.guide.step2_title", @"创建组织"),
-                       MPLocalized(@"mp.guide.step2_desc", @"登录后输入组织名称，点击「Create Organization」。免费套餐自带一个 Network Group 和一个 Network")];
+                       MPLocalized(@"mp.guide.step2_title", @"Create an organization"),
+                       MPLocalized(@"mp.guide.step2_desc", @"After signing in, enter an organization name and tap Create Organization. The free plan includes one Network Group and one Network.")];
 
     NSString *step3 = [NSString stringWithFormat:@"3. %@\n   %@",
-                       MPLocalized(@"mp.guide.step3_title", @"获取 Network ID"),
-                       MPLocalized(@"mp.guide.step3_desc", @"在左侧边栏展开「Networks」，点击默认网络（如 my-first-network），复制顶部的 16 位 Network ID")];
+                       MPLocalized(@"mp.guide.step3_title", @"Get the Network ID"),
+                       MPLocalized(@"mp.guide.step3_desc", @"Expand Networks in the sidebar, open the default network (e.g. my-first-network), and copy the 16-character Network ID at the top.")];
 
     NSString *step4 = [NSString stringWithFormat:@"4. %@\n   %@",
-                       MPLocalized(@"mp.guide.step4_title", @"设置网络访问控制"),
-                       MPLocalized(@"mp.guide.step4_desc", @"Private（推荐）：需手动授权成员更安全；Public：任何人可直接加入")];
+                       MPLocalized(@"mp.guide.step4_title", @"Set network access control"),
+                       MPLocalized(@"mp.guide.step4_desc", @"Private (recommended): manually authorize members. Public: anyone can join.")];
 
     NSString *step5 = [NSString stringWithFormat:@"5. %@\n   %@",
-                       MPLocalized(@"mp.guide.step5_title", @"填入启动器"),
-                       MPLocalized(@"mp.guide.step5_desc", @"回到本页面，点击「预设 Network ID」行，粘贴并保存")];
+                       MPLocalized(@"mp.guide.step5_title", @"Enter it in the launcher"),
+                       MPLocalized(@"mp.guide.step5_desc", @"Return here, tap the Preset Network ID row, paste, and save.")];
 
     NSString *step6 = [NSString stringWithFormat:@"6. %@\n   %@",
-                       MPLocalized(@"mp.guide.step6_title", @"授权房客设备"),
-                       MPLocalized(@"mp.guide.step6_desc", @"房客加入后在「Member Devices」标签点击三点菜单→「Authorize」授权（Private 模式需要，Public 模式跳过）")];
+                       MPLocalized(@"mp.guide.step6_title", @"Authorize guest devices"),
+                       MPLocalized(@"mp.guide.step6_desc", @"After a guest joins, open Member Devices, tap the three-dot menu → Authorize (required for Private; skip for Public).")];
 
     NSString *step7 = [NSString stringWithFormat:@"7. %@\n   %@",
-                       MPLocalized(@"mp.guide.step7_title", @"开始联机"),
-                       MPLocalized(@"mp.guide.step7_desc", @"启动游戏后在悬浮球中打开联机界面，选择「当房主」即可开房")];
+                       MPLocalized(@"mp.guide.step7_title", @"Start multiplayer"),
+                       MPLocalized(@"mp.guide.step7_desc", @"After launching the game, open multiplayer from the floating ball and choose Host.")];
 
     // 快速模式步骤
-    NSString *fastTitle = [NSString stringWithFormat:@"\n【%@】", MPLocalized(@"mp.guide.mode_fast", @"快速模式")];
+    NSString *fastTitle = [NSString stringWithFormat:@"\n【%@】", MPLocalized(@"mp.guide.mode_fast", @"Quick Mode")];
 
     NSString *fastStep1 = [NSString stringWithFormat:@"1. %@\n   %@",
-                           MPLocalized(@"mp.guide.fast_step1_title", @"点击「预设 Network ID」"),
-                           MPLocalized(@"mp.guide.fast_step1_desc", @"在本页面点击「预设 Network ID」行")];
+                           MPLocalized(@"mp.guide.fast_step1_title", @"Tap Preset Network ID"),
+                           MPLocalized(@"mp.guide.fast_step1_desc", @"On this page, tap the Preset Network ID row.")];
 
     NSString *fastStep2 = [NSString stringWithFormat:@"2. %@\n   %@",
-                           MPLocalized(@"mp.guide.fast_step2_title", @"选择快速模式"),
-                           MPLocalized(@"mp.guide.fast_step2_desc", @"点击「使用快速模式（无需注册）」按钮，系统自动生成 Network ID")];
+                           MPLocalized(@"mp.guide.fast_step2_title", @"Choose Quick Mode"),
+                           MPLocalized(@"mp.guide.fast_step2_desc", @"Tap Use Quick Mode (no signup). The system generates a Network ID automatically.")];
 
     NSString *fastStep3 = [NSString stringWithFormat:@"3. %@\n   %@",
-                           MPLocalized(@"mp.guide.fast_step3_title", @"开始联机"),
-                           MPLocalized(@"mp.guide.fast_step3_desc", @"启动游戏后在悬浮球中打开联机界面，选择「当房主」即可开房")];
+                           MPLocalized(@"mp.guide.fast_step3_title", @"Start multiplayer"),
+                           MPLocalized(@"mp.guide.fast_step3_desc", @"After launching the game, open multiplayer from the floating ball and choose Host.")];
 
     NSString *message = [NSString stringWithFormat:@"%@\n\n%@\n\n%@\n\n%@%@",
-                         MPLocalized(@"mp.guide.intro", @"ZeroTier 提供两种联机模式，根据需求选择："),
+                         MPLocalized(@"mp.guide.intro", @"ZeroTier offers two multiplayer modes. Choose the one that fits:"),
                          modeStandard,
                          modeFast,
                          standardTitle, step1];
@@ -603,16 +603,16 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
     // 添加注意事项
     message = [NSString stringWithFormat:@"%@\n\n%@",
                message,
-               MPLocalized(@"mp.guide.note", @"注意：房主和房客使用相同的 Network ID 才能联机。标准模式需在后台授权成员（Private）或设为 Public。快速模式所有人共享同一公开网络。")];
+               MPLocalized(@"mp.guide.note", @"Note: host and guests must use the same Network ID. Standard Mode requires authorizing members (Private) or setting Public. Quick Mode shares one public network.")];
 
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:MPLocalized(@"mp.guide.title", @"ZeroTier 联机教程")
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:MPLocalized(@"mp.guide.title", @"ZeroTier multiplayer guide")
                                                                    message:message
                                                             preferredStyle:UIAlertControllerStyleAlert];
 
     // 「打开 central.zerotier.com」按钮：直接跳转到浏览器（标准模式需要）
     // 新版 Central：central.zerotier.com（推荐新用户使用）
     // 旧版 Central：my.zerotier.com（老用户继续使用）
-    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"mp.guide.open_website", @"打开 central.zerotier.com（标准模式）")
+    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"mp.guide.open_website", @"Open central.zerotier.com (Standard Mode)")
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *action) {
         NSURL *url = [NSURL URLWithString:@"https://central.zerotier.com/"];
@@ -623,7 +623,7 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
 
     // 「使用快速模式」按钮：直接生成 Ad-hoc 网络 ID
     __weak typeof(self) weakSelf = self;
-    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"mp.guide.use_fast_mode", @"使用快速模式")
+    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"mp.guide.use_fast_mode", @"Use Quick Mode")
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *action) {
         __strong typeof(weakSelf) strongSelf = weakSelf;
@@ -631,16 +631,16 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
 
         // 检查 ZeroTier 框架可用性
         if (![[MultiplayerManager sharedManager] isFrameworkAvailable]) {
-            [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.core.unavailable_title", @"联机核心不可用")
-                                          message:MPLocalized(@"mp.core.unavailable_msg", @"ZeroTier 联机核心未加载，无法使用快速模式。")];
+            [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.core.unavailable_title", @"Multiplayer core unavailable")
+                                          message:MPLocalized(@"mp.core.unavailable_msg", @"ZeroTier multiplayer core is not loaded, so Quick Mode cannot be used.")];
             return;
         }
 
         // 生成 Ad-hoc 网络 ID
         NSString *adhocNetId = [[MultiplayerManager sharedManager] generateAdhocNetworkId];
         if (!adhocNetId.length) {
-            [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.network_id.adhoc_failed_title", @"生成失败")
-                                          message:MPLocalized(@"mp.network_id.adhoc_failed_msg", @"无法生成快速模式 Network ID，请改用标准模式")];
+            [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.network_id.adhoc_failed_title", @"Generation failed")
+                                          message:MPLocalized(@"mp.network_id.adhoc_failed_msg", @"Could not generate a Quick Mode Network ID. Please use Standard Mode instead.")];
             return;
         }
 
@@ -649,14 +649,14 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
         [strongSelf.tableView reloadData];
 
         // 提示用户
-        [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.network_id.adhoc_success_title", @"已启用快速模式")
+        [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.network_id.adhoc_success_title", @"Quick Mode enabled")
                                       message:[NSString stringWithFormat:@"%@\n\n%@",
-                                               MPLocalized(@"mp.network_id.adhoc_success_msg", @"已自动生成 Network ID，无需注册账号即可联机。注意：快速模式稳定性不如标准模式，IP 可能变化。"),
+                                               MPLocalized(@"mp.network_id.adhoc_success_msg", @"A Network ID was generated automatically. No account is required. Note: Quick Mode is less stable than Standard Mode, and the IP may change."),
                                                [NSString stringWithFormat:@"Network ID: %@", adhocNetId]]];
     }]];
 
     // 「我知道了」按钮
-    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"common.ok", @"我知道了")
+    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"common.ok", @"Got it")
                                               style:UIAlertActionStyleCancel
                                             handler:nil]];
 
@@ -730,8 +730,8 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
         // 未连接则连接
         [self connectToRoom:room completion:^(BOOL success, NSError *error) {
             if (!success) {
-                [self showSimpleAlertWithTitle:MPLocalized(@"mp.connect.failed", @"连接失败")
-                                        message:error.localizedDescription ?: MPLocalized(@"mp.connect.failed_msg", @"无法连接到房间，请检查 Network ID 是否正确以及网络是否畅通。")];
+                [self showSimpleAlertWithTitle:MPLocalized(@"mp.connect.failed", @"Connection failed")
+                                        message:error.localizedDescription ?: MPLocalized(@"mp.connect.failed_msg", @"Could not connect to the room. Check the Network ID and your network connection.")];
             }
         }];
     }
@@ -748,7 +748,7 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
 - (void)showRoomActionsForRoom:(MultiplayerRoom *)room {
     [self.view endEditing:YES];
 
-    NSString *title = room.name.length ? room.name : MPLocalized(@"mp.room.unnamed", @"未命名房间");
+    NSString *title = room.name.length ? room.name : MPLocalized(@"mp.room.unnamed", @"Unnamed room");
     NSString *message = [NSString stringWithFormat:@"%@: %@",
                          MPLocalized(@"mp.room.network_id", @"Network ID"),
                          room.networkId ?: @"-"];
@@ -759,8 +759,8 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
 
     // 连接 / 断开按钮（根据当前状态切换标题）
     NSString *connectTitle = (room.status == MultiplayerRoomStatusConnected)
-        ? MPLocalized(@"mp.room.action.disconnect", @"断开连接")
-        : MPLocalized(@"mp.room.action.connect", @"连接房间");
+        ? MPLocalized(@"mp.room.action.disconnect", @"Disconnect")
+        : MPLocalized(@"mp.room.action.connect", @"Connect");
 
     __weak typeof(self) weakSelf = self;
     [sheet addAction:[UIAlertAction actionWithTitle:connectTitle style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
@@ -772,15 +772,15 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
         } else {
             [strongSelf connectToRoom:room completion:^(BOOL success, NSError *error) {
                 if (!success) {
-                    [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.connect.failed", @"连接失败")
-                                                  message:error.localizedDescription ?: MPLocalized(@"mp.connect.failed_msg", @"无法连接到房间，请检查 Network ID 是否正确以及网络是否畅通。")];
+                    [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.connect.failed", @"Connection failed")
+                                                  message:error.localizedDescription ?: MPLocalized(@"mp.connect.failed_msg", @"Could not connect to the room. Check the Network ID and your network connection.")];
                 }
             }];
         }
     }]];
 
     // 分享房间按钮（使用 shareTextForRoom: 生成可读分享文本）
-    [sheet addAction:[UIAlertAction actionWithTitle:MPLocalized(@"mp.room.action.share", @"分享房间")
+    [sheet addAction:[UIAlertAction actionWithTitle:MPLocalized(@"mp.room.action.share", @"Share room")
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *action) {
         __strong typeof(weakSelf) strongSelf = weakSelf;
@@ -800,21 +800,21 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
     }]];
 
     // 删除房间按钮（destructive 红色）
-    [sheet addAction:[UIAlertAction actionWithTitle:MPLocalized(@"mp.room.action.delete", @"删除房间")
+    [sheet addAction:[UIAlertAction actionWithTitle:MPLocalized(@"mp.room.action.delete", @"Delete room")
                                               style:UIAlertActionStyleDestructive
                                             handler:^(UIAlertAction *action) {
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (!strongSelf) return;
 
         // 二次确认对话框
-        UIAlertController *confirm = [UIAlertController alertControllerWithTitle:MPLocalized(@"mp.room.delete.confirm_title", @"确认删除")
+        UIAlertController *confirm = [UIAlertController alertControllerWithTitle:MPLocalized(@"mp.room.delete.confirm_title", @"Confirm delete")
                                                                          message:[NSString stringWithFormat:@"%@「%@」？\n%@",
-                                                                                  MPLocalized(@"mp.room.delete.confirm_prefix", @"确定要删除房间"),
+                                                                                  MPLocalized(@"mp.room.delete.confirm_prefix", @"Delete room"),
                                                                                   room.name,
-                                                                                  MPLocalized(@"mp.room.delete.confirm_warning", @"此操作无法撤销。")]
+                                                                                  MPLocalized(@"mp.room.delete.confirm_warning", @"This cannot be undone.")]
                                                                   preferredStyle:UIAlertControllerStyleAlert];
-        [confirm addAction:[UIAlertAction actionWithTitle:MPLocalized(@"common.cancel", @"取消") style:UIAlertActionStyleCancel handler:nil]];
-        [confirm addAction:[UIAlertAction actionWithTitle:MPLocalized(@"mp.room.delete.button", @"删除") style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        [confirm addAction:[UIAlertAction actionWithTitle:MPLocalized(@"common.cancel", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
+        [confirm addAction:[UIAlertAction actionWithTitle:MPLocalized(@"mp.room.delete.button", @"Delete") style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) return;
 
@@ -829,7 +829,7 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
     }]];
 
     // 取消按钮
-    [sheet addAction:[UIAlertAction actionWithTitle:MPLocalized(@"common.cancel", @"取消") style:UIAlertActionStyleCancel handler:nil]];
+    [sheet addAction:[UIAlertAction actionWithTitle:MPLocalized(@"common.cancel", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
 
     // iPad 适配：popover 指向屏幕中央
     if (sheet.popoverPresentationController) {
@@ -853,8 +853,8 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
 
     // 校验：IP 非空
     if (ip.length == 0) {
-        [self showSimpleAlertWithTitle:MPLocalized(@"mp.direct.error_title", @"提示")
-                                message:MPLocalized(@"mp.direct.error.ip_empty", @"请输入服务器 IP 地址")];
+        [self showSimpleAlertWithTitle:MPLocalized(@"mp.direct.error_title", @"Notice")
+                                message:MPLocalized(@"mp.direct.error.ip_empty", @"Enter the server IP address")];
         return;
     }
 
@@ -865,8 +865,8 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
 
     // 校验：IP 格式
     if (![[MultiplayerManager sharedManager] isValidIPAddress:ip]) {
-        [self showSimpleAlertWithTitle:MPLocalized(@"mp.direct.error_title", @"提示")
-                                message:MPLocalized(@"mp.direct.error.ip_invalid", @"IP 地址格式不正确，请检查输入")];
+        [self showSimpleAlertWithTitle:MPLocalized(@"mp.direct.error_title", @"Notice")
+                                message:MPLocalized(@"mp.direct.error.ip_invalid", @"Invalid IP address format. Please check your input.")];
         return;
     }
 
@@ -876,16 +876,16 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
     // 将服务器地址写入当前 profile
     NSString *profileName = [PLProfiles current].selectedProfileName;
     if (!profileName || profileName.length == 0) {
-        [self showSimpleAlertWithTitle:MPLocalized(@"mp.direct.error_title", @"提示")
-                                message:MPLocalized(@"mp.direct.error.no_profile", @"未找到当前 profile，请先选择一个游戏配置")];
+        [self showSimpleAlertWithTitle:MPLocalized(@"mp.direct.error_title", @"Notice")
+                                message:MPLocalized(@"mp.direct.error.no_profile", @"No profile selected. Choose a game profile first.")];
         return;
     }
     [[PLProfiles current] setServerIp:serverAddress forProfile:profileName];
 
     // 显示成功提示
-    [self showSimpleAlertWithTitle:MPLocalized(@"mp.direct.success_title", @"已添加服务器")
+    [self showSimpleAlertWithTitle:MPLocalized(@"mp.direct.success_title", @"Server added")
                            message:[NSString stringWithFormat:@"%@ %@",
-                                    MPLocalized(@"mp.direct.success_msg_prefix", @"已添加服务器"),
+                                    MPLocalized(@"mp.direct.success_msg_prefix", @"Server added"),
                                     serverAddress]];
 }
 
@@ -915,8 +915,8 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
 
     // 检查 1：ZeroTier 框架可用性
     if (![[MultiplayerManager sharedManager] isFrameworkAvailable]) {
-        [self showSimpleAlertWithTitle:MPLocalized(@"mp.core.unavailable_title", @"联机核心不可用")
-                                message:MPLocalized(@"mp.core.unavailable_msg", @"ZeroTier 联机核心未加载，无法作为房主开房。请使用包含真实 zt.framework 的构建版本。")];
+        [self showSimpleAlertWithTitle:MPLocalized(@"mp.core.unavailable_title", @"Multiplayer core unavailable")
+                                message:MPLocalized(@"mp.core.unavailable_msg", @"ZeroTier multiplayer core is not loaded, so hosting is unavailable. Please use a build that includes the real zt.framework.")];
         return;
     }
 
@@ -924,18 +924,18 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
     NSString *presetNetId = [[MultiplayerManager sharedManager] presetNetworkId];
     if (!presetNetId.length) {
         // 未设置：提示用户去启动器设置
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:MPLocalized(@"mp.host.no_network_id_title", @"未设置 Network ID")
-                                                                       message:MPLocalized(@"mp.host.no_network_id_msg", @"房主需要先设置预设 ZeroTier Network ID。请在启动器联机界面中设置后再来。")
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:MPLocalized(@"mp.host.no_network_id_title", @"Network ID not set")
+                                                                       message:MPLocalized(@"mp.host.no_network_id_msg", @"The host must set a preset ZeroTier Network ID in the launcher multiplayer screen first.")
                                                                 preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"common.ok", @"好") style:UIAlertActionStyleDefault handler:nil]];
+        [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"common.ok", @"OK") style:UIAlertActionStyleDefault handler:nil]];
         [self presentViewController:alert animated:YES completion:nil];
         return;
     }
 
     // 校验 Network ID 格式
     if (![[MultiplayerManager sharedManager] isValidNetworkId:presetNetId]) {
-        [self showSimpleAlertWithTitle:MPLocalized(@"mp.network_id.invalid_title", @"Network ID 格式不正确")
-                                message:MPLocalized(@"mp.network_id.invalid_msg", @"请在启动器联机界面设置正确的 16 位十六进制 Network ID")];
+        [self showSimpleAlertWithTitle:MPLocalized(@"mp.network_id.invalid_title", @"Invalid Network ID format")
+                                message:MPLocalized(@"mp.network_id.invalid_msg", @"Set a valid 16-character hexadecimal Network ID in the launcher multiplayer screen")];
         return;
     }
 
@@ -997,7 +997,7 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
     if (!room || ![room.networkId isEqualToString:presetNetId]) {
         room = [[MultiplayerRoom alloc] init];
         room.roomId = [[MultiplayerManager sharedManager] generateRoomId];
-        room.name = MPLocalized(@"mp.host.default_room_name", @"我的联机房间");
+        room.name = MPLocalized(@"mp.host.default_room_name", @"My multiplayer rooms");
         room.networkId = presetNetId;
         room.hostIP = @"";
         room.hostPort = @"25565";
@@ -1026,8 +1026,8 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
     // 用户无法知道后台进度，连接流程耗时 15-30 秒期间用户只能干等。
     // 现在使用 showConnectionProgressWithTitle:message: 显示一个带 Cancel 按钮的 Alert，
     // 并通过 multiplayerConnectionProgress: 回调实时更新 message 为"步骤 1/6：..."等进度。
-    [self showConnectionProgressWithTitle:MPLocalized(@"mp.host.connecting_title", @"正在开启联机")
-                                   message:MPLocalized(@"mp.host.connecting_msg", @"正在连接到 ZeroTier 网络，请稍候...")];
+    [self showConnectionProgressWithTitle:MPLocalized(@"mp.host.connecting_title", @"Starting multiplayer")
+                                   message:MPLocalized(@"mp.host.connecting_msg", @"Connecting to ZeroTier…")];
 
     // 关键修复（端口检测改为手动输入）：
     // 不再启动 LanPortDetector 的自动检测。自动检测存在以下问题：
@@ -1066,8 +1066,8 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
             } else {
                 // 连接失败
                 strongSelf.isHostFlowActive = NO;
-                [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.connect.failed", @"连接失败")
-                                              message:error.localizedDescription ?: MPLocalized(@"mp.connect.failed_msg", @"无法连接到 ZeroTier 网络，请检查 Network ID 是否正确以及网络是否畅通。")];
+                [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.connect.failed", @"Connection failed")
+                                              message:error.localizedDescription ?: MPLocalized(@"mp.connect.failed_msg", @"Could not connect to the ZeroTier network. Check the Network ID and your network connection.")];
             }
         }];
         [strongSelf.tableView reloadData];
@@ -1099,24 +1099,24 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
     NSLog(@"[PORT-AUTO] host manual-port dialog prefill: gameDir=%@ detected=%u", autoGameDir ?: @"(nil)", autoPort);
 
     NSMutableString *message = [NSMutableString stringWithFormat:@"%@\n\n%@\n%@\n\n%@: %@",
-                         MPLocalized(@"mp.host.connected_msg", @"已连接到联机网络，请在 MC 中开放局域网后输入端口号"),
-                         MPLocalized(@"mp.host.tip.create_world", @"请在 MC 中创建世界并点击「对局域网开放」"),
-                         MPLocalized(@"mp.host.tip.manual_port", @"开放局域网后，MC 会在聊天框显示端口号，请将其输入下方"),
-                         MPLocalized(@"mp.host.local_ip", @"本机 IP"),
+                         MPLocalized(@"mp.host.connected_msg", @"Connected to the multiplayer network. Open to LAN in Minecraft, then enter the port"),
+                         MPLocalized(@"mp.host.tip.create_world", @"Create a world in Minecraft and tap Open to LAN"),
+                         MPLocalized(@"mp.host.tip.manual_port", @"After opening to LAN, Minecraft shows the port in chat — enter it below"),
+                         MPLocalized(@"mp.host.local_ip", @"Device IP"),
                          localIP];
     if (autoPortText.length > 0) {
         [message appendFormat:@"\n\n%@", [NSString stringWithFormat:
-            MPLocalized(@"mp.host.port_autodetected", @"已自动检测到端口 %@，可直接生成分享代码（也可手动修改）"), autoPortText]];
+            MPLocalized(@"mp.host.port_autodetected", @"Detected port %@. You can generate a share code now (or edit it manually)"), autoPortText]];
     } else {
-        [message appendFormat:@"\n\n%@", MPLocalized(@"mp.host.port_notdetected", @"未检测到端口，请先在游戏里「对局域网开放」（也可手动填写）")];
+        [message appendFormat:@"\n\n%@", MPLocalized(@"mp.host.port_notdetected", @"No port detected. Open to LAN in-game first (or enter it manually)")];
     }
 
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:MPLocalized(@"mp.host.connected_title", @"联机已开启")
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:MPLocalized(@"mp.host.connected_title", @"Multiplayer enabled")
                                                                    message:message
                                                             preferredStyle:UIAlertControllerStyleAlert];
 
     [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
-        textField.placeholder = MPLocalized(@"mp.host.port_placeholder", @"端口号（如 54321）");
+        textField.placeholder = MPLocalized(@"mp.host.port_placeholder", @"Port (e.g. 54321)");
         textField.keyboardType = UIKeyboardTypeNumberPad;
         textField.autocapitalizationType = UITextAutocapitalizationTypeNone;
         textField.autocorrectionType = UITextAutocorrectionTypeNo;
@@ -1124,12 +1124,12 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
         if (autoPortText.length > 0) textField.text = autoPortText;   // ★ [PORT-AUTO] 预填
     }];
 
-    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"common.cancel", @"取消")
+    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"common.cancel", @"Cancel")
                                               style:UIAlertActionStyleCancel
                                             handler:nil]];
 
     __weak typeof(self) weakSelf = self;
-    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"mp.host.generate_code", @"生成分享代码")
+    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"mp.host.generate_code", @"Generate share code")
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *action) {
         __strong typeof(weakSelf) strongSelf = weakSelf;
@@ -1140,16 +1140,16 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
 
         // 校验：端口非空
         if (port.length == 0) {
-            [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.host.port_empty_title", @"端口为空")
-                                          message:MPLocalized(@"mp.host.port_empty_msg", @"请输入 LAN 端口号")];
+            [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.host.port_empty_title", @"Port is empty")
+                                          message:MPLocalized(@"mp.host.port_empty_msg", @"Enter the LAN port")];
             return;
         }
 
         // 校验：端口范围（1-65535）
         NSInteger portNum = [port integerValue];
         if (portNum < 1 || portNum > 65535) {
-            [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.host.port_invalid_title", @"端口无效")
-                                          message:MPLocalized(@"mp.host.port_invalid_msg", @"端口号必须在 1-65535 之间")];
+            [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.host.port_invalid_title", @"Invalid port")
+                                          message:MPLocalized(@"mp.host.port_invalid_msg", @"Port must be between 1 and 65535")];
             return;
         }
 
@@ -1229,8 +1229,8 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
     // 如果 currentLocalIP 为空（异常情况），不生成无效分享代码
     if (!localIP.length) {
         NSLog(@"[MultiplayerVC] Warning: currentLocalIP is nil, cannot generate valid share code");
-        [self showSimpleAlertWithTitle:MPLocalized(@"mp.host.share_code_failed", @"生成分享代码失败")
-                                  message:MPLocalized(@"mp.host.no_local_ip", @"无法获取本机 ZeroTier IP，请检查网络连接后重试")];
+        [self showSimpleAlertWithTitle:MPLocalized(@"mp.host.share_code_failed", @"Failed to generate share code")
+                                  message:MPLocalized(@"mp.host.no_local_ip", @"Could not get this device's ZeroTier IP. Check the network and try again.")];
         return;
     }
 
@@ -1263,8 +1263,8 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
     // 如果 IP 变化，额外提示房主旧代码已失效
     if (ipChanged) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            [self showSimpleAlertWithTitle:MPLocalized(@"mp.host.ip_changed_title", @"房主 IP 已变化")
-                                      message:MPLocalized(@"mp.host.ip_changed_msg", @"你的 ZeroTier IP 已变化，之前分享的旧代码已失效。请将新的分享代码重新发给房客。")];
+            [self showSimpleAlertWithTitle:MPLocalized(@"mp.host.ip_changed_title", @"Host IP changed")
+                                      message:MPLocalized(@"mp.host.ip_changed_msg", @"Your ZeroTier IP changed, so earlier share codes no longer work. Send guests the new share code.")];
         });
     }
 }
@@ -1279,18 +1279,18 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
     NSString *serverAddr = self.lastServerAddress ?: @"-";
 
     NSString *message = [NSString stringWithFormat:@"%@\n\n%@\n\n%@\n%@\n\n%@",
-                         MPLocalized(@"mp.host.share_code_ready", @"分享代码已生成！将以下代码发给房客："),
+                         MPLocalized(@"mp.host.share_code_ready", @"Share code generated! Send this code to your guests:"),
                          shareCode,
-                         MPLocalized(@"mp.host.tip.wait_guest", @"房客输入此代码即可加入你的联机网络"),
-                         [NSString stringWithFormat:@"%@: %@", MPLocalized(@"mp.host.server_address", @"服务器地址"), serverAddr],
-                         MPLocalized(@"mp.host.tip.copy_or_share", @"可点击下方按钮复制或分享代码")];
+                         MPLocalized(@"mp.host.tip.wait_guest", @"Guests enter this code to join your multiplayer network"),
+                         [NSString stringWithFormat:@"%@: %@", MPLocalized(@"mp.host.server_address", @"Server address"), serverAddr],
+                         MPLocalized(@"mp.host.tip.copy_or_share", @"You can copy or share the code with the buttons below")];
 
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:MPLocalized(@"mp.host.share_code_title", @"分享代码已生成")
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:MPLocalized(@"mp.host.share_code_title", @"Share code generated")
                                                                    message:message
                                                             preferredStyle:UIAlertControllerStyleAlert];
 
     // 复制按钮
-    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"mp.host.copy_code", @"复制代码")
+    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"mp.host.copy_code", @"Copy code")
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *action) {
         UIPasteboard *pasteboard = [UIPasteboard generalPasteboard];
@@ -1299,7 +1299,7 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
 
     // 分享按钮
     __weak typeof(self) weakSelf = self;
-    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"mp.host.share_button", @"分享...")
+    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"mp.host.share_button", @"Share…")
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *action) {
         __strong typeof(weakSelf) strongSelf = weakSelf;
@@ -1316,7 +1316,7 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
     }]];
 
     // 关闭按钮
-    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"common.ok", @"好")
+    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"common.ok", @"OK")
                                               style:UIAlertActionStyleCancel
                                             handler:nil]];
 
@@ -1339,29 +1339,29 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
 
     // 检查 ZeroTier 框架可用性
     if (![[MultiplayerManager sharedManager] isFrameworkAvailable]) {
-        [self showSimpleAlertWithTitle:MPLocalized(@"mp.core.unavailable_title", @"联机核心不可用")
-                                message:MPLocalized(@"mp.core.unavailable_msg", @"ZeroTier 联机核心未加载，无法作为房客加入。请使用包含真实 zt.framework 的构建版本。")];
+        [self showSimpleAlertWithTitle:MPLocalized(@"mp.core.unavailable_title", @"Multiplayer core unavailable")
+                                message:MPLocalized(@"mp.core.unavailable_msg", @"ZeroTier multiplayer core is not loaded, so joining as a guest is unavailable. Please use a build that includes the real zt.framework.")];
         return;
     }
 
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:MPLocalized(@"mp.guest.input_title", @"输入分享代码")
-                                                                   message:MPLocalized(@"mp.guest.input_msg", @"请输入房主提供的分享代码")
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:MPLocalized(@"mp.guest.input_title", @"Enter share code")
+                                                                   message:MPLocalized(@"mp.guest.input_msg", @"Enter the share code from the host")
                                                             preferredStyle:UIAlertControllerStyleAlert];
 
     [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
-        textField.placeholder = MPLocalized(@"mp.guest.code_placeholder", @"在此粘贴分享代码");
+        textField.placeholder = MPLocalized(@"mp.guest.code_placeholder", @"Paste the share code here");
         textField.autocapitalizationType = UITextAutocapitalizationTypeNone;
         textField.autocorrectionType = UITextAutocorrectionTypeNo;
         textField.keyboardType = UIKeyboardTypeASCIICapable;
         textField.clearButtonMode = UITextFieldViewModeWhileEditing;
     }];
 
-    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"common.cancel", @"取消")
+    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"common.cancel", @"Cancel")
                                               style:UIAlertActionStyleCancel
                                             handler:nil]];
 
     __weak typeof(self) weakSelf = self;
-    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"mp.guest.join_button", @"加入")
+    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"mp.guest.join_button", @"Join")
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *action) {
         __strong typeof(weakSelf) strongSelf = weakSelf;
@@ -1372,31 +1372,31 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
 
         // 校验：代码非空
         if (code.length == 0) {
-            [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.guest.error_title", @"输入为空")
-                                          message:MPLocalized(@"mp.guest.error.empty", @"请输入房主提供的分享代码")];
+            [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.guest.error_title", @"Input is empty")
+                                          message:MPLocalized(@"mp.guest.error.empty", @"Enter the share code from the host")];
             return;
         }
 
         // 解析分享代码
         MultiplayerRoom *parsedRoom = [[MultiplayerManager sharedManager] parseShareCode:code];
         if (!parsedRoom) {
-            [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.guest.error_title", @"代码无效")
-                                          message:MPLocalized(@"mp.guest.error.invalid_code", @"无法解析分享代码，请确认代码完整无误")];
+            [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.guest.error_title", @"Invalid code")
+                                          message:MPLocalized(@"mp.guest.error.invalid_code", @"Could not parse the share code. Make sure it is complete and correct.")];
             return;
         }
 
         // 校验解析出的 Network ID
         if (!parsedRoom.networkId.length || ![[MultiplayerManager sharedManager] isValidNetworkId:parsedRoom.networkId]) {
-            [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.guest.error_title", @"代码无效")
-                                          message:MPLocalized(@"mp.guest.error.invalid_network_id", @"分享代码中的 Network ID 无效")];
+            [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.guest.error_title", @"Invalid code")
+                                          message:MPLocalized(@"mp.guest.error.invalid_network_id", @"The Network ID in the share code is invalid")];
             return;
         }
 
         // 关键修复（P0-6）：校验分享码中的 hostIP 非空
         // 房客必须有房主 IP 才能进行端口转发，空 hostIP 的分享码无法使用
         if (!parsedRoom.hostIP.length) {
-            [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.sharecode.invalid", @"分享代码无效")
-                                          message:MPLocalized(@"mp.sharecode.missing_host", @"分享代码缺少房主 IP，请确认代码完整无误")];
+            [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.sharecode.invalid", @"Invalid share code")
+                                          message:MPLocalized(@"mp.sharecode.missing_host", @"Share code is missing the host IP. Make sure the code is complete.")];
             return;
         }
 
@@ -1430,8 +1430,8 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
     //
     // 关键修复（前台无反馈）：
     // 与 hostButtonTapped 相同，使用可更新进度的 Alert 替代静态提示。
-    [self showConnectionProgressWithTitle:MPLocalized(@"mp.guest.connecting_title", @"正在加入联机")
-                                   message:MPLocalized(@"mp.guest.connecting_msg", @"正在连接到房主的 ZeroTier 网络，请稍候...")];
+    [self showConnectionProgressWithTitle:MPLocalized(@"mp.guest.connecting_title", @"Joining multiplayer")
+                                   message:MPLocalized(@"mp.guest.connecting_msg", @"Connecting to the host ZeroTier network…")];
 
     // 连接到房间
     __weak typeof(self) weakSelf = self;
@@ -1447,8 +1447,8 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
             } else {
                 // 连接失败
                 strongSelf.isGuestFlowActive = NO;
-                [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.connect.failed", @"连接失败")
-                                              message:error.localizedDescription ?: MPLocalized(@"mp.connect.failed_msg", @"无法连接到房主的网络，请检查分享代码是否正确以及网络是否畅通。")];
+                [strongSelf showSimpleAlertWithTitle:MPLocalized(@"mp.connect.failed", @"Connection failed")
+                                              message:error.localizedDescription ?: MPLocalized(@"mp.connect.failed_msg", @"Could not connect to the host network. Check the share code and your network connection.")];
             }
         }];
         [strongSelf.tableView reloadData];
@@ -1473,7 +1473,7 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
 - (void)showGuestConnectedAlert {
     MultiplayerRoom *room = self.guestRoom;
     // 关键修复（P1-5）：hostIP 为空时显示"未知"，而非用 currentLocalIP 误导用户
-    NSString *hostIP = room.hostIP.length ? room.hostIP : MPLocalized(@"mp.unknown", @"未知");
+    NSString *hostIP = room.hostIP.length ? room.hostIP : MPLocalized(@"mp.unknown", @"Unknown");
     NSString *hostPort = room.hostPort.length ? room.hostPort : @"25565";
 
     // 关键修复：MC 使用 Netty 的 NioSocketChannel，不走 Java 的 SOCKS5 代理。
@@ -1501,8 +1501,8 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
         serverAddress = [NSString stringWithFormat:@"%@:%@", hostIP, hostPort];
         NSLog(@"[MultiplayerVC] Warning: port forwarder not started, not writing profile serverIp");
         // 显示警告提示而非成功提示
-        [self showSimpleAlertWithTitle:MPLocalized(@"mp.connect.failed", @"连接失败")
-                               message:MPLocalized(@"mp.connect.port_forward_failed_msg", @"端口转发器启动失败，无法连接到房主。请尝试断开重连。")];
+        [self showSimpleAlertWithTitle:MPLocalized(@"mp.connect.failed", @"Connection failed")
+                               message:MPLocalized(@"mp.connect.port_forward_failed_msg", @"Port forwarder failed to start, so the host could not be reached. Disconnect and try again.")];
         return;
     }
 
@@ -1512,14 +1512,14 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
 
     // 构建提示信息
     NSString *message = [NSString stringWithFormat:@"%@\n\n%@\n%@\n\n%@: %@\n\n%@",
-                         MPLocalized(@"mp.guest.connected_msg", @"已连接到房主的联机网络"),
-                         MPLocalized(@"mp.guest.tip.add_server", @"请在 MC 多人游戏界面点击「添加服务器」，粘贴以下地址即可加入"),
-                         MPLocalized(@"mp.guest.tip.address_copied", @"服务器地址已自动复制到剪贴板，直接粘贴即可"),
-                         MPLocalized(@"mp.guest.server_address", @"服务器地址"),
+                         MPLocalized(@"mp.guest.connected_msg", @"Connected to the host multiplayer network"),
+                         MPLocalized(@"mp.guest.tip.add_server", @"In Minecraft multiplayer, tap Add Server and paste this address to join"),
+                         MPLocalized(@"mp.guest.tip.address_copied", @"Server address copied to the clipboard — paste it directly"),
+                         MPLocalized(@"mp.guest.server_address", @"Server address"),
                          serverAddress,
-                         MPLocalized(@"mp.guest.tip.auto_saved", @"地址已自动保存到当前配置，下次启动游戏会自动连接")];
+                         MPLocalized(@"mp.guest.tip.auto_saved", @"Address saved to the current profile and will connect automatically next launch")];
 
-    [self showSimpleAlertWithTitle:MPLocalized(@"mp.guest.connected_title", @"已加入联机")
+    [self showSimpleAlertWithTitle:MPLocalized(@"mp.guest.connected_title", @"Joined multiplayer")
                            message:message];
 }
 
@@ -1593,7 +1593,7 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
         // 关键修复：显示新 Alert 前清除进度 Alert 引用（如果存在）
         self.connectionProgressAlert = nil;
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:title message:message preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"common.ok", @"好") style:UIAlertActionStyleDefault handler:nil]];
+        [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"common.ok", @"OK") style:UIAlertActionStyleDefault handler:nil]];
         // 避免重复 present
         if (self.presentedViewController) {
             [self.presentedViewController dismissViewControllerAnimated:NO completion:^{
@@ -1641,7 +1641,7 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
 
     // 添加"取消"按钮：用户可在连接过程中取消
     __weak typeof(self) weakSelf = self;
-    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"common.cancel", @"取消")
+    [alert addAction:[UIAlertAction actionWithTitle:MPLocalized(@"common.cancel", @"Cancel")
                                               style:UIAlertActionStyleCancel
                                             handler:^(UIAlertAction *action) {
         __strong typeof(weakSelf) strongSelf = weakSelf;
@@ -1721,13 +1721,13 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
 - (NSString *)textForRoomStatus:(MultiplayerRoomStatus)status {
     switch (status) {
         case MultiplayerRoomStatusDisconnected:
-            return MPLocalized(@"mp.room.status.disconnected", @"未连接");
+            return MPLocalized(@"mp.room.status.disconnected", @"Disconnected");
         case MultiplayerRoomStatusConnecting:
-            return MPLocalized(@"mp.room.status.connecting", @"连接中");
+            return MPLocalized(@"mp.room.status.connecting", @"Connecting");
         case MultiplayerRoomStatusConnected:
-            return MPLocalized(@"mp.room.status.connected", @"已连接");
+            return MPLocalized(@"mp.room.status.connected", @"Connected");
         case MultiplayerRoomStatusError:
-            return MPLocalized(@"mp.room.status.error", @"错误");
+            return MPLocalized(@"mp.room.status.error", @"Error");
     }
     return @"";
 }
@@ -1752,15 +1752,15 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
     UIColor *bgColor;
 
     if (room.status == MultiplayerRoomStatusConnected) {
-        title = MPLocalized(@"mp.room.button.disconnect", @"断开");
+        title = MPLocalized(@"mp.room.button.disconnect", @"Disconnect");
         bgColor = [UIColor systemRedColor];
         button.enabled = YES;
     } else if (room.status == MultiplayerRoomStatusConnecting) {
-        title = MPLocalized(@"mp.room.button.connecting", @"连接中");
+        title = MPLocalized(@"mp.room.button.connecting", @"Connecting");
         bgColor = [UIColor systemGrayColor];
         button.enabled = NO;
     } else {
-        title = MPLocalized(@"mp.room.button.connect", @"连接");
+        title = MPLocalized(@"mp.room.button.connect", @"Connect");
         bgColor = [UIColor systemBlueColor];
         button.enabled = YES;
     }
@@ -1832,20 +1832,20 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
     if (self.mode == MultiplayerVCModeInGame) {
         switch (section) {
             case 0:
-                return MPLocalized(@"mp.ingame.section.role", @"选择角色");
+                return MPLocalized(@"mp.ingame.section.role", @"Choose role");
             case 1:
-                return MPLocalized(@"mp.ingame.section.status", @"联机状态");
+                return MPLocalized(@"mp.ingame.section.status", @"Multiplayer status");
             default:
                 return nil;
         }
     }
     switch (section) {
         case 0:
-            return MPLocalized(@"mp.section.settings", @"联机设置");
+            return MPLocalized(@"mp.section.settings", @"Multiplayer settings");
         case 1:
-            return MPLocalized(@"mp.section.rooms", @"我的房间");
+            return MPLocalized(@"mp.section.rooms", @"My rooms");
         case 2:
-            return MPLocalized(@"mp.section.direct", @"直连");
+            return MPLocalized(@"mp.section.direct", @"Direct connect");
         default:
             return nil;
     }
@@ -1856,18 +1856,18 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
     if (self.mode == MultiplayerVCModeInGame) {
         switch (section) {
             case 0:
-                return MPLocalized(@"mp.ingame.section.role_footer", @"房主需在 MC 中开放局域网，房客输入分享代码即可加入");
+                return MPLocalized(@"mp.ingame.section.role_footer", @"Host opens to LAN in Minecraft; guests join with the share code");
             case 1:
-                return MPLocalized(@"mp.ingame.section.status_footer", @"显示当前联机网络的状态信息");
+                return MPLocalized(@"mp.ingame.section.status_footer", @"Show current multiplayer network status");
             default:
                 return nil;
         }
     }
     switch (section) {
         case 0:
-            return MPLocalized(@"mp.section.settings_footer", @"启用联机后可设置 Network ID，房主开房时自动使用");
+            return MPLocalized(@"mp.section.settings_footer", @"After enabling multiplayer you can set a Network ID, used automatically when hosting");
         case 2:
-            return MPLocalized(@"mp.section.direct_footer", @"输入服务器 IP 和端口，写入当前 profile，启动游戏后自动加入");
+            return MPLocalized(@"mp.section.direct_footer", @"Enter server IP and port, save to the current profile, and auto-join on launch");
         default:
             return nil;
     }
@@ -1908,7 +1908,7 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
         // 启用联机开关行
         UITableViewCell *cell = [self.tableView dequeueReusableCellWithIdentifier:@"SwitchCell"];
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
-        cell.textLabel.text = MPLocalized(@"mp.settings.enable_multiplayer", @"启用联机");
+        cell.textLabel.text = MPLocalized(@"mp.settings.enable_multiplayer", @"Enable multiplayer");
         cell.textLabel.font = [UIFont systemFontOfSize:16];
 
         // 懒初始化 UISwitch
@@ -1925,16 +1925,16 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
         BOOL started = [[MultiplayerManager sharedManager] isNodeStarted];
         if (started) {
             if ([[MultiplayerManager sharedManager] isNodeOnline]) {
-                cell.detailTextLabel.text = MPLocalized(@"mp.settings.node_online", @"节点已上线");
+                cell.detailTextLabel.text = MPLocalized(@"mp.settings.node_online", @"Node online");
             } else {
-                cell.detailTextLabel.text = MPLocalized(@"mp.settings.node_starting", @"节点启动中...");
+                cell.detailTextLabel.text = MPLocalized(@"mp.settings.node_starting", @"Starting node…");
             }
         } else {
             // 节点未启动：如果用户已启用（等待自动重启），显示"启动中"
             if (enabled) {
-                cell.detailTextLabel.text = MPLocalized(@"mp.settings.node_starting", @"节点启动中...");
+                cell.detailTextLabel.text = MPLocalized(@"mp.settings.node_starting", @"Starting node…");
             } else {
-                cell.detailTextLabel.text = MPLocalized(@"mp.settings.node_offline", @"节点未启动");
+                cell.detailTextLabel.text = MPLocalized(@"mp.settings.node_offline", @"Node not started");
             }
         }
         cell.detailTextLabel.font = [UIFont systemFontOfSize:12];
@@ -1954,7 +1954,7 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
         // 预设 Network ID 行
         UITableViewCell *cell = [self.tableView dequeueReusableCellWithIdentifier:@"NetworkIdCell"];
         cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-        cell.textLabel.text = MPLocalized(@"mp.settings.preset_network_id", @"预设 Network ID");
+        cell.textLabel.text = MPLocalized(@"mp.settings.preset_network_id", @"Preset Network ID");
         cell.textLabel.font = [UIFont systemFontOfSize:16];
 
         // 显示当前预设的 Network ID（脱敏显示：前 4 + ... + 后 4）
@@ -1967,7 +1967,7 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
         } else if (presetNetId.length > 0) {
             displayValue = presetNetId;
         } else {
-            displayValue = MPLocalized(@"mp.settings.not_set", @"未设置");
+            displayValue = MPLocalized(@"mp.settings.not_set", @"Not set");
         }
 
         // 使用 detailTextLabel 显示值
@@ -2002,7 +2002,7 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
 - (UITableViewCell *)cellForGuideSection {
     UITableViewCell *cell = [self.tableView dequeueReusableCellWithIdentifier:@"DefaultCell"];
     cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-    cell.textLabel.text = MPLocalized(@"mp.settings.zt_guide", @"ZeroTier 网络创建教程");
+    cell.textLabel.text = MPLocalized(@"mp.settings.zt_guide", @"ZeroTier network setup guide");
     cell.textLabel.font = [UIFont systemFontOfSize:16];
 
     // 左侧图标：问号圆圈
@@ -2013,7 +2013,7 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
     cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
 
     // 辅助文字：简短说明
-    cell.detailTextLabel.text = MPLocalized(@"mp.settings.zt_guide_desc", @"不知道怎么创建网络？点这里");
+    cell.detailTextLabel.text = MPLocalized(@"mp.settings.zt_guide_desc", @"Not sure how to create a network? Tap here");
     cell.detailTextLabel.font = [UIFont systemFontOfSize:12];
 
     // 适配自定义背景
@@ -2036,7 +2036,7 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
     if (self.rooms.count == 0) {
         UITableViewCell *cell = [self.tableView dequeueReusableCellWithIdentifier:@"EmptyCell"];
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
-        cell.textLabel.text = MPLocalized(@"mp.rooms.empty", @"暂无房间（房间仅在本次会话中保留）");
+        cell.textLabel.text = MPLocalized(@"mp.rooms.empty", @"No rooms (rooms are kept for this session only)");
         cell.textLabel.textAlignment = NSTextAlignmentCenter;
         cell.textLabel.font = [UIFont systemFontOfSize:14];
         // 适配自定义背景
@@ -2059,7 +2059,7 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
     cell.selectionStyle = UITableViewCellSelectionStyleDefault;
 
     // 房间名
-    cell.textLabel.text = room.name.length ? room.name : MPLocalized(@"mp.room.unnamed", @"未命名房间");
+    cell.textLabel.text = room.name.length ? room.name : MPLocalized(@"mp.room.unnamed", @"Unnamed room");
     cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
 
     // 详情：Network ID + 状态 + 服务器地址（已连接时显示完整地址方便分享）
@@ -2073,10 +2073,10 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
     NSString *roomRoleTag = nil;
     if (room.role == MultiplayerRoomRoleHost) {
         roomRoleTag = [NSString stringWithFormat:@"%@ · %@",
-                       MPLocalized(@"i18n_str_2068", @"我"), MPLocalized(@"i18n_str_1027", @"房主")];
+                       MPLocalized(@"i18n_str_2068", @"Me"), MPLocalized(@"i18n_str_1027", @"Host")];
     } else if (room.role == MultiplayerRoomRoleGuest) {
         roomRoleTag = [NSString stringWithFormat:@"%@ · %@",
-                       MPLocalized(@"i18n_str_2068", @"我"), MPLocalized(@"i18n_str_2069", @"房客")];
+                       MPLocalized(@"i18n_str_2068", @"Me"), MPLocalized(@"i18n_str_2069", @"Guest")];
     }
     if (roomRoleTag.length > 0) {
         [detail appendFormat:@"\n%@", roomRoleTag];
@@ -2088,7 +2088,7 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
         NSString *hostPort = room.hostPort.length ? room.hostPort : @"25565";
         if (hostIP.length) {
             [detail appendFormat:@"\n%@: %@:%@",
-                MPLocalized(@"mp.room.server_address", @"服务器地址"),
+                MPLocalized(@"mp.room.server_address", @"Server address"),
                 hostIP, hostPort];
         }
     }
@@ -2131,7 +2131,7 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
         // 懒初始化 IP 输入框
         if (!self.directIPField) {
             self.directIPField = [[UITextField alloc] init];
-            self.directIPField.placeholder = MPLocalized(@"mp.direct.ip_placeholder", @"服务器 IP");
+            self.directIPField.placeholder = MPLocalized(@"mp.direct.ip_placeholder", @"Server IP");
             self.directIPField.font = [UIFont systemFontOfSize:15];
             self.directIPField.autocapitalizationType = UITextAutocapitalizationTypeNone;
             self.directIPField.autocorrectionType = UITextAutocorrectionTypeNo;
@@ -2221,7 +2221,7 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
         // 加入游戏按钮行
         UITableViewCell *cell = [self.tableView dequeueReusableCellWithIdentifier:@"ButtonCell"];
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
-        cell.textLabel.text = MPLocalized(@"mp.direct.join_button", @"加入游戏");
+        cell.textLabel.text = MPLocalized(@"mp.direct.join_button", @"Join game");
         cell.textLabel.textAlignment = NSTextAlignmentCenter;
         cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
         // 适配自定义背景
@@ -2260,9 +2260,9 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
         // 当房主
         cell.imageView.image = [UIImage systemImageNamed:@"crown"];
         cell.imageView.tintColor = [UIColor systemOrangeColor];
-        cell.textLabel.text = MPLocalized(@"mp.ingame.host_title", @"当房主");
+        cell.textLabel.text = MPLocalized(@"mp.ingame.host_title", @"Host");
         cell.textLabel.font = [UIFont systemFontOfSize:18 weight:UIFontWeightSemibold];
-        cell.detailTextLabel.text = MPLocalized(@"mp.ingame.host_desc", @"创建联机房间，开放局域网后生成分享代码");
+        cell.detailTextLabel.text = MPLocalized(@"mp.ingame.host_desc", @"Create a multiplayer room, open to LAN, then generate a share code");
         cell.detailTextLabel.font = [UIFont systemFontOfSize:13];
         cell.detailTextLabel.numberOfLines = 0;
 
@@ -2276,9 +2276,9 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
         // 当房客
         cell.imageView.image = [UIImage systemImageNamed:@"person.2"];
         cell.imageView.tintColor = [UIColor systemBlueColor];
-        cell.textLabel.text = MPLocalized(@"mp.ingame.guest_title", @"当房客");
+        cell.textLabel.text = MPLocalized(@"mp.ingame.guest_title", @"Join as guest");
         cell.textLabel.font = [UIFont systemFontOfSize:18 weight:UIFontWeightSemibold];
-        cell.detailTextLabel.text = MPLocalized(@"mp.ingame.guest_desc", @"输入分享代码，加入房主的联机网络");
+        cell.detailTextLabel.text = MPLocalized(@"mp.ingame.guest_desc", @"Enter the share code to join the host network");
         cell.detailTextLabel.font = [UIFont systemFontOfSize:13];
         cell.detailTextLabel.numberOfLines = 0;
 
@@ -2320,7 +2320,7 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
     BOOL connected = (currentRoom != nil) && (currentRoom.status == MultiplayerRoomStatusConnected);
 
     // 标题：联机状态
-    cell.textLabel.text = connected ? MPLocalized(@"mp.ingame.status.connected", @"已连接") : MPLocalized(@"mp.ingame.status.disconnected", @"未连接");
+    cell.textLabel.text = connected ? MPLocalized(@"mp.ingame.status.connected", @"Connected") : MPLocalized(@"mp.ingame.status.disconnected", @"Disconnected");
     cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
 
     // 详情：Network ID + 本地 IP + （房主）分享代码 / （房客）服务器地址
@@ -2328,11 +2328,11 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
 
     // 状态指示
     if (self.isHostFlowActive) {
-        [detail appendString:MPLocalized(@"mp.ingame.status.host_mode", @"房主模式")];
+        [detail appendString:MPLocalized(@"mp.ingame.status.host_mode", @"Host mode")];
     } else if (self.isGuestFlowActive) {
-        [detail appendString:MPLocalized(@"mp.ingame.status.guest_mode", @"房客模式")];
+        [detail appendString:MPLocalized(@"mp.ingame.status.guest_mode", @"Guest mode")];
     } else {
-        [detail appendString:MPLocalized(@"mp.ingame.status.idle", @"未开始")];
+        [detail appendString:MPLocalized(@"mp.ingame.status.idle", @"Not started")];
     }
 
     // Network ID
@@ -2340,26 +2340,26 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
     if (networkId.length) {
         [detail appendFormat:@"\n%@: %@", MPLocalized(@"mp.ingame.status.network_id", @"Network ID"), networkId];
     } else {
-        [detail appendFormat:@"\n%@: %@", MPLocalized(@"mp.ingame.status.network_id", @"Network ID"), MPLocalized(@"mp.settings.not_set", @"未设置")];
+        [detail appendFormat:@"\n%@: %@", MPLocalized(@"mp.ingame.status.network_id", @"Network ID"), MPLocalized(@"mp.settings.not_set", @"Not set")];
     }
 
     // 本地 IP
     NSString *localIP = manager.currentLocalIP;
     if (localIP.length) {
-        [detail appendFormat:@"\n%@: %@", MPLocalized(@"mp.ingame.status.local_ip", @"本地 IP"), localIP];
+        [detail appendFormat:@"\n%@: %@", MPLocalized(@"mp.ingame.status.local_ip", @"Local IP"), localIP];
     }
 
     // 房主流程：显示分享代码
     if (self.isHostFlowActive && self.lastShareCode.length) {
         [detail appendFormat:@"\n%@: %@",
-            MPLocalized(@"mp.ingame.status.share_code", @"分享代码"),
+            MPLocalized(@"mp.ingame.status.share_code", @"Share code"),
             self.lastShareCode];
     }
 
     // 房客流程：显示服务器地址
     if (self.isGuestFlowActive && self.lastServerAddress.length) {
         [detail appendFormat:@"\n%@: %@",
-            MPLocalized(@"mp.ingame.status.server_address", @"服务器地址"),
+            MPLocalized(@"mp.ingame.status.server_address", @"Server address"),
             self.lastServerAddress];
     }
 
@@ -2416,8 +2416,8 @@ NS_INLINE NSString *MPLocalized(NSString *key, NSString *fallback) {
         case 1:
             if (self.rooms.count == 0) {
                 // 空状态：提示用户先设置 Network ID 或直接加入房间
-                [self showSimpleAlertWithTitle:MPLocalized(@"mp.rooms.empty_title", @"暂无房间")
-                                         message:MPLocalized(@"mp.rooms.empty_msg", @"请先在 Section 0 设置 Network ID，然后在游戏内模式中选择当房主或房客")];
+                [self showSimpleAlertWithTitle:MPLocalized(@"mp.rooms.empty_title", @"No rooms")
+                                         message:MPLocalized(@"mp.rooms.empty_msg", @"Set a Network ID in Section 0 first, then choose Host or Guest in-game")];
             } else {
                 // 点击房间行：弹出 ActionSheet
                 MultiplayerRoom *room = self.rooms[indexPath.row];
